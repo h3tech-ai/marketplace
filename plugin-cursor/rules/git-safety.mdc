@@ -1,0 +1,7 @@
+---
+description: Synaptory git safety — no force history rewrite
+globs: "**/*"
+alwaysApply: true
+---
+
+Do not `git push --force`, `git push --force-with-lease` onto a shared branch, `git reset --hard`, or `git checkout --force`. Do not `git commit --no-verify`. Synaptory boundary hooks deny these in the shell (`failClosed`). Ask the human if history repair is truly required.

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "host": "codex",
+  "status": "inherited-runtime",
+  "minimum_runtime_version": "0.147.0",
+  "roles": {},
+  "notes": [
+    "Standard execution inherits the user's effective Codex model and records the honest runtime model in each receipt.",
+    "A managed model/provider pin and route attestation are required only for certified regulated execution and cost-policy enforcement."
+  ]
+}

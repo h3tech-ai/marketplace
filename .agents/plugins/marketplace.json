@@ -1,0 +1,20 @@
+{
+  "name": "synaptory-dev",
+  "interface": {
+    "displayName": "Synaptory Development"
+  },
+  "plugins": [
+    {
+      "name": "synaptory",
+      "source": {
+        "source": "local",
+        "path": "./plugins/synaptory"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

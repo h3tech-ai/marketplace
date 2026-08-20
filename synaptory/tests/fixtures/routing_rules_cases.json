@@ -1,0 +1,102 @@
+[
+  {
+    "description": "greenfield build triggers Scrum lifecycle",
+    "trigger_signal": "build a SaaS from scratch",
+    "expected_mode": "Build",
+    "expected_lifecycle": "scrum",
+    "expected_skills_include": [
+      "software-engineer",
+      "project-owner"
+    ]
+  },
+  {
+    "description": "sprint continuation routes to Sprint mode",
+    "trigger_signal": "continue sprint",
+    "expected_mode": "Sprint",
+    "expected_lifecycle": "scrum",
+    "expected_skills_include": [
+      "software-engineer"
+    ]
+  },
+  {
+    "description": "kanban maintenance mode",
+    "trigger_signal": "maintenance mode",
+    "expected_mode": "Kanban",
+    "expected_lifecycle": "kanban",
+    "expected_skills_include": [
+      "software-engineer"
+    ]
+  },
+  {
+    "description": "write tests routes to Test standalone",
+    "trigger_signal": "write tests",
+    "expected_mode": "Test",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "quality-engineer"
+    ]
+  },
+  {
+    "description": "code review routes to Review standalone",
+    "trigger_signal": "review my code",
+    "expected_mode": "Review",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "code-reviewer"
+    ]
+  },
+  {
+    "description": "architecture design routes to Architect",
+    "trigger_signal": "design",
+    "expected_mode": "Architect",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "solution-architect"
+    ]
+  },
+  {
+    "description": "debug crash routes to Debug",
+    "trigger_signal": "fix this bug",
+    "expected_mode": "Debug",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "code-reviewer",
+      "software-engineer"
+    ]
+  },
+  {
+    "description": "doctor command routes to Doctor",
+    "trigger_signal": "synaptory doctor",
+    "expected_mode": "Doctor",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": []
+  },
+  {
+    "description": "opening a slice routes to the SPQ lifecycle",
+    "trigger_signal": "open slice 3",
+    "expected_mode": "SPQ",
+    "expected_lifecycle": "spq",
+    "expected_skills_include": [
+      "software-engineer",
+      "project-owner"
+    ]
+  },
+  {
+    "description": "syncing workstreams routes to the barrier",
+    "trigger_signal": "sync workstreams",
+    "expected_mode": "Sync",
+    "expected_lifecycle": "spq",
+    "expected_skills_include": [
+      "quality-engineer"
+    ]
+  },
+  {
+    "description": "checkpoint closes the slice after integration",
+    "trigger_signal": "checkpoint",
+    "expected_mode": "Checkpoint",
+    "expected_lifecycle": "spq",
+    "expected_skills_include": [
+      "technical-writer"
+    ]
+  }
+]

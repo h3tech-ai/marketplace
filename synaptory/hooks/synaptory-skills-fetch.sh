@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Copyright (c) 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
+#
+# Hook: SessionStart
+# Purpose: Warm the CLI skill cache so agents can resolve SKILL.md bodies offline.
+#
+# The control-plane URL is stamped at build time into hooks/lib/cp-url.
+# In dev mode (SYNAPTORY_CP_ENV=dev), SYNAPTORY_CONTROL_PLANE_URL env overrides it.
+
+set -euo pipefail
+
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# shellcheck source=./_plugin-env.sh
+source "${PLUGIN_ROOT}/hooks/_plugin-env.sh"
+
+# Resolve the control-plane URL.
+_cp_url_file="${PLUGIN_ROOT}/hooks/lib/cp-url"
+_cp_url=""
+if [[ -f "$_cp_url_file" ]]; then
+  _cp_url=$(tr -d '[:space:]' < "$_cp_url_file")
+fi
+if [[ "${SYNAPTORY_CP_ENV:-}" == "dev" ]] && [[ -n "${SYNAPTORY_CONTROL_PLANE_URL:-}" ]]; then
+  _cp_url="${SYNAPTORY_CONTROL_PLANE_URL}"
+fi
+if [[ -z "$_cp_url" ]] || [[ "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
+  if [[ -n "${CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL:-}" ]]; then
+    _cp_url="${CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL}"
+  fi
+fi
+if [[ -z "$_cp_url" ]] || [[ "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
+  echo "synaptory: control-plane URL not stamped in this build; cannot fetch skills." >&2
+  exit 1
+fi
+export SYNAPTORY_CONTROL_PLANE_URL="$_cp_url"
+
+cli=$("${PLUGIN_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
+if [[ -z "$cli" ]] || [[ ! -x "$cli" ]]; then
+  echo "synaptory: CLI binary not found; cannot fetch skills." >&2
+  exit 1
+fi
+
+# Best-effort: on failure, agents fall back to the previous cache. The
+# timeout in hooks.json caps any stall. Emit reloadSkills:true on success
+# so Claude Code re-indexes the refreshed skill cache without a restart.
+if "$cli" skills sync >/dev/null 2>&1; then
+  SYNAPTORY_HOOK_LIB="${PLUGIN_ROOT}/hooks/lib" python3 -c "
+import sys, os
+sys.path.insert(0, os.environ['SYNAPTORY_HOOK_LIB'])
+from hook_io import emit
+emit('SessionStart', reload_skills=True)
+" 2>/dev/null || printf '{"reloadSkills":true}\n'
+fi

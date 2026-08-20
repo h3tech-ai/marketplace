@@ -1,0 +1,639 @@
+"""Linear transport — GraphQL API for issue/label/cycle operations.
+
+Uses Linear's single GraphQL endpoint with a personal API key.
+Auth: LINEAR_API_KEY env var + team_key/team_id from config.
+
+Two things differ from every other transport in this package and drive the
+design here:
+
+1. **Linear returns HTTP 200 with an `errors` array.** Classifying on the HTTP
+   status alone (what `teamwork_transport` does) would surface an auth failure
+   as a confusing missing-key error, so `_api_call` runs a second
+   classification pass over the JSON envelope.
+2. **GraphQL is not a query string.** Jira builds JQL *strings* and joins them
+   with `AND`; Linear takes a nested `IssueFilter` *dict*. Callers pass and
+   merge dicts — see `LinearAdapter._merge_filters`.
+
+API docs: https://linear.app/developers/graphql
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from typing import Optional
+
+from ..base import AdapterError, AdapterAuthError, AdapterOfflineError
+
+_ENDPOINT = "https://api.linear.app/graphql"
+
+# Requests/hour for a personal API key. Surfaced in the 429 message so the
+# operator knows whether they tripped a burst or a sustained limit.
+_RATE_LIMIT_PER_HOUR = 1500
+
+_UUID_RE = re.compile(
+    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+)
+
+
+def _norm_status(s: str) -> str:
+    """Normalize a status name for comparison: strip separators, casefold.
+
+    Mirrors `jira_transport._norm_status`. Linear teams name their own workflow
+    states, so `In Review` / `in-review` / `IN_REVIEW` must all compare equal.
+    """
+    return re.sub(r"[\s_\-]+", "", (s or "")).casefold()
+
+
+# ── GraphQL documents ────────────────────────────────────────────────────
+# Named module constants so the contract test can iterate them and assert
+# balanced braces, declared-vs-used variables, and pageInfo on paginated
+# queries. Keep every field in _ISSUE_FIELDS consumed by
+# LinearAdapter._issue_to_story — a test pins that correspondence, because a
+# trimmed fragment fails silently as `Story(status="TODO")` for every issue.
+
+_ISSUE_FIELDS = """
+fragment IssueFields on Issue {
+  id
+  identifier
+  url
+  title
+  description
+  estimate
+  priority
+  state { id name type position }
+  labels(first: 50) { nodes { id name } }
+  assignee { id name email }
+  cycle { id number }
+  project { id name }
+}
+"""
+
+_Q_VIEWER = """
+query Viewer {
+  viewer { id name email }
+}
+"""
+
+# One call gets everything `initialize()` needs: team identity, the workflow
+# state vocabulary for status resolution, the label namespace, and whether
+# estimates are enabled at all.
+_Q_TEAM = """
+query Team($key: String!) {
+  teams(filter: { key: { eq: $key } }, first: 1) {
+    nodes {
+      id
+      key
+      name
+      issueEstimationType
+      states(first: 50) { nodes { id name type position } }
+      labels(first: 250) { nodes { id name } }
+    }
+  }
+}
+"""
+
+_Q_TEAM_BY_ID = """
+query TeamById($id: String!) {
+  team(id: $id) {
+    id
+    key
+    name
+    issueEstimationType
+    states(first: 50) { nodes { id name type position } }
+    labels(first: 250) { nodes { id name } }
+  }
+}
+"""
+
+_Q_ISSUES = _ISSUE_FIELDS + """
+query Issues($filter: IssueFilter, $first: Int, $after: String, $orderBy: PaginationOrderBy) {
+  issues(filter: $filter, first: $first, after: $after, orderBy: $orderBy) {
+    nodes { ...IssueFields }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+_Q_ISSUE = _ISSUE_FIELDS + """
+query Issue($id: String!) {
+  issue(id: $id) { ...IssueFields }
+}
+"""
+
+_M_ISSUE_CREATE = """
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue { id identifier url }
+  }
+}
+"""
+
+_M_ISSUE_UPDATE = _ISSUE_FIELDS + """
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+    issue { ...IssueFields }
+  }
+}
+"""
+
+_M_LABEL_CREATE = """
+mutation IssueLabelCreate($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) {
+    success
+    issueLabel { id name }
+  }
+}
+"""
+
+_Q_TEAM_LABELS = """
+query TeamLabels($id: String!) {
+  team(id: $id) {
+    labels(first: 250) { nodes { id name } }
+  }
+}
+"""
+
+# Cycle *scalars only* — deliberately no nested `issues` connection.
+#
+# Linear scores query complexity by multiplying nested connection sizes, so
+# `cycles(first: 100) { issues(first: 250) }` is ~25,000 nodes before field
+# costs and is rejected against the 10,000-point ceiling. The adapter instead
+# fetches cycle issues with one flat, filtered `issues` query keyed on
+# `cycle.id.in`, then groups them client-side — which also lets the spec and
+# entity-label filters apply to cycle-backed reads (they cannot be expressed
+# on a nested connection). Still O(1) calls, not the per-cycle N+1 that
+# `jira_adapter.list_sprints` does.
+_Q_CYCLES = """
+query Cycles($id: String!, $first: Int, $after: String) {
+  team(id: $id) {
+    cycles(first: $first, after: $after) {
+      nodes {
+        id
+        number
+        name
+        description
+        startsAt
+        endsAt
+        completedAt
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+_Q_PROJECTS = """
+query Projects($id: String!, $first: Int, $after: String) {
+  team(id: $id) {
+    projects(first: $first, after: $after) {
+      nodes { id name }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+_M_CYCLE_CREATE = """
+mutation CycleCreate($input: CycleCreateInput!) {
+  cycleCreate(input: $input) {
+    success
+    cycle { id number name startsAt endsAt completedAt }
+  }
+}
+"""
+
+_M_CYCLE_UPDATE = """
+mutation CycleUpdate($id: String!, $input: CycleUpdateInput!) {
+  cycleUpdate(id: $id, input: $input) {
+    success
+    cycle { id number name startsAt endsAt completedAt }
+  }
+}
+"""
+
+# Error codes Linear reports inside the `errors` array (HTTP 200).
+_AUTH_ERROR_CODES = {
+    "AUTHENTICATION_ERROR", "INVALID_API_KEY", "FORBIDDEN",
+    "FEATURE_NOT_ACCESSIBLE", "USAGE_LIMIT_EXCEEDED",
+}
+_RATE_LIMIT_ERROR_CODES = {"RATELIMITED"}
+
+
+class LinearTransport:
+    """Transport layer for Linear operations via the GraphQL API.
+
+    Uses urllib.request (stdlib) — no external dependencies.
+    Auth: `Authorization: <key>` with **no** `Bearer ` prefix. Personal API
+    keys are sent raw; only OAuth access tokens take `Bearer`, and OAuth is
+    out of scope. Getting this wrong yields a bare 400, so it is pinned by a
+    test.
+    """
+
+    def __init__(self, team_key: str, team_id: str = ""):
+        """Initialize with a Linear team key and optionally its uuid.
+
+        Args:
+            team_key: Linear team key, e.g. 'ENG'
+            team_id: Optional team uuid — skips the by-key lookup when known.
+        """
+        self.team_key = team_key
+        self.team_id = team_id
+        self._api_available: Optional[bool] = None
+        self._team: Optional[dict] = None
+        self._labels_cache: Optional[dict[str, str]] = None  # name -> label id
+        self._projects_cache: Optional[dict[str, str]] = None  # name -> project id
+
+    # ── Auth ─────────────────────────────────────────────────
+
+    def check_api(self) -> bool:
+        """Check if the Linear API is configured via env vars."""
+        if self._api_available is not None:
+            return self._api_available
+        api_key = os.environ.get("LINEAR_API_KEY", "")
+        self._api_available = bool(api_key and (self.team_key or self.team_id))
+        return self._api_available
+
+    def health_check(self) -> dict:
+        api = self.check_api()
+        out = {
+            "status": "ok" if api else "offline",
+            "api": api,
+            "team_key": self.team_key,
+        }
+        if not api:
+            return out
+        try:
+            viewer = self.viewer()
+            out["user"] = viewer.get("email") or viewer.get("name", "")
+        except (AdapterError, AdapterAuthError, AdapterOfflineError) as e:
+            out["status"] = "degraded"
+            out["error"] = str(e)
+        return out
+
+    def viewer(self) -> dict:
+        """Return the authenticated user ({id, name, email})."""
+        data = self._api_call(_Q_VIEWER, op="viewer")
+        return data.get("viewer") or {}
+
+    # ── Team / workflow states / labels ──────────────────────
+
+    def get_team(self, refresh: bool = False) -> dict:
+        """Fetch and cache the team, its workflow states, and its labels.
+
+        One round trip serves status resolution, label attachment, and the
+        estimate gate — see `_Q_TEAM`.
+        """
+        if self._team is not None and not refresh:
+            return self._team
+
+        if self.team_id:
+            data = self._api_call(_Q_TEAM_BY_ID, {"id": self.team_id}, op="get_team")
+            team = data.get("team")
+        else:
+            data = self._api_call(_Q_TEAM, {"key": self.team_key}, op="get_team")
+            nodes = ((data.get("teams") or {}).get("nodes")) or []
+            team = nodes[0] if nodes else None
+
+        if not team:
+            raise AdapterError(
+                f"Linear team not found: {self.team_key or self.team_id!r}. "
+                "Check .synaptory.yaml tracker.linear.team_key — it is the short "
+                "team key (e.g. ENG), not the team name."
+            )
+
+        self._team = team
+        self.team_id = team.get("id", self.team_id)
+        self._labels_cache = {
+            n["name"]: n["id"]
+            for n in ((team.get("labels") or {}).get("nodes") or [])
+        }
+        return team
+
+    def list_workflow_states(self) -> list[dict]:
+        """Return the team's workflow states ({id, name, type, position})."""
+        team = self.get_team()
+        return list((team.get("states") or {}).get("nodes") or [])
+
+    def issue_estimation_type(self) -> str:
+        """Return the team's estimation scale, or 'notUsed' when disabled."""
+        return self.get_team().get("issueEstimationType") or "notUsed"
+
+    def get_or_create_label(self, name: str) -> str:
+        """Resolve a label name to its id, creating the label if absent.
+
+        Linear labels must exist before they can be attached — unlike Jira's
+        free-form labels. Modeled on `teamwork_transport.get_or_create_tag`,
+        including the already-exists race: a create can lose to a concurrent
+        writer, so on failure we re-read the team's labels once before giving
+        up.
+        """
+        if self._labels_cache is None:
+            self.get_team()
+        cache = self._labels_cache or {}
+        if name in cache:
+            return cache[name]
+
+        team_id = self.team_id or self.get_team().get("id", "")
+        try:
+            data = self._api_call(
+                _M_LABEL_CREATE,
+                {"input": {"name": name, "teamId": team_id}},
+                op="get_or_create_label",
+            )
+            label = (data.get("issueLabelCreate") or {}).get("issueLabel") or {}
+            if label.get("id"):
+                cache[name] = label["id"]
+                self._labels_cache = cache
+                return label["id"]
+        except AdapterError:
+            pass  # fall through to the re-read below
+
+        # Lost a race, or the name collided case-insensitively — re-read.
+        data = self._api_call(_Q_TEAM_LABELS, {"id": team_id}, op="get_or_create_label")
+        nodes = (((data.get("team") or {}).get("labels") or {}).get("nodes")) or []
+        refreshed = {n["name"]: n["id"] for n in nodes}
+        self._labels_cache = refreshed
+        if name in refreshed:
+            return refreshed[name]
+        # Case-insensitive last resort — Linear treats label names as unique
+        # case-insensitively, so a differing-case match is the same label.
+        for label_name, label_id in refreshed.items():
+            if label_name.casefold() == name.casefold():
+                return label_id
+        raise AdapterError(f"Could not create or resolve Linear label: {name!r}")
+
+    # ── Issues ───────────────────────────────────────────────
+
+    def create_issue(self, input_: dict) -> dict:
+        """Create an issue. `input_` is a Linear IssueCreateInput dict."""
+        payload = dict(input_)
+        payload.setdefault("teamId", self.team_id or self.get_team().get("id", ""))
+        data = self._api_call(_M_ISSUE_CREATE, {"input": payload}, op="create_issue")
+        result = data.get("issueCreate") or {}
+        if not result.get("success"):
+            raise AdapterError(f"Linear issueCreate failed for {payload.get('title')!r}")
+        return result.get("issue") or {}
+
+    def get_issue(self, issue_id: str) -> Optional[dict]:
+        """Fetch one issue by uuid or by human identifier (e.g. 'ENG-123')."""
+        data = self._api_call(_Q_ISSUE, {"id": issue_id}, op="get_issue")
+        return data.get("issue")
+
+    def update_issue(self, issue_id: str, input_: dict) -> dict:
+        """Update an issue. `input_` is a Linear IssueUpdateInput dict."""
+        data = self._api_call(
+            _M_ISSUE_UPDATE, {"id": issue_id, "input": input_}, op="update_issue"
+        )
+        result = data.get("issueUpdate") or {}
+        if not result.get("success"):
+            raise AdapterError(f"Linear issueUpdate failed for {issue_id}")
+        return result.get("issue") or {}
+
+    def search_issues(self, filter_: Optional[dict] = None,
+                      order_by: str = "updatedAt",
+                      max_results: int = 200) -> list[dict]:
+        """Search issues, always scoped to this team.
+
+        The team scope is merged in here rather than at every call site so no
+        caller can accidentally query the whole workspace.
+        """
+        scoped = {"team": {"key": {"eq": self.team_key}}} if self.team_key \
+            else {"team": {"id": {"eq": self.team_id}}}
+        merged = dict(filter_ or {})
+        merged.update(scoped)
+        return self._paginate(
+            _Q_ISSUES,
+            {"filter": merged, "orderBy": order_by},
+            ("issues",),
+            max_items=max_results,
+        )
+
+    # ── Cycles ───────────────────────────────────────────────
+
+    def list_cycles(self, max_results: int = 100) -> list[dict]:
+        """Return the team's cycles (scalars only — no issues).
+
+        Issues are fetched separately by the adapter; see `_Q_CYCLES` for why
+        the nested connection is not used.
+        """
+        team_id = self.team_id or self.get_team().get("id", "")
+        return self._paginate(
+            _Q_CYCLES, {"id": team_id}, ("team", "cycles"), max_items=max_results
+        )
+
+    def resolve_project_id(self, name_or_id: str) -> str:
+        """Resolve a Linear Project name to its uuid; pass uuids through.
+
+        Writes need the uuid — `IssueCreateInput.projectId` rejects a display
+        name — while a spec's `filter.value` is allowed to be either. Matching
+        is case-insensitive because project names are user-typed.
+        """
+        if not name_or_id or _UUID_RE.fullmatch(name_or_id):
+            return name_or_id
+        if self._projects_cache is None:
+            team_id = self.team_id or self.get_team().get("id", "")
+            nodes = self._paginate(
+                _Q_PROJECTS, {"id": team_id}, ("team", "projects"), max_items=250
+            )
+            self._projects_cache = {n["name"]: n["id"] for n in nodes if n.get("name")}
+        cache = self._projects_cache
+        if name_or_id in cache:
+            return cache[name_or_id]
+        for name, pid in cache.items():
+            if name.casefold() == name_or_id.casefold():
+                return pid
+        raise AdapterError(
+            f"Linear project not found: {name_or_id!r}. Known projects on team "
+            f"{self.team_key or self.team_id}: {sorted(cache) or '(none)'}"
+        )
+
+    def create_cycle(self, input_: dict) -> dict:
+        """Create a cycle. `input_` is a Linear CycleCreateInput dict."""
+        payload = dict(input_)
+        payload.setdefault("teamId", self.team_id or self.get_team().get("id", ""))
+        data = self._api_call(_M_CYCLE_CREATE, {"input": payload}, op="create_cycle")
+        result = data.get("cycleCreate") or {}
+        if not result.get("success"):
+            raise AdapterError(f"Linear cycleCreate failed for {payload.get('name')!r}")
+        return result.get("cycle") or {}
+
+    def update_cycle(self, cycle_id: str, input_: dict) -> dict:
+        """Update a cycle. `input_` is a Linear CycleUpdateInput dict."""
+        data = self._api_call(
+            _M_CYCLE_UPDATE, {"id": cycle_id, "input": input_}, op="update_cycle"
+        )
+        result = data.get("cycleUpdate") or {}
+        if not result.get("success"):
+            raise AdapterError(f"Linear cycleUpdate failed for {cycle_id}")
+        return result.get("cycle") or {}
+
+    # ── Pagination ───────────────────────────────────────────
+
+    def _paginate(self, query: str, variables: dict, path: tuple,
+                  page_size: int = 100, max_items: int = 500) -> list[dict]:
+        """Walk a Relay connection and return its accumulated nodes.
+
+        `path` names the connection inside the response, e.g. `("issues",)` or
+        `("team", "cycles")`. A response missing `pageInfo` terminates the loop
+        rather than spinning.
+        """
+        out: list[dict] = []
+        cursor: Optional[str] = None
+        while True:
+            page_vars = dict(variables)
+            page_vars["first"] = min(page_size, max_items - len(out))
+            page_vars["after"] = cursor
+            data = self._api_call(query, page_vars, op=f"paginate:{'.'.join(path)}")
+
+            node = data
+            for key in path:
+                node = (node or {}).get(key) or {}
+            out.extend(node.get("nodes") or [])
+
+            page_info = node.get("pageInfo")
+            if not isinstance(page_info, dict):
+                break
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+            if len(out) >= max_items:
+                # Never truncate silently: a short read here surfaces later as
+                # an empty sprint backlog or an undercounted velocity, with
+                # nothing pointing back at the cap that caused it.
+                print(
+                    f"tracker(linear): result cap of {max_items} reached for "
+                    f"{'.'.join(path)} and more pages remain — results are "
+                    "incomplete.",
+                    file=sys.stderr,
+                )
+                break
+        return out[:max_items]
+
+    # ── HTTP ─────────────────────────────────────────────────
+
+    def _api_call(self, query: str, variables: Optional[dict] = None,
+                  *, op: str = "") -> dict:
+        """POST a GraphQL document and return its `data` payload.
+
+        Raises rather than returning partial results: Linear can answer with
+        both `data` and `errors`, and nothing in the tracker layer has
+        partial-result semantics.
+        """
+        if not self.check_api():
+            raise AdapterOfflineError(
+                "Linear API not configured. Required:\n"
+                "  LINEAR_API_KEY — Linear → Settings → Security & access → "
+                "Personal API keys\n"
+                "  .synaptory.yaml tracker.linear.team_key — your Linear team "
+                "key (e.g. ENG)\n\n"
+                "Tip: use direnv for project-scoped keys:\n"
+                "  echo 'export LINEAR_API_KEY=\"lin_api_...\"' > .envrc && "
+                "direnv allow .\n"
+                "  Add .envrc to .gitignore."
+            )
+
+        api_key = os.environ["LINEAR_API_KEY"]
+        body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+
+        # No `Bearer ` prefix — personal API keys go in raw.
+        headers = {
+            "Authorization": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "synaptory-tracker",
+        }
+        req = urllib.request.Request(_ENDPOINT, data=body, headers=headers, method="POST")
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                # Header names are not contractual — treat as advisory so a
+                # rename degrades to "no proactive warning", not a crash.
+                remaining = response.headers.get("X-RateLimit-Requests-Remaining")
+                if remaining is not None:
+                    try:
+                        if int(remaining) <= 0:
+                            raise AdapterOfflineError(
+                                "Linear API rate limit reached "
+                                f"({_RATE_LIMIT_PER_HOUR} req/hour). Wait before retrying."
+                            )
+                    except (TypeError, ValueError):
+                        pass
+
+                raw = response.read().decode("utf-8")
+
+        except urllib.error.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            if e.code in (401, 403):
+                raise AdapterAuthError(
+                    "Linear API authentication failed. Check LINEAR_API_KEY "
+                    f"(personal API keys are sent without a 'Bearer' prefix).\n{error_body}"
+                )
+            if e.code == 429:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                suffix = f" Retry after {retry_after}s." if retry_after else ""
+                raise AdapterOfflineError(
+                    f"Linear API rate limit exceeded ({_RATE_LIMIT_PER_HOUR} "
+                    f"req/hour for API keys).{suffix}"
+                )
+            if e.code == 400:
+                raise AdapterError(
+                    f"Linear GraphQL request rejected ({op or 'query'}):\n{error_body}"
+                )
+            raise AdapterError(f"Linear API error ({e.code}) [{op}]:\n{error_body}")
+        except urllib.error.URLError as e:
+            raise AdapterOfflineError(f"Linear API unreachable: {e.reason}")
+        except TimeoutError:
+            raise AdapterOfflineError(f"Linear API timed out: {op or 'query'}")
+
+        if not raw.strip():
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            raise AdapterError(f"Invalid JSON response from Linear [{op}]")
+
+        errors = payload.get("errors")
+        if errors:
+            self._raise_for_graphql_errors(errors, op)
+        return payload.get("data") or {}
+
+    @staticmethod
+    def _raise_for_graphql_errors(errors, op: str) -> None:
+        """Classify Linear's HTTP-200 `errors` array into adapter exceptions."""
+        messages, codes = [], set()
+        for err in errors if isinstance(errors, list) else [errors]:
+            if not isinstance(err, dict):
+                messages.append(str(err))
+                continue
+            messages.append(str(err.get("message", err)))
+            ext = err.get("extensions")
+            if isinstance(ext, dict):
+                for key in ("code", "type"):
+                    val = ext.get(key)
+                    if val:
+                        codes.add(str(val).upper())
+
+        joined = "; ".join(m for m in messages if m) or "unknown error"
+        blob = f"{joined} {' '.join(sorted(codes))}".upper()
+
+        if codes & _RATE_LIMIT_ERROR_CODES or "RATE LIMIT" in blob:
+            raise AdapterOfflineError(
+                f"Linear API rate limited ({_RATE_LIMIT_PER_HOUR} req/hour): {joined}"
+            )
+        if codes & _AUTH_ERROR_CODES or "AUTHENTICATION REQUIRED" in blob:
+            raise AdapterAuthError(
+                f"Linear authentication failed. Check LINEAR_API_KEY.\n{joined}"
+            )
+        raise AdapterError(f"Linear GraphQL error ({op or 'query'}): {joined}")

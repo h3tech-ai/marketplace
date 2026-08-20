@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Stub `synaptory` CLI for plugin tests. Behaves enough like the real
+# Go binary that hooks can drive it without a live control plane.
+#
+# Subcommand handlers (extend as more tests need them):
+#
+#   skills get <name>
+#       Look up "${SYNAPTORY_STUB_BODIES_DIR}/<name>.md" and stream it
+#       to stdout. If missing, exit 1. If the env var
+#       SYNAPTORY_STUB_FAIL_NAMES contains <name> (whitespace-separated),
+#       force exit 1 — used to simulate selective per-skill failures.
+#       Prepends a synthetic watermark line so tests can detect
+#       "came from CP" vs "came from disk fallback".
+#
+#   telemetry <anything> ...
+#       Silently exit 0. Tests don't (yet) assert on telemetry shape.
+#
+#   skills sync, skills list
+#       Silently exit 0; the hooks under test don't depend on the side
+#       effects.
+#
+# All other subcommands exit non-zero so an unintended invocation is
+# caught loudly.
+set -euo pipefail
+
+cmd="${1:-}"
+case "$cmd" in
+  skills)
+    shift
+    sub="${1:-}"
+    case "$sub" in
+      get)
+        shift
+        name="${1:-}"
+        if [[ -z "$name" ]]; then
+          echo "stub synaptory: missing name for 'skills get'" >&2
+          exit 2
+        fi
+        # Selective per-name failure (for partial-fallback tests).
+        if [[ -n "${SYNAPTORY_STUB_FAIL_NAMES:-}" ]]; then
+          for fail in ${SYNAPTORY_STUB_FAIL_NAMES}; do
+            if [[ "$fail" == "$name" ]]; then
+              echo "stub synaptory: forced failure for $name" >&2
+              exit 1
+            fi
+          done
+        fi
+        # Optional artificial delay (ms). Lets parallel-fetch tests
+        # exercise the hook's order-preservation under variable timing.
+        if [[ -n "${SYNAPTORY_STUB_DELAY_MS:-}" ]]; then
+          # `sleep` accepts fractional seconds on bsd & gnu sleep alike.
+          sleep "$(awk "BEGIN{print ${SYNAPTORY_STUB_DELAY_MS}/1000}")" \
+            2>/dev/null || true
+        fi
+        body_path="${SYNAPTORY_STUB_BODIES_DIR:-}/${name}.md"
+        if [[ ! -f "$body_path" ]]; then
+          # Fall back to a default body if the test set one — useful when
+          # 17 protocols want the same canned content.
+          body_path="${SYNAPTORY_STUB_BODIES_DIR:-}/_default.md"
+        fi
+        if [[ ! -f "$body_path" ]]; then
+          echo "stub synaptory: no canned body for $name (looked at $body_path)" >&2
+          exit 1
+        fi
+        # Prepend a synthetic watermark so tests can distinguish CP
+        # vs on-disk fallback at a glance. Hash is deterministic from
+        # the name so repeated fetches produce the same first line.
+        wm=$(printf '%s' "stub|$name" | shasum -a 256 | cut -c1-16)
+        printf '<!-- synaptory-id: %s -->\n' "$wm"
+        cat "$body_path"
+        ;;
+      sync|list)
+        # Quietly succeed — tests don't assert these.
+        exit 0
+        ;;
+      *)
+        echo "stub synaptory: unhandled 'skills $sub'" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  telemetry)
+    # Append the args to a per-test log so tests can assert the hook
+    # actually invoked telemetry. Out-of-band tests that don't care
+    # leave the log unset and behaviour is unchanged.
+    if [[ -n "${SYNAPTORY_STUB_TELEMETRY_LOG:-}" ]]; then
+      shift
+      printf 'telemetry %s\n' "$*" >> "${SYNAPTORY_STUB_TELEMETRY_LOG}"
+    fi
+    exit 0
+    ;;
+  whoami|status)
+    # Used by some hooks for liveness checks; return a minimal sane body.
+    echo "stub@synaptory.test"
+    ;;
+  --version|-v)
+    # cli_min_version gate calls `synaptory --version`; emit a high version
+    # so the gate always passes in tests (override via SYNAPTORY_STUB_VERSION).
+    echo "synaptory version ${SYNAPTORY_STUB_VERSION:-9.9.9}"
+    ;;
+  version)
+    shift
+    # `version --check --json` drives the SessionStart update banner. Tests
+    # inject the freshness payload via SYNAPTORY_STUB_VERSION_JSON; the default
+    # is an "everything up to date" doc so unrelated tests see no banner.
+    if [[ "${1:-}" == "--check" ]]; then
+      if [[ -n "${SYNAPTORY_STUB_VERSION_JSON:-}" ]]; then
+        printf '%s\n' "${SYNAPTORY_STUB_VERSION_JSON}"
+      else
+        printf '%s\n' '{"checked":true,"latest":"9.9.9","cli":{"installed":"9.9.9","update_available":false},"plugin":{"installed":"9.9.9","update_available":false}}'
+      fi
+    else
+      echo "${SYNAPTORY_STUB_VERSION:-9.9.9}"
+    fi
+    ;;
+  update)
+    # Record that the CLI self-update path fired (A3 critical-force test)
+    # without touching any real binary.
+    if [[ -n "${SYNAPTORY_STUB_UPDATE_LOG:-}" ]]; then
+      shift; printf 'update %s\n' "$*" >> "${SYNAPTORY_STUB_UPDATE_LOG}"
+    fi
+    exit 0
+    ;;
+  config)
+    shift
+    # `config value <key> [--default D]` → the offline policy reader the
+    # SessionStart hook uses to resolve the CP-provided update policy (#96).
+    # Tests inject the "cached CP value" via SYNAPTORY_STUB_CONFIG_VALUE;
+    # absent that, echo the --default arg (mirrors a missing/stale cache).
+    if [[ "${1:-}" == "value" ]]; then
+      shift
+      _def=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --default) _def="${2:-}"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      printf '%s\n' "${SYNAPTORY_STUB_CONFIG_VALUE:-$_def}"
+    fi
+    exit 0
+    ;;
+  *)
+    echo "stub synaptory: unhandled subcommand '$cmd'" >&2
+    exit 2
+    ;;
+esac

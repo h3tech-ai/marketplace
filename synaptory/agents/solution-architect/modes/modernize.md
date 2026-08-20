@@ -1,0 +1,215 @@
+# Modernize Mode — Migration Strategy & Roadmap
+
+Load this mode when the orchestrator task contains "modernize", "migration plan", "modernization", or "upgrade architecture". This mode produces migration planning artifacts — it does NOT write migration code.
+
+## Prerequisites
+
+Context packages MUST exist. If `.synaptory/.orchestrator/context-packages/` is empty:
+- Print: `⚠ Context packages not found. Run /synaptory first to analyze the codebase.`
+- Stop. Do not proceed with modernization planning without codebase understanding.
+
+## Input
+
+Read these files before starting (in parallel):
+```python
+Read(".synaptory/.orchestrator/context-packages/dependency-map.md")
+Read(".synaptory/.orchestrator/context-packages/interface-contracts.md")
+Read(".synaptory/.orchestrator/context-packages/business-rules-inventory.md")
+Read(".synaptory/.orchestrator/context-packages/risk-register.md")
+Read(".synaptory/.orchestrator/context-packages/health-assessment.md")
+Read(".synaptory/reverse-engineering/architecture/hidden-coupling.md")
+Read(".synaptory/reverse-engineering/coverage/risk-priority-map.md")
+```
+
+## Process
+
+### Step 1: Migration Strategy Selection
+
+Evaluate which migration pattern fits based on the dependency map and module structure:
+
+| Strategy | When to Use | Risk Level |
+|---|---|---|
+| **Strangler Fig** | Most legacy systems. New functionality built alongside, traffic routed gradually. | LOW — incremental, reversible |
+| **Module Extraction** | Clear service boundaries exist. Extract one bounded context at a time. | MEDIUM — requires clean API boundary |
+| **Parallel Run** | High-risk data processing. Run old + new simultaneously, compare outputs. | MEDIUM — costly but safe for data systems |
+| **Encapsulation First** | No API boundaries exist (tightly coupled monolith). Wrap with API facades first. | LOW — non-destructive first step |
+| **Leave Alone** | Module works, low business value in changing, high risk. | NONE — sometimes the best strategy |
+
+**Default recommendation**: Strangler Fig unless evidence strongly suggests another. **Never recommend big-bang rewrite** — if user asks for one, document the risk explicitly and recommend incremental alternatives.
+
+Write strategy rationale to `.synaptory/solution-architect/modernization-plan/strategy.md`
+
+### Step 2: Module Scoring
+
+For each module from the dependency map, score three dimensions:
+
+- **Migration Value (1-5)**: How much business and technical value does replacing this module deliver?
+  - 5: Core business differentiator, high maintenance cost, blocks other improvements
+  - 3: Important but stable, moderate maintenance burden
+  - 1: Utility/infrastructure, works fine, low business impact
+
+- **Migration Risk (1-5)**: How dangerous is it to change?
+  - 5: Many hidden couplings, zero tests, core business logic, many dependents
+  - 3: Some coupling, partial test coverage, moderate complexity
+  - 1: Isolated, well-tested, simple, few dependents
+
+- **Migration Effort (1-5)**: How much work?
+  - 5: >10K LOC, complex business logic, multiple integrations, stored proc chains
+  - 3: 2-5K LOC, moderate logic, some integrations
+  - 1: <1K LOC, simple logic, self-contained
+
+**Priority Score = Value / (Risk × Effort)**
+
+Higher score = better candidate to migrate first (high value, low risk, low effort).
+
+Write to `.synaptory/solution-architect/modernization-plan/module-scoring.md`:
+```markdown
+| Module | Value | Risk | Effort | Priority Score | Order | Strategy |
+|---|---|---|---|---|---|---|
+| [name] | [1-5] | [1-5] | [1-5] | [score] | [1-N] | [strategy] |
+```
+
+**Rules**:
+- Every score MUST be backed by evidence from context packages — no scoring from intuition
+- Modules with P1 files at 0% coverage that are Q1 candidates → flag as BLOCKER in warnings
+- Q1 candidates MUST have at least P2 coverage from Discover mode before migration starts
+
+### Step 3: Phased Roadmap
+
+Generate a quarter-by-quarter roadmap:
+
+```markdown
+## Quarter 1: Foundation
+- Objective: [what we establish]
+- Modules targeted: [list from scoring — highest priority first]
+- Prerequisites: [what must exist before starting — tests, API facades, etc.]
+- Success metric: [measurable outcome]
+- Risk: [what could go wrong, with mitigation]
+
+## Quarter 2: First Extraction
+- Objective: [first module migrated]
+- Modules targeted: [list]
+- Dependencies on Q1: [what Q1 must have delivered]
+- Success metric: [measurable outcome]
+- Risk: [what could go wrong]
+
+## Quarter N: ...
+```
+
+Write to `.synaptory/solution-architect/modernization-plan/roadmap.md`
+
+**Rules**:
+- Q1 always starts with "Foundation" — establishing test baseline, API facades, monitoring
+- Never schedule a module for migration before its dependencies are migrated or facades exist
+- Respect the dependency graph — if A depends on B, B migrates first or gets a facade first
+
+### Step 4: Rollback Plans
+
+For each module in Q1 and Q2:
+
+```markdown
+# Rollback Plan: [module]
+
+## Trigger conditions
+- Error rate exceeds [X]%
+- Response time exceeds [X]ms for [Y] minutes
+- Data inconsistency detected between old and new
+
+## Rollback steps
+1. [step — route traffic back to legacy]
+2. [step — verify data consistency]
+3. [step — notify team]
+
+## Data reconciliation
+- [what data might be inconsistent]
+- [how to reconcile]
+
+## Estimated rollback time: [X minutes]
+```
+
+Write to `.synaptory/solution-architect/modernization-plan/rollback-plans/[module]-rollback.md`
+
+### Step 5: Feature Parity Checklists
+
+For each Q1 module:
+
+```markdown
+# Feature Parity: [module]
+
+## Inbound contracts that MUST remain supported
+- [list from interface-contracts.md]
+
+## Outbound behaviors that MUST be preserved
+- [list from dependency-map.md]
+
+## Business rules that MUST be maintained
+- [list from business-rules-inventory.md, filtered to this module]
+
+## LOW confidence rules — verify with domain expert BEFORE migration
+- [list of LOW/INFERRED confidence rules from this module]
+
+## Edge cases from characterization tests
+- [list from Discover mode characterization tests for this module]
+```
+
+Write to `.synaptory/solution-architect/modernization-plan/feature-parity/[module].md`
+
+### Step 6: Write ADRs
+
+For each major decision:
+- ADR: Migration strategy selection (why strangler fig / extraction / etc.)
+- ADR: Module migration order rationale
+- ADR: Technology choices for new implementations (if applicable)
+
+Write to standard ADR location from `.synaptory.yaml` paths.
+
+## Output
+
+```
+.synaptory/solution-architect/modernization-plan/
+├── strategy.md                    # Migration strategy + rationale
+├── module-scoring.md              # All modules scored and ranked
+├── roadmap.md                     # Quarter-by-quarter plan
+├── rollback-plans/
+│   └── [module]-rollback.md       # Per-module rollback
+├── feature-parity/
+│   └── [module].md                # Before/after parity requirements
+└── receipt.json
+```
+
+### Receipt `token_usage` (drives /cost)
+
+`receipt.json` MUST include a `token_usage` block. Read the counts off the
+SDK's final `Usage` object (`input_tokens` → `input`, `output_tokens` →
+`output`, `cache_read_input_tokens` → `cache_read`,
+`cache_creation_input_tokens` → `cache_write`):
+
+```json
+"token_usage": {
+  "input": 0,
+  "output": 0,
+  "cache_read": 0,
+  "cache_write": 0,
+  "stage": "sa-architecture"
+}
+```
+
+`stage` is fixed for every SA mode: exactly `"sa-architecture"`. Do NOT invent
+a mode-specific value (e.g. `"sa-modernize"`) — anything else rolls the
+receipt up under "Unknown / untagged" on the /cost page.
+
+## Completion Summary
+
+```
+━━━ Solution Architect (Modernize) ━━━━━━━━━━━━━━━━━ ⏱ Xm Ys ━━
+  Strategy:          {strategy name}
+  Modules scored:    {N}
+  Migration order:   {top 3 modules listed}
+  Roadmap:           {N} quarters
+  Rollback plans:    {N} generated
+  Parity checklists: {N} generated
+  ADRs:              {N} written
+
+  Artifacts: .synaptory/solution-architect/modernization-plan/
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```

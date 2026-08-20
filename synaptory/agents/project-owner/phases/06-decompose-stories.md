@@ -1,0 +1,166 @@
+### Step 6: Decompose Features into User Stories (Level 4)
+
+> **Anchor: You are the Product Manager. Decompose features into user stories. One story per file. INVEST validation on every story.**
+
+Execute this step for EVERY feature across ALL epics.
+
+**GROUND (per feature):** Before generating stories for FEAT-NNN, re-read:
+1. `epics/EPIC-NNN.md` — the parent epic file (contains the feature you're decomposing)
+2. Any existing sibling stories in `stories/FEAT-NNN/` (prevents duplicate coverage)
+3. Relevant source doc sections (PRD acceptance criteria, data model constraints for this feature's tables)
+
+#### DO — Generate Stories (per feature)
+
+**Method: One API/Screen/Flow Sizing Rule:**
+
+A well-sized story satisfies EXACTLY ONE of:
+- One API endpoint (POST /encounters, GET /members/:id)
+- One screen state change (empty → loaded, form → submitted)
+- One background process (CSV import, LLM generation)
+
+If a story requires 2+ endpoints AND a screen change AND a background process → split.
+If a story is just "add a field" with no new logic → merge into parent story.
+
+**Method: Developer Handoff Test** — every story must answer these 5 questions (a dev reads ONLY this story):
+
+1. What API endpoint(s) do I build? (method, path, request, response)
+2. What database operations? (tables, read/write/update, constraints)
+3. What UI component(s)? (what renders, what's interactive, what's static)
+4. What validation rules? (field-level, form-level, server-level)
+5. How do I know I'm done? (AC with specific test values)
+
+If any answer requires reading another document → the story is missing information. Add it.
+
+**Method: Input Specification** — for every story with user input:
+
+| Field | Type | Validation | Constraints | Required |
+|-------|------|-----------|-------------|----------|
+
+For every story with an API call:
+```
+Endpoint: {METHOD} {path}
+Request:  {typed fields}
+Response: {success shape} | {error codes with messages}
+Timeout:  {value}
+Fallback: {what happens on failure}
+```
+
+**Method: Negative Scenario Forcing** — ≥3 per story:
+
+| Category | Given | When | Then |
+|----------|-------|------|------|
+| Input validation | {valid precondition} | {bad data submitted} | {specific error code, message, no side effects} |
+| Authorization | {valid precondition} | {wrong role attempts action} | {403 + message, audit log entry} |
+| System failure | {valid precondition} | {timeout/downstream error} | {fallback behavior, retry policy, user feedback} |
+
+If a category doesn't apply: write `N/A — {reason}` (forces explicit decision, not accidental skip).
+
+**Story Sizing & Review Estimation:**
+
+| Size | Meaning | Scope | Review Hours |
+|------|---------|-------|-------------|
+| S | Simple | Single endpoint or component, no data model changes | 0.5h |
+| M | Medium | One endpoint + one UI screen | 1.0h |
+| L | Large | Multiple endpoints or complex business logic | 1.5h |
+
+Adjustment: +0.5h if security-sensitive (auth, PII, payment).
+If a story sizes as XL (cross-service, multiple screens, complex state) → split it.
+
+**Every story MUST contain ALL 6 of these sections:**
+1. Story statement
+2. Acceptance Criteria (Given/When/Then)
+3. Business Rules
+4. Edge Cases (≥3 negative scenarios)
+5. Handoff — Technical Contract (endpoint, request/response, DB tables, auth)
+6. INVEST Validation
+
+**Self-check before writing the next story:** Re-read what you just wrote. Count the major sections. If you count fewer than 6, you skipped a section — go back and add it. A story missing any section is incomplete. Do NOT proceed to Step 7 with incomplete stories.
+
+**Output:** Create each story in the tracker. Assemble the full story content (all 6 sections) as `raw_text`, then:
+
+```
+echo '{"id":"US-XXX","title":"...","feature":"FEAT-NNN","epic":"EPIC-NNN","priority":"Must","size":"M","sprint":"","raw_text":"<full story markdown>","acceptance_criteria":[{"id":"AC-1","text":"...","met":false},...]}' | python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir . create-story
+```
+
+Each story MUST include `| **Parent Feature** | FEAT-NNN |` in its metadata — this is the linkage that maps stories to features. The `raw_text` field contains the complete story Markdown (narrative, ACs, business rules, testing notes). The tracker adapter stores it appropriately for the configured backend.
+
+#### VALIDATE — INVEST Checklist (run per story)
+
+| Letter | Test | Pass Criteria |
+|--------|------|--------------|
+| **I** Independent | Can it be developed + merged without waiting for another same-sprint story? | If blocked, Blocked By field must list the dependency. |
+| **N** Negotiable | Does it define WHAT/WHY, not HOW? | Specify the contract (endpoint path, request/response shape, DB table) but NOT the implementation (no framework, no code patterns, no library choices). The Handoff Test fields are contracts, not prescriptions. |
+| **V** Valuable | Does completing it produce a testable increment? | Working endpoint, rendered component, or passing integration test. |
+| **E** Estimable | Enough detail (input spec, API shape, AC) to estimate S/M/L? | If a dev would ask "but what about...?" → add detail. |
+| **S** Small | Fits One API/Screen/Flow rule? Review ≤ 1.5h? | If review > 1.5h → split. |
+| **T** Testable | Every AC has Given/When/Then with concrete values? | A QA engineer can write a test from the AC alone. |
+
+Report: `{US-ID}: I✓ N✓ V✓ E✓ S✓ T✓` or flag + fix.
+
+#### VALIDATE — Completeness Matrices (per feature)
+
+**Matrix H — AC Coverage:**
+
+| Feature AC | US-X | US-Y | ... | Covered? |
+|------------|------|------|-----|----------|
+
+Every feature-level AC must be implemented by ≥1 story.
+
+**Matrix I — Business Rule Coverage:**
+
+| Business Rule | Story | How Implemented |
+|---------------|-------|----------------|
+
+Every BR from the feature must trace to an implementing story.
+
+**Matrix J — Edge Case Coverage:**
+
+| Edge Case (from Four D's) | Story | Handling |
+|---------------------------|-------|---------|
+
+Every edge case must map to a story (as a dedicated story or negative scenario within one).
+
+**Matrix K — API Endpoint Coverage:**
+
+| Endpoint | Story | Method |
+|----------|-------|--------|
+
+Every implied endpoint must have a story. An endpoint without a story will not be built.
+
+**STOP gate (per feature):**
+- All stories pass INVEST.
+- Matrix H: zero uncovered ACs.
+- Matrix I: zero uncovered business rules.
+- Matrix J: zero uncovered edge cases.
+- Matrix K: zero uncovered endpoints.
+
+**STOP gate (global):** ALL features across ALL epics must have complete story decomposition before proceeding to Step 7. Partial decomposition — where some epics have full stories and others have only titles — is a structural failure.
+
+**Persist matrices:** Write Matrices H, I, J, K (per feature) to `validation/step6-matrices.md`.
+
+#### Story ID Prefix Convention
+
+Each epic uses a distinct prefix to make story IDs globally unique and visually traceable:
+
+| Epic | Prefix | Example |
+|------|--------|---------|
+| EPIC-001 (Auth/Infra) | E | US-E01, US-E02 |
+| EPIC-002 (Data Ingestion) | D | US-D01, US-D02 |
+| EPIC-003 (Encounters) | *(numeric)* | US-001, US-002 |
+| EPIC-004 (Rules Engine) | R | US-R01, US-R02 |
+| EPIC-005 (Benefit Activation) | A | US-A01, US-A02 |
+| EPIC-006 (Queue & Panel) | Q | US-Q01, US-Q02 |
+| EPIC-007 (Dashboard) | P | US-P01, US-P02 |
+
+For new projects: assign a single-letter prefix per epic based on the epic's domain. Numbering restarts at 01 per prefix. If the project has >9 epics, use two-letter prefixes.
+
+#### Parallel Execution Protocol
+
+When the orchestrator assigns a **subset** of epics to this agent (e.g., "generate EPIC-001 and EPIC-002"):
+- Execute Steps 4-6 for your assigned epics ONLY.
+- Skip global STOP gates — these run in Step 8 after all parallel agents complete.
+- Per-epic and per-feature STOP gates still apply within your scope.
+- Write your files to the standard paths (`epics/`, `stories/`). File-per-artifact prevents write conflicts.
+- Do NOT generate ROADMAP.md or create sprints in the tracker yet — Step 7 runs AFTER all parallel agents finish.
+
+---

@@ -1,0 +1,210 @@
+# Branch Finish Mode
+
+Clean lifecycle management for development branches. Verify, merge or PR, and clean up.
+
+## Trigger Signals
+
+"finish this branch", "merge", "create a PR", "done with this branch", "ship this branch", "clean up branch", "ready to merge"
+
+## Execution
+
+### Phase 0 — Definition of Done Checklist
+
+Before any verification or merge action, check the team's Definition of Done:
+
+```python
+config    = Read(".synaptory.yaml") or {}
+dod_file  = config.get("dod", {}).get("file", "")
+dod_inline = config.get("dod", {}).get("inline", [])
+dod_items  = []
+
+if dod_file and file_exists(dod_file):
+    raw = Read(dod_file)
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- [ ]") or stripped.startswith("- [x]"):
+            checked  = stripped.startswith("- [x]")
+            text     = stripped[5:].strip()
+            # Lines containing "(critical)" or "**critical**" are merge-blocking
+            critical = "(critical)" in text.lower() or "**critical**" in text.lower()
+            dod_items.append({"text": text, "checked": checked, "critical": critical})
+elif dod_inline:
+    for item in dod_inline:
+        dod_items.append({
+            "text":     item.get("text", str(item)),
+            "checked":  False,
+            "critical": item.get("critical", False)
+        })
+
+if dod_items:
+    log("━━━ Definition of Done ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    for item in dod_items:
+        marker   = "[x]" if item["checked"] else "[ ]"
+        crit_tag = " ← CRITICAL" if item["critical"] and not item["checked"] else ""
+        log(f"  {marker} {item['text']}{crit_tag}")
+    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    blocking = [i for i in dod_items if i["critical"] and not i["checked"]]
+    if blocking:
+        AskUserQuestion(questions=[{
+            "question": "The following CRITICAL Definition of Done items are not checked off:\n\n"
+                + "\n".join([f"  ✗ {b['text']}" for b in blocking])
+                + "\n\nMerging with unchecked critical items violates team agreements.",
+            "header": "Definition of Done — Blocked",
+            "options": [
+                {"label": "All items satisfied — continue",
+                 "description": "Confirm all critical items are done; proceed to branch verification"},
+                {"label": "Abandon merge — fix these first",
+                 "description": "Stop branch-finish; return to address outstanding DoD items"},
+                {"label": "Override — proceed anyway",
+                 "description": "⚠ Skip DoD enforcement. Document reason in PR description."}
+            ],
+            "multiSelect": False
+        }])
+        # "Abandon merge" → return (stop here)
+        # "All items satisfied" or "Override" → continue to Phase 1
+# If no dod configured — silent pass, continue to Phase 1
+```
+
+### Phase 1 — Verification
+
+Before any merge/PR action, verify the branch is in good shape:
+
+```python
+Bash("git status")
+Bash("git log --oneline main..HEAD")  # or origin/main..HEAD
+Bash("git diff --stat main..HEAD")
+```
+
+Run project tests:
+```python
+# Detect test command from package.json, Makefile, etc.
+Bash("npm test 2>/dev/null || pytest 2>/dev/null || go test ./... 2>/dev/null || make test 2>/dev/null || echo 'No test command detected'")
+```
+
+If tests fail:
+```python
+AskUserQuestion(questions=[{
+  "question": "Tests are failing on this branch.\n\n{failure_summary}\n\nHow would you like to proceed?",
+  "options": [
+    {"id": "fix", "label": "Fix the failures first (Recommended)", "description": "Debug and fix before merging"},
+    {"id": "force", "label": "Proceed anyway — tests known to be broken", "description": "Merge/PR with known failures"},
+    {"id": "abort", "label": "Cancel — I'll handle this manually", "description": "Stop branch finishing"}
+  ]
+}])
+```
+
+### Phase 2 — Branch Summary
+
+Compile what this branch contains:
+
+```
+━━━ Branch Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Branch:    {branch_name}
+  Base:      {base_branch} (main or specified)
+  Commits:   {N}
+  Files:     +{added} ~{modified} -{deleted}
+  Tests:     {pass_count} passing, {fail_count} failing
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Phase 3 — Choose Exit Strategy
+
+```python
+AskUserQuestion(questions=[{
+  "question": "Branch '{branch_name}' is ready. What would you like to do?",
+  "header": "Branch Finish",
+  "options": [
+    {"id": "merge", "label": "Merge locally into {base_branch}", "description": "git merge, verify tests, delete branch"},
+    {"id": "pr", "label": "Push and create a Pull Request", "description": "git push, gh pr create with summary"},
+    {"id": "keep", "label": "Keep as-is — I'll come back to it", "description": "Leave branch and worktree intact"},
+    {"id": "discard", "label": "Discard branch and changes", "description": "Delete branch, remove worktree (requires confirmation)"}
+  ]
+}])
+```
+
+### Option 1 — Merge Locally
+
+```python
+# Ensure base is up to date
+Bash("git checkout {base_branch} && git pull origin {base_branch}")
+# Merge
+Bash("git merge {branch_name}")
+# Verify tests still pass on merged result
+Bash("{test_command}")
+# If tests pass: delete the branch
+Bash("git branch -d {branch_name}")
+# If in a worktree: clean up
+Bash("git worktree remove {worktree_path}")
+```
+
+If merge conflicts:
+- Attempt auto-resolution for known safe files (VERSION, CHANGELOG, lockfiles)
+- For code conflicts: present to user with context and let them decide
+
+### Option 2 — Push and Create PR
+
+```python
+Bash("git push -u origin {branch_name}")
+```
+
+Generate PR body from commits and branch summary:
+
+```python
+Bash("""gh pr create --title "{pr_title}" --body "$(cat <<'EOF'
+## Summary
+{bullet_points_from_commits}
+
+## Changes
+- {files_changed} files changed (+{additions}, -{deletions})
+
+## Test Plan
+- [ ] All {test_count} tests passing
+- [ ] {specific_test_items_from_changes}
+
+Generated with [synaptory](https://github.com/h3tech-ai/synaptory)
+EOF
+)" """)
+```
+
+Do NOT clean up worktree — the PR is still open.
+
+### Option 3 — Keep As-Is
+
+Report location and how to return:
+
+```
+Branch '{branch_name}' kept at: {worktree_path or current location}
+To return: cd {path} or git checkout {branch_name}
+```
+
+Do NOT clean up anything.
+
+### Option 4 — Discard
+
+Require explicit confirmation:
+
+```python
+AskUserQuestion(questions=[{
+  "question": "This will permanently delete branch '{branch_name}' and all uncommitted changes. Are you sure?",
+  "options": [
+    {"id": "confirm", "label": "Yes, discard everything"},
+    {"id": "cancel", "label": "No, keep the branch"}
+  ]
+}])
+```
+
+On confirm:
+```python
+Bash("git checkout {base_branch}")
+Bash("git branch -D {branch_name}")
+# If worktree exists
+Bash("git worktree remove --force {worktree_path}")
+```
+
+## Notes
+
+- Always verify tests before merge (Option 1). Never merge broken code.
+- For PRs (Option 2), use `gh pr create` — never push directly to main.
+- Worktree cleanup only for Options 1 (merged) and 4 (discarded). NOT for 2 (PR open) or 3 (keeping).
+- If the branch has synaptory receipts, include receipt summary in PR body.

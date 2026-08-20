@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+generate_reports.py — Render PIPELINE.md and PIPELINE.html from pipeline-summary.json.
+
+Also generates versioned requirements/technical reports and sprint-scoped
+quality/progress reports.
+
+Usage:
+  python3 generate_reports.py [project_dir] [--format md|html|all]
+  python3 generate_reports.py [project_dir] --requirements
+  python3 generate_reports.py [project_dir] --technical
+  python3 generate_reports.py [project_dir] --sprint N [--sprint-type dev|hardening|uat]
+  python3 generate_reports.py [project_dir] --sprint N --overwrite
+
+Defaults: --format all (produces both .synaptory/PIPELINE.md and .synaptory/PIPELINE.html)
+"""
+
+import json
+import sys
+from pathlib import Path
+
+from reports.pipeline_md import render_markdown
+from reports.pipeline_html import render_html
+from reports.writers import write_sprint_reports, write_versioned_report
+
+
+# ── Load summary ─────────────────────────────────────────────────────────────
+
+def load_summary(project_dir: Path) -> dict:
+    path = project_dir / ".synaptory" / "pipeline-summary.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"pipeline-summary.json not found. Run build_summary.py first.\n"
+            f"Expected at: {path}"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def generate(project_dir: Path, fmt: str = "all") -> list[Path]:
+    summary = load_summary(project_dir)
+    synaptory_dir = project_dir / ".synaptory"
+    outputs = []
+
+    if fmt in ("md", "all"):
+        md_path = synaptory_dir / "PIPELINE.md"
+        md_path.write_text(render_markdown(summary), encoding="utf-8")
+        outputs.append(md_path)
+
+    if fmt in ("html", "all"):
+        html_path = synaptory_dir / "PIPELINE.html"
+        html_path.write_text(render_html(summary), encoding="utf-8")
+        outputs.append(html_path)
+
+    return outputs
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Generate pipeline, requirements, technical, and sprint reports"
+    )
+    parser.add_argument("project_dir", nargs="?", default=".",
+                        help="Project root (default: current dir)")
+    parser.add_argument("--format", choices=["md", "html", "all"], default="all",
+                        help="Output format for pipeline report (default: all)")
+    parser.add_argument("--requirements", action="store_true",
+                        help="Generate requirements report HTML (next version)")
+    parser.add_argument("--technical", action="store_true",
+                        help="Generate technical report HTML (next version)")
+    parser.add_argument("--sprint", type=int, metavar="N",
+                        help="Generate quality + progress HTML for sprint N")
+    parser.add_argument("--sprint-type", choices=["dev", "hardening", "uat"],
+                        default="dev", help="Sprint type (default: dev)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Allow overwriting locked sprint reports")
+    args = parser.parse_args()
+
+    project_dir = Path(args.project_dir).resolve()
+
+    try:
+        if args.sprint:
+            outputs = write_sprint_reports(
+                project_dir, args.sprint, args.sprint_type, args.overwrite
+            )
+        elif args.requirements:
+            outputs = write_versioned_report(project_dir, "requirements")
+        elif args.technical:
+            outputs = write_versioned_report(project_dir, "technical")
+        else:
+            outputs = generate(project_dir, args.format)
+        for p in outputs:
+            print(f"[synaptory] Report written: {p}")
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

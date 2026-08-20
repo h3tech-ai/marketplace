@@ -1,0 +1,82 @@
+# Debug Mode
+
+Structured 4-phase root-cause analysis and fix. Prevents random guessing — problems are properly understood before solving.
+
+**Phase 1 — Reproduce:**
+- Read the user's error description. Attempt to reproduce by running the failing command, test, or flow.
+- Capture exact error output, stack trace, and environment details.
+- Write a minimal failing test if possible (ideal: test that fails now, passes after fix).
+- Determine reproduction rate: Always (100%) / Often (50-90%) / Sometimes (10-50%) / Rare (<10%).
+- If cannot reproduce: ask user for exact steps, check environment differences, add logging.
+
+**Phase 2 — Isolate (Code Reviewer):**
+- Read the error trace, identify the failure point (file, line, function).
+- Narrow the scope using binary search:
+  - **For regressions:** Use `git bisect` strategy — `git log --oneline -20`, identify when behavior changed, `git diff` between known-good and known-bad commits.
+  - **For new bugs:** Binary search through the call chain — add logging at midpoints to isolate the faulty layer.
+- Answer isolation questions: When did this start? What changed? Does it happen in all environments? What's the smallest change that triggers it?
+
+**Phase 3 — Understand (Root Cause Analysis):**
+- Apply the **5 Whys** technique to find the root cause, not just the symptom:
+  1. Why did the error occur? → (immediate cause)
+  2. Why did that happen? → (deeper cause)
+  3. Why? → (still deeper)
+  4. Why? → (getting closer)
+  5. Why? → (root cause)
+- Classify: logic error, type mismatch, missing null check, race condition, config issue, dependency issue, environment issue.
+- Document the causal chain in `.synaptory/debug/diagnosis.md`:
+  ```markdown
+  # Diagnosis: {issue title}
+  ## Root Cause
+  {classification}: {description}
+  ## Evidence
+  - {file}:{line} — {what the code does wrong}
+  - {git commit or change that introduced it, if applicable}
+  ## Causal Chain (5 Whys)
+  1. {symptom} because {immediate cause}
+  2. {immediate cause} because {deeper cause}
+  ...
+  ## Proposed Fix
+  {minimal fix description}
+  ## Risk Assessment
+  - Blast radius: {files affected}
+  - Regression risk: {low/medium/high}
+  ```
+
+**Phase 4 — Fix & Verify:**
+- **Fix (SE [backend/frontend])** — implement the fix based on the diagnosis. Follow existing code patterns. Minimal change — fix the bug, nothing else.
+- **Verify (Quality Engineer):**
+  - Confirm the bug no longer reproduces.
+  - Write a regression test that fails without the fix and passes with it.
+  - Run full test suite to confirm no regressions.
+  - Check similar code paths for the same class of bug (e.g., if null check was missing, scan for similar patterns).
+
+**1 gate:** After Phase 3 (diagnosis), present root cause, 5 Whys chain, and proposed fix for user confirmation before applying.
+
+**Visual flow:**
+```
+━━━ Debug Mode ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Issue: {user's error description}
+  Scope: Reproduce → Isolate → Understand → Fix & Verify
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [1/4] Reproduce
+    ✓ Error reproduced: {error summary}
+    ✓ Reproduction rate: {Always/Often/Sometimes/Rare}
+
+  [2/4] Isolate
+    ✓ Narrowed to: {file}:{line range}
+    ✓ Regression: {git bisect result or "not a regression"}
+
+  [3/4] Understand
+    ✓ Root cause: {classification} in {file}:{line}
+    ✓ 5 Whys: {final root cause}
+
+  ⬥ Confirm fix approach before proceeding
+
+  [4/4] Fix & Verify
+    ✓ {N} files modified
+    ✓ Regression test passes
+    ✓ {N}/{N} existing tests passing
+    ✓ Similar patterns checked: {N} locations
+```

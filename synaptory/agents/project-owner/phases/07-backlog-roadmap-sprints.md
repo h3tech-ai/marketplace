@@ -1,0 +1,201 @@
+### Step 7: Build Backlog, Roadmap & Sprint Plans
+
+> **Anchor: You are the Product Manager. You are now in planning mode — backlog, roadmap, sprint assignment. Use the Planning Parameters from ROADMAP.md. Size sprints to human review capacity, NOT agent dev speed.**
+
+```bash
+# Gate: verify complete decomposition before building sprint plans
+TRACKER_CLI="python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir ."
+HEALTH=$(${TRACKER_CLI} health-check 2>&1)
+if echo "$HEALTH" | grep -qi "error\|orphan\|missing\|fail"; then
+    echo "⚠ Decomposition incomplete. Fix these issues before proceeding to Step 7:"
+    echo "$HEALTH"
+    # STOP — return to decomposition steps
+fi
+```
+
+#### Method: MoSCoW Decision Tree
+
+For each story, run this sequence:
+
+```
+1. Can the system launch without this?
+   NO  → Must
+   YES → continue
+
+2. Does a stated success metric depend on this?
+   YES → Should
+   NO  → continue
+
+3. Did a stakeholder explicitly request this?
+   YES → Should
+   NO  → Could
+```
+
+Override rules:
+- Every story in an `[ENABLER]` epic → **Must** (enablers are foundational).
+- Every story that another Must story depends on → **Must** (dependency promotion).
+- Stories flagged `[ASSUMPTION]` with unvalidated BRs → **Should** until validated.
+
+#### Method: Sprint Assignment
+
+```
+Step 1 — Read Planning Parameters:
+  Load resolved parameters (start date, sprint duration, reviewer capacity, max dev sprints).
+  Calculate: available_capacity = reviewer_count × review_hours_per_week × 0.8
+
+Step 2 — Dependency sort:
+  Build directed graph (Story A → Story B = A must finish before B starts).
+  Topological sort → earliest possible sprint per story.
+
+Step 3 — Capacity fit:
+  For each sprint, sum human review hours.
+  If total > available_capacity → move lowest-priority story to next sprint.
+
+Step 4 — Epic cohesion:
+  Keep stories from the same epic in adjacent sprints.
+  A story from EPIC-005 must not land in Sprint 1 if EPIC-005 depends on EPIC-003 (Sprint 3).
+
+Step 5 — Timeline fit:
+  If dev_sprint_count > max_dev_sprints (from Planning Parameters):
+    → SCOPE-TIMELINE CONFLICT. Present options:
+      a) Cut Could/Should stories to fit
+      b) Extend timeline (recalculate go-live)
+      c) Increase reviewer capacity
+    In Autonomous mode: auto-cut Could stories first, then Should, log decisions.
+
+Step 6 — Validate:
+  - No story scheduled before its Blocked By dependency.
+  - No sprint exceeds 80% of human review capacity.
+  - Must stories scheduled before Should stories (within dependency constraints).
+  - Dev sprint count fits within max_dev_sprints (or conflict resolved).
+```
+
+#### Method: Cross-Epic Dependency Detection
+
+Scan every feature's Dependencies and Blocked By fields. If any points to a different epic, record it:
+
+**Cross-Epic Dependency Table:**
+
+| Downstream (needs) | Upstream (provides) | Type | Impact if Missing |
+|--------------------|--------------------|----- |-------------------|
+
+**Sequencing validation:** For each row, upstream_sprint must be < downstream_sprint. If not → SEQUENCING ERROR. Fix by moving downstream later, creating a stub story, or re-examining the dependency.
+
+**Interface Contract Rule:** For each cross-epic dependency:
+- Upstream must document: Provides (what), Contract (shape), Available (sprint).
+- Downstream must document: Requires (what), Fallback (if upstream not ready).
+
+#### Method: Roadmap Phases (Dev + Hardening + UAT)
+
+The roadmap MUST include all phases from first dev sprint through go-live. Dev sprints alone are not a roadmap — they are a build plan missing its delivery tail.
+
+```
+Phase 1 — Dev Sprints (Sprint 1 through Sprint N):
+  Feature development. Stories assigned per capacity. Gates at milestones.
+
+Phase 2 — Hardening Sprint (Sprint N+1):
+  Purpose: Regression testing, bug fixes, performance tuning, security remediation.
+  Activities:
+    - Full regression suite execution (all stories' AC re-verified)
+    - Performance testing against NFR thresholds
+    - Security scan remediation (Critical/High from VERIFY phase)
+    - Bug fixes from dev sprints (tracked as remediation stories)
+    - Documentation completeness check
+  Entry criteria: All dev stories pass AC. No Critical bugs open.
+  Exit criteria (Gate 7): QA Lead signs off. All NFR thresholds met. Zero Critical, zero High bugs.
+  Review load: Estimate 50% of dev sprint capacity (reviewers verify fixes, not new features).
+
+Phase 3 — UAT Sprint (Sprint N+2):
+  Purpose: Client acceptance testing with pilot users on staging environment.
+  Activities:
+    - Client walkthrough of all 6 screens (or equivalent user journeys)
+    - Pilot user testing with synthetic data
+    - Feedback collection and triage (fix vs. defer to Phase 2)
+    - Final data migration / seed data validation
+    - Production deployment preparation
+  Entry criteria: Gate 7 passed. Staging environment mirrors production config.
+  Exit criteria (Gate 8): Client signs off. Production deployment approved.
+  Review load: Minimal dev review; client-side effort.
+
+Code freeze: No new features after last dev sprint. Only bug fixes during Hardening.
+```
+
+**Gantt must show all 3 phases.** A Gantt that ends at the last dev story is incomplete — it hides 2 sprints of delivery work.
+
+**Timeline summary table** (include in ROADMAP.md header):
+
+```markdown
+| Phase | Sprints | Dates | Gate |
+|-------|---------|-------|------|
+| Development | Sprint 1-N | {start} to {code_freeze} | Gates 1-3 (milestone) |
+| Hardening | Sprint N+1 | {code_freeze} to {uat_start} | Gate 7 (QA sign-off) |
+| UAT | Sprint N+2 | {uat_start} to {go_live} | Gate 8 (Client sign-off) |
+| **Total** | **N+2** | **{start} to {go_live}** | |
+```
+
+#### Generate Artifacts
+
+```
+TRACKER_CLI = python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir .
+```
+
+**0. Validate sprint capacity before creating sprints:**
+
+Run the capacity script for each planned sprint. Use Planning Parameters values for `reviewer-count` and `review-hours-per-week`.
+
+```bash
+CAPACITY_CLI="python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/sprint_capacity.py --project-dir ."
+REVIEWER_COUNT=2          # from Planning Parameters (override if different)
+REVIEW_HOURS=15           # combined hours/week from Planning Parameters
+
+for sprint_num in $(seq 1 ${dev_sprint_count}); do
+    RESULT=$(${CAPACITY_CLI} \
+        --sprint ${sprint_num} \
+        --reviewer-count ${REVIEWER_COUNT} \
+        --review-hours-per-week ${REVIEW_HOURS})
+    STATUS=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','ERROR'))")
+    UTIL=$(echo "$RESULT"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('utilization_percent',0))")
+    if [ "$STATUS" = "OVERLOADED" ]; then
+        echo "⚠ Sprint ${sprint_num} is OVERLOADED (${UTIL}% utilization). Move lowest-priority story to next sprint."
+        echo "$RESULT"
+        # STOP — return to capacity assignment step before proceeding
+        exit 1
+    fi
+    echo "✓ Sprint ${sprint_num}: ${UTIL}% utilization (${STATUS})"
+done
+```
+
+If any sprint is OVERLOADED, move the lowest-review-hours Could/Should story from that sprint to the next sprint and re-run validation. Do NOT proceed to create-sprint until all sprints pass.
+
+Record the final capacity results in the receipt (see verification section).
+
+**1. Create sprints in the tracker:**
+For each sprint, create it via the tracker:
+```
+echo '{"number":1,"goal":"Sprint 1 — Auth & Infrastructure"}' | ${TRACKER_CLI} create-sprint
+```
+Repeat for each sprint. The tracker adapter creates milestones (GitHub), sprints (Jira), cycles (Linear), or SPRINT_N.md files (local) as appropriate.
+
+**2. Assign stories to sprints:**
+Each story should already have a `sprint` field from Step 6. If not, update each story's sprint assignment:
+```
+${TRACKER_CLI} update-status <story-id> TODO
+```
+
+**3. Write ROADMAP.md** — always written to `docs/requirements/` as a documentation artifact. Must include:
+   - **Planning Parameters table** (resolved values from Planning Parameters section)
+   - **Timeline summary table** (Dev / Hardening / UAT phases with dates and gates)
+   - Epic sequencing across dev sprints
+   - Mermaid Gantt chart **including Hardening and UAT phases** as named sections
+   - Gate checkpoints, cross-epic dependency table, risk register
+
+**NO PHANTOM IDs RULE:** A story ID referenced anywhere MUST exist in the tracker. Verify: `${TRACKER_CLI} get-story <id>` returns data for every ID mentioned in ROADMAP.md.
+
+**STOP gate — verify before proceeding to Step 8:**
+- All sprints exist: `${TRACKER_CLI} list-sprints` returns expected count
+- All stories exist: `${TRACKER_CLI} get-backlog` returns expected count, no phantom IDs
+- `ROADMAP.md` exists with Planning Parameters, Timeline, Gantt, Gates
+
+If ANY check fails → fix before proceeding. Do NOT skip to Step 8 with incomplete Step 7 output.
+
+---

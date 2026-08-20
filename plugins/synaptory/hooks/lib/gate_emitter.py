@@ -1,0 +1,350 @@
+"""Lifecycle gate emitter — drives v3 §6.5 ``gate_events`` from the plugin.
+
+Thin Python wrapper around ``synaptory telemetry gate-event``. Used by
+the scrum / kanban state machines and ceremony Python helpers to record
+gate transitions as the orchestrator runs:
+
+- Project Inception completion → ``project_inception / approved``
+- Sprint Planning end → ``spec_ready / opened`` per accepted spec
+- Sprint Review accept_story (#116) → ``evidence_dod / approved``
+- Sprint Review reject_story (#116) → ``evidence_dod / rejected``
+- Release ceremony exit → ``release / approved``
+
+The emitter is **best-effort**: a failing CLI call writes a stderr
+warning but never raises (gate emission must never block a ceremony).
+The CLI itself queues to the outbox when the CP is unreachable, so a
+network blip doesn't lose the event.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from typing import Iterable, Literal
+
+GateType = Literal[
+    "project_inception", "spec_ready", "evidence_dod", "release",
+]
+TargetType = Literal["project", "spec_version", "release"]
+State = Literal[
+    "opened", "approved", "rejected", "returned", "superseded",
+]
+DecisionRole = Literal[
+    "delivery_owner", "compliance_reviewer", "global_admin",
+]
+
+
+_GATE_TYPES = {"project_inception", "spec_ready", "evidence_dod", "release"}
+_TARGET_TYPES = {"project", "spec_version", "release"}
+_STATES = {"opened", "approved", "rejected", "returned", "superseded"}
+_DECISION_ROLES = {"delivery_owner", "compliance_reviewer", "global_admin"}
+
+
+def _resolve_cli() -> str | None:
+    """Resolve the synaptory CLI path.
+
+    Mirrors hooks/_resolve-cli.sh: explicit override via
+    ``SYNAPTORY_CLI_BIN``, else search ``PATH`` for ``synaptory``. Returns
+    ``None`` if neither resolves — caller decides whether to warn or
+    silently skip (gate emission is best-effort).
+    """
+    override = os.environ.get("SYNAPTORY_CLI_BIN")
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+    return shutil.which("synaptory")
+
+
+def emit_gate_event(
+    *,
+    gate_type: GateType,
+    target_type: TargetType,
+    target_id: str,
+    state: State,
+    decided_by: str | None = None,
+    decision_role: DecisionRole | None = None,
+    reason: str | None = None,
+    timeout: float = 10.0,
+) -> bool:
+    """Post a single gate event via ``synaptory telemetry gate-event``.
+
+    Returns ``True`` on success (or successful outbox-queue), ``False``
+    on any failure. Never raises — gate emission must not block a
+    ceremony.
+    """
+    # Validate enums before shelling out so a typo surfaces here, not
+    # buried inside CLI stderr. Mirrors the api-side validation.
+    if gate_type not in _GATE_TYPES:
+        print(
+            f"gate_emitter: refusing to emit — invalid gate_type {gate_type!r}; "
+            f"expected one of {sorted(_GATE_TYPES)}",
+            file=sys.stderr,
+        )
+        return False
+    if target_type not in _TARGET_TYPES:
+        print(
+            f"gate_emitter: refusing to emit — invalid target_type "
+            f"{target_type!r}; expected one of {sorted(_TARGET_TYPES)}",
+            file=sys.stderr,
+        )
+        return False
+    if state not in _STATES:
+        print(
+            f"gate_emitter: refusing to emit — invalid state {state!r}; "
+            f"expected one of {sorted(_STATES)}",
+            file=sys.stderr,
+        )
+        return False
+    if decision_role is not None and decision_role not in _DECISION_ROLES:
+        print(
+            f"gate_emitter: refusing to emit — invalid decision_role "
+            f"{decision_role!r}; expected one of {sorted(_DECISION_ROLES)}",
+            file=sys.stderr,
+        )
+        return False
+
+    cli = _resolve_cli()
+    if cli is None:
+        # CLI not installed yet — emission is silently skipped. This is
+        # the same fallback path other hooks use; the operator install
+        # script (cli/install.sh) is the canonical fix.
+        return False
+
+    cmd: list[str] = [
+        cli, "telemetry", "gate-event",
+        "--gate-type", gate_type,
+        "--target-type", target_type,
+        "--target-id", target_id,
+        "--state", state,
+        "--quiet",
+    ]
+    if decided_by:
+        cmd += ["--decided-by", decided_by]
+    if decision_role:
+        cmd += ["--decision-role", decision_role]
+    if reason:
+        cmd += ["--reason", reason]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(
+            f"gate_emitter: {gate_type}/{state} for {target_id} — "
+            f"{type(e).__name__}; CLI outbox should retry on next session.",
+            file=sys.stderr,
+        )
+        return False
+
+    if result.returncode != 0:
+        # Best-effort: log the failure with the CLI's stderr tail so the
+        # operator can diagnose, but never block the ceremony.
+        tail = (result.stderr or result.stdout or "").strip().splitlines()
+        last = tail[-1] if tail else f"exit {result.returncode}"
+        print(
+            f"gate_emitter: {gate_type}/{state} for {target_id} failed "
+            f"({last}); CLI outbox should retry on next session.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def emit_spec_ready_opened(spec_ids: Iterable[str]) -> int:
+    """Convenience: emit `spec_ready / opened` for each spec in a sprint plan.
+
+    Called at the end of Sprint Planning when the orchestrator commits
+    the sprint backlog. Returns the count of successful emissions.
+    """
+    n = 0
+    for sid in spec_ids:
+        if emit_gate_event(
+            gate_type="spec_ready",
+            target_type="spec_version",
+            target_id=sid,
+            state="opened",
+        ):
+            n += 1
+    return n
+
+
+def emit_evidence_dod_accepted(
+    spec_id: str, accepted_by: str,
+) -> bool:
+    """Convenience: PO accept_story (#116) → `evidence_dod / approved`."""
+    return emit_gate_event(
+        gate_type="evidence_dod",
+        target_type="spec_version",
+        target_id=spec_id,
+        state="approved",
+        decided_by=accepted_by,
+        decision_role="delivery_owner",
+    )
+
+
+def emit_evidence_dod_rejected(
+    spec_id: str, rejected_by: str, reason_text: str,
+) -> bool:
+    """Convenience: PO reject_story (#116) → `evidence_dod / rejected`."""
+    return emit_gate_event(
+        gate_type="evidence_dod",
+        target_type="spec_version",
+        target_id=spec_id,
+        state="rejected",
+        decided_by=rejected_by,
+        decision_role="delivery_owner",
+        reason=reason_text,
+    )
+
+
+#: Machine-readable prefix on the `reason` of a replay-mismatch gate event.
+#: Queries that count E1 activity centrally match on this, so it is a
+#: contract: do not reword it without updating the consumers named in
+#: `emit_evidence_dod_replay_mismatch`.
+REPLAY_MISMATCH_REASON_PREFIX = "evidence_replay_mismatch"
+
+#: `gate_events.reason` is String(2048) on the CP (api/synaptory_api/models.py).
+#: A receipt command can be arbitrarily long, so the reason is truncated here
+#: rather than being silently rejected at ingest.
+_REASON_MAX = 2048
+
+
+def emit_evidence_dod_replay_mismatch(
+    spec_id: str,
+    *,
+    check_id: str,
+    command: str | None,
+    attested_exit_code: int | None,
+    replayed_exit_code: int | None,
+) -> bool:
+    """E1 evidence-replay mismatch → `evidence_dod / returned` (#181).
+
+    Why this exists: `evaluate_story_dod` already records a mismatch by
+    appending `evidence_replay_mismatch` to `.synaptory/.orchestrator/
+    events.jsonl`, but nothing ever reads that file off the machine that
+    wrote it. The 2026-07-29 soak on #181 found that E4's gating
+    precondition ("confirm evidence-replay mismatches are being emitted
+    and handled") was therefore **unsatisfiable by inspecting
+    production** — the signal existed only on whichever laptop ran the
+    pipeline, and a receipt's `tests_pass: false` is indistinguishable
+    from a genuinely failing test.
+
+    `evidence_dod / returned` is the honest shape rather than a
+    convenient one: a replay mismatch blocks the reviewing→done
+    transition, which is exactly a gate returning work for rework. It
+    needs no new table, endpoint, or migration, and `returned` is
+    already a first-class state in `GateEvent.STATES` and the UI vocab.
+
+    No `decided_by` / `decision_role` is set: this is a machine
+    detection, and every value in `DECISION_ROLES` names a human
+    principal. Leaving both null is what distinguishes an automated
+    return from a Delivery Owner rejecting a story.
+
+    Consumers of `REPLAY_MISMATCH_REASON_PREFIX`:
+    - `/v1/analytics/gate-queue` counts it as `evidence_dod / returned`
+      with no query change.
+    - Ad-hoc soak queries filter `reason LIKE 'evidence_replay_mismatch%'`
+      to separate E1 returns from Delivery-Owner returns.
+    """
+    parts = [
+        REPLAY_MISMATCH_REASON_PREFIX,
+        f"check={check_id}",
+        f"attested_exit={attested_exit_code}",
+        f"replayed_exit={replayed_exit_code}",
+    ]
+    if command:
+        # Last so truncation eats the command, never the structured keys.
+        parts.append(f"command={command}")
+    reason = " ".join(parts)
+    if len(reason) > _REASON_MAX:
+        reason = reason[:_REASON_MAX - 3] + "..."
+    return emit_gate_event(
+        gate_type="evidence_dod",
+        target_type="spec_version",
+        target_id=spec_id,
+        state="returned",
+        reason=reason,
+    )
+
+
+#: Machine-readable prefix marking a gate event as the PIPELINE's computed DoD
+#: verdict rather than a human decision. `/v1/analytics/evidence-gates` prefers
+#: these over agent self-assessment, and `/v1/analytics/gate-queue` excludes
+#: them so the human decision queue stays human. Contract: do not reword.
+EVALUATED_DOD_REASON_PREFIX = "evidence_dod_evaluated"
+
+
+def emit_evidence_dod_evaluated(
+    spec_id: str,
+    *,
+    checks: dict[str, bool | None],
+    passed: bool,
+    tier: str | None = None,
+) -> bool:
+    """Ship the pipeline's COMPUTED DoD verdict for a story (#199).
+
+    Why: `evaluate_story_dod` computes all five canonical checks on every
+    `reviewing → done` transition, then assigns the result to
+    ``story["dod"]`` in ``.synaptory/.orchestrator/pipeline-state.json`` —
+    which never leaves the machine. What shipped instead was
+    ``receipts.payload.story_dod``, an agent-authored *self-assessment*. Over
+    an 11-day prod window that left four of the five checks at zero
+    occurrences, so `/quality`'s Evidence gate scored one signal out of five.
+
+    ``decided_by`` / ``decision_role`` stay null: every value in
+    ``DECISION_ROLES`` names a human principal, and null on both is what marks
+    a row as machine-computed. `gate-queue` filters on exactly that so these
+    rows never appear as work awaiting a human.
+
+    Re-evaluating a story emits again rather than deduping here — the reader
+    takes the LATEST row per story, which is correct regardless of how often
+    the pipeline runs and cannot drift the way a local dedupe cache would.
+
+    ``checks`` values may be None for a check the tier did not evaluate; those
+    serialize as ``none`` and contribute to neither pass nor fail, matching how
+    `evidence-gates` already treats a missing key.
+    """
+    parts = [EVALUATED_DOD_REASON_PREFIX]
+    if tier:
+        parts.append(f"tier={tier}")
+    for key in sorted(checks):
+        v = checks[key]
+        parts.append(f"{key}={'none' if v is None else str(bool(v)).lower()}")
+    reason = " ".join(parts)
+    if len(reason) > _REASON_MAX:
+        reason = reason[:_REASON_MAX - 3] + "..."
+    return emit_gate_event(
+        gate_type="evidence_dod",
+        target_type="spec_version",
+        target_id=spec_id,
+        state="approved" if passed else "rejected",
+        reason=reason,
+    )
+
+
+def emit_project_inception_approved(
+    project_slug: str, approved_by: str,
+) -> bool:
+    """Emit when INCEPTION → SPRINT_PLANNING transitions."""
+    return emit_gate_event(
+        gate_type="project_inception",
+        target_type="project",
+        target_id=project_slug,
+        state="approved",
+        decided_by=approved_by,
+        decision_role="delivery_owner",
+    )
+
+
+def emit_release_approved(release_id: str, approved_by: str) -> bool:
+    """Emit when the release ceremony completes."""
+    return emit_gate_event(
+        gate_type="release",
+        target_type="release",
+        target_id=release_id,
+        state="approved",
+        decided_by=approved_by,
+        decision_role="delivery_owner",
+    )

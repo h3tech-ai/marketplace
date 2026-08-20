@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""
+build_summary.py — Assemble pipeline-summary.json from .synaptory/ workspace.
+
+Reads pipeline-state.json, receipts, settings, rework-log, and context packages
+to produce a single canonical JSON that both PIPELINE.md and PIPELINE.html render from.
+
+Output: .synaptory/pipeline-summary.json
+Usage: python3 build_summary.py [project_dir] [--output path]
+"""
+
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+from summary.helpers import _now_iso, _read, _load_json, _ts_display
+from summary.receipts import normalize_receipt, extract_findings
+from summary.pipeline import (
+    build_project, build_pipeline, build_dod_summary, build_verification,
+    build_sprint_state, build_context_packages, build_open_items,
+    load_settings, load_config, load_receipts_raw,
+)
+from summary.sprint_detail import build_sprint_detail
+
+
+# ── Main assembler ───────────────────────────────────────────────────────────
+
+def assemble(project_dir: Path) -> dict:
+    """Assemble the canonical pipeline-summary.json."""
+    settings = load_settings(project_dir)
+    config = load_config(project_dir)
+    state_path = project_dir / ".synaptory" / ".orchestrator" / "pipeline-state.json"
+    state = _load_json(state_path)
+    rework_log = _read(project_dir / ".synaptory" / ".orchestrator" / "rework-log.md")
+
+    # Load and normalize receipts
+    raw_receipts = load_receipts_raw(project_dir)
+    receipts = [normalize_receipt(r) for r in raw_receipts]
+
+    # Sort by story_id
+    receipts.sort(key=lambda r: r.get("story_id", ""))
+
+    sprint_state = build_sprint_state(state, receipts)
+
+    result = {
+        "generated_at": _now_iso(),
+        "generated_at_display": _ts_display(_now_iso()),
+        "project": build_project(project_dir, settings, config),
+        "pipeline": build_pipeline(state, receipts),
+        "dod_summary": build_dod_summary(state),
+        "findings": extract_findings(receipts),
+        "verification": build_verification(receipts),
+        "context_packages": build_context_packages(project_dir),
+        "open_items": build_open_items(receipts),
+        "receipts_normalized": receipts,
+    }
+
+    # Include sprint state when build_mode is scrum
+    if sprint_state:
+        result["sprint"] = sprint_state
+        sprint_detail = build_sprint_detail(
+            project_dir, sprint_state["current_sprint"], state, receipts
+        )
+        if sprint_detail:
+            result["sprint_detail"] = sprint_detail
+
+    return result
+
+
+def generate(project_dir: Path, output_path: Optional[Path] = None) -> Path:
+    synaptory_dir = project_dir / ".synaptory"
+    if not synaptory_dir.exists():
+        raise FileNotFoundError(f".synaptory/ not found in {project_dir}")
+
+    summary = assemble(project_dir)
+
+    if output_path is None:
+        output_path = synaptory_dir / "pipeline-summary.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    return output_path
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    from summary.versioned_data import (
+        generate_sprint_data, generate_requirements_data, generate_technical_data,
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Assemble pipeline-summary.json and optional report data"
+    )
+    parser.add_argument("project_dir", nargs="?", default=".",
+                        help="Project root (default: current dir)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output path for pipeline-summary.json")
+    parser.add_argument("--sprint", type=int,
+                        help="Generate sprint report data for sprint N")
+    parser.add_argument("--sprint-type", choices=["dev", "hardening", "uat"],
+                        default="dev", help="Sprint type (default: dev)")
+    parser.add_argument("--requirements", action="store_true",
+                        help="Generate requirements report data (next version)")
+    parser.add_argument("--technical", action="store_true",
+                        help="Generate technical report data (next version)")
+    args = parser.parse_args()
+
+    project_dir = Path(args.project_dir).resolve()
+
+    try:
+        if args.sprint:
+            out = generate_sprint_data(project_dir, args.sprint, args.sprint_type)
+            print(f"[synaptory] Sprint {args.sprint} data written to: {out}")
+        elif args.requirements:
+            out = generate_requirements_data(project_dir)
+            print(f"[synaptory] Requirements data written to: {out}")
+        elif args.technical:
+            out = generate_technical_data(project_dir)
+            print(f"[synaptory] Technical data written to: {out}")
+        else:
+            output_path = Path(args.output) if args.output else None
+            out = generate(project_dir, output_path)
+            print(f"[synaptory] Pipeline summary written to: {out}")
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

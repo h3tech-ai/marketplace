@@ -1,0 +1,38 @@
+# Receipt Protocol — Compliance Engineer
+
+The full schema and required fields live in the shared
+`protocols/receipt-protocol.md`, which is auto-injected into your
+SubagentStart `additional_context`. This file is the CE-specific
+checklist.
+
+## Before you stop
+
+1. Complete the audit (STRIDE/OWASP findings, BAA checks, license scan).
+2. Verify outputs exist
+   (`test -s .synaptory/compliance-engineer/audit-report.md`).
+3. **Write the receipt** to:
+
+   ```
+   .synaptory/.orchestrator/receipts/{story_id}-ce.json
+   ```
+
+   Use the canonical short code `ce`. Do **not** use the full role
+   name (`compliance-engineer`) or append a timestamp.
+
+4. THEN call `TaskUpdate(status="completed")`.
+
+## Required fields for CE
+
+- `role` — `"compliance-engineer"`
+- `token_usage.stage` — `"ce-compliance"`
+- `metrics` — at minimum `findings_critical`, `findings_high`,
+  `findings_medium`, `findings_low` (mirror the CR shape).
+- `verification_commands` — at minimum
+  `test -s .synaptory/compliance-engineer/audit-report.md` plus one
+  command per artefact you produced.
+
+## Anti-patterns the hook will reject
+
+- ❌ Improvised filenames (`{story}-compliance-engineer-...Z.json`)
+- ❌ Receipt JSON only in response text (no `Write` call)
+- ❌ `TaskUpdate(completed)` before the receipt file exists

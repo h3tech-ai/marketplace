@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Thin CLI entry point for the tracker adapter.
+
+Agents call this via Bash() instead of editing BACKLOG.md directly.
+For the Markdown adapter, this still edits BACKLOG.md (identical behavior).
+For GitHub/Jira adapters, this calls the external API.
+
+Usage:
+    python3 tracker_cli.py --project-dir /path update-status US-E01 DONE
+    python3 tracker_cli.py --project-dir /path update-status US-E01 DONE --allow-skip
+    python3 tracker_cli.py --project-dir /path get-sprint-backlog 1
+    python3 tracker_cli.py --project-dir /path get-backlog
+    python3 tracker_cli.py --project-dir /path health-check
+    python3 tracker_cli.py --project-dir /path query --status BLOCKED
+
+`update-status` enforces an audit-gate FSM (see #111): tickets must enter
+IN_REVIEW before they can reach DONE. Pass `--allow-skip` to bypass.
+"""
+
+import json
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+# Ensure package is importable
+_this_dir = Path(__file__).resolve().parent
+_scripts_dir = str(_this_dir.parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+if str(_this_dir) not in sys.path:
+    sys.path.insert(0, str(_this_dir))
+
+from tracker import get_adapter, AdapterError, resolve_spec
+from tracker.base import QueryFilter
+
+
+def _extract_flag(args: list, flag: str):
+    """Extract `--flag value` or `--flag=value` from args; return (value, args')."""
+    out = list(args)
+    for i, a in enumerate(out):
+        if a == flag and i + 1 < len(out):
+            value = out[i + 1]
+            return value, out[:i] + out[i + 2:]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1], out[:i] + out[i + 1:]
+    return None, out
+
+
+def main():
+    args = sys.argv[1:]
+
+    # Parse --project-dir and --spec before subcommand dispatch (design §6.1).
+    project_dir_val, args = _extract_flag(args, "--project-dir")
+    project_dir = Path(project_dir_val) if project_dir_val else Path.cwd()
+    spec_flag, args = _extract_flag(args, "--spec")
+
+    if not args:
+        print("Usage: tracker_cli.py [--project-dir DIR] [--spec ID] <command> [args...]", file=sys.stderr)
+        print("Commands: update-status, get-sprint-backlog, get-backlog, health-check, query, sync", file=sys.stderr)
+        sys.exit(1)
+
+    command = args[0]
+    cmd_args = args[1:]
+
+    try:
+        try:
+            spec = resolve_spec(project_dir, spec_flag)
+        except ValueError as e:
+            print(f"spec resolution failed: {e}", file=sys.stderr)
+            sys.exit(2)
+        adapter = get_adapter(project_dir, spec=spec)
+
+        if command == "update-status":
+            allow_skip = False
+            if "--allow-skip" in cmd_args:
+                allow_skip = True
+                cmd_args = [a for a in cmd_args if a != "--allow-skip"]
+            if len(cmd_args) < 2:
+                print("Usage: update-status <story-id> <status> [--allow-skip]",
+                      file=sys.stderr)
+                sys.exit(1)
+            story_id, status = cmd_args[0], cmd_args[1]
+            result = adapter.update_story_status(story_id, status,
+                                                 allow_skip=allow_skip)
+            print(json.dumps(asdict(result), indent=2, default=str))
+
+        elif command == "get-sprint-backlog":
+            if len(cmd_args) < 1:
+                print("Usage: get-sprint-backlog <sprint-num> [--mine] [--assignee <value>]", file=sys.stderr)
+                sys.exit(1)
+            sprint_num = int(cmd_args[0])
+            assignee = None
+            i = 1
+            while i < len(cmd_args):
+                if cmd_args[i] == "--assignee" and i + 1 < len(cmd_args):
+                    assignee = cmd_args[i + 1]
+                    i += 2
+                elif cmd_args[i] == "--mine":
+                    assignee = "currentUser()"
+                    i += 1
+                else:
+                    i += 1
+            # #187 — honour the documented `tracker.scope: mine` default: with
+            # no explicit --assignee/--mine, a "mine"-scoped project restricts
+            # to the current user (an explicit flag still wins).
+            if assignee is None and getattr(adapter.config, "scope", "all") == "mine":
+                assignee = "currentUser()"
+            if assignee:
+                qf = QueryFilter(sprint=sprint_num, assignee=assignee)
+                items = adapter.query_tickets(qf)
+                stories = [adapter.get_story(it.id) for it in items]
+                stories = [s for s in stories if s is not None]
+            else:
+                stories = adapter.get_sprint_backlog(sprint_num)
+            print(json.dumps([asdict(s) for s in stories], indent=2, default=str))
+
+        elif command == "get-backlog":
+            items = adapter.get_backlog()
+            print(json.dumps([asdict(i) for i in items], indent=2, default=str))
+
+        elif command == "health-check":
+            result = adapter.health_check()
+            print(json.dumps(result, indent=2))
+
+        elif command == "query":
+            qf = QueryFilter()
+            i = 0
+            while i < len(cmd_args):
+                if cmd_args[i] == "--status" and i + 1 < len(cmd_args):
+                    qf.status = cmd_args[i + 1].split(",")
+                    i += 2
+                elif cmd_args[i] == "--priority" and i + 1 < len(cmd_args):
+                    qf.priority = cmd_args[i + 1].split(",")
+                    i += 2
+                elif cmd_args[i] == "--sprint" and i + 1 < len(cmd_args):
+                    qf.sprint = int(cmd_args[i + 1])
+                    i += 2
+                elif cmd_args[i] == "--text" and i + 1 < len(cmd_args):
+                    qf.text = cmd_args[i + 1]
+                    i += 2
+                elif cmd_args[i] == "--assignee" and i + 1 < len(cmd_args):
+                    qf.assignee = cmd_args[i + 1]
+                    i += 2
+                elif cmd_args[i] == "--mine":
+                    qf.assignee = "currentUser()"
+                    i += 1
+                else:
+                    i += 1
+            # #187 — honour the documented `tracker.scope: mine` default.
+            if qf.assignee is None and getattr(adapter.config, "scope", "all") == "mine":
+                qf.assignee = "currentUser()"
+            items = adapter.query_tickets(qf)
+            print(json.dumps([asdict(i) for i in items], indent=2, default=str))
+
+        elif command == "get-story":
+            if len(cmd_args) < 1:
+                print("Usage: get-story <story-id>", file=sys.stderr)
+                sys.exit(1)
+            story = adapter.get_story(cmd_args[0])
+            if story:
+                print(json.dumps(asdict(story), indent=2, default=str))
+            else:
+                print(json.dumps({"error": f"Story not found: {cmd_args[0]}"}))
+                sys.exit(1)
+
+        elif command == "get-sprint":
+            if len(cmd_args) < 1:
+                print("Usage: get-sprint <sprint-num>", file=sys.stderr)
+                sys.exit(1)
+            sprint = adapter.get_sprint(int(cmd_args[0]))
+            if sprint:
+                print(json.dumps(asdict(sprint), indent=2, default=str))
+            else:
+                print(json.dumps({"error": f"Sprint not found: {cmd_args[0]}"}))
+                sys.exit(1)
+
+        elif command == "list-sprints":
+            sprints = adapter.list_sprints()
+            print(json.dumps([asdict(s) for s in sprints], indent=2, default=str))
+
+        elif command == "sprint-metrics":
+            if len(cmd_args) < 1:
+                print("Usage: sprint-metrics <sprint-num>", file=sys.stderr)
+                sys.exit(1)
+            metrics = adapter.get_sprint_metrics(int(cmd_args[0]))
+            print(json.dumps(asdict(metrics), indent=2, default=str))
+
+        elif command == "list-epics":
+            epics = adapter.list_epics()
+            print(json.dumps([asdict(e) for e in epics], indent=2, default=str))
+
+        elif command == "get-epic":
+            if len(cmd_args) < 1:
+                print("Usage: get-epic <epic-id>", file=sys.stderr)
+                sys.exit(1)
+            epic = adapter.get_epic(cmd_args[0])
+            if epic:
+                print(json.dumps(asdict(epic), indent=2, default=str))
+            else:
+                print(json.dumps({"error": f"Epic not found: {cmd_args[0]}"}))
+                sys.exit(1)
+
+        elif command == "list-stories":
+            sprint = None
+            epic_id = None
+            assignee = None
+            i = 0
+            while i < len(cmd_args):
+                if cmd_args[i] == "--sprint" and i + 1 < len(cmd_args):
+                    sprint = int(cmd_args[i + 1])
+                    i += 2
+                elif cmd_args[i] == "--epic" and i + 1 < len(cmd_args):
+                    epic_id = cmd_args[i + 1]
+                    i += 2
+                elif cmd_args[i] == "--assignee" and i + 1 < len(cmd_args):
+                    assignee = cmd_args[i + 1]
+                    i += 2
+                elif cmd_args[i] == "--mine":
+                    assignee = "currentUser()"
+                    i += 1
+                else:
+                    i += 1
+            # #187 — honour the documented `tracker.scope: mine` default.
+            if assignee is None and getattr(adapter.config, "scope", "all") == "mine":
+                assignee = "currentUser()"
+            if assignee:
+                qf = QueryFilter(sprint=sprint, assignee=assignee)
+                items = adapter.query_tickets(qf)
+                stories = [adapter.get_story(it.id) for it in items]
+                stories = [s for s in stories if s is not None]
+                # #187 — QueryFilter has no epic dimension, so an `--epic X`
+                # passed alongside `--mine` would otherwise be discarded and
+                # broaden results across every epic. Honour it by filtering the
+                # resolved stories on their epic linkage.
+                if epic_id:
+                    stories = [s for s in stories if s.epic == epic_id]
+            else:
+                stories = adapter.list_stories(epic_id=epic_id, sprint=sprint)
+            print(json.dumps([asdict(s) for s in stories], indent=2, default=str))
+
+        elif command == "sprint-count":
+            sprints = adapter.list_sprints()
+            print(len(sprints))
+
+        elif command == "create-epic":
+            # Accepts JSON on stdin: {"id": "EPIC-001", "title": "...", "raw_text": "..."}
+            input_data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+            if not input_data.get("id"):
+                print("Usage: echo '{\"id\":\"EPIC-001\",\"title\":\"...\"}' | tracker_cli.py create-epic", file=sys.stderr)
+                sys.exit(1)
+            from tracker.base import Epic
+            epic = Epic(
+                id=input_data["id"],
+                title=input_data.get("title", ""),
+                feature_count=input_data.get("feature_count", 0),
+                raw_text=input_data.get("raw_text", ""),
+            )
+            result = adapter.create_epic(epic, raw_text=epic.raw_text)
+            print(json.dumps(asdict(result), indent=2, default=str))
+
+        elif command in ("create-ticket", "create-story"):
+            # Accepts JSON on stdin: {"id": "US-001", "title": "...", "feature": "...", ...}
+            input_data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+            if not input_data.get("id"):
+                print("Usage: echo '{\"id\":\"US-001\",\"title\":\"...\"}' | tracker_cli.py create-ticket", file=sys.stderr)
+                sys.exit(1)
+            from tracker.base import Story, AcceptanceCriterion
+            acs = [AcceptanceCriterion(**ac) for ac in input_data.get("acceptance_criteria", [])]
+            story = Story(
+                id=input_data["id"],
+                title=input_data.get("title", ""),
+                feature=input_data.get("feature", ""),
+                epic=input_data.get("epic", ""),
+                priority=input_data.get("priority", ""),
+                status=input_data.get("status", "TODO"),
+                size=input_data.get("size", ""),
+                sprint=input_data.get("sprint", ""),
+                ac_count=len(acs),
+                acceptance_criteria=acs,
+                raw_text=input_data.get("raw_text", ""),
+            )
+            result = adapter.create_ticket(story, raw_text=story.raw_text)
+            print(json.dumps(asdict(result), indent=2, default=str))
+
+        elif command == "create-sprint":
+            # Accepts JSON on stdin: {"number": 1, "goal": "..."}
+            input_data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+            if not input_data.get("number"):
+                print("Usage: echo '{\"number\":1,\"goal\":\"...\"}' | tracker_cli.py create-sprint", file=sys.stderr)
+                sys.exit(1)
+            from tracker.base import SprintInfo
+            sprint = SprintInfo(
+                number=input_data["number"],
+                goal=input_data.get("goal", ""),
+                dates=input_data.get("dates", ""),
+                capacity=input_data.get("capacity", ""),
+            )
+            result = adapter.create_sprint(sprint)
+            print(json.dumps(asdict(result), indent=2, default=str))
+
+        elif command == "close-sprint":
+            if len(cmd_args) < 1:
+                print("Usage: tracker_cli.py close-sprint <sprint-num>", file=sys.stderr)
+                sys.exit(1)
+            result = adapter.close_sprint(int(cmd_args[0]))
+            print(json.dumps(asdict(result), indent=2, default=str))
+
+        elif command == "sync":
+            # Pull live status from remote tracker into tracker-data.json
+            # Usage: tracker_cli.py sync [--sprint N] [--all]
+            if not hasattr(adapter, 'sync_to_local_cache'):
+                print(json.dumps({"error": f"sync not supported by {type(adapter).__name__} backend"}), file=sys.stderr)
+                sys.exit(1)
+            sprint_num = None
+            i = 0
+            while i < len(cmd_args):
+                if cmd_args[i] == "--sprint" and i + 1 < len(cmd_args):
+                    sprint_num = int(cmd_args[i + 1])
+                    i += 2
+                elif cmd_args[i] == "--all":
+                    sprint_num = None
+                    i += 1
+                else:
+                    i += 1
+            result = adapter.sync_to_local_cache(sprint_num=sprint_num)
+            print(json.dumps(result, indent=2, default=str))
+
+        elif command == "migrate":
+            # Usage: tracker_cli.py migrate --from <backend> --to <backend>
+            from_backend = None
+            to_backend = None
+            i = 0
+            while i < len(cmd_args):
+                if cmd_args[i] == "--from" and i + 1 < len(cmd_args):
+                    from_backend = cmd_args[i + 1]
+                    i += 2
+                elif cmd_args[i] == "--to" and i + 1 < len(cmd_args):
+                    to_backend = cmd_args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            if not from_backend or not to_backend:
+                print("Usage: tracker_cli.py migrate --from <local|github|jira|teamwork> --to <local|github|jira|teamwork>", file=sys.stderr)
+                sys.exit(1)
+            if from_backend == to_backend:
+                print(json.dumps({"error": f"Source and target are the same: {from_backend}"}), file=sys.stderr)
+                sys.exit(1)
+
+            from tracker import get_adapter_by_name
+
+            source = get_adapter_by_name(project_dir, from_backend)
+            target = get_adapter_by_name(project_dir, to_backend)
+            target.initialize()
+
+            stats = {"epics": 0, "stories": 0, "sprints": 0, "errors": []}
+
+            # Sprints first (milestones/boards must exist before stories reference them)
+            for sp in source.list_sprints():
+                try:
+                    target.create_sprint(sp)
+                    stats["sprints"] += 1
+                except AdapterError as e:
+                    stats["errors"].append(f"Sprint {sp.number}: {e}")
+
+            # Epics
+            for epic in source.list_epics():
+                try:
+                    target.create_epic(epic, raw_text=epic.raw_text)
+                    stats["epics"] += 1
+                except AdapterError as e:
+                    stats["errors"].append(f"Epic {epic.id}: {e}")
+
+            # Stories
+            for story in source.list_stories():
+                try:
+                    target.create_ticket(story, raw_text=story.raw_text)
+                    stats["stories"] += 1
+                except AdapterError as e:
+                    stats["errors"].append(f"Story {story.id}: {e}")
+
+            print(json.dumps(stats, indent=2))
+
+        else:
+            print(f"Unknown command: {command}", file=sys.stderr)
+            sys.exit(1)
+
+    except AdapterError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

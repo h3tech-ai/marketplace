@@ -1,0 +1,46 @@
+# Receipt Protocol — Code Reviewer
+
+The full schema and required fields live in the shared
+`protocols/receipt-protocol.md`, which is auto-injected into your
+SubagentStart `additional_context`. This file is the CR-specific
+checklist.
+
+## Before you stop
+
+1. Complete the review (read diff, run static analysis, document findings).
+2. Verify outputs exist (`test -s .synaptory/code-reviewer/review-report.md`).
+3. **Write the receipt** to:
+
+   ```
+   .synaptory/.orchestrator/receipts/{story_id}-cr.json
+   ```
+
+   Use the canonical short code `cr`. Do **not** use the full role
+   name (`code-reviewer`) or append a timestamp — the SubagentStop
+   verify hook and `collect_story_receipts()` only recognise
+   `{story_id}-cr.json`.
+
+4. THEN call `TaskUpdate(status="completed")`.
+
+## Required fields for CR
+
+In addition to the shared schema:
+
+- `role` — `"code-reviewer"`
+- `token_usage.stage` — `"cr-review"`
+- `metrics` — at minimum `findings_critical`, `findings_high`,
+  `findings_medium`, `findings_low`.
+- `verification_commands` — at minimum
+  `test -s .synaptory/code-reviewer/review-report.md` and one
+  command per finding artefact you produced.
+- `story_dod.code_reviewed` — set to `true` only when the
+  review is complete and findings are documented.
+- `status` — top-level `"complete"` on an approve verdict ONLY.
+  The `code_reviewed` DoD gate reads this field (or
+  `story_dod.code_reviewed`); a needs-work review must not set it.
+
+## Anti-patterns the hook will reject
+
+- ❌ `US-042-code-reviewer-20260512T0830Z.json` — improvised filename
+- ❌ Receipt JSON emitted only in your response text (no `Write` call)
+- ❌ `TaskUpdate(completed)` before the receipt file exists

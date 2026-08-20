@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+
+# --- synaptory: resolve Python interpreter (magic-number safe) ---
+# shellcheck source=lib/resolve-python.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/resolve-python.sh"
+: "${SYNAPTORY_PYTHON:?synaptory requires a working Python 3 interpreter (set SYNAPTORY_PYTHON to override)}"
+# -------------------------------------------------------------
+# Copyright (c) 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
+# Hook: SessionEnd
+# Purpose: Close the session span on the control plane, append a one-line audit
+#          entry to the session log, and update the CLAUDE.md pipeline sentinel.
+
+_HOOK_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# shellcheck source=./_plugin-env.sh
+PLUGIN_ROOT="$_HOOK_ROOT" source "${_HOOK_ROOT}/hooks/_plugin-env.sh"
+# shellcheck source=lib/resolve-python.sh
+source "${_HOOK_ROOT}/hooks/lib/resolve-python.sh"
+_py="${SYNAPTORY_PYTHON:-python3}"
+
+cli=$("${_HOOK_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
+if [[ -n "$cli" ]] && [[ -x "$cli" ]]; then
+  "$cli" telemetry session-end >/dev/null 2>&1 || true
+fi
+
+SUITE_DIR="${CLAUDE_PROJECT_DIR}/.synaptory"
+
+if [ ! -d "$SUITE_DIR" ]; then
+  exit 0
+fi
+
+# Final-flush ship loop: ship every unshipped receipt in the directory.
+# Catches receipts written inline by the orchestrator (notably RA, which
+# is documented as a conversational thinking partner — no Agent() spawn,
+# so no SubagentStop fires its ship loop) and any receipt written so close
+# to session end that the SubagentStop pass missed it. Sentinel-driven
+# (idempotent) — re-runs are safe; only successful CLI calls touch the
+# `.shipped` marker, so transient failures retry on the next session.
+RECEIPTS_DIR="$SUITE_DIR/.orchestrator/receipts"
+if [ -d "$RECEIPTS_DIR" ] && [[ -n "$cli" ]] && [[ -x "$cli" ]]; then
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    sentinel="${f}.shipped"
+    if [ ! -e "$sentinel" ] || [ "$f" -nt "$sentinel" ]; then
+      if "$cli" telemetry receipt --file "$f" >/dev/null 2>&1; then
+        touch "${sentinel}" 2>/dev/null || true
+      fi
+    fi
+  done < <(find "$RECEIPTS_DIR" -name "*.json" -not -name "*.shipped" 2>/dev/null)
+fi
+
+INPUT=$(cat)
+SESSION_ID=""
+END_REASON=""
+if [ -n "${_py:-}" ]; then
+  SESSION_ID=$(echo "$INPUT" | "$_py" -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id','unknown'))" 2>/dev/null)
+  END_REASON=$(echo "$INPUT" | "$_py" -c "import sys,json; d=json.load(sys.stdin); print(d.get('reason','other'))" 2>/dev/null)
+fi
+
+RECEIPT_COUNT=$(find "$SUITE_DIR/.orchestrator/receipts" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+
+mkdir -p "$SUITE_DIR/.orchestrator"
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
+echo "| ${TIMESTAMP} | ${SESSION_ID:-unknown} | ${END_REASON:-other} | ${RECEIPT_COUNT} receipts |" \
+  >> "$SUITE_DIR/.orchestrator/session-log.md" 2>/dev/null
+
+# Update CLAUDE.md sentinel with latest pipeline state (background — non-blocking).
+# Multi-spec aware: same two-step pattern as synaptory-reanchor.sh — rollup
+# rebuilds state-derived fields, then overlay settings-derived fields.
+(
+  SETTINGS_FILE="$SUITE_DIR/.orchestrator/settings.md"
+  UPDATER="${CLAUDE_PLUGIN_ROOT}/hooks/lib/update_claude_md.py"
+
+  if [ ! -f "$UPDATER" ]; then exit 0; fi
+
+  "$_py" "$UPDATER" "$CLAUDE_PROJECT_DIR" --rollup-sentinel >/dev/null 2>&1 || true
+
+  if [ -f "$SETTINGS_FILE" ]; then
+    "$_py" - "$CLAUDE_PROJECT_DIR" "$SETTINGS_FILE" "$UPDATER" <<'PYEOF'
+import json, os, subprocess, sys
+project_dir, settings_file, updater = sys.argv[1], sys.argv[2], sys.argv[3]
+overlay = {}
+try:
+    with open(settings_file) as f:
+        for line in f:
+            line = line.strip()
+            for key in ("engagement", "parallelism", "quality", "tracker"):
+                if line.lower().startswith(key + ":"):
+                    overlay[key] = line.split(":", 1)[1].strip().lower()
+                    break
+except Exception:
+    pass
+if overlay:
+    subprocess.run(
+        [os.environ.get("SYNAPTORY_PYTHON", "python3"), updater, project_dir, "--sentinel-write"],
+        input=json.dumps(overlay).encode(),
+        capture_output=True,
+    )
+PYEOF
+  fi
+) 2>/dev/null &
+
+exit 0

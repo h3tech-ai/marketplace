@@ -1,0 +1,689 @@
+"""Local adapter — compact JSON state with Markdown artifact content.
+
+The local backend keeps mutable workflow state in:
+  .synaptory/.orchestrator/tracker-data.json
+
+Canonical artifact content lives in ID-named Markdown files under:
+  docs/requirements/epics/{EPIC-ID}.md
+  docs/requirements/stories/{STORY-ID}.md
+  docs/requirements/sprints/SPRINT-{NNN}.md
+
+Older JSON-only tracker data and legacy Markdown filenames are still readable
+so existing projects can migrate gradually.
+"""
+
+import json
+import re
+from pathlib import Path
+from typing import Optional
+
+from .base import (
+    ArtifactAdapter, Epic, Story, SprintInfo, BacklogItem,
+    AcceptanceCriterion, SprintMetrics, QueryFilter,
+    AdapterError,
+)
+
+
+class LocalAdapter(ArtifactAdapter):
+    """Adapter using local JSON file for structured ticket tracking."""
+
+    def __init__(self, project_dir: Path, config, spec=None):
+        super().__init__(project_dir, config)
+        self.spec = spec
+        if spec is not None:
+            spec_dir = project_dir / ".synaptory" / ".orchestrator" / "specs" / spec.id
+            self._data_path = spec_dir / "tracker-data.json"
+        else:
+            self._data_path = project_dir / ".synaptory" / ".orchestrator" / "tracker-data.json"
+        self._data: Optional[dict] = None
+        self._requirements_dir: Optional[Path] = None
+
+    def _load(self) -> dict:
+        if self._data is not None:
+            return self._data
+        if self._data_path.exists():
+            try:
+                self._data = json.loads(self._data_path.read_text(encoding="utf-8"))
+            except Exception:
+                self._data = {"epics": [], "stories": [], "sprints": []}
+        else:
+            self._data = {"epics": [], "stories": [], "sprints": []}
+        return self._data
+
+    def _save(self) -> None:
+        data = self._load()
+        self._data_path.parent.mkdir(parents=True, exist_ok=True)
+        self._data_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+    # ── Lifecycle ─────────────────────────────────────────────
+
+    def initialize(self) -> None:
+        self._load()
+        self._save()
+
+    def health_check(self) -> dict:
+        data = self._load()
+        return {
+            "status": "ok",
+            "backend": "local",
+            "epics": len(data.get("epics", [])),
+            "stories": len(data.get("stories", [])),
+            "sprints": len(data.get("sprints", [])),
+        }
+
+    # ── Epic Operations ──────────────────────────────────────
+
+    def list_epics(self) -> list[Epic]:
+        return [self._dict_to_epic(e) for e in self._load().get("epics", [])]
+
+    def get_epic(self, epic_id: str) -> Optional[Epic]:
+        for e in self._load().get("epics", []):
+            if e["id"] == epic_id:
+                return self._dict_to_epic(e)
+        return None
+
+    def create_epic(self, epic: Epic, raw_text: str = "") -> Epic:
+        data = self._load()
+        self._write_epic_markdown(epic, raw_text or epic.raw_text)
+        entry = self._compact_entry({"id": epic.id})
+        # Update if exists, else append
+        existing = [i for i, e in enumerate(data["epics"]) if e["id"] == epic.id]
+        if existing:
+            data["epics"][existing[0]] = self._compact_entry({**data["epics"][existing[0]], **entry})
+        else:
+            data["epics"].append(entry)
+        self._save()
+        return self._dict_to_epic(entry)
+
+    def update_epic(self, epic_id: str, **fields) -> Epic:
+        data = self._load()
+        for e in data["epics"]:
+            if e["id"] == epic_id:
+                e.update(fields)
+                self._save()
+                return self._dict_to_epic(e)
+        raise AdapterError(f"Epic not found: {epic_id}")
+
+    # ── Story Operations ─────────────────────────────────────
+
+    def list_stories(self, epic_id: Optional[str] = None,
+                     sprint: Optional[int] = None) -> list[Story]:
+        stories = [self._dict_to_story(s) for s in self._load().get("stories", [])]
+        if epic_id:
+            stories = [s for s in stories if s.epic == epic_id]
+        if sprint is not None:
+            stories = [s for s in stories if s.sprint == str(sprint)]
+        return stories
+
+    def get_story(self, story_id: str) -> Optional[Story]:
+        for s in self._load().get("stories", []):
+            if s["id"] == story_id:
+                return self._dict_to_story(s)
+        return None
+
+    def create_ticket(self, story: Story, raw_text: str = "") -> Story:
+        data = self._load()
+        self._write_story_markdown(story, raw_text or story.raw_text)
+        entry = self._compact_entry({
+            "id": story.id,
+            "status": story.status or "BACKLOG",
+            "sprint": story.sprint,
+            "blocked_by": story.blocked_by,
+        })
+        existing = [i for i, s in enumerate(data["stories"]) if s["id"] == story.id]
+        if existing:
+            data["stories"][existing[0]] = self._compact_entry({**data["stories"][existing[0]], **entry})
+        else:
+            data["stories"].append(entry)
+        self._save()
+        return self._dict_to_story(entry)
+
+    def update_story_status(self, story_id: str, status: str, *,
+                            allow_skip: bool = False) -> Story:
+        self._validate_status_transition(story_id, status, allow_skip)
+        data = self._load()
+        for s in data["stories"]:
+            if s["id"] == story_id:
+                s["status"] = status
+                self._save()
+                return self._dict_to_story(s)
+        raise AdapterError(f"Story not found: {story_id}")
+
+    def update_story(self, story_id: str, **fields) -> Story:
+        if "status" in fields:
+            return self.update_story_status(story_id, fields["status"])
+        data = self._load()
+        for s in data["stories"]:
+            if s["id"] == story_id:
+                s.update(fields)
+                self._save()
+                return self._dict_to_story(s)
+        raise AdapterError(f"Story not found: {story_id}")
+
+    def get_acceptance_criteria(self, story_id: str) -> list[AcceptanceCriterion]:
+        story = self.get_story(story_id)
+        return story.acceptance_criteria if story else []
+
+    def update_acceptance_criteria(self, story_id: str, ac_id: str,
+                                   met: bool) -> AcceptanceCriterion:
+        data = self._load()
+        for s in data["stories"]:
+            if s["id"] == story_id:
+                story = self._dict_to_story(s)
+                for ac in story.acceptance_criteria:
+                    if ac.id == ac_id:
+                        status = s.setdefault("acceptance_status", {})
+                        status[ac_id] = met
+                        self._save()
+                        return AcceptanceCriterion(id=ac_id, text=ac.text, met=met)
+                for ac in s.get("acceptance_criteria", []):
+                    if ac["id"] == ac_id:
+                        ac["met"] = met
+                        self._save()
+                        return AcceptanceCriterion(id=ac_id, text=ac.get("text", ""), met=met)
+        raise AdapterError(f"AC not found: {ac_id} in {story_id}")
+
+    # ── Task & Bug Operations ────────────────────────────────
+
+    def create_aux_ticket(self, ticket_type: str, title: str,
+                          parent_id: Optional[str] = None, **fields) -> dict:
+        ticket_id = f"{ticket_type.upper()}-{len(self._load().get('stories', [])) + 1}"
+        story = Story(id=ticket_id, title=title, epic=parent_id or "")
+        self.create_ticket(story, raw_text=fields.get("body", ""))
+        return {"id": ticket_id, "title": title, "type": ticket_type}
+
+    def close_ticket(self, ticket_id: str, resolution: str = "") -> dict:
+        self.update_story_status(ticket_id, "DONE")
+        return {"id": ticket_id, "status": "DONE", "resolution": resolution}
+
+    # ── Sprint Operations ────────────────────────────────────
+
+    def list_sprints(self) -> list[SprintInfo]:
+        sprints = [self._dict_to_sprint(s) for s in self._load().get("sprints", [])]
+        return sorted(sprints, key=lambda s: s.number)
+
+    def get_sprint(self, sprint_num: int) -> Optional[SprintInfo]:
+        for s in self._load().get("sprints", []):
+            if s["number"] == sprint_num:
+                return self._dict_to_sprint(s)
+        return None
+
+    def create_sprint(self, sprint: SprintInfo, raw_text: str = "") -> SprintInfo:
+        data = self._load()
+        self._write_sprint_markdown(sprint, raw_text)
+        entry = self._compact_entry({
+            "number": sprint.number,
+            "story_ids": sprint.story_ids,
+        })
+        existing = [i for i, s in enumerate(data["sprints"]) if s["number"] == sprint.number]
+        if existing:
+            data["sprints"][existing[0]] = self._compact_entry({**data["sprints"][existing[0]], **entry})
+        else:
+            data["sprints"].append(entry)
+        self._save()
+        return self._dict_to_sprint(entry)
+
+    def get_sprint_backlog(self, sprint_num: int) -> list[Story]:
+        return self.list_stories(sprint=sprint_num)
+
+    def assign_to_sprint(self, story_id: str, sprint_num: int) -> Story:
+        return self.update_story(story_id, sprint=str(sprint_num))
+
+    def remove_from_sprint(self, story_id: str, sprint_num: int) -> Story:
+        return self.update_story(story_id, sprint="")
+
+    def close_sprint(self, sprint_num: int) -> SprintInfo:
+        data = self._load()
+        sprint_entry = None
+        for s in data.get("sprints", []):
+            if s["number"] == sprint_num:
+                sprint_entry = s
+                break
+        if sprint_entry is None:
+            raise AdapterError(f"Sprint not found: {sprint_num}")
+
+        # Mark sprint as closed
+        sprint_entry["closed"] = True
+
+        # Mark all sprint stories with status != DONE as DONE — but never
+        # force-promote stories the PO has not yet decided on (#116:
+        # AWAITING_ACCEPTANCE) or explicitly cancelled (CANCELLED). Those
+        # carry over to the next sprint untouched.
+        _terminal = ("DONE", "COMPLETED", "AWAITING_ACCEPTANCE", "CANCELLED")
+        for s in data.get("stories", []):
+            if (str(s.get("sprint", "")) == str(sprint_num)
+                    and s.get("status") not in _terminal):
+                s["status"] = "DONE"
+
+        self._save()
+        return self._dict_to_sprint(sprint_entry)
+
+    def move_incomplete_to_next(self, from_sprint: int, to_sprint: int) -> list[Story]:
+        stories = self.get_sprint_backlog(from_sprint)
+        incomplete = [s for s in stories if s.status not in ("DONE", "COMPLETED")]
+        for s in incomplete:
+            self.assign_to_sprint(s.id, to_sprint)
+        return incomplete
+
+    def get_sprint_metrics(self, sprint_num: int) -> SprintMetrics:
+        stories = self.get_sprint_backlog(sprint_num)
+        return SprintMetrics(
+            planned=len(stories),
+            completed=sum(1 for s in stories if s.status in ("DONE", "COMPLETED")),
+            in_progress=sum(1 for s in stories if s.status in ("IN_PROGRESS", "IN_REVIEW")),
+            blocked=sum(1 for s in stories if s.status == "BLOCKED"),
+            velocity=float(sum(1 for s in stories if s.status in ("DONE", "COMPLETED"))),
+        )
+
+    # ── Backlog Operations ───────────────────────────────────
+
+    def get_backlog(self) -> list[BacklogItem]:
+        return [
+            BacklogItem(
+                id=s.id, title=s.title, feature=s.feature,
+                priority=s.priority, status=s.status,
+                size=s.size, sprint=s.sprint,
+                review_hours=s.review_hours, blocked_by=s.blocked_by,
+            )
+            for s in self.list_stories()
+        ]
+
+    def query_tickets(self, query_filter: QueryFilter) -> list[BacklogItem]:
+        items = self.get_backlog()
+        if query_filter.status:
+            items = [i for i in items if i.status in query_filter.status]
+        if query_filter.priority:
+            items = [i for i in items if i.priority in query_filter.priority]
+        if query_filter.sprint is not None:
+            items = [i for i in items if i.sprint == str(query_filter.sprint)]
+        if query_filter.text:
+            q = query_filter.text.lower()
+            items = [i for i in items if q in i.title.lower() or q in i.id.lower()]
+        return items
+
+    # ── Reporting Operations ─────────────────────────────────
+
+    def get_velocity_data(self, num_sprints: int = 0) -> list[dict]:
+        data = []
+        for sprint in self.list_sprints():
+            m = self.get_sprint_metrics(sprint.number)
+            data.append({"sprint": sprint.number, "planned": m.planned, "completed": m.completed})
+        if num_sprints > 0:
+            data = data[-num_sprints:]
+        return data
+
+    def get_sprint_report_data(self, sprint_num: int) -> dict:
+        m = self.get_sprint_metrics(sprint_num)
+        sprint = self.get_sprint(sprint_num)
+        stories = self.get_sprint_backlog(sprint_num)
+        return {
+            "sprint_num": sprint_num,
+            "sprint_goal": sprint.goal if sprint else f"Sprint {sprint_num}",
+            "stories": {
+                "planned": m.planned, "completed": m.completed,
+                "in_progress": m.in_progress, "blocked": m.blocked,
+                "completion_pct": round((m.completed / m.planned * 100) if m.planned > 0 else 0),
+                "status_by_story": [
+                    {"id": s.id, "title": s.title, "status": s.status,
+                     "priority": s.priority, "size": s.size, "feature": s.feature}
+                    for s in stories
+                ],
+            },
+        }
+
+    def get_burndown_data(self, sprint_num: int) -> list[dict]:
+        return []
+
+    # ── Private Helpers ──────────────────────────────────────
+
+    def _dict_to_epic(self, d: dict) -> Epic:
+        path = self._find_epic_file(d["id"], d)
+        raw_text = path.read_text(encoding="utf-8") if path and path.exists() else d.get("raw_text", "")
+        title = self._title_from_markdown(raw_text, d["id"]) or d.get("title", "")
+        feature_count = d.get("feature_count", 0)
+        if raw_text and not feature_count:
+            feature_count = raw_text.lower().count("<feature>") or len(re.findall(r"\bFEAT-\w+", raw_text))
+        return Epic(
+            id=d["id"], title=title,
+            feature_count=feature_count,
+            raw_text=raw_text,
+            file_path=str(path.relative_to(self.project_dir)) if path else d.get("file_path") or d.get("file"),
+        )
+
+    def _dict_to_story(self, d: dict) -> Story:
+        path = self._find_story_file(d["id"], d)
+        raw_text = path.read_text(encoding="utf-8") if path and path.exists() else d.get("raw_text", "")
+        metadata = self._parse_story_metadata(raw_text) if raw_text else {}
+        acs = [AcceptanceCriterion(id=ac["id"], text=ac.get("text", ""), met=ac.get("met", False))
+               for ac in d.get("acceptance_criteria", [])]
+        if raw_text:
+            acs = self._parse_acceptance_criteria(raw_text)
+        status_by_ac = d.get("acceptance_status", {})
+        for ac in acs:
+            if ac.id in status_by_ac:
+                ac.met = bool(status_by_ac[ac.id])
+        title = self._title_from_markdown(raw_text, d["id"]) or d.get("title", "")
+        return Story(
+            id=d["id"], title=title,
+            feature=d.get("feature") or metadata.get("feature", ""),
+            epic=d.get("epic") or metadata.get("epic", ""),
+            priority=d.get("priority") or metadata.get("priority", ""),
+            status=d.get("status") or metadata.get("status", "BACKLOG"),
+            size=d.get("size") or metadata.get("size", ""),
+            sprint=d.get("sprint") or metadata.get("sprint", ""),
+            review_hours=d.get("review_hours") or metadata.get("review_hours", ""),
+            ac_count=len(acs), acceptance_criteria=acs,
+            raw_text=raw_text,
+            file_path=str(path.relative_to(self.project_dir)) if path else d.get("file_path") or d.get("file"),
+            blocked_by=d.get("blocked_by") or metadata.get("blocked_by", ""),
+        )
+
+    def _dict_to_sprint(self, d: dict) -> SprintInfo:
+        number = int(d["number"])
+        path = self._find_sprint_file(number, d)
+        raw_text = path.read_text(encoding="utf-8") if path and path.exists() else d.get("raw_text", "")
+        parsed = self._parse_sprint_markdown(raw_text) if raw_text else {}
+        return SprintInfo(
+            number=number, goal=parsed.get("goal") or d.get("goal", ""),
+            dates=parsed.get("dates") or d.get("dates", ""),
+            capacity=parsed.get("capacity") or d.get("capacity", ""),
+            story_ids=d.get("story_ids") or parsed.get("story_ids", []),
+            story_count=len(d.get("story_ids") or parsed.get("story_ids", [])),
+            file_path=str(path.relative_to(self.project_dir)) if path else d.get("file_path") or d.get("file"),
+        )
+
+    # ── Markdown-backed local storage helpers ───────────────────
+
+    _DROP_FROM_COMPACT = {
+        "title", "raw_text", "acceptance_criteria", "ac_count", "file", "file_path",
+        "feature", "epic", "priority", "size", "review_hours", "goal", "dates", "capacity",
+    }
+
+    @classmethod
+    def _compact_entry(cls, entry: dict) -> dict:
+        compact = {
+            k: v for k, v in entry.items()
+            if k not in cls._DROP_FROM_COMPACT and v not in ("", None, [], {})
+        }
+        return compact
+
+    @property
+    def requirements_dir(self) -> Path:
+        if self._requirements_dir is None:
+            if self.spec is not None and getattr(self.spec, "local", None):
+                configured = getattr(self.spec.local, "requirements_dir", "") or ""
+                if configured:
+                    self._requirements_dir = self.project_dir / configured.rstrip("/")
+                    return self._requirements_dir
+            data = self._load()
+            meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+            configured = ""
+            paths = meta.get("paths") or meta.get("canonical_paths")
+            if isinstance(paths, dict):
+                for value in paths.values():
+                    if isinstance(value, str) and value.startswith("docs/requirements"):
+                        configured = "docs/requirements"
+                        break
+            legacy = self.project_dir / ".requirements"
+            if not configured and ((legacy / "BRD").exists() or (legacy / "SPRINTS").exists()):
+                self._requirements_dir = legacy
+            else:
+                self._requirements_dir = self.project_dir / (configured or "docs/requirements")
+        return self._requirements_dir
+
+    def _artifact_dir(self, kind: str) -> Path:
+        data = self._load()
+        meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+        paths = meta.get("paths") or meta.get("canonical_paths")
+        if isinstance(paths, dict) and isinstance(paths.get(kind), str):
+            return self.project_dir / paths[kind].rstrip("/")
+        return self.requirements_dir / kind
+
+    def _find_epic_file(self, epic_id: str, entry: Optional[dict] = None) -> Optional[Path]:
+        return self._find_id_file(epic_id, [
+            self._artifact_dir("epics"),
+            self.requirements_dir / "BRD" / "epics",
+            self.project_dir / ".requirements" / "BRD" / "epics",
+        ], entry)
+
+    def _find_story_file(self, story_id: str, entry: Optional[dict] = None) -> Optional[Path]:
+        roots = [
+            self._artifact_dir("stories"),
+            self.requirements_dir / "BRD" / "stories",
+            self.project_dir / ".requirements" / "BRD" / "stories",
+        ]
+        return self._find_id_file(story_id, roots, entry, recursive=True)
+
+    def _find_sprint_file(self, sprint_num: int, entry: Optional[dict] = None) -> Optional[Path]:
+        sprint_id = self._sprint_id(sprint_num)
+        candidates = [
+            f"{sprint_id}.md",
+            f"SPRINT_{sprint_num}.md",
+            f"SPRINT_{sprint_num:03d}.md",
+        ]
+        roots = [
+            self._artifact_dir("sprints"),
+            self.requirements_dir / "SPRINTS",
+            self.project_dir / ".requirements" / "SPRINTS",
+        ]
+        if entry:
+            explicit = entry.get("file") or entry.get("file_path")
+            if explicit:
+                path = self.project_dir / explicit
+                if path.exists():
+                    return path
+        for root in roots:
+            if not root.exists():
+                continue
+            for filename in candidates:
+                path = root / filename
+                if path.exists():
+                    return path
+            for path in sorted(root.glob(f"sprint-{sprint_num}*.md")):
+                return path
+        return None
+
+    def _find_id_file(self, artifact_id: str, roots: list[Path],
+                      entry: Optional[dict] = None, *, recursive: bool = False) -> Optional[Path]:
+        if entry:
+            explicit = entry.get("file") or entry.get("file_path")
+            if explicit:
+                path = self.project_dir / explicit
+                if path.exists():
+                    return path
+        for root in roots:
+            if not root.exists():
+                continue
+            exact = root / f"{artifact_id}.md"
+            if exact.exists():
+                return exact
+            pattern = f"{artifact_id}-*.md"
+            matches = sorted(root.rglob(pattern) if recursive else root.glob(pattern))
+            if matches:
+                return matches[0]
+        return None
+
+    def _write_epic_markdown(self, epic: Epic, raw_text: str) -> Path:
+        path = self._artifact_dir("epics") / f"{epic.id}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = raw_text or f"# {epic.id}: {epic.title}\n"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _write_story_markdown(self, story: Story, raw_text: str) -> Path:
+        path = self._artifact_dir("stories") / f"{story.id}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if raw_text:
+            content = raw_text
+        else:
+            lines = [f"# {story.id}: {story.title}", ""]
+            meta = []
+            if story.status:
+                meta.append(f"**Status:** {story.status}")
+            if story.epic:
+                meta.append(f"**Epic:** {story.epic}")
+            if story.feature:
+                meta.append(f"**Feature:** {story.feature}")
+            if meta:
+                lines.append("> " + " · ".join(meta))
+            meta = []
+            if story.priority:
+                meta.append(f"**Priority:** {story.priority}")
+            if story.size:
+                meta.append(f"**Size:** {story.size}")
+            if story.sprint:
+                meta.append(f"**Sprint:** {story.sprint}")
+            if story.blocked_by:
+                meta.append(f"**Blocked by:** {story.blocked_by}")
+            if meta:
+                lines.append("> " + " · ".join(meta))
+            if story.acceptance_criteria:
+                lines.extend(["", "## Acceptance Criteria"])
+                for ac in story.acceptance_criteria:
+                    mark = "x" if ac.met else " "
+                    lines.append(f"* [{mark}] **{ac.id}:** {ac.text}")
+            content = "\n".join(lines).rstrip() + "\n"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _write_sprint_markdown(self, sprint: SprintInfo, raw_text: str) -> Path:
+        path = self._artifact_dir("sprints") / f"{self._sprint_id(sprint.number)}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if raw_text:
+            content = raw_text
+        else:
+            lines = [f"# {self._sprint_id(sprint.number)}: {sprint.goal}", ""]
+            if sprint.dates:
+                lines.append(f"- Dates: {sprint.dates}")
+            if sprint.capacity:
+                lines.append(f"- Capacity: {sprint.capacity}")
+            if sprint.story_ids:
+                lines.extend(["", "## Stories", "", "| Story | Title |", "|-------|-------|"])
+                for sid in sprint.story_ids:
+                    lines.append(f"| {sid} | |")
+            content = "\n".join(lines).rstrip() + "\n"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _sprint_id(sprint_num: int) -> str:
+        return f"SPRINT-{int(sprint_num):03d}"
+
+    @staticmethod
+    def _title_from_markdown(text: str, artifact_id: str) -> str:
+        if not text:
+            return ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                pattern = rf"^{re.escape(artifact_id)}\s*[:\-–—]\s*"
+                return re.sub(pattern, "", title).strip()
+        return ""
+
+    @classmethod
+    def _parse_acceptance_criteria(cls, text: str) -> list[AcceptanceCriterion]:
+        acs: list[AcceptanceCriterion] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            checkbox = re.match(
+                r"^[*\-]\s+\[([ xX])\]\s+\*\*(AC[-\w]+):?\*\*\s*(.+)$",
+                stripped,
+            )
+            if checkbox:
+                acs.append(AcceptanceCriterion(
+                    id=cls._normalize_ac_id(checkbox.group(2)),
+                    text=checkbox.group(3).strip(),
+                    met=checkbox.group(1).lower() == "x",
+                ))
+                continue
+            bold = re.match(r"^[*\-]?\s*\*\*(AC[-\w]+):?\*\*\s*(.+)$", stripped)
+            if bold:
+                acs.append(AcceptanceCriterion(
+                    id=cls._normalize_ac_id(bold.group(1)),
+                    text=bold.group(2).strip(),
+                ))
+                continue
+            plain = re.match(r"^[*\-]?\s*(AC[-\w]+)[:.]\s+(.+)$", stripped)
+            if plain and any(kw in stripped.lower() for kw in ("given", "when", "then", "shall", "must")):
+                acs.append(AcceptanceCriterion(
+                    id=cls._normalize_ac_id(plain.group(1)),
+                    text=plain.group(2).strip(),
+                ))
+        return acs
+
+    @staticmethod
+    def _normalize_ac_id(raw: str) -> str:
+        raw = raw.strip().rstrip(":")
+        if raw.upper().startswith("AC-"):
+            return "AC-" + raw[3:]
+        return raw
+
+    @staticmethod
+    def _parse_story_metadata(text: str) -> dict:
+        metadata: dict[str, str] = {}
+        if not text:
+            return metadata
+        aliases = {
+            "status": "status",
+            "epic": "epic",
+            "parent epic": "epic",
+            "feature": "feature",
+            "parent feature": "feature",
+            "priority": "priority",
+            "size": "size",
+            "sprint": "sprint",
+            "review hours": "review_hours",
+            "review": "review_hours",
+            "blocked by": "blocked_by",
+            "blocked_by": "blocked_by",
+        }
+        for line in text.splitlines():
+            stripped = line.strip().lstrip(">").strip()
+            if not stripped:
+                continue
+            parts = re.split(r"\s+·\s+|\s+\|\s+", stripped)
+            for part in parts:
+                m = re.match(r"\*\*([^*]+):\*\*\s*(.+)$", part.strip())
+                if not m:
+                    continue
+                key = aliases.get(m.group(1).strip().lower())
+                if key:
+                    metadata[key] = m.group(2).strip()
+        return metadata
+
+    @staticmethod
+    def _parse_sprint_markdown(text: str) -> dict:
+        parsed: dict = {"story_ids": []}
+        if not text:
+            return parsed
+        lines = text.splitlines()
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                parsed["goal"] = re.sub(r"^SPRINT-\d+\s*[:\-–—]\s*", "", title).strip()
+                break
+        goal_section: list[str] = []
+        in_goal = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_goal = stripped.lower() == "## goal"
+                continue
+            if in_goal and stripped.startswith("#"):
+                break
+            if in_goal and stripped:
+                goal_section.append(stripped)
+        if goal_section:
+            parsed["goal"] = " ".join(goal_section)
+        for line in lines:
+            stripped = line.strip().lstrip("-").strip()
+            if stripped.lower().startswith("dates:"):
+                parsed["dates"] = stripped.split(":", 1)[1].strip()
+            elif stripped.lower().startswith("capacity:"):
+                parsed["capacity"] = stripped.split(":", 1)[1].strip()
+            for sid in re.findall(r"\b(?:US|BUG|TASK|TICKET)-[A-Za-z0-9]+\b", line):
+                if sid not in parsed["story_ids"]:
+                    parsed["story_ids"].append(sid)
+        return parsed

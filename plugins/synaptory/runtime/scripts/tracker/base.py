@@ -1,0 +1,295 @@
+"""Abstract adapter interface and shared data classes for ticket tracking."""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# ── Data Classes ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class Epic:
+    id: str
+    title: str
+    feature_count: int = 0
+    raw_text: str = ""
+    file_path: Optional[str] = None
+    tracker_url: Optional[str] = None
+    tracker_id: Optional[str] = None
+
+
+@dataclass
+class AcceptanceCriterion:
+    id: str
+    text: str
+    met: bool = False
+    given: str = ""
+    when: str = ""
+    then: str = ""
+
+
+@dataclass
+class Story:
+    id: str
+    title: str
+    feature: str = ""
+    epic: str = ""
+    priority: str = ""
+    status: str = "TODO"
+    size: str = ""
+    sprint: str = ""
+    review_hours: str = ""
+    ac_count: int = 0
+    acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
+    raw_text: str = ""
+    file_path: Optional[str] = None
+    tracker_url: Optional[str] = None
+    tracker_id: Optional[str] = None
+    blocked_by: str = ""
+    assignee: Optional[str] = None
+
+
+@dataclass
+class SprintInfo:
+    number: int
+    goal: str
+    dates: str = ""
+    capacity: str = ""
+    story_ids: list[str] = field(default_factory=list)
+    story_count: int = 0
+    file_path: Optional[str] = None
+    tracker_url: Optional[str] = None
+    tracker_id: Optional[str] = None
+
+
+@dataclass
+class BacklogItem:
+    id: str
+    title: str
+    feature: str = ""
+    priority: str = ""
+    status: str = "TODO"
+    size: str = ""
+    sprint: str = ""
+    review_hours: str = ""
+    blocked_by: str = ""
+    assignee: Optional[str] = None
+
+
+@dataclass
+class SprintMetrics:
+    planned: int = 0
+    completed: int = 0
+    in_progress: int = 0
+    blocked: int = 0
+    velocity: float = 0.0
+
+
+@dataclass
+class QueryFilter:
+    status: Optional[list[str]] = None
+    priority: Optional[list[str]] = None
+    ticket_type: Optional[list[str]] = None
+    sprint: Optional[int] = None
+    assignee: Optional[str] = None
+    text: Optional[str] = None
+
+
+# ── Exceptions ───────────────────────────────────────────────────────────
+
+
+class AdapterError(Exception):
+    """Base error for adapter operations."""
+    pass
+
+
+class AdapterOfflineError(AdapterError):
+    """Raised when external service unreachable and no cache available."""
+    pass
+
+
+class AdapterAuthError(AdapterError):
+    """Raised when authentication fails."""
+    pass
+
+
+# ── Abstract Interface ───────────────────────────────────────────────────
+
+
+class ArtifactAdapter(ABC):
+    """Abstract interface for ticket tracking operations.
+
+    All adapters implement this interface. The orchestrator and reporting
+    layer call these operations without knowing which backend is active.
+    """
+
+    def __init__(self, project_dir: Path, config: "TrackerConfig"):
+        self.project_dir = project_dir
+        self.config = config
+
+    # ── Lifecycle ─────────────────────────────────────────────
+
+    @abstractmethod
+    def initialize(self) -> None:
+        """Run adapter-specific initialization."""
+        ...
+
+    @abstractmethod
+    def health_check(self) -> dict:
+        """Return adapter health: {"status": "ok"|"degraded"|"offline", ...}."""
+        ...
+
+    # ── Epic Operations ──────────────────────────────────────
+
+    @abstractmethod
+    def list_epics(self) -> list[Epic]:
+        ...
+
+    @abstractmethod
+    def get_epic(self, epic_id: str) -> Optional[Epic]:
+        ...
+
+    @abstractmethod
+    def create_epic(self, epic: Epic) -> Epic:
+        ...
+
+    @abstractmethod
+    def update_epic(self, epic_id: str, **fields) -> Epic:
+        ...
+
+    # ── Story Operations ─────────────────────────────────────
+
+    @abstractmethod
+    def list_stories(self, epic_id: Optional[str] = None,
+                     sprint: Optional[int] = None) -> list[Story]:
+        ...
+
+    @abstractmethod
+    def get_story(self, story_id: str) -> Optional[Story]:
+        ...
+
+    @abstractmethod
+    def create_ticket(self, story: Story, raw_text: str = "") -> Story:
+        ...
+
+    # Backward-compatible alias — old callers that use create_story() keep working.
+    def create_story(self, story: Story, raw_text: str = "") -> Story:
+        return self.create_ticket(story, raw_text=raw_text)
+
+    @abstractmethod
+    def update_story_status(self, story_id: str, status: str, *,
+                            allow_skip: bool = False) -> Story:
+        """Move a story to a new tracker stage.
+
+        Implementations MUST call `self._validate_status_transition` before
+        applying the change unless `allow_skip=True` (see #111). The guard
+        rejects illegal jumps like TO_DO → DONE that would erase the
+        QE+CR review gate from the tracker's audit trail.
+        """
+        ...
+
+    def _validate_status_transition(self, story_id: str, target: str,
+                                    allow_skip: bool) -> None:
+        """Shared guard for `update_story_status` (#111).
+
+        Reads the current tracker stage via `get_story` and delegates to
+        `transitions.validate_transition`. Adapters call this at the top
+        of their `update_story_status` override.
+        """
+        # Local import to avoid a circular dependency at module load time:
+        # `transitions` imports `AdapterError` from this module.
+        from .transitions import validate_transition
+        if allow_skip:
+            return
+        story = self.get_story(story_id)
+        current = story.status if story else None
+        validate_transition(story_id, current, target, allow_skip=False)
+
+    @abstractmethod
+    def update_story(self, story_id: str, **fields) -> Story:
+        ...
+
+    @abstractmethod
+    def get_acceptance_criteria(self, story_id: str) -> list[AcceptanceCriterion]:
+        ...
+
+    @abstractmethod
+    def update_acceptance_criteria(self, story_id: str, ac_id: str,
+                                   met: bool) -> AcceptanceCriterion:
+        ...
+
+    # ── Task & Bug Operations ────────────────────────────────
+
+    @abstractmethod
+    def create_aux_ticket(self, ticket_type: str, title: str,
+                          parent_id: Optional[str] = None, **fields) -> dict:
+        ...
+
+    @abstractmethod
+    def close_ticket(self, ticket_id: str, resolution: str = "") -> dict:
+        ...
+
+    # ── Sprint Operations ────────────────────────────────────
+
+    @abstractmethod
+    def list_sprints(self) -> list[SprintInfo]:
+        ...
+
+    @abstractmethod
+    def get_sprint(self, sprint_num: int) -> Optional[SprintInfo]:
+        ...
+
+    @abstractmethod
+    def create_sprint(self, sprint: SprintInfo) -> SprintInfo:
+        ...
+
+    @abstractmethod
+    def get_sprint_backlog(self, sprint_num: int) -> list[Story]:
+        ...
+
+    @abstractmethod
+    def assign_to_sprint(self, story_id: str, sprint_num: int) -> Story:
+        ...
+
+    @abstractmethod
+    def remove_from_sprint(self, story_id: str, sprint_num: int) -> Story:
+        ...
+
+    @abstractmethod
+    def close_sprint(self, sprint_num: int) -> SprintInfo:
+        ...
+
+    @abstractmethod
+    def move_incomplete_to_next(self, from_sprint: int,
+                                to_sprint: int) -> list[Story]:
+        ...
+
+    @abstractmethod
+    def get_sprint_metrics(self, sprint_num: int) -> SprintMetrics:
+        ...
+
+    # ── Backlog Operations ───────────────────────────────────
+
+    @abstractmethod
+    def get_backlog(self) -> list[BacklogItem]:
+        ...
+
+    @abstractmethod
+    def query_tickets(self, query_filter: QueryFilter) -> list[BacklogItem]:
+        ...
+
+    # ── Reporting Operations ─────────────────────────────────
+
+    @abstractmethod
+    def get_velocity_data(self, num_sprints: int = 0) -> list[dict]:
+        ...
+
+    @abstractmethod
+    def get_sprint_report_data(self, sprint_num: int) -> dict:
+        ...
+
+    @abstractmethod
+    def get_burndown_data(self, sprint_num: int) -> list[dict]:
+        ...

@@ -1,0 +1,517 @@
+"""Sprint detail builder — story board, AC drill-down, DoD checklist (ISSUE-003)."""
+
+import re
+import sys
+from pathlib import Path
+from typing import Optional
+
+from .helpers import _read, _extract_heading, _extract_section, _parse_markdown_table, _parse_all_markdown_tables
+from .receipts import extract_findings
+
+# Ensure tracker package is importable
+_scripts_dir = str(Path(__file__).resolve().parent.parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+
+from tracker import get_adapter
+
+
+def _parse_story_map(synaptory_dir: Path) -> dict[str, str]:
+    """Parse story-map.md into {story_id: files_str} dict.
+
+    Supports both markdown pipe tables and arrow-delimited formats.
+    Parses ALL tables in the file (Block A, Block B, etc.).
+    """
+    text = _read(synaptory_dir / "software-engineer" / "story-map.md")
+    result = {}
+
+    # Try markdown table format first (columns: Story, Files Created/Modified)
+    rows = _parse_all_markdown_tables(text)
+    for row in rows:
+        sid = row.get("Story", row.get("ID", row.get("id", "")))
+        files = row.get("Files Created/Modified", row.get("Files", row.get("files", "")))
+        if sid and files:
+            result[sid] = files
+
+    # Fallback: arrow-delimited format (Story → files)
+    if not result:
+        for line in text.splitlines():
+            if "→" in line or "->" in line:
+                sep = "→" if "→" in line else "->"
+                parts = line.split(sep, 1)
+                if len(parts) == 2:
+                    sid = parts[0].strip().strip("|").strip()
+                    files = parts[1].strip().strip("|").strip()
+                    if sid and files:
+                        result[sid] = files
+
+    return result
+
+
+def _build_file_to_story_index(story_files: dict[str, str]) -> dict[str, list[str]]:
+    """Build reverse index: {file_path: [story_ids]} from story-map data."""
+    index: dict[str, list[str]] = {}
+    for sid, files_str in story_files.items():
+        for f in files_str.split(","):
+            f = f.strip()
+            if f:
+                index.setdefault(f, []).append(sid)
+    return index
+
+
+def _parse_acs_from_story(story_text: str) -> list[dict]:
+    """Parse acceptance criteria from a story .md file.
+
+    Handles multiple formats:
+      - **AC-1:** text
+      - **AC-1 — Happy path login:**
+      - **AC-1 — title:** \\n - Given ... When ... Then ...
+      - - **AC-1:** text
+    """
+    acs = []
+    for line in story_text.splitlines():
+        stripped = line.strip()
+        # Match: **AC-N ...:** or **AC-N — title:**  (any text between AC-ID and closing **)
+        m = re.match(r"[-*\s]*\*\*AC[-‑]?(\w+)\b([^*]*)\*\*[:\s]*(.*)", stripped)
+        if m:
+            ac_id = m.group(1)
+            # Title is either the text between ID and ** (for "AC-1 — title:" format)
+            # or the text after ** (for "AC-1:** text" format)
+            inline_title = m.group(2).strip().strip("—–-:").strip()
+            after_text = m.group(3).strip() if m.group(3) else ""
+            text = inline_title or after_text or f"AC-{ac_id}"
+            acs.append({"id": f"AC-{ac_id}", "text": text})
+            continue
+        # Fallback: Given/When/Then patterns with AC prefix (unbolded)
+        m2 = re.match(r"[-*\s]*AC[-‑]?(\w+)[:\.]?\s+(.+)", stripped)
+        if m2 and any(kw in stripped.lower() for kw in ("given", "when", "then", "shall", "must")):
+            acs.append({"id": f"AC-{m2.group(1)}", "text": m2.group(2).strip()})
+    return acs
+
+
+def _find_story_file(project_dir: Path, story_id: str) -> Optional[Path]:
+    """Find the story .md file by searching common story locations.
+
+    Handles ID mismatches (e.g. sprint uses US-E01 but file is US-001.md)
+    by trying both the exact ID and a numeric-only variant.
+    """
+    search_roots = [
+        project_dir / "docs" / "requirements" / "BRD" / "stories",
+        project_dir / ".requirements" / "BRD" / "stories",
+        project_dir / "docs" / "requirements" / "stories",
+    ]
+
+    # Build candidate filenames: exact ID + numeric variant
+    candidates = [f"{story_id}.md"]
+    # US-E01 → US-001, US-E09 → US-009
+    m = re.match(r"(US-)[A-Z](\d+)", story_id)
+    if m:
+        candidates.append(f"{m.group(1)}{m.group(2).zfill(3)}.md")
+
+    for stories_root in search_roots:
+        if not stories_root.exists():
+            continue
+        for feat_dir in stories_root.iterdir():
+            if not feat_dir.is_dir():
+                continue
+            for filename in candidates:
+                candidate = feat_dir / filename
+                if candidate.exists():
+                    return candidate
+    return None
+
+
+def _map_findings_to_stories(
+    findings_items: list[dict],
+    file_to_story: dict[str, list[str]],
+) -> dict[str, list[dict]]:
+    """Map code review findings to stories via file references.
+
+    Returns {story_id: [finding_dicts]}.
+    """
+    result: dict[str, list[dict]] = {}
+    for f in findings_items:
+        file_ref = f.get("file_ref", "")
+        if not file_ref:
+            continue
+        # Try exact match first, then basename match
+        matched_stories = file_to_story.get(file_ref, [])
+        if not matched_stories:
+            basename = file_ref.rsplit("/", 1)[-1] if "/" in file_ref else file_ref
+            for indexed_path, sids in file_to_story.items():
+                if indexed_path.endswith(basename) or basename in indexed_path:
+                    matched_stories = sids
+                    break
+        for sid in matched_stories:
+            result.setdefault(sid, []).append(f)
+    return result
+
+
+def _match_finding_to_ac(finding: dict, acs: list[dict]) -> str:
+    """Best-effort match a finding to a specific AC by keyword overlap.
+
+    Returns AC id if matched, empty string otherwise.
+    """
+    title = (finding.get("title", "") + " " + finding.get("file_ref", "")).lower()
+    best_match = ""
+    best_score = 0
+    for ac in acs:
+        ac_text = ac["text"].lower()
+        # Count keyword overlaps (words >= 4 chars)
+        ac_words = {w for w in re.findall(r"\w{4,}", ac_text)}
+        title_words = {w for w in re.findall(r"\w{4,}", title)}
+        overlap = len(ac_words & title_words)
+        if overlap > best_score:
+            best_score = overlap
+            best_match = ac["id"]
+    return best_match if best_score >= 1 else ""
+
+
+def _evaluate_dod_item(
+    item_text: str,
+    stories_summary: dict,
+    findings_summary: dict,
+    receipts: list,
+) -> str:
+    """Evaluate a DoD item against pipeline data. Returns: met | blocked | pending."""
+    lower = item_text.lower()
+
+    # Pattern: all stories / acceptance criteria
+    if "all stories" in lower or "acceptance criteria" in lower:
+        if stories_summary.get("stories_review", 0) > 0:
+            return "blocked"
+        if stories_summary.get("stories_done", 0) == stories_summary.get("stories_total", 0):
+            return "met"
+        return "pending"
+
+    # Pattern: zero/no critical/high findings
+    if ("critical" in lower or "high" in lower) and ("zero" in lower or "no " in lower):
+        open_crit = findings_summary.get("critical", 0) - findings_summary.get("fixed_critical", 0)
+        open_high = findings_summary.get("high", 0) - findings_summary.get("fixed_high", 0)
+        if open_crit > 0 or open_high > 0:
+            return "blocked"
+        return "met"
+
+    # Pattern: tests passing / test suite
+    if "test" in lower and ("pass" in lower or "green" in lower or "suite" in lower):
+        for r in receipts:
+            if r.get("agent") == "quality-engineer" and r.get("status") == "complete":
+                m = r.get("metrics", {})
+                if m.get("tests_failing", 0) == 0 and m.get("tests_written", m.get("total_tests", 0)) > 0:
+                    return "met"
+                return "blocked"
+        return "pending"
+
+    # Pattern: code review / review complete
+    if "review" in lower and ("complete" in lower or "done" in lower):
+        for r in receipts:
+            if r.get("agent") == "code-reviewer" and r.get("status") == "complete":
+                return "met"
+        return "pending"
+
+    # Pattern: CI / pipeline / green
+    if ("ci" in lower or "pipeline" in lower) and ("green" in lower or "pass" in lower or "runs" in lower):
+        for r in receipts:
+            if r.get("agent") == "platform-engineer" and r.get("status") == "complete":
+                return "met"
+        return "pending"
+
+    # Pattern: compliance / audit / security
+    if "compliance" in lower or "audit" in lower or "security" in lower:
+        for r in receipts:
+            if r.get("agent") == "compliance-engineer" and r.get("status") == "complete":
+                return "met"
+        return "pending"
+
+    return "pending"
+
+
+def build_sprint_detail(
+    project_dir: Path,
+    sprint_num: int,
+    state: dict,
+    receipts: list,
+) -> Optional[dict]:
+    """Build sprint-level detail: story board, AC drill-down, DoD checklist.
+
+    Returns None if sprint file doesn't exist.
+    """
+    adapter = get_adapter(project_dir)
+    synaptory_dir = project_dir / ".synaptory"
+
+    # ── 1. Sprint header — from adapter
+    sprint_info = adapter.get_sprint(sprint_num)
+    if not sprint_info:
+        return None
+
+    sprint_phase = state.get("sprint", {}).get("phase", "")
+
+    header = {
+        "number": sprint_num,
+        "goal": sprint_info.goal,
+        "dates": sprint_info.dates,
+        "capacity": sprint_info.capacity,
+        "phase": sprint_phase,
+    }
+
+    # ── 2. Story board — from adapter
+    sprint_stories = adapter.get_sprint_backlog(sprint_num)
+    sprint_story_ids = [s.id for s in sprint_stories]
+
+    # Build backlog index for enrichment (used for priority/title/feature fallbacks)
+    backlog_items = adapter.get_backlog()
+    backlog_by_id: dict[str, object] = {}
+    for b in backlog_items:
+        backlog_by_id[b.id] = {
+            "Title": b.title, "title": b.title,
+            "Feature": b.feature, "Epic": b.feature,
+            "Priority": b.priority, "MoSCoW": b.priority,
+            "Status": b.status, "status": b.status,
+            "Size": b.size, "size": b.size,
+            "Story ID": b.id, "ID": b.id,
+            "Blocked By": b.blocked_by,
+        }
+
+    # Sprint plan rows for fallback title/size/priority (from sprint file if available)
+    sprint_plan_by_id: dict[str, dict] = {}
+    sprint_text = ""
+    req_dir = adapter.req_dir if hasattr(adapter, "req_dir") else project_dir / ".requirements"
+    sprint_file = req_dir / "SPRINTS" / f"SPRINT_{sprint_num}.md"
+    if sprint_file.exists():
+        sprint_text = _read(sprint_file)
+        for row in _parse_all_markdown_tables(sprint_text):
+            sid = row.get("ID", row.get("Story", row.get("id", row.get("Story ID", ""))))
+            if sid:
+                sprint_plan_by_id[sid] = row
+
+    # Story-map for file → story mapping
+    story_files = _parse_story_map(synaptory_dir)
+    file_to_story = _build_file_to_story_index(story_files)
+
+    # Findings from receipts
+    findings = extract_findings(receipts)
+    findings_by_story = _map_findings_to_stories(findings["items"], file_to_story)
+
+    # 2d: When no individual findings exist but aggregate counts do,
+    # distribute to stories that have file mappings
+    if not findings["items"] and file_to_story:
+        for r in receipts:
+            if r.get("agent") in ("code-reviewer", "compliance-engineer"):
+                m = r.get("metrics", {})
+                crit = m.get("findings_critical", 0) or 0
+                high = m.get("findings_high", 0) or 0
+                if crit or high:
+                    # Find stories with file mappings (most likely to have findings)
+                    stories_with_files = set()
+                    for _, sids in file_to_story.items():
+                        stories_with_files.update(sids)
+                    for sid in stories_with_files:
+                        if sid not in findings_by_story:
+                            findings_by_story[sid] = []
+                        # Add synthetic aggregate finding
+                        findings_by_story[sid].append({
+                            "id": f"{r['agent']}-aggregate",
+                            "severity": "critical" if crit else "high",
+                            "title": f"{crit}C/{high}H findings from {r['agent']} (see receipt for details)",
+                            "file_ref": "",
+                        })
+
+    # Build completed stories list from SE receipts
+    completed_story_ids = set()
+    se_total_tests = 0
+    for r in receipts:
+        if r.get("agent") in ("software-engineer",) and r.get("status") == "complete":
+            m = r.get("metrics", {})
+            for sl_key in ("stories_list", "stories_completed_list", "stories"):
+                sl = m.get(sl_key, [])
+                if isinstance(sl, list):
+                    completed_story_ids.update(sl)
+            # 2c: Collect aggregate test count from SE receipt as fallback
+            se_total_tests += m.get("tests_passing") or m.get("tests_written") or 0
+
+    # Build story board (sprint plan is primary source, backlog is fallback)
+    story_board = []
+    for sid in sprint_story_ids:
+        sp = sprint_plan_by_id.get(sid, {})
+        bl = backlog_by_id.get(sid, {})
+        story_findings = findings_by_story.get(sid, [])
+        has_critical_high = any(
+            f.get("severity") in ("critical", "high") for f in story_findings
+        )
+
+        # Status: check receipt first, then backlog
+        bl_status = bl.get("Status", bl.get("status", ""))
+        if sid in completed_story_ids or bl_status == "DONE":
+            status = "review" if has_critical_high else "done"
+        elif bl_status == "IN_PROGRESS":
+            status = "in_progress"
+        elif bl_status == "BLOCKED":
+            status = "blocked"
+        else:
+            status = "not_started"
+
+        # AC from adapter (2a: track whether BRD file exists)
+        adapter_acs = adapter.get_acceptance_criteria(sid)
+        acs = [{"id": ac.id, "text": ac.text} for ac in adapter_acs]
+        story_obj = adapter.get_story(sid)
+        has_brd = story_obj is not None and story_obj.file_path is not None
+
+        # Map findings to ACs
+        ac_entries = []
+        for ac in acs:
+            ac_status = "met"
+            finding_ref = ""
+            for f in story_findings:
+                matched_ac = _match_finding_to_ac(f, [ac])
+                if matched_ac == ac["id"]:
+                    ac_status = "finding"
+                    finding_ref = f.get("id", "")
+                    break
+            ac_entries.append({
+                "id": ac["id"],
+                "text": ac["text"][:100],
+                "status": ac_status,
+                "finding_ref": finding_ref,
+            })
+
+        # If findings exist but weren't matched to ACs, mark unmatched findings
+        unmatched = [f for f in story_findings
+                     if not any(a["finding_ref"] == f.get("id", "") for a in ac_entries)]
+        for f in unmatched:
+            # Attach as story-level finding (no specific AC)
+            pass  # They'll appear in the findings list on the story row
+
+        acs_met = sum(1 for a in ac_entries if a["status"] == "met")
+
+        # Test count: QE per-story metrics first, then SE aggregate fallback (2c)
+        test_count = 0
+        for r in receipts:
+            if r.get("agent") == "quality-engineer":
+                per_story = r.get("metrics", {}).get("per_story_tests", {})
+                if isinstance(per_story, dict):
+                    test_count = per_story.get(sid, 0)
+        # 2c: If no QE data and SE has tests, show aggregate on first story only
+        if not test_count and se_total_tests and sid == sprint_story_ids[0]:
+            test_count = se_total_tests
+
+        # Use sprint plan data as primary, backlog as fallback
+        title = sp.get("Title", sp.get("title", "")) or bl.get("Title", bl.get("title", sid))
+        size = sp.get("Size", sp.get("size", "")) or bl.get("Size", bl.get("size", ""))
+        priority = sp.get("Priority", sp.get("priority", "")) or bl.get("Priority", bl.get("MoSCoW", ""))
+        feature = sp.get("Feature", sp.get("Epic", "")) or bl.get("Feature", bl.get("Epic", ""))
+
+        story_board.append({
+            "id": sid,
+            "title": title[:50],
+            "feature": feature,
+            "size": size,
+            "priority": priority,
+            "status": status,
+            "has_brd": has_brd,
+            "acs_total": len(acs),
+            "acs_met": acs_met,
+            "test_count": test_count,
+            "findings_count": len(story_findings),
+            "findings": [
+                {"id": f.get("id", ""), "severity": f.get("severity", ""), "title": f.get("title", "")[:80]}
+                for f in story_findings
+            ],
+            "acs": ac_entries,
+        })
+
+    # ── 3. Summary counts
+    stories_done = sum(1 for s in story_board if s["status"] == "done")
+    stories_review = sum(1 for s in story_board if s["status"] == "review")
+    stories_in_progress = sum(1 for s in story_board if s["status"] == "in_progress")
+    stories_blocked = sum(1 for s in story_board if s["status"] == "blocked")
+    must_total = sum(1 for s in story_board if s["priority"] == "Must")
+    must_done = sum(1 for s in story_board if s["priority"] == "Must" and s["status"] in ("done", "review"))
+    must_pct = round(must_done / must_total * 100) if must_total > 0 else 0
+
+    total_acs = sum(s["acs_total"] for s in story_board)
+    total_acs_met = sum(s["acs_met"] for s in story_board)
+    total_acs_finding = sum(
+        sum(1 for a in s["acs"] if a["status"] == "finding") for s in story_board
+    )
+
+    summary = {
+        "stories_total": len(story_board),
+        "stories_done": stories_done,
+        "stories_review": stories_review,
+        "stories_in_progress": stories_in_progress,
+        "stories_blocked": stories_blocked,
+        "must_completion": must_pct,
+        "acs_total": total_acs,
+        "acs_met": total_acs_met,
+        "acs_finding": total_acs_finding,
+    }
+
+    # ── 4. DoD checklist
+    dod_section = _extract_section(sprint_text, "Definition of Done")
+    dod_items = []
+    if dod_section:
+        for line in dod_section.splitlines():
+            stripped = line.strip()
+            # Match: - [ ] item  or  - [x] item  or  - item
+            m = re.match(r"[-*]\s*\[([xX ])\]\s*(.+)", stripped)
+            if m:
+                dod_items.append({"text": m.group(2).strip(), "checked": m.group(1).lower() == "x"})
+            elif stripped.startswith("- ") or stripped.startswith("* "):
+                text = stripped[2:].strip()
+                if text and len(text) > 5:
+                    dod_items.append({"text": text, "checked": False})
+            else:
+                # Match numbered lists: 1. item  or  1) item
+                m_num = re.match(r"\d+[.)]\s+(.+)", stripped)
+                if m_num:
+                    text = m_num.group(1).strip()
+                    if text and len(text) > 5:
+                        dod_items.append({"text": text, "checked": False})
+
+    # Build findings summary for DoD evaluation
+    findings_sum = findings["summary"].copy()
+    findings_sum["fixed_critical"] = findings["fixed"].get("critical", 0)
+    findings_sum["fixed_high"] = findings["fixed"].get("high", 0)
+
+    dod_checklist = []
+    dod_met = 0
+    dod_blocked = 0
+    for item in dod_items:
+        eval_status = _evaluate_dod_item(item["text"], summary, findings_sum, receipts)
+        dod_checklist.append({
+            "text": item["text"],
+            "status": eval_status,
+        })
+        if eval_status == "met":
+            dod_met += 1
+        elif eval_status == "blocked":
+            dod_blocked += 1
+
+    # If no DoD section in sprint file, use standard template
+    if not dod_items:
+        standard_dod = [
+            "All stories pass acceptance criteria",
+            "Zero critical/high findings open",
+            "All tests passing",
+            "Code review complete",
+            "Compliance check complete",
+        ]
+        for text in standard_dod:
+            eval_status = _evaluate_dod_item(text, summary, findings_sum, receipts)
+            dod_checklist.append({"text": text, "status": eval_status})
+            if eval_status == "met":
+                dod_met += 1
+            elif eval_status == "blocked":
+                dod_blocked += 1
+
+    summary["dod_met"] = dod_met
+    summary["dod_total"] = len(dod_checklist)
+    summary["dod_blocked"] = dod_blocked
+
+    return {
+        "header": header,
+        "story_board": story_board,
+        "dod_checklist": dod_checklist,
+        "summary": summary,
+    }
+

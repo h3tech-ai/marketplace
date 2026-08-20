@@ -1,0 +1,211 @@
+# Release Mode
+
+Full verification + production preparation. Replaces v1's DEPLOY + OPERATE phases. Runs when the team decides to ship — not automatically after the last sprint.
+
+## Trigger Signals
+
+"release", "ship it", "prepare for production", "deploy to production", "go live", "production ready"
+
+## When to Release
+
+Release is **manually triggered** with orchestrator suggestion:
+- **Manual**: User says "release" / "ship it" / "prepare for production"
+- **Suggested**: Orchestrator notes "All epics are Done — consider releasing" at Sprint Close
+- **Mid-project**: User can release after any sprint or any time in Kanban
+
+## Prerequisites
+
+Verify lifecycle state:
+```
+STATE=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.py" read "$(pwd)" 2>&1 || \
+       python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/kanban_state_machine.py" read "$(pwd)" 2>&1)
+```
+
+If state is `RELEASE` or transitioning to `RELEASE`: proceed.
+If state is anything else: transition to RELEASE first (requires SPRINT_CLOSE for Scrum, or REVIEW for Kanban).
+
+---
+
+## Release Activities
+
+Execute all release activities. Each agent runs at **maximum depth** (release-tier DoD intensity).
+
+### Activity 1 — Full Regression Testing (QE)
+
+```
+QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
+```
+
+**QE prompt context:**
+- All stories across all sprints (or all Kanban tickets)
+- Full test suite: unit, integration, e2e, performance
+- Regression across the entire codebase
+- DoD intensity: `release` (all checks at maximum depth)
+
+**QE output:**
+- Full test execution results
+- Coverage report
+- Performance benchmark results
+- Receipt: `release-qe.json`
+
+### Activity 2 — Full Security Audit (CE)
+
+```
+CE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "compliance-engineer")
+```
+
+**CE prompt context:**
+- Complete STRIDE threat model
+- OWASP Top 10 assessment
+- Dependency audit (known vulnerabilities)
+- Full scope, maximum depth
+
+**CE output:**
+- Threat model document
+- Security findings report
+- Dependency audit results
+- Receipt: `release-ce.json`
+
+### Activity 3 — Production Infrastructure (PE)
+
+```
+PE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "platform-engineer")
+```
+
+**PE prompt context:**
+- IaC modules for production environment
+- Production CI/CD pipeline (not just dev)
+- Monitoring dashboards and alerting rules
+- Rollback scripts and procedures
+- Runbooks for operational scenarios
+
+**PE output:**
+- Production IaC (Terraform/OpenTofu/Pulumi)
+- Production CI/CD workflow
+- Monitoring + alerting configuration
+- Rollback scripts
+- Operational runbooks
+- Receipt: `release-pe.json`
+
+### Activity 4 — Complete Documentation (TW)
+
+```
+TW_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "technical-writer")
+```
+
+**TW prompt context:**
+- All completed stories/tickets for documentation scope
+- Existing architecture docs (ADRs, API contracts)
+- Existing README and guides
+
+**TW output:**
+- API reference (from OpenAPI spec)
+- Developer guides (setup, contributing)
+- Operational guide (deployment, monitoring, troubleshooting)
+- Architecture guide (system overview, ADR index)
+- Updated README
+- Receipt: `release-tw.json`
+
+### Activity 5 — Final Code Review (CR)
+
+```
+CR_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "code-reviewer")
+```
+
+**CR prompt context:**
+- Full codebase review (not per-story scoped)
+- Architecture conformance check
+- Performance anti-pattern scan
+- Quality assessment
+
+**CR output:**
+- Final review report
+- Architecture conformance findings
+- Receipt: `release-cr.json`
+
+### Activity 6 — Skill Extraction (Orchestrator)
+
+The Orchestrator itself extracts recurring patterns into reusable Claude Code skills:
+- Analyze completed stories for recurring implementation patterns
+- Identify project-specific conventions worth codifying
+- Generate skill definitions (if patterns found)
+
+This replaces the retired Skill Maker agent — the Orchestrator handles it directly during Release.
+
+---
+
+## Release Readiness Check
+
+After all activities complete, present the release readiness dashboard:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  RELEASE READINESS                        v{version}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Sprints        {completed}/{total} complete
+  Stories        {done}/{total} Done
+  Tests          {passed}/{total} passing ({coverage}% coverage)
+  Security       {critical} Critical, {high} High remaining
+  Infrastructure ✓ IaC validates, CI/CD configured
+  Documentation  ✓ API docs, guides, runbooks
+  Rollback       ✓ Scripts exist and tested
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Options:
+  1. Ship it (Recommended)
+  2. Show full report
+  3. Fix remaining issues
+  4. Chat about this
+```
+
+**Blocking conditions** (must be resolved before shipping):
+- Critical security findings > 0
+- Tests failing
+- Infrastructure validation failed
+
+**Warning conditions** (can ship with acknowledgment):
+- High security findings > 0
+- Coverage below target
+- Documentation gaps
+
+### On "Ship it"
+
+```python
+# Transition to COMPLETE
+BUILD_MODE = STATE.get("build_mode")
+if BUILD_MODE == "scrum":
+    python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.py" transition "$(pwd)" COMPLETE
+elif BUILD_MODE == "kanban":
+    python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/kanban_state_machine.py" transition "$(pwd)" COMPLETE
+```
+
+Print:
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ✓ RELEASED                               v{version}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Lifecycle complete.
+  All documentation, infrastructure, and security artifacts
+  are ready for production deployment.
+
+  Next steps:
+  - Deploy using the production CI/CD pipeline
+  - Monitor via the configured dashboards
+  - Switch to Kanban mode for post-launch maintenance:
+    build_mode: kanban in .synaptory.yaml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### On "Fix remaining issues"
+
+Present the specific blocking/warning issues. User can address them and re-run the readiness check.
+
+### On "Show full report"
+
+Generate a comprehensive release report via TW agent in report mode:
+```
+Read("${CLAUDE_PLUGIN_ROOT}/agents/technical-writer/modes/report.md")
+```

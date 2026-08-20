@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Engagement mode reader for synaptory hooks.
+
+Reads the engagement mode from .synaptory/.orchestrator/settings.md
+and provides helper functions for mode-aware hook behavior.
+
+Designed to complete in <50ms (just file reads, no network).
+"""
+
+import os
+import re
+
+# Canonical engagement modes.
+#   structured    — bounded workflow, reduced user interaction (was "autonomous")
+#   interactive   — strategic-role gates, full user-in-the-loop (was "controlled")
+#
+# BEA6-F1 rename: "autonomous" mistakenly suggested open-ended planning
+# (Anthropic's pattern-VI definition). The mode is actually a structured
+# pipeline with less prompting, not open-ended autonomy. The old names are
+# kept as aliases for backward compat — reading either still works, writing
+# new config should use the canonical names.
+MODE_ALIASES = {
+    "structured": "structured",
+    "autonomous": "structured",       # legacy alias
+    "interactive": "interactive",
+    "controlled": "interactive",      # legacy alias
+    # Also accept hands-on / hands-off phrasing from user-facing docs
+    "hands-off": "structured",
+    "hands_off": "structured",
+    "hands-on": "interactive",
+    "hands_on": "interactive",
+}
+VALID_MODES = set(MODE_ALIASES.keys())
+CANONICAL_MODES = {"structured", "interactive"}
+DEFAULT_MODE = "structured"
+
+# Legacy names still returned by get_engagement_mode() for callers that compare
+# against the old strings (e.g. `if mode == "autonomous"`). Controlled by the
+# SYNAPTORY_ENGAGEMENT_MODE_LEGACY env var so new code can opt in to canonical names
+# by setting it to "0". Default is "1" until the rollover deadline.
+_RETURN_LEGACY_NAME_ENV = "SYNAPTORY_ENGAGEMENT_MODE_LEGACY"
+
+_CANONICAL_TO_LEGACY = {"structured": "autonomous", "interactive": "controlled"}
+
+VALID_QUALITY_MODES = {"strict", "standard", "lenient"}
+DEFAULT_QUALITY_MODE = "strict"
+
+
+def normalize_mode(raw: str) -> str:
+    """Normalize a raw engagement mode string to its canonical form."""
+    return MODE_ALIASES.get(raw.lower(), DEFAULT_MODE)
+
+
+def get_engagement_mode(project_dir: str) -> str:
+    """Read engagement mode from project settings.
+
+    Parses the `Engagement:` line in .synaptory/.orchestrator/settings.md.
+    Accepts both canonical names (structured/interactive) and legacy names
+    (autonomous/controlled). By default returns legacy names for backward
+    compatibility; set SYNAPTORY_ENGAGEMENT_MODE_LEGACY=0 to get canonical names.
+    """
+    settings_path = os.path.join(
+        project_dir, ".synaptory", ".orchestrator", "settings.md"
+    )
+    canonical = DEFAULT_MODE
+    try:
+        with open(settings_path, "r") as f:
+            for line in f:
+                match = re.match(r"^\s*Engagement\s*:\s*(\S+)", line, re.IGNORECASE)
+                if match:
+                    raw = match.group(1).lower()
+                    if raw in MODE_ALIASES:
+                        canonical = MODE_ALIASES[raw]
+                    break
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    # Default to legacy names so existing hooks (which compare against
+    # "autonomous"/"controlled") continue to work without modification.
+    if os.environ.get(_RETURN_LEGACY_NAME_ENV, "1") != "0":
+        return _CANONICAL_TO_LEGACY.get(canonical, canonical)
+    return canonical
+
+
+def get_quality_enforcement(project_dir: str) -> str:
+    """Read quality enforcement mode from project settings.
+
+    Parses the `Quality-Enforcement:` line in .synaptory/.orchestrator/settings.md.
+    Returns one of: strict, standard, lenient.
+    Defaults to 'strict' if file missing or unparseable.
+    """
+    settings_path = os.path.join(
+        project_dir, ".synaptory", ".orchestrator", "settings.md"
+    )
+    try:
+        with open(settings_path, "r") as f:
+            for line in f:
+                match = re.match(
+                    r"^\s*Quality-Enforcement\s*:\s*(\w+)", line, re.IGNORECASE
+                )
+                if match:
+                    mode = match.group(1).lower()
+                    if mode in VALID_QUALITY_MODES:
+                        return mode
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    return DEFAULT_QUALITY_MODE
+
+
+def should_block_on_failure(project_dir: str) -> bool:
+    """True for strict/standard quality enforcement (hooks block on failure).
+    False for lenient (hooks warn but don't block).
+    """
+    return get_quality_enforcement(project_dir) in {"strict", "standard"}
+
+
+def is_autonomous(project_dir: str) -> bool:
+    """True when hooks should block on failure. Delegates to quality enforcement setting.
+    Kept for backward compatibility with existing hooks.
+    """
+    return should_block_on_failure(project_dir)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <project_dir>")
+        sys.exit(1)
+    project_dir = sys.argv[1]
+    mode = get_engagement_mode(project_dir)
+    quality = get_quality_enforcement(project_dir)
+    print(
+        f"mode={mode} quality={quality} "
+        f"block_on_failure={should_block_on_failure(project_dir)} "
+        f"autonomous={is_autonomous(project_dir)}"
+    )

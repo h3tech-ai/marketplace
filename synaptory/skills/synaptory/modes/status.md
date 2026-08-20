@@ -1,0 +1,347 @@
+# Status Mode
+
+Reads the current pipeline state from the workspace and prints a rich status dashboard with agent metrics, findings, gate history, and actionable next steps.
+
+## Step 1: Build and Read Pipeline Summary
+
+First, refresh the canonical pipeline summary JSON from raw workspace data:
+
+```python
+Bash("python3 \"${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/build_summary.py\" \"${CLAUDE_PROJECT_DIR}\"")
+```
+
+Then read the assembled summary and sprint state as data sources:
+
+```python
+Read(".synaptory/pipeline-summary.json")
+Read(".synaptory/.orchestrator/last-session.md")  # session context (not in summary)
+
+# Read lifecycle state (returns full v2 state with sprint/kanban context, or empty if no state)
+lifecycle_state = Bash(f'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.py" read "${CLAUDE_PROJECT_DIR}" 2>/dev/null || echo "{{}}"')
+```
+
+The `pipeline-summary.json` contains all normalized data: project info, pipeline phases with grouped agents, structured findings with fixed/open status, gate decisions, verification commands, and context packages.
+
+## Step 2: Extract Dashboard Data from Summary
+
+All dashboard data comes from `pipeline-summary.json`. Parse the JSON to extract:
+
+- `lifecycle_state` — the active lifecycle state (from pipeline-state.json)
+- `build_mode` — scrum, kanban, or spq
+- `current_sprint` / `sprint_goal` — sprint context (Scrum)
+- `current_stories[]` — story sub-states (queued, in_progress, testing, reviewing, done, blocked)
+- `sprints_completed[]` — velocity, DoD compliance, cycle time (Scrum)
+- `tickets_completed[]` — throughput, cycle time (Kanban)
+- `findings.summary` — counts by severity (critical, high, medium, low)
+- `findings.fixed` — counts of remediated findings by severity
+- `findings.items[]` — individual findings with `status: "open"|"fixed"` and `fixed_by`
+- `verification.commands[]` — re-runnable checks from receipts
+- `context_packages[]` — brownfield knowledge packages
+- `project.engagement` — engagement mode
+
+### Engagement mode display
+
+```
+autonomous →  "Autonomous ⚡"
+controlled →  "Controlled 🔭"
+```
+
+## Step 3: Print Status Dashboard
+
+Format the output as a rich multi-section status board. Adapt to actual state — omit sections with no data.
+
+### 3.1 Header
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  synaptory · {project_name}
+  Mode: {engagement_mode}  ·  Stack: {stack}  ·  Uptime: {total_elapsed}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 3.2 Pipeline Progress
+
+Show sprint/kanban progress with visual status indicators:
+
+```
+  SPRINT {N} PROGRESS
+  ─────────────────────────────────────────────────────────────
+  Lifecycle:  SPRINT_EXECUTION
+  Goal:       {sprint_goal}
+  Velocity:   {velocity} stories/sprint (avg)
+
+  Story Pipeline:
+    ✓ US-042  User login with MFA          Done    DoD ✓
+    ✓ US-043  Password reset               Done    DoD ✓
+    ● US-044  Session management           Testing
+    ○ US-045  Profile settings             Queued
+
+  Sprint DoD:  {completed}/{total} stories passing
+  ─────────────────────────────────────────────────────────────
+```
+
+Phase status symbols: `✓` completed · `●` active · `○` pending
+
+Agent status symbols: `✓` receipt verified · `↻` in progress · `○` not started · `✗` failed
+
+Progress bar: count verified receipts for phase ÷ expected receipts × 20 chars.
+
+### 3.2b Sprint Progress (Scrum mode)
+
+If `build_mode == "scrum"` and `sprints_completed` exists:
+
+```
+  SPRINT HISTORY
+  ─────────────────────────────────────────────────────────────
+  Sprint    Stories   DoD%    Velocity   Cycle Time    Status
+  ────────  ────────  ──────  ─────────  ──────────    ──────────
+  Sprint 1  5/5       100%    5          2.4h avg      ✓ Complete
+  Sprint 2  ●/4       75%     —          —             ↻ Execution
+  ─────────────────────────────────────────────────────────────
+  Overall: 1 sprint complete · Sprint 2 in progress
+```
+
+### 3.2c Story Pipeline Status (shown during SPRINT_EXECUTION)
+
+If `lifecycle_state` is `"SPRINT_EXECUTION"`:
+
+```python
+TRACKER_CLI = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/skills/_shared/scripts/tracker/tracker_cli.py" --project-dir .'
+
+# Fetch sprint stories — capture stderr to surface tracker errors
+tracker_result = Bash(f'{TRACKER_CLI} get-sprint-backlog {sprint_state.current_sprint} 2>&1')
+tracker_error = None
+sprint_stories = parse_json(tracker_result)
+if sprint_stories is None:
+    # Parse failed — tracker returned an error message instead of JSON
+    tracker_error = tracker_result.strip() if tracker_result else "Tracker returned no data"
+    sprint_stories = []
+
+# Open PRs with CI gate status (requires gh CLI)
+open_prs = parse_json(
+    Bash('gh pr list --state open --json number,title,headRefName,statusCheckRollup 2>/dev/null || echo "[]"')
+) or []
+
+# Impediments — parse ## Impediments table from sprint state doc
+impediments = []
+sprint_doc = f"docs/requirements/SPRINTS/SPRINT_{sprint_state.current_sprint}.md"
+if file_exists(sprint_doc):
+    sprint_text = Read(sprint_doc)
+    in_section = False
+    for line in sprint_text.splitlines():
+        if line.strip().lower().startswith("## impediment"):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section and "|" in line and "---" not in line and "Description" not in line:
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            if parts:
+                impediments.append(parts)
+
+# Count by status
+done_count       = len([s for s in sprint_stories if s.get("status","").upper() == "DONE"])
+in_progress_count = len([s for s in sprint_stories if s.get("status","").upper() == "IN_PROGRESS"])
+blocked_count    = len([s for s in sprint_stories if s.get("status","").upper() == "BLOCKED"])
+todo_count       = len([s for s in sprint_stories if s.get("status","").upper() == "TODO"])
+total_count      = len(sprint_stories)
+
+log(f"""
+  DAILY SCRUM — Sprint {sprint_state.current_sprint}
+  ─────────────────────────────────────────────────────────────""")
+
+# Surface tracker errors so they're visible, not silently swallowed
+if tracker_error:
+    log(f"  ⚠ TRACKER ERROR: {tracker_error}")
+    log(f"  (Showing empty board — check TEAMWORK_API_KEY and .synaptory.yaml tracker config)")
+    log(f"  ─────────────────────────────────────────────────────────────")
+else:
+    log(f"""  Story Board  ({done_count}/{total_count} done · {in_progress_count} in progress · {blocked_count} blocked · {todo_count} todo)
+  ─────────────────────────────────────────────────────────────
+  ID          Title                                  Status        Priority
+  ──────────  ─────────────────────────────────────  ────────────  ────────""")
+
+    STATUS_ICONS = {"DONE": "✓", "IN_PROGRESS": "●", "BLOCKED": "✗", "TODO": "○"}
+    for story in sprint_stories:
+        status_upper = story.get("status", "TODO").upper()
+        icon  = STATUS_ICONS.get(status_upper, "?")
+        title = story.get("title", "")[:35]
+        prio  = story.get("priority", "")
+        log(f"  {story['id']:<10}  {title:<35}  {icon} {status_upper:<10}  {prio}")
+
+# Open PRs with CI status
+if open_prs:
+    log(f"""
+  OPEN PULL REQUESTS
+  ─────────────────────────────────────────────────────────────""")
+    for pr in open_prs:
+        checks = pr.get("statusCheckRollup") or []
+        if not checks:
+            ci_status = "? no checks"
+        else:
+            states = [
+                (c.get("state") or c.get("conclusion") or "UNKNOWN").upper()
+                for c in checks
+            ]
+            if any(s in ("FAILURE", "ERROR", "CANCELLED") for s in states):
+                ci_status = "✗ FAILING"
+            elif all(s in ("SUCCESS", "COMPLETED", "NEUTRAL") for s in states):
+                ci_status = "✓ PASSING"
+            else:
+                ci_status = "↻ PENDING"
+        log(f"  #{pr['number']}  {pr['title'][:45]}  [{ci_status}]")
+
+# Impediments log
+if impediments:
+    log(f"""
+  IMPEDIMENTS
+  ─────────────────────────────────────────────────────────────""")
+    for imp in impediments:
+        log("  " + "  ".join(imp[:5]))
+elif lifecycle_state in ("SPRINT_EXECUTION", "SPRINT_REVIEW"):
+    log("\n  No impediments logged. Add rows to the ## Impediments table in SPRINT_{sprint_state.current_sprint}.md.")
+
+log("  ─────────────────────────────────────────────────────────────")
+```
+
+### 3.3 Agent Metrics
+
+```
+  AGENT METRICS
+  ─────────────────────────────────────────────────────────────
+  Story    Role                    Backend  Artifacts  Key Outputs
+  ───────  ──────────────────────  ───────  ─────────  ─────────────────
+  US-001   software-engineer       claude   12         user.service.ts
+  US-001   quality-engineer        claude    4         user.test.ts
+  ─────────────────────────────────────────────────────────────
+```
+
+### 3.4 Findings Summary
+
+```
+  FINDINGS
+  ─────────────────────────────────────────────────────────────
+  🔴 CRITICAL  {n}  — {first 2 titles}
+  🟠 HIGH      {n}
+  🟡 MEDIUM    {n}
+  🟢 LOW       {n}
+
+  Remediation: {n_fixed} fixed · {n_open} open
+  ─────────────────────────────────────────────────────────────
+```
+
+### 3.5 Gate History
+
+```
+  DOD COMPLIANCE
+  ─────────────────────────────────────────────────────────────
+  Sprint 1:  5/5 stories passed (100%)
+  Sprint 2:  3/4 stories passed (75%) — US-044 pending
+  Inception: ⊙ Approved
+  ─────────────────────────────────────────────────────────────
+```
+
+### 3.6 Context Packages (brownfield only)
+
+```
+  BROWNFIELD CONTEXT  ({n} packages)
+  ─────────────────────────────────────────────────────────────
+  ✓ dependency-map        (2026-03-12)
+  ✓ business-rules        (2026-03-12)
+  ○ health-assessment     — not yet generated
+  ─────────────────────────────────────────────────────────────
+```
+
+### 3.7 Session Summary
+
+```
+  LAST SESSION
+  ─────────────────────────────────────────────────────────────
+  Saved: {timestamp}
+  {2-3 key facts from last-session.md}
+  ─────────────────────────────────────────────────────────────
+```
+
+### 3.8 Verification Status
+
+```
+  VERIFICATION COMMANDS
+  ─────────────────────────────────────────────────────────────
+  US-042-se  npm test               ✓ exit 0
+  US-042-qe  pytest -x              ✓ exit 0  (82% coverage)
+  ─────────────────────────────────────────────────────────────
+```
+
+### 3.9 Next Action Banner
+
+```
+  ─────────────────────────────────────────────────────────────
+  NEXT ACTION
+  {context-aware guidance from table below}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Next Action Logic
+
+| Lifecycle State | Next Action |
+|----------------|-------------|
+| No state / INIT | "No project active. Describe what you want to build, or say 'initialize my project'" |
+| INCEPTION | "Inception in progress — setting up foundation" |
+| SPRINT_PLANNING | "Sprint {N} Planning — refine stories and confirm backlog" |
+| SPRINT_EXECUTION | "Sprint {N} Execution — {done}/{total} stories done" |
+| SPRINT_REVIEW | "Sprint {N} Review — demo and collect feedback" |
+| SPRINT_RETRO | "Sprint {N} Retrospective — analyze and improve process" |
+| SPRINT_CLOSE | "Sprint {N} Close — handle carry-over, decide next step" |
+| READY (Kanban) | "Ready — pull next ticket from backlog" |
+| EXECUTION (Kanban) | "Executing ticket {ticket_id}" |
+| REVIEW (Kanban) | "Review — demo ticket and collect feedback" |
+| RELEASE | "Release preparation in progress" |
+| COMPLETE | "Lifecycle complete ✓" |
+
+## Step 4: Handle No Pipeline Found
+
+If `.synaptory/` does not exist or is empty:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  synaptory · No active pipeline
+
+  To get started:
+    Just describe what you want to build — "Build me a SaaS for..."
+    Or say "initialize my project" to configure first.
+
+  For existing codebases:
+    /synaptory — understand architecture and dependencies first
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+## Step 5: Offer Actions
+
+After printing the dashboard:
+
+```python
+AskUserQuestion(questions=[{
+  "question": "What would you like to do?",
+  "options": [
+    {"id": "continue",  "label": "Continue from current lifecycle state",    "description": "Resume from where you left off"},
+    {"id": "review",    "label": "Review Sprint/Release readiness",          "description": "Read story DoD results and verification reports"},
+    {"id": "reports",   "label": "Generate reports (PIPELINE.md + HTML)",    "description": "Refresh .synaptory/PIPELINE.md and .synaptory/PIPELINE.html"},
+    {"id": "reanchor",  "label": "Re-anchor context",                       "description": "Re-inject ADRs, sprint state, and last 3 receipts"},
+    {"id": "nothing",   "label": "Just showing — no action needed"}
+  ]
+}])
+```
+
+### On "Generate reports"
+
+```python
+Bash("python3 \"${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/build_summary.py\" \"${CLAUDE_PROJECT_DIR}\"")
+Bash("python3 \"${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/generate_reports.py\" \"${CLAUDE_PROJECT_DIR}\"")
+```
+
+## Notes
+
+- This mode is read-only — never modifies workspace files (except optional report generation)
+- Skip sections with no data rather than showing empty placeholders
+- Receipts in `.synaptory/.orchestrator/receipts/` are the authoritative source
+- For brownfield projects, always show Context Packages section

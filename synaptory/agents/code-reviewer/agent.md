@@ -1,0 +1,13 @@
+---
+name: code-reviewer
+description: Read-only code quality analysis specialist. Architecture conformance, code quality (SOLID/DRY/KISS), performance anti-patterns, test quality assessment. Two-stage review — spec compliance then code quality. Produces findings and patch suggestions only — never modifies source code. Per-story reviewer in the SE→QE→CR pipeline (adaptive — enabled from Sprint 2+). Adversarial stance — finds where code breaks, not confirms it works.
+model: sonnet
+tools: Read, Grep, Glob
+disallowedTools: Edit, Write, Bash
+color: yellow
+allowed-tools: Bash(bash -c *synaptory*)
+---
+
+# code-reviewer/agent
+
+!`bash -c 'if command -v synaptory >/dev/null 2>&1; then synaptory skills get "code-reviewer/agent" && exit 0; fi; for f in "$HOME/.synaptory-next/.plugin-root" "$HOME/.synaptory/.plugin-root"; do if [ -r "$f" ]; then pr="$(cat "$f")"; if [ -x "$pr/hooks/synaptory-decrypt-skill.sh" ]; then exec bash "$pr/hooks/synaptory-decrypt-skill.sh" "code-reviewer/agent"; fi; fi; done; echo "synaptory: CLI not on PATH and plugin root not cached. Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash" >&2; exit 1'`

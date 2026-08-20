@@ -1,0 +1,15 @@
+---
+description: Synaptory on Cursor — remaining platform gaps
+globs: "**/*"
+alwaysApply: true
+---
+
+You are on the Cursor host of Synaptory (`plugin-cursor`), not Claude Code.
+
+- Spawn named plugin subagents (`software-engineer`, …). Roles must not spawn roles (one nesting level).
+- Receipts: `host: cursor`, `not_claude_code_session: true`. Backbone `backend` from the real model id; never invent `claude`.
+- Missing receipts: do not `advance`. MCP `advance` refuses without a valid receipt (`subagentStop` followup is not a hard block).
+- `await_sync` / `await_acceptance` are human gates — stop and wait.
+- If `healthcare.baa_enforced`, Teams/Pro/Start are refused; do not send PHI over plugin MCP.
+- Cloud VMs skip sessionStart — restore `.synaptory/.orchestrator/pipeline-state.json` from the `/synaptory` skill body.
+- Bootstrap `PLUGIN_ROOT` from this plugin, never `~/.claude/plugins/cache`.

@@ -1,0 +1,59 @@
+## Research Discipline
+
+Web search is your primary superpower — what separates you from an LLM working from stale training data.
+
+### When to Search (MUST)
+
+- Any claim about current market state, pricing, or adoption
+- Technology recommendations (verify current version, maintenance status, known issues)
+- Competitive landscape (companies launch, pivot, and die constantly)
+- Regulatory or compliance requirements (rules change)
+- Cost estimates (cloud pricing changes quarterly)
+- "Best practice" claims (what was best 2 years ago may be anti-pattern now)
+
+### When NOT to Search (training data is sufficient)
+
+- Programming language fundamentals and syntax
+- Established design patterns (SOLID, CQRS, event sourcing)
+- Mathematical concepts and algorithms
+- Historical context
+- General architecture principles
+
+### Research Patterns
+
+**Landscape Sweep** — 3-5 parallel WebSearch calls covering different angles:
+```
+WebSearch("[domain] platforms 2026 comparison")
+WebSearch("[domain] market size growth trends")
+WebSearch("[domain] pain points challenges")
+WebSearch("[domain] technology stack patterns")
+```
+
+**Deep Dive** — follow up on specific findings:
+```
+WebSearch("[specific topic]")
+→ finds relevant page
+WebFetch("[url]")
+→ extract detailed insights
+```
+
+**Validation** — verify claims before advising:
+```
+WebSearch("[specific claim] accuracy [year]")
+→ cross-reference 2-3 sources
+```
+
+**Cost Modeling** — real numbers, not guesses:
+```
+WebSearch("[cloud service] pricing [year]")
+WebSearch("[competitor] pricing plans")
+```
+
+### Research Quality Rules
+
+1. **Multiple sources.** Never base advice on a single search result. Cross-reference 2-3 sources for important claims.
+2. **Recency matters.** Prefer results from the last 12 months. Flag when relying on older sources.
+3. **Synthesize, don't dump.** The user wants insights, not links. Every research session produces a synthesis.
+4. **Flag uncertainty.** When sources conflict: "I found conflicting info — source A says X, source B says Y. Here's my assessment..."
+5. **Persist findings.** Write research to `research/YYYY-MM-DD-topic.md`. Don't re-search the same topic in future sessions.
+6. **Proactive search.** If the conversation touches a topic where training data is likely stale, search automatically and present findings with direction options.

@@ -1,0 +1,209 @@
+# Lightweight Modes
+
+Single-agent and dual-agent modes with minimal orchestration overhead. Each section is self-contained.
+
+## Table of Contents
+- [Deploy Mode](#deploy-mode)
+- [Test Mode](#test-mode)
+- [Review Mode](#review-mode)
+- [Architect Mode](#architect-mode)
+- [Document Mode](#document-mode)
+- [Explore Mode](#explore-mode)
+- [Optimize Mode](#optimize-mode)
+- [Stabilize Mode](#stabilize-mode)
+- [Modernize Mode](#modernize-mode)
+- [Help Mode](#help-mode)
+- [Custom Mode](#custom-mode)
+
+---
+
+## Deploy Mode
+
+Get existing code deployed. Infrastructure + reliability.
+
+1. **Codebase scan** — read existing code, identify services, dependencies
+2. **Platform Engineer** — Dockerfiles, CI/CD pipelines, IaC (Terraform/Pulumi), monitoring, SLO definitions, runbooks, alerting, chaos experiment plan
+
+**1 gate:** After DevOps infra plan, before applying.
+
+---
+
+## Test Mode
+
+Write tests for existing code. Single skill.
+
+1. Invoke Quality Engineer directly against existing code
+2. Quality Engineer reads code, writes test plan, implements tests, runs them
+3. Report results
+
+**0 gates.** QA operates autonomously.
+
+---
+
+## Review Mode
+
+Code quality review. Single skill, read-only.
+
+1. Invoke Code Reviewer directly
+2. Review produces findings report
+3. Present findings with severity distribution
+
+**0 gates.** Read-only operation.
+
+---
+
+## Architect Mode
+
+Design or redesign architecture. Single skill.
+
+1. Invoke Solution Architect
+2. Full discovery interview (depth based on engagement mode)
+3. Produces ADRs, diagrams, tech stack, API contracts, scaffold
+
+**1 gate:** Architecture approval before scaffold generation.
+
+---
+
+## Document Mode
+
+Generate documentation for existing code. Single skill.
+
+1. Invoke Technical Writer
+2. Reads all code + existing docs
+3. Generates API reference, dev guides, architecture overview
+
+**0 gates.** Technical Writer operates autonomously.
+
+---
+
+## Explore Mode
+
+Thinking partner. Single skill.
+
+1. Invoke Research Advisor
+2. Research, advise, ideate — whatever the user needs
+3. When ready, offer to hand off to any other mode
+
+**0 gates.** Research Advisor manages its own dialogue.
+
+> **Receipt requirement (RA inline carve-out):** RA usually runs inline in this mode rather than via `Agent()`, so SubagentStop does not fire and the receipt ship loop is never triggered. **At the end of each meaningful RA turn (one that produced an artifact under `.synaptory/research-advisor/`, recorded a decision, or wrote a handoff bundle), the orchestrator MUST write `.synaptory/.orchestrator/receipts/{session_id}-ra.json`** following the receipt template in `${CLAUDE_PLUGIN_ROOT}/agents/research-advisor/SKILL.md`. The session-end hook ships unshipped receipts to the control plane.
+
+---
+
+## Optimize Mode
+
+Performance + reliability analysis. Two skills.
+
+1. **Code Reviewer** — identify performance anti-patterns, N+1 queries, memory leaks
+2. **Platform Engineer** — capacity analysis, scaling bottlenecks, SLO evaluation
+3. **Consolidated report** — performance findings + reliability recommendations
+4. **Remediation** — fix top issues
+
+**1 gate:** After analysis, before fixes.
+
+---
+
+## Stabilize Mode
+
+Establish a test safety net on existing code. Two skills.
+
+Requires context packages — if `.synaptory/.orchestrator/context-packages/` is empty, suggest running Discover mode first ("understand this codebase").
+
+1. **Quality Engineer** — read the coverage baseline from Discover mode, write characterization tests for remaining P1/P2 uncovered files, extend existing test suites
+2. **Code Reviewer** — identify structural risks in modules being stabilized, flag files that are frequently changed but never tested
+
+**1 gate:** After analysis, present coverage improvement plan before test generation.
+
+---
+
+## Modernize Mode
+
+Plan system modernization. Two skills.
+
+Requires context packages — if `.synaptory/.orchestrator/context-packages/` is empty, suggest running Discover mode first ("understand this codebase").
+
+1. **Solution Architect** (modernize mode) — read all context packages, score modules, select migration strategies, produce quarterly roadmap with rollback plans
+2. **Compliance Engineer** — audit legacy security vulnerabilities in target modules, feed findings into SA risk scoring
+
+**1 gate:** After roadmap generation, before finalizing. Present module scoring and proposed migration order for user approval.
+
+---
+
+## Help Mode
+
+Print the quick reference card immediately. No questions, no preamble.
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  synaptory — Quick Reference
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  COMMAND
+  ─────────────────────────────────────────────────────────────
+  /synaptory       Everything — build, discover, preview, status, help
+
+  GETTING STARTED
+  ─────────────────────────────────────────────────────────────
+  New project:       Just describe what you want to build
+  Existing codebase: "understand this codebase" first, then build
+  Quick task:        "review my code", "add tests", "debug this"
+
+  10 AGENTS
+  ─────────────────────────────────────────────────────────────
+  Product Manager      Requirements, BRD, user stories
+  Solution Architect   System design, ADRs, API contracts
+  Software Engineer    Backend · Frontend · AI/ML · Mobile
+  Quality Engineer     Tests · Diff-aware · Browser QA
+  Compliance Engineer  OWASP · STRIDE · HIPAA · Pentest
+  Code Reviewer        Code quality, architecture conformance
+  Platform Engineer    Docker · CI/CD · Terraform · SLOs · Runbooks
+  Technical Writer     API docs · Dev guides · Sprint reports
+  Research Advisor     Thinking partner, ideation
+
+  MODES — the orchestrator auto-routes:
+  ─────────────────────────────────────────────────────────────
+  sprint · debug · explore · preview · status · help
+  architect · document · explore · optimize · debug · preview
+  retro · discover · stabilize · modernize · branch-finish
+  init · status · help · report
+
+  DELIVERY LIFECYCLE
+  ─────────────────────────────────────────────────────────────
+  Scrum:  Inception → Sprint ceremonies → Release
+  Kanban: Discover → Ready → Execute → Review → loop
+  Per-story: SE → QE → CR → DoD evaluation
+
+  USEFUL PHRASES
+  ─────────────────────────────────────────────────────────────
+  "status"            — pipeline dashboard
+  "help"              — this reference card
+  "report a bug"      — file an issue against synaptory
+  "initialize"        — (re)configure project settings
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Custom Mode
+
+User picks skills from a menu.
+
+```python
+AskUserQuestion(questions=[{
+  "question": "Which skills do you need?",
+  "header": "Skill Selection",
+  "options": [
+    {"label": "Product Manager", "description": "Requirements, user stories, BRD"},
+    {"label": "Solution Architect", "description": "System design, API contracts, tech stack"},
+    {"label": "Software Engineer", "description": "Backend, frontend, review, or AI/ML mode"},
+    {"label": "Quality Engineer", "description": "Tests — unit, integration, e2e, performance"},
+    {"label": "Compliance Engineer", "description": "OWASP audit, STRIDE, vulnerability scan, HIPAA"},
+    {"label": "Platform Engineer", "description": "Docker, CI/CD, Terraform, SLOs, runbooks, chaos engineering"},
+    {"label": "Technical Writer", "description": "API docs, dev guides, architecture docs"},
+    {"label": "Chat about this", "description": "Free-form input"}
+  ],
+  "multiSelect": true
+}])
+```
+
+Execute selected skills in dependency order. If user picks conflicting skills, resolve via the authority hierarchy.

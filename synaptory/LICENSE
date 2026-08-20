@@ -1,0 +1,64 @@
+H3Tech Inc. — Proprietary Software License
+
+Copyright 2024-2026 H3Tech Inc. All rights reserved.
+
+CONFIDENTIAL AND PROPRIETARY
+
+This software and its associated documentation, including but not limited to
+source code, scripts, configuration files, agent definitions, skill
+definitions, protocols, hooks, rules, templates, and any other files
+distributed as part of the Synaptory plugin package (collectively, the
+"Software"), are the confidential and proprietary property of H3Tech Inc.
+
+## Terms of Use
+
+1. **Authorized Use Only.** The Software is licensed, not sold. You may use
+   the Software only if you have been issued a personal license key by
+   H3Tech Inc. or an authorized representative.
+
+2. **No Redistribution.** You may not copy, distribute, sublicense, sell,
+   lease, or otherwise transfer the Software or any portion thereof to any
+   third party without prior written consent from H3Tech Inc.
+
+3. **No Reverse Engineering.** You may not decompile, disassemble, decrypt,
+   reverse engineer, or attempt to derive the source code or underlying
+   algorithms of any encrypted or compiled portions of the Software.
+
+4. **No Circumvention.** You may not move, change, disable, or circumvent
+   the license key functionality, encryption, or any other protection
+   mechanisms in the Software.
+
+5. **Personal License Keys.** Each license key is issued to a specific
+   individual and is non-transferable. You may not share your license key
+   with any other person. All usage is watermarked and traceable to the
+   individual licensee.
+
+6. **Watermarking and Audit.** The Software embeds unique identifiers tied
+   to your license key in all decrypted content. H3Tech Inc. reserves the
+   right to audit usage and trace any unauthorized disclosure of the
+   Software's contents back to the responsible licensee.
+
+7. **Confidentiality.** You agree to maintain the confidentiality of the
+   Software, including its source code, algorithms, methodologies,
+   protocols, and any other proprietary information contained therein.
+   You shall not disclose any such information to any third party.
+
+8. **Termination.** This license terminates immediately if you violate any
+   of these terms. Upon termination, you must destroy all copies of the
+   Software in your possession.
+
+## No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. H3TECH INC. SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE
+USE OR INABILITY TO USE THE SOFTWARE.
+
+## Governing Law
+
+This license shall be governed by the laws of the jurisdiction in which
+H3Tech Inc. is incorporated.
+
+---
+
+For licensing inquiries, contact H3Tech Inc.
+https://github.com/h3tech-ai

@@ -1,0 +1,1021 @@
+"""Tracker configuration loader — reads .synaptory.yaml tracker section."""
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional
+
+
+# Multi-spec design (see docs/multi-spec-design.md): a project can host N
+# label-/tag-/milestone-filtered "specs" inside one tracker project. Opt-in
+# via top-level `specs:` block; absent block → legacy single-spec behavior
+# is unchanged.
+#
+# Filter-type matrix per backend (covers Jira + GitHub + Teamwork + Linear).
+# A spec's filter.type must be one of the values listed for the active
+# tracker backend; mismatches are rejected by _validate_specs() at load time.
+_FILTER_TYPES_BY_BACKEND = {
+    "jira": ("label", "component", "epic", "jql"),
+    "github": ("label", "milestone"),
+    "teamwork": ("tag", "tasklist"),
+    "linear": ("label", "project"),
+    "local": (),
+}
+# Union of all known types — used when the backend is unknown (e.g. local).
+_VALID_FILTER_TYPES = tuple(
+    sorted({t for types in _FILTER_TYPES_BY_BACKEND.values() for t in types})
+)
+# Filter types that are read-only — refuse writes to keep the spec scope tight.
+_READONLY_FILTER_TYPES = {"jql"}
+_SPEC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# Canonical synaptory story states that a `status_map` override may remap onto
+# tracker-side names: Jira workflow status names, GitHub status label names,
+# Teamwork status tag names. CANCELLED / COMPLETED are included because they
+# are first-class on the write path (labels/tags on GitHub/Teamwork, STATUS_MAP
+# aliases on Jira).
+_CANONICAL_STATUS_KEYS = frozenset(
+    {"BACKLOG", "TO_DO", "IN_PROGRESS", "IN_REVIEW", "AWAITING_ACCEPTANCE",
+     "BLOCKED", "DONE", "COMPLETED", "CANCELLED"}
+)
+
+# Synaptory entity kinds an `issue_type` override may remap onto tracker-side
+# type names: Jira issue types, GitHub Issue Types, Teamwork entity tags.
+# `enhancement` shares the story path.
+_ISSUE_TYPE_ENTITY_KEYS = frozenset(
+    {"story", "epic", "bug", "task", "subtask", "enhancement"}
+)
+
+
+def _normalize_status_key(key) -> str:
+    """Normalize a status-map key to canonical form: upper-case, `-`/space → `_`."""
+    return str(key).strip().upper().replace("-", "_").replace(" ", "_")
+
+
+def _is_int_like(value) -> bool:
+    """True when a raw config value parses as an int (e.g. a Teamwork
+    workflow-stage ID). Used to disambiguate flattened keys shared between
+    `workflow_stages` (int stage IDs) and `status_map` (string names)."""
+    try:
+        int(str(value).strip())
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_truthy(value) -> bool:
+    """Normalize a raw config value to a bool.
+
+    `_coerce` already turns bare `true`/`false` into real bools at parse time,
+    but a *quoted* `"true"` reaches here as a string — accept both so the flag
+    behaves the way the YAML reads.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "yes", "1")
+
+
+def _parse_status_map(backend_raw: dict) -> dict:
+    """Parse a `status_map` override from a raw tracker-backend config dict.
+
+    Maps canonical synaptory states → the tracker's literal names: Jira
+    workflow status names, GitHub status *label* names, or Teamwork status
+    *tag* names. Keys are upper-cased and normalized (`-`/spaces → `_`), so
+    `in_review` / `IN-REVIEW` / `in review` all resolve to `IN_REVIEW`.
+    Values are kept verbatim. Unknown keys and non-dict / empty inputs are
+    ignored gracefully (⇒ empty map ⇒ the backend's built-in defaults).
+
+    Accepts BOTH the nested form (`<backend>.status_map.IN_REVIEW: ...`) and a
+    flattened form (canonical keys directly under the backend block). This
+    mirrors the Teamwork `workflow_stages` parser and is required because the
+    lite YAML parser cannot descend into a 4-level-nested map — its keys land
+    flattened under the backend block instead. Nested entries win over
+    flattened ones for the same canonical key. Flattened **int-like** values
+    are skipped: those are Teamwork workflow-stage IDs sharing the same
+    canonical key namespace (e.g. `IN_REVIEW: 379228`), never status names.
+    """
+    out: dict = {}
+    # Flattened form: canonical status keys sitting directly under the block.
+    for key, value in backend_raw.items():
+        if key == "status_map" or value is None or _is_int_like(value):
+            continue
+        norm = _normalize_status_key(key)
+        if norm in _CANONICAL_STATUS_KEYS:
+            out[norm] = str(value)
+    # Nested form (takes precedence).
+    raw = backend_raw.get("status_map", {})
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if value is None:
+                continue
+            norm = _normalize_status_key(key)
+            if norm in _CANONICAL_STATUS_KEYS:
+                out[norm] = str(value)
+    return out
+
+
+def _parse_issue_type(backend_raw: dict) -> dict:
+    """Parse an `issue_type` override into a per-entity dict.
+
+    Maps synaptory entity kinds (story, epic, bug, task, subtask, enhancement)
+    → the tracker's literal type names: Jira issue types, GitHub Issue Types,
+    or Teamwork entity tag names. Accepts BOTH forms:
+
+    - **string** (back-compat) → applies to the story path only, i.e.
+      ``{"story": <v>, "enhancement": <v>}``.
+    - **dict** → per-entity. Keys are lowercased; unknown keys are dropped.
+
+    Like `_parse_status_map`, the dict form is also accepted **flattened**
+    (entity keys sitting directly under the backend block) because the lite
+    YAML parser cannot descend into a 4-level-nested map — its keys land
+    flattened under the backend block instead. Nested entries win over
+    flattened ones. Empty / non-str-non-dict input ⇒ empty map ⇒ the backend's
+    built-in defaults apply and behavior is unchanged.
+    """
+    out: dict = {}
+    raw = backend_raw.get("issue_type")
+    # String form: story path only (story + enhancement share it).
+    if isinstance(raw, str):
+        val = raw.strip()
+        if val:
+            out["story"] = val
+            out["enhancement"] = val
+        return out
+    # Flattened form: entity keys sitting directly under the backend block.
+    for key, value in backend_raw.items():
+        if key == "issue_type" or value is None:
+            continue
+        lk = str(key).strip().lower()
+        if lk in _ISSUE_TYPE_ENTITY_KEYS:
+            out[lk] = str(value)
+    # Nested dict form (takes precedence).
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if value is None:
+                continue
+            lk = str(key).strip().lower()
+            if lk in _ISSUE_TYPE_ENTITY_KEYS:
+                out[lk] = str(value)
+    return out
+
+
+@dataclass
+class GitHubConfig:
+    repo: str = ""
+    label_prefix: str = "hc:"
+    points_label_prefix: str = "points:"
+    sprint_milestone_prefix: str = "Sprint "
+    status_map: dict = field(default_factory=dict)
+    """Optional override mapping canonical synaptory states → this repo's
+    status *label* names. Only the label-backed states are meaningful on
+    GitHub (BLOCKED, IN_REVIEW, AWAITING_ACCEPTANCE, CANCELLED — the
+    open/closed axis handles the rest); other keys are parsed but unused.
+    Empty ⇒ the built-in STATUS_LABELS defaults apply."""
+    issue_type_overrides: dict = field(default_factory=dict)
+    """Optional override of the GitHub Issue Type names used when creating
+    issues, keyed by synaptory entity kind (story, epic, bug, task,
+    enhancement) → GitHub Issue Type name. Parsed from the public
+    `issue_type` YAML key (string ⇒ story path only, dict ⇒ per-entity).
+    Empty ⇒ the built-in ENTITY_TYPE_MAP defaults apply."""
+
+
+@dataclass
+class JiraConfig:
+    url: str = ""
+    project_key: str = ""
+    board_id: Optional[int] = None
+    story_points_field: str = "story_point_estimate"
+    epic_link_field: str = "parent"
+    sprint_milestone_prefix: str = ""
+    """Optional per-spec sprint-name namespace. Unlike GitHub/Teamwork (where
+    the prefix *is* the leading literal, defaulting to `"Sprint "`), the Jira
+    prefix is *prepended* to the canonical `Sprint N` name — so `VA_` yields
+    `VA_Sprint 1`. Empty (the default) ⇒ today's board-wide `Sprint N` naming
+    and parsing, backward compatible. When set, the adapter both names created
+    sprints `{prefix}Sprint N` and scopes every sprint read (list/get/velocity)
+    to names starting with the prefix — isolating specs that share one board.
+    In multi-spec, this same JiraConfig field carries the per-spec override."""
+    status_map: dict = field(default_factory=dict)
+    """Optional per-spec override mapping canonical synaptory states →
+    this project's Jira status *names*. Keys are the canonical states
+    (BACKLOG, TO_DO, IN_PROGRESS, IN_REVIEW, AWAITING_ACCEPTANCE, BLOCKED,
+    DONE); values are the literal Jira status names on the project's board
+    (e.g. IN_REVIEW → "IN CODE REVIEW"). Empty ⇒ the built-in STATUS_MAP
+    defaults apply and behavior is unchanged."""
+    issue_type_overrides: dict = field(default_factory=dict)
+    """Optional per-spec override of the Jira issue types Synaptory creates and
+    queries, keyed by synaptory entity kind (story, epic, bug, task, subtask,
+    enhancement) → literal Jira issue-type name. Parsed from the public
+    `issue_type` YAML key which accepts BOTH a bare string (applies to the
+    story path only — story + enhancement) and a per-entity map. Empty ⇒ the
+    built-in ISSUE_TYPES defaults apply and behavior is unchanged."""
+
+
+@dataclass
+class TeamworkConfig:
+    site_name: str = ""                  # subdomain: "mycompany" for mycompany.teamwork.com
+    project_id: int = 0                  # numeric Teamwork project ID
+    sprint_milestone_prefix: str = "Sprint "
+    workflow_stages: dict = field(default_factory=dict)  # e.g. {"TODO": 379226, "IN_PROGRESS": 379227, "DONE": 379229}
+    status_map: dict = field(default_factory=dict)
+    """Optional override mapping canonical synaptory states → this project's
+    status *tag* names. Only the tag-backed states are meaningful on Teamwork
+    (BLOCKED, IN_REVIEW, AWAITING_ACCEPTANCE, CANCELLED — workflow_stages
+    handles the column axis); other keys are parsed but unused. Empty ⇒ the
+    built-in STATUS_TAGS defaults apply."""
+    issue_type_overrides: dict = field(default_factory=dict)
+    """Optional override of the entity *tag* names used to type tasks, keyed
+    by synaptory entity kind (story, epic, bug, task) → tag name (defaults are
+    the `hc:`-prefixed ENTITY_TAGS). Parsed from the public `issue_type` YAML
+    key (string ⇒ story path only, dict ⇒ per-entity). Empty ⇒ defaults."""
+
+
+@dataclass
+class LinearConfig:
+    team_key: str = ""                   # Linear team key, e.g. "ENG"
+    team_id: str = ""                    # optional team uuid; skips the by-key lookup
+    project_id: str = ""                 # optional default Linear Project for new issues
+    label_prefix: str = "hc:"
+    cycle_length_days: int = 14
+    """Length of a cycle Synaptory creates when `manage_cycles` is true and the
+    caller supplied no dates. `CycleCreateInput.startsAt`/`endsAt` are non-null
+    in Linear's schema, so a window always has to be derived."""
+    manage_cycles: bool = False
+    """Whether Synaptory may call `cycleCreate`. Default False: Linear creates
+    cycles automatically on the team's configured cadence, and injecting cycles
+    into someone's cadence is worse than reporting why we can't. When False,
+    `create_sprint` binds to an existing cycle and raises if none matches."""
+    status_map: dict = field(default_factory=dict)
+    """Optional override mapping canonical synaptory states → this team's
+    literal Linear WorkflowState *names*. Linear teams define their own state
+    names, so this is the first-tier override ahead of the built-in STATUS_MAP
+    names and the `state.type`-based fallback. Empty ⇒ built-in resolution."""
+    issue_type_overrides: dict = field(default_factory=dict)
+    """Optional override of the entity *label* names used to type issues, keyed
+    by synaptory entity kind (story, epic, bug, task) → label name (defaults are
+    the `hc:`-prefixed ENTITY_LABELS). Linear has no native issue-type field, so
+    entity kind is carried on a label the way Teamwork carries it on a tag."""
+
+
+@dataclass
+class TemplatesConfig:
+    """Paths to tracker description templates (relative to project root).
+
+    If a path is empty, the adapter uses built-in defaults from
+    skills/_shared/templates/tracker/*.md
+    """
+    story: str = ""                    # e.g. "docs/templates/tracker/user-story.md"
+    task: str = ""                     # e.g. "docs/templates/tracker/task.md"
+    epic: str = ""                     # e.g. "docs/templates/tracker/epic.md"
+    bug: str = ""                      # e.g. "docs/templates/tracker/bug.md"
+
+
+@dataclass
+class SpecFilter:
+    type: str = "label"
+    """One of: label | component | epic | jql (Jira) | label | milestone (GitHub)
+       | tag | tasklist (Teamwork). Validated per active tracker backend."""
+    value: str = ""
+    """Label name, component name, epic key, JQL fragment, milestone title,
+       tag name, or tasklist id (as a string) — interpreted by the adapter."""
+
+
+@dataclass
+class GitHubSpecBinding:
+    """Per-spec GitHub Issues configuration.
+
+    The `repo` mirrors `tracker.github.repo` (multi-spec stays within one
+    repo) but is duplicated here for parity with Jira's per-spec block —
+    callers may also leave it empty and the adapter will fall back to
+    `tracker.github.repo`.
+    """
+    repo: str = ""
+    sprint_milestone_prefix: str = ""
+    """Optional per-spec override for `tracker.github.sprint_milestone_prefix`.
+       Useful if spec teams want their own milestone namespace
+       (e.g. `Platform Sprint `). Empty → falls back to the global prefix."""
+    status_map: dict = field(default_factory=dict)
+    """Per-spec `status_map` override (see GitHubConfig.status_map).
+       Empty → falls back to the top-level map."""
+    issue_type_overrides: dict = field(default_factory=dict)
+    """Per-spec `issue_type` override (see GitHubConfig.issue_type_overrides).
+       Empty → falls back to the top-level map."""
+
+
+@dataclass
+class TeamworkSpecBinding:
+    """Per-spec Teamwork configuration.
+
+    `site_name` + `project_id` mirror the top-level `tracker.teamwork.*`
+    values (multi-spec stays within one Teamwork project) but are
+    duplicated here for parity.
+
+    `workflow_stages` is per-spec because Teamwork assigns stage IDs per
+    project — when specs target distinct Teamwork projects, the top-level
+    `tracker.teamwork.workflow_stages` map only resolves in one of them.
+    Empty → falls back to the top-level map.
+    """
+    site_name: str = ""
+    project_id: int = 0
+    sprint_milestone_prefix: str = ""
+    workflow_stages: dict = field(default_factory=dict)
+    status_map: dict = field(default_factory=dict)
+    """Per-spec `status_map` override (see TeamworkConfig.status_map).
+       Empty → falls back to the top-level map."""
+    issue_type_overrides: dict = field(default_factory=dict)
+    """Per-spec `issue_type` override (see TeamworkConfig.issue_type_overrides).
+       Empty → falls back to the top-level map."""
+
+
+@dataclass
+class LocalSpecBinding:
+    """Per-spec local tracker configuration.
+
+    Local multi-spec uses filesystem partitioning rather than tracker-side
+    labels/tags. Each spec gets its own tracker-data.json under
+    `.synaptory/.orchestrator/specs/<id>/`; `requirements_dir` optionally
+    points Markdown artifacts at a spec-specific docs subtree.
+    """
+    requirements_dir: str = ""
+
+
+@dataclass
+class SpecConfig:
+    """One spec inside a multi-spec project. Carries exactly one backend
+    binding (local / jira / github / teamwork / linear) plus a filter —
+    validation rejects specs that bind to a different backend than
+    `tracker.backend`."""
+    id: str = ""
+    name: str = ""
+    local: Optional[LocalSpecBinding] = None
+    jira: Optional[JiraConfig] = None
+    github: Optional[GitHubSpecBinding] = None
+    teamwork: Optional[TeamworkSpecBinding] = None
+    linear: Optional[LinearConfig] = None
+    """Linear reuses one `LinearConfig` for both the top-level and per-spec
+    positions (as Jira does with `JiraConfig`) rather than a separate
+    `*SpecBinding` — no Linear field needs to differ between the two, so the
+    duplication would be pure cost."""
+    filter: SpecFilter = field(default_factory=SpecFilter)
+
+    def backend(self) -> str:
+        """Return the backend this spec is bound to
+        (`local`/`jira`/`github`/`teamwork`/`linear`) or `""` if none —
+        validation will have raised by then."""
+        if self.local is not None:
+            return "local"
+        if self.jira is not None:
+            return "jira"
+        if self.github is not None:
+            return "github"
+        if self.teamwork is not None:
+            return "teamwork"
+        if self.linear is not None:
+            return "linear"
+        return ""
+
+
+@dataclass
+class TrackerConfig:
+    backend: str = "local"
+    github: GitHubConfig = field(default_factory=GitHubConfig)
+    jira: JiraConfig = field(default_factory=JiraConfig)
+    teamwork: TeamworkConfig = field(default_factory=TeamworkConfig)
+    linear: LinearConfig = field(default_factory=LinearConfig)
+    templates: TemplatesConfig = field(default_factory=TemplatesConfig)
+    build_mode: str = "scrum"
+    scope: str = "all"
+    specs: List[SpecConfig] = field(default_factory=list)
+
+    def is_multispec(self) -> bool:
+        return bool(self.specs)
+
+    def find_spec(self, spec_id: str) -> Optional[SpecConfig]:
+        for s in self.specs:
+            if s.id == spec_id:
+                return s
+        return None
+
+    @classmethod
+    def load(cls, project_dir: Path) -> "TrackerConfig":
+        """Load tracker config from .synaptory.yaml.
+
+        Falls back to local backend when:
+        - No .synaptory.yaml exists
+        - No tracker section in config
+        - build_mode is not scrum or kanban (AC-1: remote trackers need a delivery lifecycle)
+        """
+        config_path = project_dir / ".synaptory.yaml"
+        if not config_path.exists():
+            return cls()
+
+        text = config_path.read_text(encoding="utf-8")
+        raw = _parse_yaml_lite(text)
+
+        build_mode = raw.get("build_mode", "scrum")
+        tracker_raw = raw.get("tracker", {})
+        if not isinstance(tracker_raw, dict):
+            tracker_raw = {}
+
+        scope = tracker_raw.get("scope", "all")
+        if scope not in ("all", "mine"):
+            scope = "all"
+
+        backend = tracker_raw.get("backend", "local")
+        if backend == "markdown":
+            raise ValueError(
+                "tracker.backend='markdown' has been removed. Use "
+                "tracker.backend='local'; the local backend stores compact "
+                "JSON state with ID-named Markdown artifacts."
+            )
+
+        # AC-1: force local when build_mode is not a delivery lifecycle (remote trackers need scrum/kanban)
+        if build_mode not in ("scrum", "kanban", "spq") and backend in ("github", "jira", "teamwork", "linear"):
+            backend = "local"
+
+        gh_raw = tracker_raw.get("github", {})
+        if not isinstance(gh_raw, dict):
+            gh_raw = {}
+        github = GitHubConfig(
+            repo=gh_raw.get("repo", ""),
+            label_prefix=gh_raw.get("label_prefix", "hc:"),
+            points_label_prefix=gh_raw.get("points_label_prefix", "points:"),
+            sprint_milestone_prefix=gh_raw.get("sprint_milestone_prefix", "Sprint "),
+            status_map=_parse_status_map(gh_raw),
+            issue_type_overrides=_parse_issue_type(gh_raw),
+        )
+
+        jira_raw = tracker_raw.get("jira", {})
+        if not isinstance(jira_raw, dict):
+            jira_raw = {}
+        jira_fields = jira_raw.get("fields", {})
+        if not isinstance(jira_fields, dict):
+            jira_fields = {}
+        jira = JiraConfig(
+            url=jira_raw.get("url", ""),
+            project_key=jira_raw.get("project_key", ""),
+            board_id=jira_raw.get("board_id"),
+            story_points_field=jira_fields.get("story_points", "story_point_estimate"),
+            epic_link_field=jira_fields.get("epic_link", "parent"),
+            sprint_milestone_prefix=jira_raw.get("sprint_milestone_prefix", "") or "",
+            status_map=_parse_status_map(jira_raw),
+            issue_type_overrides=_parse_issue_type(jira_raw),
+        )
+
+        tw_raw = tracker_raw.get("teamwork", {})
+        if not isinstance(tw_raw, dict):
+            tw_raw = {}
+        # Workflow stages can be nested under workflow_stages: key, or
+        # flattened into the teamwork section (due to lite YAML parser limits).
+        # Recognized keys: BACKLOG, TO_DO, IN_PROGRESS, IN_REVIEW, DONE
+        wf_stages_raw = tw_raw.get("workflow_stages", {})
+        if not isinstance(wf_stages_raw, dict):
+            wf_stages_raw = {}
+        workflow_stages = {}
+        for stage_key in ("BACKLOG", "TO_DO", "IN_PROGRESS", "IN_REVIEW", "DONE"):
+            val = wf_stages_raw.get(stage_key) or tw_raw.get(stage_key)
+            # Non-int values on these keys are flattened status_map entries
+            # (status *tag* names share the canonical-key namespace) — those
+            # are picked up by _parse_status_map below, not here.
+            if val and _is_int_like(val):
+                workflow_stages[stage_key] = int(val)
+        teamwork = TeamworkConfig(
+            site_name=tw_raw.get("site_name", ""),
+            project_id=tw_raw.get("project_id", 0) or 0,
+            sprint_milestone_prefix=tw_raw.get("sprint_milestone_prefix", "Sprint "),
+            workflow_stages=workflow_stages,
+            status_map=_parse_status_map(tw_raw),
+            issue_type_overrides=_parse_issue_type(tw_raw),
+        )
+
+        lin_raw = tracker_raw.get("linear", {})
+        if not isinstance(lin_raw, dict):
+            lin_raw = {}
+        linear = LinearConfig(
+            team_key=lin_raw.get("team_key", ""),
+            team_id=lin_raw.get("team_id", ""),
+            project_id=lin_raw.get("project_id", ""),
+            label_prefix=lin_raw.get("label_prefix", "hc:"),
+            cycle_length_days=int(lin_raw.get("cycle_length_days", 14) or 14),
+            manage_cycles=_is_truthy(lin_raw.get("manage_cycles", False)),
+            status_map=_parse_status_map(lin_raw),
+            issue_type_overrides=_parse_issue_type(lin_raw),
+        )
+
+        tmpl_raw = tracker_raw.get("templates", {})
+        if not isinstance(tmpl_raw, dict):
+            tmpl_raw = {}
+        templates = TemplatesConfig(
+            story=tmpl_raw.get("story", ""),
+            task=tmpl_raw.get("task", ""),
+            epic=tmpl_raw.get("epic", ""),
+            bug=tmpl_raw.get("bug", ""),
+        )
+
+        # Multi-spec: opt-in via top-level `specs:` list (design §5.1).
+        # _parse_yaml_lite() doesn't handle list syntax, so we scan the raw
+        # text separately and merge the result.
+        specs = _parse_specs_block(text)
+        _validate_specs(specs, backend, jira, github, teamwork, linear)
+
+        return cls(
+            backend=backend,
+            github=github,
+            jira=jira,
+            teamwork=teamwork,
+            linear=linear,
+            templates=templates,
+            build_mode=build_mode,
+            scope=scope,
+            specs=specs,
+        )
+
+
+def _parse_yaml_lite(text: str) -> dict:
+    """Minimal YAML parser for flat/two-level-nested config.
+
+    Handles the subset of YAML used in .synaptory.yaml without requiring PyYAML.
+    Supports: scalars, two-level nesting, comments, quoted strings.
+
+    Indent levels:
+      0       → top-level key
+      2       → section-level key (under a top-level section)
+      4       → subsection-level key (under a section.subsection)
+      6+      → sub-subsection-level key (under section.subsection.subkey)
+    """
+    result: dict = {}
+    current_section: Optional[str] = None
+    current_subsection: Optional[str] = None
+    section_indent: int = 0
+    subsection_indent: int = 0
+
+    for line in text.splitlines():
+        # Strip comments (but not inside quotes)
+        stripped = line.split("#")[0].rstrip() if "#" in line and '"' not in line.split("#")[0] else line.rstrip()
+        if not stripped or stripped.lstrip().startswith("#"):
+            continue
+
+        indent = len(stripped) - len(stripped.lstrip())
+        stripped = stripped.strip()
+
+        # Key: value
+        m = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)', stripped)
+        if not m:
+            continue
+
+        key = m.group(1)
+        value = _clean_yaml_scalar(m.group(2).strip())
+
+        if indent == 0:
+            # Top-level key
+            if value:
+                result[key] = _coerce(value)
+            else:
+                result[key] = {}
+                current_section = key
+                current_subsection = None
+                section_indent = 0
+        elif current_section is not None and current_subsection is not None and indent > subsection_indent:
+            # Sub-subsection level (deepest nesting)
+            section = result.get(current_section, {})
+            if isinstance(section, dict):
+                subsection = section.setdefault(current_subsection, {})
+                if isinstance(subsection, dict) and value:
+                    subsection[key] = _coerce(value)
+        elif current_section is not None and indent > section_indent:
+            # Section level
+            section = result.setdefault(current_section, {})
+            if isinstance(section, dict):
+                if value:
+                    section[key] = _coerce(value)
+                else:
+                    section[key] = {}
+                    current_subsection = key
+                    subsection_indent = indent
+
+    return result
+
+
+def _parse_specs_block(text: str) -> List[SpecConfig]:
+    """Parse the `specs:` list from a .synaptory.yaml file.
+
+    Canonical block-style only (no flow `{k: v}` mappings):
+
+        specs:
+          - id: "platform"
+            name: "Multi-tenant Platform"
+            jira:
+              url: "https://...atlassian.net"
+              project_key: "HT"
+              board_id: 136
+              filter:
+                type: "label"
+                value: "platform"
+          - id: "..."
+            ...
+
+    Returns [] when no `specs:` block is present.
+    """
+    lines = text.splitlines()
+
+    # Find `specs:` line at column 0
+    start = None
+    for i, raw in enumerate(lines):
+        stripped = raw.split("#", 1)[0].rstrip() if ("#" in raw and '"' not in raw.split("#", 1)[0]) else raw.rstrip()
+        if re.match(r"^specs\s*:\s*$", stripped):
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    # Collect all subsequent indented lines (anything at column 0 ends the block).
+    block: List[str] = []
+    for raw in lines[start:]:
+        # Strip trailing comments but keep leading whitespace
+        if "#" in raw and '"' not in raw.split("#", 1)[0]:
+            raw = raw.split("#", 1)[0].rstrip()
+        else:
+            raw = raw.rstrip()
+        if not raw.strip():
+            continue
+        if not raw.startswith(" ") and not raw.startswith("\t"):
+            break
+        block.append(raw)
+
+    if not block:
+        return []
+
+    base_indent = min(len(l) - len(l.lstrip()) for l in block)
+
+    # Split into per-spec chunks at every `- ` marker at base_indent
+    chunks: List[List[str]] = []
+    current: List[str] = []
+    for line in block:
+        ind = len(line) - len(line.lstrip())
+        body = line.lstrip()
+        if ind == base_indent and body.startswith("- "):
+            if current:
+                chunks.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        chunks.append(current)
+
+    specs: List[SpecConfig] = []
+    for chunk in chunks:
+        spec_dict = _parse_spec_chunk(chunk, base_indent)
+        specs.append(_build_spec_config(spec_dict))
+
+    return specs
+
+
+def _parse_spec_chunk(lines: List[str], base_indent: int) -> dict:
+    """Parse one `- id: ...` list-item chunk into a nested dict."""
+    # Normalize first line: replace `- ` prefix with `  ` so it becomes a
+    # regular key line at base_indent + 2.
+    first = lines[0]
+    body_start = first.index("- ") + 2
+    norm_first = " " * (base_indent + 2) + first[body_start:]
+    norm_lines = [norm_first] + lines[1:]
+
+    # Strip base_indent + 2 leading spaces from every line.
+    strip_n = base_indent + 2
+    body: List[str] = []
+    for line in norm_lines:
+        if len(line) >= strip_n and line[:strip_n].strip() == "":
+            body.append(line[strip_n:])
+        else:
+            body.append(line.lstrip())
+
+    return _parse_indented_dict(body)
+
+
+def _parse_indented_dict(lines: List[str]) -> dict:
+    """Indent-based parser for `key: value` blocks with nested dicts.
+
+    Does NOT support flow mappings or lists — keep specs block-style.
+    """
+    root: dict = {}
+    # Stack of (indent_of_keys_in_this_scope, target_dict)
+    stack: List[tuple] = [(0, root)]
+
+    for raw in lines:
+        if not raw.strip():
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        content = raw.strip()
+        m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)$", content)
+        if not m:
+            continue
+        key = m.group(1)
+        value = m.group(2).strip()
+
+        # Pop scopes that are at or deeper than our indent.
+        while len(stack) > 1 and stack[-1][0] > indent:
+            stack.pop()
+        while len(stack) > 1 and stack[-1][0] == indent:
+            stack.pop()
+        # Now stack[-1] is the parent (strictly less-indented) scope.
+        parent_indent, parent_dict = stack[-1]
+        if indent <= parent_indent and len(stack) > 1:
+            # Sibling of parent — pop one more.
+            stack.pop()
+            parent_indent, parent_dict = stack[-1]
+
+        if value:
+            parent_dict[key] = _coerce(_clean_yaml_scalar(value))
+        else:
+            new_dict: dict = {}
+            parent_dict[key] = new_dict
+            stack.append((indent, new_dict))
+
+    return root
+
+
+def _build_spec_config(d: dict) -> SpecConfig:
+    """Coerce a parsed dict into a SpecConfig dataclass.
+
+    The spec may carry exactly one of `local:` / `jira:` / `github:` /
+    `teamwork:` / `linear:` sub-blocks. The `filter:` block lives inside that
+    backend sub-block. Mixed bindings are caught by _validate_specs().
+    """
+    spec_id = str(d.get("id", "") or "")
+    spec_name = str(d.get("name", "") or "")
+
+    local: Optional[LocalSpecBinding] = None
+    jira: Optional[JiraConfig] = None
+    github: Optional[GitHubSpecBinding] = None
+    teamwork: Optional[TeamworkSpecBinding] = None
+    linear: Optional[LinearConfig] = None
+    spec_filter = SpecFilter()
+
+    if isinstance(d.get("local"), dict):
+        local_raw = d["local"]
+        local = LocalSpecBinding(
+            requirements_dir=str(local_raw.get("requirements_dir", "") or ""),
+        )
+
+    elif isinstance(d.get("jira"), dict):
+        jira_raw = d["jira"]
+        jira_fields_raw = jira_raw.get("fields", {}) if isinstance(jira_raw.get("fields"), dict) else {}
+        jira = JiraConfig(
+            url=str(jira_raw.get("url", "") or ""),
+            project_key=str(jira_raw.get("project_key", "") or ""),
+            board_id=jira_raw.get("board_id"),
+            story_points_field=jira_fields_raw.get("story_points", "story_point_estimate"),
+            epic_link_field=jira_fields_raw.get("epic_link", "parent"),
+            sprint_milestone_prefix=str(jira_raw.get("sprint_milestone_prefix", "") or ""),
+            status_map=_parse_status_map(jira_raw),
+            issue_type_overrides=_parse_issue_type(jira_raw),
+        )
+        filter_raw = jira_raw.get("filter", {}) if isinstance(jira_raw.get("filter"), dict) else {}
+        spec_filter = SpecFilter(
+            type=str(filter_raw.get("type", "label") or "label"),
+            value=str(filter_raw.get("value", "") or ""),
+        )
+
+    elif isinstance(d.get("github"), dict):
+        gh_raw = d["github"]
+        github = GitHubSpecBinding(
+            repo=str(gh_raw.get("repo", "") or ""),
+            sprint_milestone_prefix=str(gh_raw.get("sprint_milestone_prefix", "") or ""),
+            status_map=_parse_status_map(gh_raw),
+            issue_type_overrides=_parse_issue_type(gh_raw),
+        )
+        filter_raw = gh_raw.get("filter", {}) if isinstance(gh_raw.get("filter"), dict) else {}
+        spec_filter = SpecFilter(
+            type=str(filter_raw.get("type", "label") or "label"),
+            value=str(filter_raw.get("value", "") or ""),
+        )
+
+    elif isinstance(d.get("teamwork"), dict):
+        tw_raw = d["teamwork"]
+        # Mirror the top-level workflow_stages parser: recognized keys only;
+        # both nested (workflow_stages:) and flattened forms accepted.
+        wf_stages_raw = tw_raw.get("workflow_stages", {})
+        if not isinstance(wf_stages_raw, dict):
+            wf_stages_raw = {}
+        spec_workflow_stages: dict = {}
+        for stage_key in ("BACKLOG", "TO_DO", "IN_PROGRESS", "IN_REVIEW", "DONE"):
+            val = wf_stages_raw.get(stage_key) or tw_raw.get(stage_key)
+            # Non-int values are flattened status_map entries — see the
+            # top-level teamwork parser.
+            if val and _is_int_like(val):
+                spec_workflow_stages[stage_key] = int(val)
+        teamwork = TeamworkSpecBinding(
+            site_name=str(tw_raw.get("site_name", "") or ""),
+            project_id=int(tw_raw.get("project_id", 0) or 0),
+            sprint_milestone_prefix=str(tw_raw.get("sprint_milestone_prefix", "") or ""),
+            workflow_stages=spec_workflow_stages,
+            status_map=_parse_status_map(tw_raw),
+            issue_type_overrides=_parse_issue_type(tw_raw),
+        )
+        filter_raw = tw_raw.get("filter", {}) if isinstance(tw_raw.get("filter"), dict) else {}
+        spec_filter = SpecFilter(
+            type=str(filter_raw.get("type", "tag") or "tag"),
+            value=str(filter_raw.get("value", "") or ""),
+        )
+
+    elif isinstance(d.get("linear"), dict):
+        lin_raw = d["linear"]
+        linear = LinearConfig(
+            team_key=str(lin_raw.get("team_key", "") or ""),
+            team_id=str(lin_raw.get("team_id", "") or ""),
+            project_id=str(lin_raw.get("project_id", "") or ""),
+            label_prefix=str(lin_raw.get("label_prefix", "hc:") or "hc:"),
+            cycle_length_days=int(lin_raw.get("cycle_length_days", 14) or 14),
+            manage_cycles=_is_truthy(lin_raw.get("manage_cycles", False)),
+            status_map=_parse_status_map(lin_raw),
+            issue_type_overrides=_parse_issue_type(lin_raw),
+        )
+        filter_raw = lin_raw.get("filter", {}) if isinstance(lin_raw.get("filter"), dict) else {}
+        spec_filter = SpecFilter(
+            type=str(filter_raw.get("type", "label") or "label"),
+            value=str(filter_raw.get("value", "") or ""),
+        )
+
+    return SpecConfig(
+        id=spec_id, name=spec_name,
+        local=local, jira=jira, github=github, teamwork=teamwork, linear=linear,
+        filter=spec_filter,
+    )
+
+
+def _validate_specs(
+    specs: List[SpecConfig],
+    tracker_backend: str,
+    legacy_jira: JiraConfig,
+    legacy_github: GitHubConfig,
+    legacy_teamwork: TeamworkConfig,
+    legacy_linear: Optional["LinearConfig"] = None,
+) -> None:
+    """Validate the parsed specs list (design §5.1, §9).
+
+    Raises ValueError with a clear message on:
+      - duplicate / non-kebab-case spec ids
+      - empty filter.value (remote backends only)
+      - filter.type that doesn't apply to the active tracker backend
+      - spec backend binding that doesn't match `tracker.backend`
+      - mixed-mode conflict: legacy top-level tracker.{jira,github,teamwork}
+        disagrees with at least one spec's binding
+
+    `local` backend multi-spec is filesystem-partitioned: each spec gets its
+    own `.synaptory/.orchestrator/specs/<id>/tracker-data.json`. Since there
+    is no tracker-side discriminator, local specs do not require `filter`.
+    """
+    if not specs:
+        return
+
+    legacy_linear = legacy_linear or LinearConfig()
+    allowed_filter_types = _FILTER_TYPES_BY_BACKEND.get(tracker_backend, _VALID_FILTER_TYPES)
+
+    seen: set = set()
+    for s in specs:
+        if not s.id:
+            raise ValueError("spec entry is missing required field 'id'")
+        if not _SPEC_ID_RE.match(s.id):
+            raise ValueError(
+                f"spec id {s.id!r} must be kebab-case (lowercase letters, digits, "
+                "hyphens; must start with a letter or digit)"
+            )
+        if s.id in seen:
+            raise ValueError(f"duplicate spec id {s.id!r}")
+        seen.add(s.id)
+
+        spec_backend = s.backend()
+        if tracker_backend == "local":
+            if spec_backend not in ("", "local"):
+                raise ValueError(
+                    f"spec {s.id!r}: binds to {spec_backend!r} but tracker.backend="
+                    "'local'. Local multi-spec specs must use a `local:` block "
+                    "or omit the backend block."
+                )
+            continue
+
+        if spec_backend == "":
+            raise ValueError(
+                f"spec {s.id!r}: missing backend binding — expected a "
+                f"`{tracker_backend}:` block inside the spec"
+            )
+        if spec_backend != tracker_backend:
+            raise ValueError(
+                f"spec {s.id!r}: binds to {spec_backend!r} but tracker.backend="
+                f"{tracker_backend!r}. Every spec must bind to the active backend."
+            )
+
+        if s.filter.type not in allowed_filter_types:
+            raise ValueError(
+                f"spec {s.id!r}: filter.type={s.filter.type!r} not supported by "
+                f"tracker.backend={tracker_backend!r}. Allowed: {allowed_filter_types}"
+            )
+        if not s.filter.value:
+            raise ValueError(f"spec {s.id!r}: filter.value is required")
+
+        # Backend-specific required fields.
+        if spec_backend == "jira" and not s.jira.project_key:
+            raise ValueError(f"spec {s.id!r}: jira.project_key is required")
+        if spec_backend == "github" and not (s.github.repo or legacy_github.repo):
+            raise ValueError(
+                f"spec {s.id!r}: github.repo is required (or set tracker.github.repo)"
+            )
+        if spec_backend == "teamwork" and not s.teamwork.project_id and not legacy_teamwork.project_id:
+            raise ValueError(
+                f"spec {s.id!r}: teamwork.project_id is required "
+                "(or set tracker.teamwork.project_id)"
+            )
+        if spec_backend == "linear" and not (
+            s.linear.team_key or s.linear.team_id
+            or legacy_linear.team_key or legacy_linear.team_id
+        ):
+            raise ValueError(
+                f"spec {s.id!r}: linear.team_key is required "
+                "(or set tracker.linear.team_key)"
+            )
+
+    # Mixed-mode rejection (design §9): the legacy top-level tracker.<backend>
+    # block must either be absent or agree with every spec's binding.
+    if tracker_backend == "jira" and legacy_jira.project_key:
+        for s in specs:
+            if s.jira and s.jira.project_key and s.jira.project_key != legacy_jira.project_key:
+                raise ValueError(
+                    f"Mixed-mode conflict: top-level tracker.jira.project_key="
+                    f"{legacy_jira.project_key!r} disagrees with spec {s.id!r} "
+                    f"project_key={s.jira.project_key!r}. Remove the top-level "
+                    "tracker.jira block (or make it match every spec)."
+                )
+    if tracker_backend == "github" and legacy_github.repo:
+        for s in specs:
+            if s.github and s.github.repo and s.github.repo != legacy_github.repo:
+                raise ValueError(
+                    f"Mixed-mode conflict: top-level tracker.github.repo="
+                    f"{legacy_github.repo!r} disagrees with spec {s.id!r} "
+                    f"repo={s.github.repo!r}."
+                )
+    if tracker_backend == "teamwork" and legacy_teamwork.project_id:
+        for s in specs:
+            if s.teamwork and s.teamwork.project_id \
+                    and s.teamwork.project_id != legacy_teamwork.project_id:
+                raise ValueError(
+                    f"Mixed-mode conflict: top-level tracker.teamwork.project_id="
+                    f"{legacy_teamwork.project_id} disagrees with spec {s.id!r} "
+                    f"project_id={s.teamwork.project_id}."
+                )
+    if tracker_backend == "linear" and legacy_linear.team_key:
+        for s in specs:
+            if s.linear and s.linear.team_key \
+                    and s.linear.team_key != legacy_linear.team_key:
+                raise ValueError(
+                    f"Mixed-mode conflict: top-level tracker.linear.team_key="
+                    f"{legacy_linear.team_key!r} disagrees with spec {s.id!r} "
+                    f"team_key={s.linear.team_key!r}. Remove the top-level "
+                    "tracker.linear block (or make it match every spec)."
+                )
+
+
+def _clean_yaml_scalar(value: str) -> str:
+    """Strip YAML-lite inline comments and surrounding quotes.
+
+    A `#` opens an inline comment only outside quotes AND when it is at the
+    start of the scalar or preceded by whitespace — matching YAML. This keeps
+    a `#` inside an unquoted scalar (e.g. `pass#1`, or a URL `…#frag`) intact
+    instead of truncating at the first `#`.
+    """
+    value = value.strip()
+    quote = ""
+    out = []
+    prev = ""
+    for ch in value:
+        if ch in ("'", '"'):
+            if not quote:
+                quote = ch
+            elif quote == ch:
+                quote = ""
+        if ch == "#" and not quote and (prev == "" or prev.isspace()):
+            break
+        out.append(ch)
+        prev = ch
+    cleaned = "".join(out).strip()
+    if ((cleaned.startswith('"') and cleaned.endswith('"'))
+            or (cleaned.startswith("'") and cleaned.endswith("'"))):
+        cleaned = cleaned[1:-1]
+    return cleaned.strip()
+
+
+def _coerce(value: str):
+    """Coerce string value to appropriate Python type."""
+    if value.lower() in ("true", "yes"):
+        return True
+    if value.lower() in ("false", "no"):
+        return False
+    if value.lower() in ("null", "none", "~"):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value

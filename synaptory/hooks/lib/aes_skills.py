@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+# Copyright 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
+"""Thin openssl AES-256-CBC wrapper for skill .enc files.
+
+Single choke-point for encryption/decryption of protected content in the
+interim (v2.1.16-bridge) window. When control-plane (v2.5) ships, skill
+bodies arrive pre-decrypted over HTTPS and this module's usage goes to zero
+— the only caller is `session_manager.activate()` on the local path.
+
+Why a dedicated module: previous code inlined openssl subprocess invocations
+in three different files with slightly different flag sets (one missed
+`-pbkdf2`, another used a hardcoded iter count). One module, one set of
+flags, one place to switch to envelope encryption if the control-plane's
+at-rest scheme lands first.
+"""
+
+from __future__ import annotations
+
+import subprocess
+
+PBKDF2_ITERATIONS = 100000
+
+
+def encrypt_file(password: str, input_path: str, output_path: str) -> bool:
+    """AES-256-CBC encrypt `input_path` → `output_path`."""
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2",
+                "-iter", str(PBKDF2_ITERATIONS),
+                "-in", input_path,
+                "-out", output_path,
+                "-pass", f"pass:{password}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def decrypt_file(password: str, enc_path: str, output_path: str) -> bool:
+    """AES-256-CBC decrypt `enc_path` → `output_path`. Returns False on any
+    failure; caller decides whether to surface openssl's stderr.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-d", "-salt", "-pbkdf2",
+                "-iter", str(PBKDF2_ITERATIONS),
+                "-in", enc_path,
+                "-out", output_path,
+                "-pass", f"pass:{password}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def steganographic_watermark(content: str, watermark: str) -> str:
+    """Embed invisible per-user watermark via zero-width chars + whitespace.
+
+    Deterministic RNG seeded from the watermark so the same user gets the
+    same pattern on every decrypt. A CSPRNG would make the mark
+    unrecoverable and defeat the attribution goal. SonarQube S2053 / bandit
+    B311 flag this as insecure — it's a false positive for this use case.
+    """
+    import random  # noqa: S311 — deterministic by design
+
+    rng = random.Random(watermark)  # noqa: S311
+    zwc = ["\u200b", "\u200c", "\u200d", "\ufeff"]
+    wm_bits = bin(int(watermark[:8], 16))[2:].zfill(32)
+    bit_idx = 0
+
+    lines = content.split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        if (
+            bit_idx < len(wm_bits)
+            and len(line) > 20
+            and not line.startswith("#")
+            and not line.startswith("```")
+        ):
+            pos = rng.randint(1, max(1, len(line) - 1))
+            char = zwc[int(wm_bits[bit_idx]) * 2 + (bit_idx % 2)]
+            line = line[:pos] + char + line[pos:]
+            bit_idx += 1
+        if line.strip() and rng.random() < 0.25:
+            spaces = 1 + (int(watermark[i % len(watermark)], 16) % 2)
+            line = line.rstrip() + " " * spaces
+        out.append(line)
+    return "\n".join(out)
+
+
+def apply_watermark(body: str, watermark: str) -> str:
+    """Two-layer watermark: visible HTML comment + steganographic zero-width
+    chars. The same function the control-plane should port for server-side
+    watermarking (see docs/control-plane-ip-protection-review.md §7).
+    """
+    return f"<!-- synaptory-id: {watermark} -->\n" + steganographic_watermark(
+        body, watermark
+    )

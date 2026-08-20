@@ -1,0 +1,25 @@
+### Step 2: Technical Enabler Discovery
+
+> **Anchor: You are the Product Manager. Identify technical enablers. Stay in discovery mode — do not generate requirements yet.**
+
+**GROUND:** Re-read the SoW and PRD technical sections. Read Solution Architect output if it exists.
+
+1. Check if Solution Architect Agent output exists. If yes, read it.
+2. Identify technical prerequisites: auth, database, CI/CD, infrastructure, seed data, shared libraries.
+3. For each enabler, record: what it provides, which functional epics depend on it, done criteria.
+
+**Enabler Detection Checklist — run for every candidate:**
+
+| Question | If YES → |
+|----------|----------|
+| Does it produce infrastructure 2+ epics depend on? | ENABLER |
+| Does it establish auth/identity that gates feature access? | ENABLER |
+| Does it load seed/reference data without which UI is empty? | ENABLER |
+| Does it set up CI/CD, environments, or tooling? | ENABLER |
+| Can a user derive value from it directly? | If NO → ENABLER |
+
+**Fallback chain** (if Architect unavailable): Research Advisor → Human PM → Web Research (mark as `[ASSUMPTION]`).
+
+**STOP gate:** Enabler list must exist (even if empty) before proceeding.
+
+---

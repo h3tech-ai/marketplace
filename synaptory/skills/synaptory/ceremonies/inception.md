@@ -1,0 +1,469 @@
+# Inception Ceremony (Sprint 0)
+
+> **Lifecycle state:** `INCEPTION`
+> **Applies to:** Scrum mode only (Kanban skips Inception — runs Discover instead)
+> **Output:** Just enough foundation to start Sprint 1 — vision, Sprint 1 stories, foundation architecture, CI/CD, test framework
+
+## Inception Mode
+
+Read from `.synaptory.yaml` → `sprint.inception`:
+
+| Mode | When to Use | Scope |
+|------|-------------|-------|
+| **foundation** (default) | Most projects. Direction is clear, details will emerge. | Mini-BRD, 3-5 epics, Sprint 1 stories with ACs, foundation ADRs, lightweight SAD (1-2 pages), API skeleton, ERD, CI/CD + Docker, test framework. |
+| **blueprint** | Complex domains, regulatory, fixed-scope contracts needing comprehensive plan. | Full BRD with NFRs, all epics decomposed, Sprint 1-2 stories, complete SAD + API contracts + ERD, full infra bootstrap, detailed test spec. |
+
+```
+CONFIG=$(cat .synaptory.yaml 2>/dev/null)
+INCEPTION_MODE=<extract sprint.inception from CONFIG, default "foundation">
+```
+
+---
+
+## Entry Points
+
+| Project Type | Path |
+|--------------|------|
+| **Greenfield** | Full Inception (foundation or blueprint) → Inception Gate → Sprint 1 |
+| **Brownfield (Scrum)** | Discover → Adaptive Inception (fill gaps only) → Inception Gate → Sprint 1 |
+| **Brownfield (Kanban)** | Discover → skip Inception → READY state |
+
+---
+
+## Adaptive Brownfield Detection
+
+For brownfield projects (after Discover has run), detect what already exists and skip those Inception steps:
+
+| Signal | Detection Method | If Present | If Missing |
+|--------|-----------------|------------|------------|
+| **CI/CD pipeline** | `.github/workflows/*`, `.gitlab-ci.yml`, `Jenkinsfile` | Skip PE bootstrap | Run PE bootstrap |
+| **Context packages** | `.synaptory/.orchestrator/context-packages/*.md` | Skip Discover | Already ran |
+| **Test framework** | `jest.config.*`, `pytest.ini`, `*_test.go`, `conftest.py` | Skip QE setup | Initialize test framework |
+| **Architecture docs** | `docs/architecture/`, `**/adr-*.md` files | Skip SA foundation | Run foundation ADRs |
+| **Project config** | `.synaptory.yaml` | Skip config gen | Run Init mode |
+| **Tracker data** | `tracker_cli.py health-check` returns OK | Skip tracker init | Initialize tracker |
+| **Business requirements** | `docs/requirements/*BRD*.md` (or `paths.brd`) exists | Skip business interview (Step 1 floor) | Run business-discovery floor |
+| **Tech stack documented** | `docs/architecture/tech-stack.md` or ADRs document the stack | Skip technical recommend-then-confirm | Run technical interview |
+| **UI mockups** | `.synaptory/design/mockups/index.html` exists and is approved | Skip mockup generation (Step 2.5c) | Generate mockup baseline (UI projects only) |
+
+```bash
+TRACKER_CLI="python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir $(pwd)"
+
+DETECTED=()
+MISSING=()
+
+# CI/CD
+ls .github/workflows/*.yml .gitlab-ci.yml Jenkinsfile 2>/dev/null | head -1 && DETECTED+=(cicd) || MISSING+=(cicd)
+
+# Test framework
+ls jest.config.* pytest.ini conftest.py 2>/dev/null | head -1 && DETECTED+=(tests) || MISSING+=(tests)
+find . -name "*_test.go" -maxdepth 3 2>/dev/null | head -1 && DETECTED+=(tests)
+
+# Architecture
+ls docs/architecture/*.md 2>/dev/null | head -1 && DETECTED+=(architecture) || MISSING+=(architecture)
+
+# Tracker
+${TRACKER_CLI} health-check 2>/dev/null && DETECTED+=(tracker) || MISSING+=(tracker)
+
+# Context packages
+ls .synaptory/.orchestrator/context-packages/*.md 2>/dev/null | head -1 && DETECTED+=(context) || MISSING+=(context)
+```
+
+### Adaptive Paths
+
+**ALL detected** → Skip Inception entirely → Start at Sprint Planning:
+```
+Print: "Brownfield ready — existing infrastructure detected. Skipping Inception."
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.py" transition "$(pwd)" SPRINT_PLANNING
+→ Load ceremonies/sprint-planning.md
+```
+
+**SOME detected** → Targeted Inception → Run only missing steps:
+```
+Print: "Partial setup detected. Running targeted Inception for: {MISSING list}"
+# Only dispatch agents for missing items (see Step sections below)
+```
+
+**NONE detected** → Full Inception → Same as greenfield:
+```
+Print: "No existing infrastructure. Running full Inception."
+# Run all steps below
+```
+
+---
+
+## Pre-Step: Workspace Bootstrap
+
+Before dispatching any agent, verify the workspace is fully initialised. This is a safety net — the Scrum Lifecycle pre-flight in SKILL.md should have run first, but inception.md enforces it idempotently.
+
+```bash
+# Idempotent — safe to run even if pre-flight already ran
+mkdir -p .synaptory/.protocols/ .synaptory/.orchestrator/receipts docs/requirements/validation
+
+# Initialise pipeline state only if missing or empty
+if [ ! -s .synaptory/.orchestrator/pipeline-state.json ]; then
+  python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.pyc" init "$(pwd)" \
+    > .synaptory/.orchestrator/pipeline-state.json
+  echo "  ✓ Workspace bootstrapped — .synaptory/ created"
+else
+  echo "  ✓ Workspace already initialised — skipping bootstrap"
+fi
+
+# Write project identity for session-start hook if missing
+if [ ! -f .synaptory/.orchestrator/settings.md ]; then
+  PROJECT_NAME=$(grep 'project_name' .synaptory.yaml 2>/dev/null | awk '{print $2}' || basename "$(pwd)")
+  INCEPTION_MODE_VAL=$(grep -A1 'sprint:' .synaptory.yaml 2>/dev/null | grep 'inception' | awk '{print $2}' || echo "foundation")
+  printf "Project: %s\nBuild Mode: scrum\nEngagement Mode: %s\nInception Mode: %s\nStarted: %s\n" \
+    "$PROJECT_NAME" \
+    "$(grep 'engagement_mode' .synaptory.yaml 2>/dev/null | awk '{print $2}' || echo "autonomous")" \
+    "$INCEPTION_MODE_VAL" \
+    "$(date -u +%Y-%m-%d)" \
+    > .synaptory/.orchestrator/settings.md
+fi
+```
+
+**If bootstrap fails** (missing pyc, permission error): create `pipeline-state.json` manually with `{"lifecycle_state": "INCEPTION", "build_mode": "scrum", "inception": {"mode": "foundation", "completed_at": null}, "current_sprint": 0}` and continue.
+
+**Generate CLAUDE.md (idempotent):**
+
+`CLAUDE.md` is the session-persistent anchor that Claude Code reads at the start of every session. It must be generated during Inception — not deferred to Init mode — because Init is skipped when `.synaptory.yaml` already exists. Without `CLAUDE.md`, cross-session pipeline state, git safety rules, and agent roster context are lost.
+
+```python
+# Generate only if CLAUDE.md is missing or has no synaptory section
+if not Read("CLAUDE.md") or "synaptory-state" not in Read("CLAUDE.md"):
+    project_name = Read(".synaptory.yaml")  # extract project_name
+    build_mode   = Read(".synaptory.yaml")  # extract build_mode, default "scrum"
+    engagement   = Read(".synaptory.yaml")  # extract engagement_mode, default "autonomous"
+
+    claude_section = f"""# Synaptory Pipeline
+
+This project uses **Synaptory** — a multi-agent adaptive delivery system. Always route requests
+through `/synaptory` rather than making ad-hoc changes.
+
+- **Config:** `.synaptory.yaml`
+- **Workspace:** `.synaptory/`
+- **Build mode:** {build_mode}
+
+## Agent Roster
+
+| Agent | Role |
+|---|---|
+| `project-owner` | Backlog, Sprint Planning, story decomposition |
+| `solution-architect` | Architecture, ADRs, API contracts (on-demand) |
+| `software-engineer` | Story-level builder (backend, frontend, mobile, ai-ml) |
+| `quality-engineer` | Per-story verifier, test generation |
+| `code-reviewer` | Per-story reviewer |
+| `compliance-engineer` | Security audit (on-demand) |
+| `platform-engineer` | CI/CD, Docker, IaC, monitoring |
+| `technical-writer` | Sprint reports, API docs, developer guides |
+| `research-advisor` | Thinking partner, domain research |
+
+## Git Safety Rules (MANDATORY)
+
+1. **NEVER commit or push to shared branches** (`main`, `dev`, `staging`, `prod`). All work on feature branches.
+2. **NEVER commit without explicit user approval.** Show diff, ask first.
+3. **NEVER push without explicit user approval.**
+4. **NEVER create or merge PRs without explicit user approval.**
+5. **NEVER run destructive git operations** (`--force`, `reset --hard`, `clean -f`).
+6. **NEVER run migrations against shared environments.**
+
+<!-- synaptory-state
+phase: INCEPTION
+sprint: 0/0
+engagement: {engagement}
+config: .synaptory.yaml
+-->"""
+
+    Bash(f'printf "%s" \'{claude_section}\' | python3 "${{CLAUDE_PLUGIN_ROOT}}/hooks/lib/update_claude_md.pyc" "${{CLAUDE_PROJECT_DIR}}"')
+```
+
+**Note:** `update_claude_md.pyc` is idempotent — it inserts or updates the `synaptory` section without overwriting other content.
+
+---
+
+## Step 1 — PO: Vision + Sprint 1 Stories
+
+Dispatch the Project Owner agent.
+
+```
+PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
+```
+
+> **MANDATORY: Spawn this agent via the `Agent()` tool — do not execute the BRD/backlog work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO inception — vision and sprint 1 backlog", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-po.json` as its last action.
+
+> **MANDATORY business-discovery floor — every engagement mode, including autonomous.**
+> Instruct the PO to run the Inception business-discovery floor (problem & who, core
+> workflow with writable AC, explicit out-of-scope, success metric, hard
+> constraints/compliance) via `AskUserQuestion` before authoring the BRD. Autonomous mode
+> does **not** skip this — it only drops the *extended* rounds. Every BRD/epic claim must
+> trace to an interview answer or a source doc, never to an unstated guess. The PO writes
+> the answers to `.synaptory/.orchestrator/business-interview-answers.md`. See
+> `plugin/agents/project-owner/phases/01-understand-input.md`.
+
+**PO prompt context:**
+- User's project description / build request
+- Inception mode (foundation or blueprint)
+- Existing context packages (if brownfield)
+- Engagement mode (from `.synaptory.yaml`) — note the floor runs regardless
+
+**Foundation mode output:**
+- Mini-BRD (1-2 pages): vision, core problem, target users, key features
+- 3-5 epics with rough story breakdowns
+- Sprint 1 stories fully decomposed with acceptance criteria (Given/When/Then)
+
+**Blueprint mode output:**
+- Full BRD with NFRs (performance, security, availability)
+- All epics decomposed to feature level
+- Sprint 1-2 stories fully decomposed with detailed ACs
+- Constraints and research notes
+
+**Skip if:** brownfield with existing BRD/backlog in tracker (adaptive detection).
+
+---
+
+## Step 2 — SA: Foundation Architecture
+
+Dispatch the Solution Architect agent.
+
+```
+SA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "solution-architect")
+```
+
+> **MANDATORY: Spawn this agent via the `Agent()` tool — do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="SA foundation architecture", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-sa.json` as its last action.
+
+> **MANDATORY technical recommend-then-confirm — every engagement mode, including
+> autonomous.** Instruct the SA to present a **Technical Recommendation Summary**
+> (language, framework, datastore(s), architecture pattern, key trade-offs) via
+> `AskUserQuestion` and get user confirmation or override **before** finalizing ADRs/SAD.
+> Autonomous mode auto-derives the *proposal* from the BRD but still surfaces this single
+> confirmation gate — it must not silently pick the stack. The SA records the confirmed
+> decision to `.synaptory/.orchestrator/tech-interview-answers.md`. See
+> `plugin/agents/solution-architect/phases/01-discovery.md`.
+
+**Foundation mode output:**
+- 3-5 foundation ADRs (architecture pattern, tech stack, data strategy, API approach) — reflecting the CONFIRMED stack from the recommend-then-confirm gate
+- Lightweight SAD (1-2 pages): system overview diagram, layer separation, key flows (auth, multi-tenancy, data access) — enough for the SE to understand how the pieces connect without locking design
+- API skeleton (OpenAPI or gRPC proto)
+- ERD for core entities
+
+**Why lightweight SAD in foundation mode:** The ERD gives the SE the data schema, but without a SAD they have no system context — how layers connect, where auth is enforced, how multi-tenancy is handled. A 1-2 page SAD closes this gap without the overhead of full blueprint-mode architecture work. Full design details emerge per-sprint via SA triggers.
+
+**Blueprint mode output:**
+- Complete SAD (System Architecture Document) with all system diagrams
+- All ADRs
+- Full API contracts (OpenAPI spec)
+- Comprehensive ERD
+- Sequence diagrams for key flows
+
+**Skip if:** brownfield with existing `docs/architecture/` (adaptive detection).
+
+---
+
+## Step 2.5 — Design: UI/UX Mockups (mandatory for UI-surface projects)
+
+**Trigger (UI surface):** `.synaptory.yaml` → `features.frontend: true`, OR
+`project.framework` is a web/mobile framework (`nextjs`, `sveltekit`, `nuxt`, `remix`,
+`react`, `react-native`, `flutter`, `expo`, …). `features.frontend` is authoritative — it
+is set/confirmed in Init and the SA technical interview, which fixes the greenfield case
+where `project.framework` is still empty when Inception runs.
+
+**For UI-surface projects the in-repo mockup baseline (Step 2.5c) is MANDATORY** and the
+Inception Gate blocks on it. `design.enabled: false` disables only the optional Claude
+Design path (2.5a/2.5b) — it does **not** skip the baseline.
+
+**Skip the entire step only if:** CLI tool, library, backend-only API, or infrastructure
+project (no UI surface).
+
+Follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/design-grooming.md`.
+
+### Step 2.5a — Connect project repo to Claude Design (one-time, optional)
+
+> Steps 2.5a and 2.5b are the **optional** richer Claude Design path — run them only if
+> `design.enabled` is not `false`. They are additive to the mandatory baseline in 2.5c.
+
+Claude Design can connect to the project's GitHub repo and extract the design system via AST once. After that, every future prototype inherits brand tokens, typography, and components automatically — no re-feeding per sprint. This is the mechanism that makes Sprint Review Step 5.5 and Sprint Planning Step 2 cheap to run.
+
+**Do once at Inception:**
+1. Detect GitHub remote: `git remote get-url origin 2>/dev/null`
+2. If a GitHub remote exists, prompt:
+   ```
+   🎨 Connect this repo to Claude Design?
+
+   Claude Design will extract your design tokens and component library once,
+   then reuse them on every future prototype — no re-explaining brand colours.
+
+     1. Yes — I'll connect now (Recommended)
+     2. Skip — we'll connect later or work without persistent design system
+     3. Not applicable — repo is private and can't be shared
+   ```
+3. If user picks Yes:
+   - User opens [claude.ai/design](https://claude.ai/design) → Settings → Connect Repository → selects this repo
+   - Record the connection in `.synaptory/design/inception-preview.md` under `connected_repo: {owner}/{name}` so future ceremonies know the design system is live
+
+**Skip if:** no GitHub remote, repo is private and user declines, or user explicitly opts out. Record `connected_repo: null` so later ceremonies know to feed context manually each time.
+
+### Step 2.5b — Generate vision prototype
+
+**Action:** Prompt the team to generate key screens/flows in Claude Design using the Mini-BRD (foundation) or Full BRD (blueprint) as the input. Suggested approach:
+1. Open [claude.ai/design](https://claude.ai/design) (use the connected repo's project if 2.5a succeeded)
+2. Provide the BRD or Mini-BRD as context
+3. Ask Claude Design to generate key screens (landing, primary user flow, core action)
+4. Generate 2-3 alternative layouts for client comparison (side-by-side — one project, one shared URL)
+
+**Output:** `.synaptory/design/inception-preview.md` — shareable URL, key screens list, design system seed (brand tokens, color palette, typography), and `connected_repo:` from 2.5a. See protocol for file format.
+
+### Step 2.5c — Generate in-repo mockup baseline (MANDATORY for UI projects)
+
+This is the guaranteed artifact — it runs for every UI-surface project regardless of
+`engagement_mode` or `design.enabled`. Generate **self-contained HTML/CSS mockups** for the
+key screens/flows derived from the Mini-BRD/BRD, using the design system reference under
+`${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/` (component-patterns, color-palettes,
+typography, spacing-layout) as the token source so the baseline is consistent rather than
+ad-hoc.
+
+**Requirements (see design-grooming.md → "In-repo mockup baseline"):**
+- Each page inlines its CSS — no external CDN/font/script fetches — so it opens directly in
+  a browser and renders under the preview server.
+- Cover the landing screen, the primary user flow, and the core action at minimum.
+- Write to `${design.mockups_dir}` (default `.synaptory/design/mockups/`): one
+  `{screen}.html` per screen plus an `index.html` gallery linking them.
+
+**Record a design receipt** at `.synaptory/.orchestrator/receipts/INCEPTION-design.json`.
+Because `SessionEnd` ships inline orchestrator receipts through
+`receipt_validator.py`, this receipt MUST carry every required field — `story_id`, `role`,
+`backend`, `model`, `artifacts`, non-empty `metrics`, `verification_commands`, and
+`completed_at` (see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/receipt-protocol.md`).
+The orchestrator generates the baseline itself, so `role` is `orchestrator` and
+`token_usage.stage` is `orchestrator`. Use the inception-scoped `story_id` `INCEPTION-0`
+(matches the `[A-Z][A-Z0-9]*-\d+` pattern):
+
+```json
+{
+  "story_id": "INCEPTION-0",
+  "role": "orchestrator",
+  "backend": "claude",
+  "model": "claude-opus-4-8",
+  "artifacts": [".synaptory/design/mockups/index.html", ".synaptory/design/mockups/landing.html"],
+  "metrics": {"screens": 3, "mockups_generated": 3},
+  "verification_commands": ["test -s .synaptory/design/mockups/index.html"],
+  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "orchestrator"},
+  "completed_at": "2026-07-06T00:00:00Z"
+}
+```
+
+(Set `model`/`token_usage` from the orchestrator's own run; the zeros above are
+placeholders. `metrics` must be non-empty — at least one concrete count.)
+
+**Inception Gate addition:** The Inception Gate (below) gains a **hard** visual approval
+checkpoint for UI projects — stakeholders review the mockups (open
+`.synaptory/design/mockups/index.html`, plus the optional Claude Design URL if 2.5b ran)
+and confirm they represent the vision before Sprint 1 backlog is locked. Approval is
+blocked until the baseline exists and is approved. If the client requests changes, iterate
+before approving.
+
+---
+
+## Step 3 — PE: CI/CD Bootstrap
+
+Dispatch the Platform Engineer agent.
+
+```
+PE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "platform-engineer")
+```
+
+> **MANDATORY: Spawn this agent via the `Agent()` tool — do not execute the infra work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PE CI/CD bootstrap", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-pe.json` as its last action.
+
+**PE output:**
+- CI/CD pipeline (GitHub Actions / GitLab CI / etc.)
+- Dockerfile + docker-compose.dev.yml
+- Dev environment setup
+- Basic monitoring configuration
+
+**Blueprint mode adds:** Staging environment setup.
+
+**Skip if:** brownfield with existing CI/CD pipeline (adaptive detection).
+
+---
+
+## Step 4 — QE: Test Framework
+
+Dispatch the Quality Engineer agent.
+
+```
+QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
+```
+
+> **MANDATORY: Spawn this agent via the `Agent()` tool — do not execute the test-framework setup inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE test framework setup", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-qe.json` as its last action.
+
+**QE output:**
+- Test framework configuration (jest/pytest/go-test based on project)
+- Sprint 1 test specification (test plan for Sprint 1 stories)
+
+**Blueprint mode adds:** Contract test stubs, detailed test spec.
+
+**Skip if:** brownfield with existing test framework (adaptive detection).
+
+---
+
+## Inception Gate
+
+After all Inception steps complete, present the Inception Gate for human approval:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  INCEPTION GATE                           Sprint 0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Vision         {✓ if BRD/Mini-BRD exists | ○ if not}
+  Epics          {N} identified
+  Sprint 1       {N} stories ready (with ACs)
+  Architecture   {N} ADRs · SAD {✓ lightweight | ✓ full} · ERD {N} entities
+  API            {✓ skeleton | ✓ full contracts}
+  CI/CD          {✓ if pipeline exists | ○ if not}
+  Tests          {✓ if framework configured | ○ if not}
+  Design         {✓ mockups approved | ⏳ mockups pending approval (BLOCKING) | ○ skipped (no UI surface)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Options:
+  1. Approve — start Sprint 1 (Recommended)
+  2. Show details
+  3. I have concerns
+  4. Chat about this
+```
+
+**Design is a HARD gate for UI-surface projects.** If `features.frontend: true` (or a
+web/mobile `project.framework`) and the in-repo mockup baseline is missing or not yet
+approved, the `Design` row reads `⏳ mockups pending approval (BLOCKING)` and **Approve is
+not available** — the mockups (`.synaptory/design/mockups/index.html`) must exist and the
+user must confirm they represent the vision first. Non-UI projects show
+`○ skipped (no UI surface)` and are not blocked.
+
+**On approval — these steps are MANDATORY and must run in order. Do not paraphrase them, do not skip, do not describe them as if they had run.** Every gate transition has been observed to silently fail when the orchestrator describes the work instead of executing it (Bug E in the v1.0.7 audit). Run these as actual tool calls:
+
+1. **Update `pipeline-state.json`** via the Edit tool. Set `inception.completed_at` to the current ISO-8601 UTC timestamp; do not change any other field.
+2. **Run the state-machine transition** via the Bash tool:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.pyc" transition "$(pwd)" SPRINT_PLANNING
+   ```
+   (Note: the deployed plugin ships `.pyc`; source dev runs use `.py`. Try `.pyc` first; if missing, fall back to `.py`.)
+3. **Verify** that `pipeline-state.json` now reads `lifecycle_state: SPRINT_PLANNING` and `inception.completed_at` is non-null. If either is wrong, do NOT proceed; surface the error to the user.
+4. Print one line: `✓ Inception Gate approved. State transitioned to SPRINT_PLANNING at <timestamp>.`
+5. Load `ceremonies/sprint-planning.md` and begin Sprint 1 planning.
+
+If you do not have permission to run any of these tool calls, **stop** and tell the user. Do not pretend the gate passed.
+
+**On concerns:**
+Present the specific concern areas and let the user guide additional work. Re-run targeted steps as needed, then re-present the gate.
+
+---
+
+## What Inception Does NOT Do
+
+| Activity | v1 PLAN Phase | v2 Inception |
+|----------|--------------|--------------|
+| Decompose ALL stories | Yes — all sprints | No — Sprint 1 only (foundation), Sprint 1-2 (blueprint) |
+| Assign ALL sprint backlogs | Yes — fixed at start | No — PO assigns per sprint during Sprint Planning |
+| Complete architecture design | Yes — full SAD, all ADRs | No — lightweight SAD + foundation ADRs only; full design emerges per-sprint |
+| Lock architecture | Yes — v1 locked at gate | No — architecture evolves per sprint via SA triggers |
+| Create deployment infra | No — deferred to DEPLOY | Yes — CI/CD bootstrapped at Inception |

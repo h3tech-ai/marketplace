@@ -1,0 +1,7 @@
+[
+  {
+    "name": "synaptory-events",
+    "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/synaptory-monitor-events.sh\"",
+    "description": "Synaptory pipeline events — notifies on blocked stories, depth-guard trips, and DoD gate failures"
+  }
+]

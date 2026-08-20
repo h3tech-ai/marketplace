@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+
+# --- synaptory: resolve Python interpreter (magic-number safe) ---
+# shellcheck source=lib/resolve-python.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/resolve-python.sh"
+: "${SYNAPTORY_PYTHON:?synaptory requires a working Python 3 interpreter (set SYNAPTORY_PYTHON to override)}"
+# -------------------------------------------------------------
+# Copyright (c) 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
+# Hook: Stop
+# Purpose: When the agent session ends, write a compact pipeline state snapshot
+# to .synaptory/.orchestrator/last-session.md for the next session to read.
+
+_HOOK_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# shellcheck source=lib/resolve-python.sh
+source "${_HOOK_ROOT}/hooks/lib/resolve-python.sh"
+_py="${SYNAPTORY_PYTHON:-python3}"
+
+SUITE_DIR="${CLAUDE_PROJECT_DIR}/.synaptory"
+SNAPSHOT_FILE="$SUITE_DIR/.orchestrator/last-session.md"
+
+# Only fire if the suite directory exists
+if [ ! -d "$SUITE_DIR" ]; then
+  exit 0
+fi
+
+# Gather state
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
+# Receipt count covers both legacy flat receipts/ AND per-spec receipts/ subtrees.
+RECEIPT_COUNT=$( {
+  find "$SUITE_DIR/.orchestrator/receipts" -name "*.json" 2>/dev/null
+  find "$SUITE_DIR/.orchestrator/specs" -path "*/receipts/*.json" 2>/dev/null
+} | wc -l | tr -d ' ')
+
+# Detect active phase (most recently modified subdirectory)
+ACTIVE_PHASE=$(ls -t "$SUITE_DIR" 2>/dev/null | grep -v "^\.orchestrator$" | head -1)
+
+# Read project name from settings
+PROJECT_NAME=""
+if [ -f "$SUITE_DIR/.orchestrator/settings.md" ]; then
+  PROJECT_NAME=$(grep -m1 "^Project:" "$SUITE_DIR/.orchestrator/settings.md" 2>/dev/null | sed 's/^Project: *//')
+fi
+
+# Get last 5 receipt filenames
+RECENT_RECEIPTS=$(ls -t "$SUITE_DIR/.orchestrator/receipts/"*.json 2>/dev/null | head -5 | xargs -I{} basename {} 2>/dev/null | sed 's/^/- /')
+
+# Read sprint state from pipeline-state.json
+SPRINT_INFO=""
+STATE_FILE="$SUITE_DIR/.orchestrator/pipeline-state.json"
+if [ -f "$STATE_FILE" ]; then
+  SPRINT_INFO=$("$_py" -c "
+import json
+def fmt_sub(sub, prefix=''):
+    return (
+        f\"{prefix}Lifecycle: {sub.get('lifecycle_state', 'INCEPTION')} \"
+        f\"sprint={sub.get('current_sprint', 0)} \"
+        f\"stories={len(sub.get('current_stories', []))}\"
+    )
+try:
+    state = json.load(open('$STATE_FILE'))
+    version = state.get('version')
+    if version == '3.0' and isinstance(state.get('specs'), dict):
+        # Multi-spec rollup
+        active = state.get('active_spec', '<none>')
+        lines = [f'Active Spec: {active}']
+        for sid, sub in state['specs'].items():
+            marker = ' (active)' if sid == active else ''
+            lines.append(f'  {sid}{marker}: ' + fmt_sub(sub, prefix=''))
+        print('\n'.join(lines))
+    elif version == '2.0' and 'lifecycle_state' in state:
+        print(fmt_sub(state))
+    else:
+        print('No sprint loop active')
+except Exception:
+    print('No sprint state')
+" 2>/dev/null || echo "No sprint state")
+fi
+
+# Count context packages
+CONTEXT_PKG_DIR="$SUITE_DIR/.orchestrator/context-packages"
+CONTEXT_PKG_COUNT=0
+if [ -d "$CONTEXT_PKG_DIR" ]; then
+  CONTEXT_PKG_COUNT=$(find "$CONTEXT_PKG_DIR" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# Ensure directory exists
+mkdir -p "$(dirname "$SNAPSHOT_FILE")"
+
+# Write snapshot
+cat > "$SNAPSHOT_FILE" << SNAPSHOT
+# Pipeline Snapshot — ${TIMESTAMP}
+
+## Project
+- Name: ${PROJECT_NAME:-$(basename "$CLAUDE_PROJECT_DIR")}
+- Active Phase: ${ACTIVE_PHASE:-unknown}
+- Receipts: ${RECEIPT_COUNT} agent completions
+- Context Packages: ${CONTEXT_PKG_COUNT} brownfield knowledge packages
+- Sprint State: ${SPRINT_INFO:-No sprint loop active}
+
+## Recent Agent Completions
+${RECENT_RECEIPTS:-No receipts yet}
+
+## Resume Instructions
+To continue: run \`/synaptory\` and select the appropriate mode.
+To check status: say "show status" or run \`/synaptory\` and say "status".
+Config: \`.synaptory.yaml\` at project root.
+SNAPSHOT
+
+# Build pipeline summary and generate reports (PIPELINE.md + PIPELINE.html)
+SCRIPTS_DIR="${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts"
+if [ -f "$SCRIPTS_DIR/build_summary.py" ]; then
+  "$_py" "$SCRIPTS_DIR/build_summary.py" "$CLAUDE_PROJECT_DIR" 2>/dev/null || true
+fi
+if [ -f "$SCRIPTS_DIR/generate_reports.py" ]; then
+  "$_py" "$SCRIPTS_DIR/generate_reports.py" "$CLAUDE_PROJECT_DIR" 2>/dev/null || true
+fi
+
+exit 0

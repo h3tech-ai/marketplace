@@ -1,0 +1,10 @@
+{
+  "synaptory": {
+    "command": "python3",
+    "args": ["${PLUGIN_ROOT}/mcp/server.py"],
+    "env": {
+      "PLUGIN_ROOT": "${PLUGIN_ROOT}",
+      "SYNAPTORY_IDE": "cursor"
+    }
+  }
+}

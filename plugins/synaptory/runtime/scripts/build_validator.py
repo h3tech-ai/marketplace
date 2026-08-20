@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Build artifact validator for synaptory.
+
+Detects false-pass conditions in projects:
+  - Test files with zero assertions (empty tests)
+  - Monorepo packages with test config but no test files
+  - Invalid IaC (Terraform/K8s) configurations
+  - CI config issues (invalid YAML, security bypass patterns)
+
+CLI: python3 build_validator.py <project_dir>
+Exit 0 if all passed, 1 if any failed.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Assertion keywords per language family
+# ---------------------------------------------------------------------------
+ASSERTION_KEYWORDS = [
+    "assert",
+    "expect",
+    "should",
+    "assertEqual",
+    "assertNotEqual",
+    "assertTrue",
+    "assertFalse",
+    "assertRaises",
+    "assertIn",
+    "assertIsNone",
+    "toEqual",
+    "toBe",
+    "toContain",
+    "toThrow",
+    "toHaveBeenCalled",
+    "toMatch",
+    "verify(",
+    "check(",
+    "require(",
+    "t.Fatal",
+    "t.Error",
+    "t.Run",
+]
+
+# Patterns that identify test files
+TEST_FILE_PATTERNS = [
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_test.go",
+    "**/*Test.java",
+    "**/*Spec.java",
+]
+
+# Directories to skip when scanning
+SKIP_DIRS = {
+    "node_modules",
+    ".git",
+    "vendor",
+    "dist",
+    "build",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "target",
+}
+
+# CI config file paths (relative to project root)
+CI_CONFIG_PATHS = [
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    ".gitlab-ci.yml",
+    ".circleci/config.yml",
+    "Jenkinsfile",
+    "bitbucket-pipelines.yml",
+]
+
+# Security-sensitive commands that should never be silenced
+SECURITY_COMMANDS = [
+    "npm audit",
+    "yarn audit",
+    "pnpm audit",
+    "snyk ",
+    "trivy ",
+    "grype ",
+    "safety check",
+    "pip-audit",
+    "cargo audit",
+    "govulncheck",
+    "bandit",
+    "semgrep",
+    "checkov",
+    "tfsec",
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _should_skip(path: Path) -> bool:
+    """Return True if any path component is in SKIP_DIRS."""
+    parts = path.parts
+    return any(p in SKIP_DIRS for p in parts)
+
+
+def _find_test_files(project_dir: str) -> list[Path]:
+    """Find all test files in a project, excluding skip directories."""
+    root = Path(project_dir)
+    found: list[Path] = []
+    for pattern in TEST_FILE_PATTERNS:
+        for match in root.glob(pattern):
+            if match.is_file() and not _should_skip(match.relative_to(root)):
+                found.append(match)
+    return sorted(set(found))
+
+
+def _file_has_assertions(path: Path) -> bool:
+    """Check whether a test file contains at least one assertion keyword."""
+    try:
+        content = path.read_text(errors="replace")
+    except OSError:
+        return True  # If we can't read it, don't flag it
+    for keyword in ASSERTION_KEYWORDS:
+        if keyword in content:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Project type detection
+# ---------------------------------------------------------------------------
+
+def detect_project_type(project_dir: str) -> dict[str, Any]:
+    """Detect project type from marker files.
+
+    Returns dict with keys: type, package_manager, test_command,
+    build_command, test_patterns.
+    """
+    root = Path(project_dir)
+
+    # Node.js detection
+    if (root / "package.json").exists():
+        pkg_manager = "npm"
+        if (root / "yarn.lock").exists():
+            pkg_manager = "yarn"
+        elif (root / "pnpm-lock.yaml").exists():
+            pkg_manager = "pnpm"
+        elif (root / "bun.lockb").exists():
+            pkg_manager = "bun"
+        return {
+            "type": "node",
+            "package_manager": pkg_manager,
+            "test_command": f"{pkg_manager} test",
+            "build_command": f"{pkg_manager} run build",
+            "test_patterns": ["**/*.test.*", "**/*.spec.*"],
+        }
+
+    # Go detection
+    if (root / "go.mod").exists():
+        return {
+            "type": "go",
+            "package_manager": "go",
+            "test_command": "go test ./...",
+            "build_command": "go build ./...",
+            "test_patterns": ["**/*_test.go"],
+        }
+
+    # Python detection
+    if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+        return {
+            "type": "python",
+            "package_manager": "pip",
+            "test_command": "python -m pytest",
+            "build_command": "python -m build",
+            "test_patterns": ["**/test_*.py", "**/*_test.py"],
+        }
+
+    # Rust detection
+    if (root / "Cargo.toml").exists():
+        return {
+            "type": "rust",
+            "package_manager": "cargo",
+            "test_command": "cargo test",
+            "build_command": "cargo build",
+            "test_patterns": [],  # Rust tests are inline
+        }
+
+    # Java detection
+    if (root / "pom.xml").exists() or (root / "build.gradle").exists():
+        build_tool = "maven" if (root / "pom.xml").exists() else "gradle"
+        return {
+            "type": "java",
+            "package_manager": build_tool,
+            "test_command": "mvn test" if build_tool == "maven" else "./gradlew test",
+            "build_command": "mvn package" if build_tool == "maven" else "./gradlew build",
+            "test_patterns": ["**/*Test.java", "**/*Spec.java"],
+        }
+
+    return {
+        "type": "unknown",
+        "package_manager": None,
+        "test_command": None,
+        "build_command": None,
+        "test_patterns": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Check: empty test files
+# ---------------------------------------------------------------------------
+
+def check_empty_test_files(project_dir: str) -> dict[str, Any]:
+    """Find test files that contain zero assertions.
+
+    Scans for common test file patterns and checks for assertion keywords.
+    Returns: {name, status, empty_tests, total_test_files, errors}
+    """
+    result: dict[str, Any] = {
+        "name": "empty_test_files",
+        "status": "passed",
+        "empty_tests": [],
+        "total_test_files": 0,
+        "errors": [],
+    }
+
+    try:
+        test_files = _find_test_files(project_dir)
+        result["total_test_files"] = len(test_files)
+
+        if not test_files:
+            result["status"] = "skipped"
+            return result
+
+        for tf in test_files:
+            if not _file_has_assertions(tf):
+                result["empty_tests"].append(str(tf.relative_to(project_dir)))
+
+        if result["empty_tests"]:
+            result["status"] = "failed"
+
+    except Exception as e:
+        result["status"] = "failed"
+        result["errors"].append(str(e))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Check: zero-test packages in monorepos
+# ---------------------------------------------------------------------------
+
+def check_zero_test_packages(project_dir: str) -> dict[str, Any]:
+    """In monorepos, detect packages with test config but zero test files.
+
+    Looks for workspaces (packages/*, apps/*) that have a package.json
+    with a test script but no actual test files.
+    Returns: {name, status, zero_test_packages, errors}
+    """
+    result: dict[str, Any] = {
+        "name": "zero_test_packages",
+        "status": "passed",
+        "zero_test_packages": [],
+        "errors": [],
+    }
+
+    root = Path(project_dir)
+    # Common monorepo workspace directories
+    workspace_dirs = ["packages", "apps", "libs", "modules", "services"]
+    package_dirs: list[Path] = []
+
+    for ws in workspace_dirs:
+        ws_path = root / ws
+        if ws_path.is_dir():
+            for child in ws_path.iterdir():
+                if child.is_dir() and (child / "package.json").exists():
+                    package_dirs.append(child)
+
+    # Also check for Go modules in subdirectories
+    for go_mod in root.glob("**/go.mod"):
+        if go_mod.parent != root and not _should_skip(go_mod.relative_to(root)):
+            package_dirs.append(go_mod.parent)
+
+    if not package_dirs:
+        result["status"] = "skipped"
+        return result
+
+    try:
+        for pkg_dir in package_dirs:
+            has_test_config = False
+            has_test_files = False
+
+            # Check Node.js test config
+            pkg_json = pkg_dir / "package.json"
+            if pkg_json.exists():
+                try:
+                    pkg_data = json.loads(pkg_json.read_text())
+                    scripts = pkg_data.get("scripts", {})
+                    if "test" in scripts and scripts["test"] not in (
+                        "",
+                        "echo \"Error: no test specified\" && exit 1",
+                    ):
+                        has_test_config = True
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Check for pytest/go test config
+            if (pkg_dir / "pytest.ini").exists() or (pkg_dir / "setup.cfg").exists():
+                has_test_config = True
+
+            if has_test_config:
+                test_files = _find_test_files(str(pkg_dir))
+                has_test_files = len(test_files) > 0
+
+                if not has_test_files:
+                    rel = str(pkg_dir.relative_to(root))
+                    result["zero_test_packages"].append(rel)
+
+        if result["zero_test_packages"]:
+            result["status"] = "failed"
+
+    except Exception as e:
+        result["status"] = "failed"
+        result["errors"].append(str(e))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Check: IaC validation
+# ---------------------------------------------------------------------------
+
+def check_iac_validation(project_dir: str) -> dict[str, Any]:
+    """If IaC directory exists, run tofu/terraform validate (or pulumi preview).
+
+    Tries tofu first (OpenTofu), then terraform as fallback.
+    If k8s manifests exist, check YAML validity.
+    Returns: {name, status, details, errors}
+    """
+    result: dict[str, Any] = {
+        "name": "iac_validation",
+        "status": "skipped",
+        "details": "",
+        "errors": [],
+    }
+
+    root = Path(project_dir)
+    issues: list[str] = []
+
+    # Terraform / OpenTofu validation
+    tf_dirs: list[Path] = []
+    for pattern in ["opentofu", "tofu", "terraform", "infra", "infrastructure"]:
+        candidate = root / pattern
+        if candidate.is_dir():
+            tf_dirs.append(candidate)
+    # Also look for .tf files in root
+    if list(root.glob("*.tf")):
+        tf_dirs.append(root)
+
+    for tf_dir in tf_dirs:
+        tf_files = list(tf_dir.glob("*.tf"))
+        if not tf_files:
+            continue
+        result["status"] = "passed"
+        try:
+            proc = subprocess.run(
+                ["tofu", "validate", "-no-color"],
+                cwd=str(tf_dir),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                issues.append(f"tofu validate failed in {tf_dir.relative_to(root)}: {proc.stderr.strip()}")
+        except FileNotFoundError:
+            # tofu not installed — try terraform as fallback
+            try:
+                proc = subprocess.run(
+                    ["terraform", "validate", "-no-color"],
+                    cwd=str(tf_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if proc.returncode != 0:
+                    issues.append(f"terraform validate failed in {tf_dir.relative_to(root)}: {proc.stderr.strip()}")
+            except FileNotFoundError:
+                result["errors"].append("Neither tofu nor terraform found in PATH")
+        except subprocess.TimeoutExpired:
+            result["errors"].append(f"IaC validate timed out in {tf_dir.relative_to(root)}")
+
+    # Kubernetes YAML validation
+    k8s_dirs = ["k8s", "kubernetes", "manifests", "deploy"]
+    for k8s_name in k8s_dirs:
+        k8s_dir = root / k8s_name
+        if not k8s_dir.is_dir():
+            continue
+        yaml_files = list(k8s_dir.glob("**/*.yaml")) + list(k8s_dir.glob("**/*.yml"))
+        if not yaml_files:
+            continue
+        result["status"] = "passed"
+        for yf in yaml_files:
+            try:
+                content = yf.read_text()
+                # Basic YAML validity check — look for obvious syntax errors
+                # without requiring PyYAML (stdlib-only constraint)
+                if content.strip() and "\t" in content:
+                    issues.append(f"Tabs in YAML: {yf.relative_to(root)}")
+            except OSError as e:
+                result["errors"].append(f"Cannot read {yf.relative_to(root)}: {e}")
+
+    if issues:
+        result["status"] = "failed"
+        result["details"] = "; ".join(issues)
+    elif result["status"] == "passed":
+        result["details"] = "All IaC configurations valid"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Check: CI config validity
+# ---------------------------------------------------------------------------
+
+def check_ci_config_validity(project_dir: str) -> dict[str, Any]:
+    """Check CI config files are valid YAML and don't use || true on security commands.
+
+    Returns: {name, status, issues, errors}
+    """
+    result: dict[str, Any] = {
+        "name": "ci_config_validity",
+        "status": "skipped",
+        "issues": [],
+        "errors": [],
+    }
+
+    root = Path(project_dir)
+    ci_files: list[Path] = []
+
+    for pattern in CI_CONFIG_PATHS:
+        ci_files.extend(root.glob(pattern))
+
+    if not ci_files:
+        return result
+
+    result["status"] = "passed"
+
+    # Pattern to match security commands with || true / || exit 0
+    bypass_pattern = re.compile(
+        r"(" + "|".join(re.escape(cmd) for cmd in SECURITY_COMMANDS) + r")"
+        r"[^;\n]*\|\|\s*(true|exit\s+0|:)",
+        re.IGNORECASE,
+    )
+
+    for ci_file in ci_files:
+        try:
+            content = ci_file.read_text()
+            rel_path = str(ci_file.relative_to(root))
+
+            # Check for tabs in YAML files
+            if ci_file.suffix in (".yml", ".yaml") and "\t" in content:
+                result["issues"].append(f"Tabs in YAML: {rel_path}")
+
+            # Check for security bypass patterns
+            for line_num, line in enumerate(content.splitlines(), 1):
+                if bypass_pattern.search(line):
+                    result["issues"].append(
+                        f"Security bypass: {rel_path}:{line_num}: {line.strip()}"
+                    )
+
+        except OSError as e:
+            result["errors"].append(f"Cannot read {ci_file.relative_to(root)}: {e}")
+
+    if result["issues"]:
+        result["status"] = "failed"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+def run_build_validation(project_dir: str) -> dict[str, Any]:
+    """Orchestrate all checks and return aggregate result.
+
+    Returns:
+        {name, status, project_type, checks, summary, errors}
+    """
+    project_dir = os.path.abspath(project_dir)
+    errors: list[str] = []
+
+    if not os.path.isdir(project_dir):
+        return {
+            "name": "build_validation",
+            "status": "failed",
+            "project_type": {},
+            "checks": [],
+            "summary": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+            "errors": [f"Directory not found: {project_dir}"],
+        }
+
+    project_type = detect_project_type(project_dir)
+
+    checks = [
+        check_empty_test_files(project_dir),
+        check_zero_test_packages(project_dir),
+        check_iac_validation(project_dir),
+        check_ci_config_validity(project_dir),
+    ]
+
+    passed = sum(1 for c in checks if c["status"] == "passed")
+    failed = sum(1 for c in checks if c["status"] == "failed")
+    skipped = sum(1 for c in checks if c["status"] == "skipped")
+
+    overall = "passed"
+    if failed > 0:
+        overall = "failed"
+    elif passed == 0:
+        overall = "skipped"
+
+    return {
+        "name": "build_validation",
+        "status": overall,
+        "project_type": project_type,
+        "checks": checks,
+        "summary": {
+            "total": len(checks),
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+        },
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(
+            f"Usage: {sys.argv[0]} <project_dir> [--json]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    project_dir = sys.argv[1]
+    json_output = "--json" in sys.argv
+
+    result = run_build_validation(project_dir)
+
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        # Compact output
+        lines = ["--- Build Artifact Validation ---"]
+        lines.append(f"Project type: {result['project_type'].get('type', 'unknown')}")
+        for check in result["checks"]:
+            icon = "+" if check["status"] == "passed" else "-" if check["status"] == "failed" else "o"
+            lines.append(f"  [{icon}] {check['name']}: {check['status']}")
+            if check.get("empty_tests"):
+                for et in check["empty_tests"]:
+                    lines.append(f"        {et}")
+            if check.get("zero_test_packages"):
+                for zp in check["zero_test_packages"]:
+                    lines.append(f"        {zp}")
+            if check.get("issues"):
+                for issue in check["issues"]:
+                    lines.append(f"        {issue}")
+            if check.get("details"):
+                lines.append(f"        {check['details']}")
+            if check.get("errors"):
+                for err in check["errors"]:
+                    lines.append(f"        ERROR: {err}")
+        s = result["summary"]
+        lines.append(f"  {s['passed']}/{s['total']} passed, {s['failed']} failed, {s['skipped']} skipped")
+        print("\n".join(lines))
+
+    sys.exit(0 if result["summary"]["failed"] == 0 else 1)

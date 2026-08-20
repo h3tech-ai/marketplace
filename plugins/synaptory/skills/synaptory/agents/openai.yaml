@@ -1,0 +1,11 @@
+interface:
+  display_name: "Synaptory"
+  short_description: "Run governed Synaptory delivery with Codex agents."
+  default_prompt: "Use $synaptory to inspect readiness and continue the deterministic Synaptory story loop with native Codex agents."
+policy:
+  allow_implicit_invocation: false
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "synaptory"
+      description: "Synaptory readiness, state, dispatch, receipt, advancement, tracker, and project-bootstrap tools."

@@ -1,0 +1,157 @@
+# Phase 5: Polish & Native Feel
+
+## Objective
+
+Transform the functional app into a native-feeling, delightful experience. This phase adds animations, haptic feedback, gesture interactions, and launch screen polish that make the app feel like it belongs on the platform — not like a web app wrapped in a native shell.
+
+## Prerequisites
+
+All screens and native integrations (Phases 3-4) MUST be complete. Do NOT polish a broken app. Every screen navigates correctly, every native module works, every API call handles all states.
+
+## 5.1 Animations
+
+Library: `react-native-reanimated` 3+ (React Native) or built-in `AnimationController` (Flutter)
+
+### Screen Transitions
+
+| Transition | When | Implementation |
+|-----------|------|----------------|
+| **Stack push** | Navigate forward | Slide from right (iOS), slide from bottom (Android) — use platform defaults |
+| **Stack pop** | Navigate back | Slide to right (iOS), slide to bottom (Android) — match push direction |
+| **Modal present** | Open modal screen | Slide up from bottom with backdrop fade |
+| **Tab switch** | Switch bottom tab | Cross-fade (no slide) — instant feel |
+| **Shared element** | List item → detail | Image/title morph from list position to detail position |
+
+### Micro-Animations
+
+Apply to interactive elements for tactile feedback:
+
+- **Button press** — Scale down to 0.97 on press, spring back to 1.0 on release (150ms, spring damping)
+- **Card press** — Subtle scale to 0.98 with slight shadow reduction
+- **Toggle switch** — Spring animation on thumb movement
+- **Pull-to-refresh** — Custom loading animation (Lottie/Rive) replacing default spinner
+- **List item appear** — Stagger fade-in when list first loads (50ms delay between items, max 10 items animated)
+- **Skeleton shimmer** — Gradient sweep animation on loading skeletons
+- **Toast enter/exit** — Slide in from top with spring, slide out with ease-out
+- **Tab bar indicator** — Smooth slide to active tab position
+- **FAB (floating action button)** — Scale up on appear, scale down on scroll
+
+### Animated Value Rules
+
+- Use `useSharedValue` and `useAnimatedStyle` (Reanimated) — never `Animated.Value` from core RN
+- Run animations on the UI thread (`withSpring`, `withTiming`) — never on JS thread
+- Respect `prefers-reduced-motion` — disable all non-essential animations when enabled
+- Keep duration under 300ms for interactive feedback, under 500ms for transitions
+- Use spring physics for natural-feeling interactions (damping 15-20, stiffness 100-200)
+
+## 5.2 Haptic Feedback
+
+Library: `expo-haptics` or `react-native-haptic-feedback`
+
+Apply haptic feedback at interaction points:
+
+| Interaction | Haptic Type | When |
+|------------|-------------|------|
+| Button tap | Light impact | On press down |
+| Toggle switch | Medium impact | On state change |
+| Pull-to-refresh trigger | Medium impact | When threshold reached |
+| Destructive action confirm | Heavy impact | On confirm tap |
+| Success/completion | Success notification | After successful submit |
+| Error/failure | Error notification | After failed action |
+| Long press menu | Selection changed | On each option highlight |
+| Swipe action trigger | Light impact | When swipe threshold crossed |
+
+**Platform awareness:** Haptics are more nuanced on iOS (Taptic Engine) than Android. Test on real devices — simulators don't produce haptic output.
+
+## 5.3 Gesture Handlers
+
+Library: `react-native-gesture-handler` + `react-native-reanimated`
+
+Implement platform-appropriate gestures:
+
+### Swipe Actions (List Items)
+- Swipe left to reveal action buttons (delete, archive, mute)
+- Swipe right for primary action (mark as read, pin)
+- Snap-to-action when threshold exceeded, rubber-band back otherwise
+- Haptic feedback at threshold
+
+### Pull-to-Refresh
+- Custom animated header (Lottie/Rive animation instead of default spinner)
+- Haptic pulse when refresh triggers
+- Smooth spring back after data loads
+
+### Dismissible Modals
+- Bottom sheet with drag-to-dismiss
+- Snap points (half screen, full screen, dismissed)
+- Velocity-based dismiss — fast flick down dismisses regardless of position
+- Background opacity tied to sheet position
+
+### Image Viewer
+- Pinch-to-zoom with double-tap to toggle
+- Pan when zoomed in, dismiss when zoomed out (swipe down)
+- Smooth spring back to bounds on over-zoom
+
+### Navigation Gestures
+- iOS: Swipe from left edge to go back (system default — do NOT disable)
+- Android: System back button and predictive back gesture (Android 14+)
+
+## 5.4 Launch Screen & App Icon
+
+### Launch Screen
+- Match the app's initial screen layout to prevent layout shift
+- Use platform-native splash screen (`expo-splash-screen` or native storyboard/theme)
+- Animated transition from splash to first screen (fade out splash, fade in content)
+- Keep splash visible until first data loads (prevent blank screen flash)
+
+### App Icon
+- Provide all required sizes: 1024x1024 (App Store), adaptive icon (Android), all iOS sizes
+- If branding assets provided in BRD, use them. Otherwise, generate a clean placeholder.
+- Android adaptive icon with proper foreground/background layers
+
+## 5.5 Performance Polish
+
+### Scroll Performance (Target: 60fps)
+- Use `FlatList` or `FlashList` for all lists — never `ScrollView` with `.map()`
+- Set `getItemLayout` for fixed-height items (skip measurement)
+- Use `keyExtractor` with stable, unique keys (never array index)
+- Implement `removeClippedSubviews` on Android for long lists
+- Memoize list items with `React.memo` and stable callbacks
+- Image caching via `expo-image` or `FastImage` — no uncached network images in lists
+
+### Image Optimization
+- Progressive JPEG loading (blur placeholder → full image)
+- Thumbnail URLs for list views, full-size URLs for detail views
+- Preload next-screen images during idle time
+- Limit concurrent image loads to 4-6
+
+### Bundle Size
+- Tree-shake unused imports
+- Analyze bundle with `react-native-bundle-visualizer`
+- Lazy-load heavy screens with `React.lazy` + `Suspense`
+- Keep initial JS bundle under 2MB (uncompressed)
+
+### Memory Management
+- Clean up subscriptions, listeners, and timers in `useEffect` cleanup
+- Cancel in-flight API requests on screen unmount
+- Release large image references when scrolled off screen
+- Monitor memory with Xcode Instruments / Android Profiler
+
+## Validation Loop
+
+Before moving to Phase 6:
+- Animations run at 60fps on mid-range devices (not just latest flagship)
+- Haptic feedback fires at all interaction points
+- Gestures work correctly on both platforms (swipe-back on iOS, system back on Android)
+- Launch screen transitions smoothly to first content screen
+- Scroll performance verified with 100+ items in lists — no jank
+- `prefers-reduced-motion` disables non-essential animations
+- No unnecessary re-renders (verify with React DevTools profiler)
+
+## Quality Bar
+
+- Every animation uses the UI thread (Reanimated worklets) — zero JS thread animations
+- Every interactive element has haptic feedback
+- Scroll FPS ≥ 55fps on a 3-year-old device (mid-range benchmark)
+- Launch-to-interactive time under 3 seconds on mid-range device
+- App size under 50MB (iOS) / 30MB (Android) download size
+- No animation runs when `prefers-reduced-motion` is enabled

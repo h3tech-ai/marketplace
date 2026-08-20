@@ -1,0 +1,753 @@
+{
+  "version": "2.0.0",
+  "description": "Canonical routing table for synaptory v2 mode dispatch. Machine-readable source of truth. v2 uses three operation layers: Scrum lifecycle, Kanban lifecycle, and standalone utilities. The 'pipeline' field is DEPRECATED (v1 phase names kept for backward compat) \u2014 v2 routing uses 'lifecycle' field instead.",
+  "modes": [
+    {
+      "mode": "Build",
+      "trigger_signals": [
+        "build a SaaS",
+        "production grade",
+        "from scratch",
+        "full stack",
+        "greenfield"
+      ],
+      "trigger_patterns": [
+        "build.*(?:saas|platform|service|app|system|product)",
+        "(?:from scratch|greenfield|new project)"
+      ],
+      "skills_involved": [
+        "project-owner",
+        "solution-architect",
+        "software-engineer",
+        "quality-engineer",
+        "code-reviewer",
+        "compliance-engineer",
+        "platform-engineer",
+        "technical-writer",
+        "research-advisor"
+      ],
+      "lifecycle": "scrum",
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Routes to Scrum lifecycle: Inception \u2192 Sprint ceremony loop \u2192 Release. All 9 agents involved across ceremonies."
+    },
+    {
+      "mode": "Sprint",
+      "trigger_signals": [
+        "build sprint",
+        "sprint N",
+        "next sprint",
+        "continue sprint",
+        "resume sprint",
+        "run sprint",
+        "start sprint"
+      ],
+      "trigger_patterns": [
+        "(?:build|run|start|continue|resume|next)\\s+sprint",
+        "sprint\\s+\\d+"
+      ],
+      "skills_involved": [
+        "project-owner",
+        "software-engineer",
+        "platform-engineer",
+        "quality-engineer",
+        "code-reviewer",
+        "compliance-engineer",
+        "technical-writer"
+      ],
+      "lifecycle": "scrum",
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Routes to Scrum ceremony dispatcher (modes/sprint.md). Reads lifecycle_state and routes to correct ceremony: Planning, Execution, Review, Retro, or Close."
+    },
+    {
+      "mode": "Kanban",
+      "trigger_signals": [
+        "fix ticket",
+        "work on TICKET-xxx",
+        "pull next ticket",
+        "maintenance mode",
+        "kanban"
+      ],
+      "trigger_patterns": [
+        "fix\\s+ticket",
+        "work on\\s+TICKET-\\d+",
+        "pull next ticket",
+        "maintenance mode",
+        "kanban"
+      ],
+      "skills_involved": [
+        "software-engineer",
+        "quality-engineer",
+        "code-reviewer"
+      ],
+      "lifecycle": "kanban",
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Routes to Kanban lifecycle: Discover \u2192 Ready \u2192 Execute \u2192 Review \u2192 loop. Brownfield only."
+    },
+    {
+      "mode": "SPQ",
+      "trigger_signals": [
+        "spq",
+        "open slice",
+        "next slice",
+        "run a slice",
+        "slice execution",
+        "spq lifecycle"
+      ],
+      "trigger_patterns": [
+        "(?:open|start|run|next)\\s+slice(?:\\s+\\d+)?",
+        "spq\\s+(?:lifecycle|delivery|mode)"
+      ],
+      "skills_involved": [
+        "project-owner",
+        "solution-architect",
+        "software-engineer",
+        "quality-engineer",
+        "code-reviewer",
+        "compliance-engineer",
+        "platform-engineer",
+        "technical-writer",
+        "research-advisor"
+      ],
+      "lifecycle": "spq",
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Routes to the SPQ lifecycle: DISCOVERY -> COMMIT -> SLICE_EXECUTION -> SYNC -> CHECKPOINT -> (loop or ACCEPTANCE). Requires build_mode: spq. The distinguishing feature vs scrum is SYNC, the cross-workstream integration barrier."
+    },
+    {
+      "mode": "Sync",
+      "trigger_signals": [
+        "sync",
+        "sync workstreams",
+        "sync crews",
+        "integrate workstreams",
+        "run the barrier",
+        "declare ready"
+      ],
+      "trigger_patterns": [
+        "sync\\s+(?:workstreams?|crews?|slice)",
+        "(?:run|clear|evaluate)\\s+the\\s+barrier",
+        "declare\\s+(?:sync\\s+)?ready"
+      ],
+      "skills_involved": [
+        "quality-engineer",
+        "software-engineer",
+        "solution-architect",
+        "compliance-engineer"
+      ],
+      "lifecycle": "spq",
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "The cross-workstream integration barrier (SYNC). Ordered procedure, and steps 2 and 5 are human by design: agents must not commit or push to shared branches. See spq/sync.md."
+    },
+    {
+      "mode": "Checkpoint",
+      "trigger_signals": [
+        "checkpoint",
+        "close slice",
+        "demo the slice",
+        "slice review"
+      ],
+      "trigger_patterns": [
+        "checkpoint(?:\\s+\\d+)?",
+        "(?:close|demo)\\s+(?:the\\s+)?slice"
+      ],
+      "skills_involved": [
+        "technical-writer",
+        "project-owner"
+      ],
+      "lifecycle": "spq",
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Closes the Slice with a customer demonstration from an integrated dev, then harvests MethodSignals. Always runs AFTER SYNC \u2014 integration precedes demonstration."
+    },
+    {
+      "mode": "Test",
+      "trigger_signals": [
+        "write tests",
+        "test coverage",
+        "test this",
+        "add tests"
+      ],
+      "trigger_patterns": [
+        "(?:write|add|generate)\\s+tests?",
+        "test coverage",
+        "test this"
+      ],
+      "skills_involved": [
+        "quality-engineer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "tiebreaker": "Use Test (not Debug) when the code works and coverage is the goal",
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Review",
+      "trigger_signals": [
+        "review my code",
+        "code review",
+        "code quality",
+        "check my code"
+      ],
+      "trigger_patterns": [
+        "(?:review|check)\\s+(?:my\\s+)?code",
+        "code review",
+        "code quality"
+      ],
+      "skills_involved": [
+        "code-reviewer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "tiebreaker": "Use Review (not Verify) when 'my code' or 'this code' is present without audit/harden intent",
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Architect",
+      "trigger_signals": [
+        "design",
+        "architecture",
+        "API design",
+        "data model",
+        "tech stack",
+        "how should I structure"
+      ],
+      "trigger_patterns": [
+        "(?:design|architect)\\s+\\w+",
+        "API design",
+        "data model",
+        "tech stack",
+        "how should I structure"
+      ],
+      "skills_involved": [
+        "solution-architect"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Document",
+      "trigger_signals": [
+        "document",
+        "write docs",
+        "API docs",
+        "README"
+      ],
+      "trigger_patterns": [
+        "(?:write|generate|create)\\s+docs?",
+        "API docs?",
+        "readme"
+      ],
+      "skills_involved": [
+        "technical-writer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Explore",
+      "trigger_signals": [
+        "explain",
+        "understand",
+        "help me think",
+        "what should I",
+        "I'm not sure"
+      ],
+      "trigger_patterns": [
+        "explain\\s+\\w+",
+        "help me think",
+        "what should I",
+        "I'm not sure",
+        "I don't know"
+      ],
+      "skills_involved": [
+        "research-advisor"
+      ],
+      "pipeline": [],
+      "skip_conditions": []
+    },
+    {
+      "mode": "Optimize",
+      "trigger_signals": [
+        "performance",
+        "slow",
+        "optimize",
+        "scale",
+        "reliability"
+      ],
+      "trigger_patterns": [
+        "(?:too\\s+)?slow",
+        "optimize\\s+\\w+",
+        "performance\\s+(?:issue|problem)",
+        "scale\\s+\\w+"
+      ],
+      "skills_involved": [
+        "platform-engineer",
+        "code-reviewer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Discover",
+      "trigger_signals": [
+        "understand this codebase",
+        "map the system",
+        "reverse engineer",
+        "what does this code do",
+        "map dependencies"
+      ],
+      "trigger_patterns": [
+        "reverse.?engineer",
+        "map.*(?:system|codebase|dependencies)",
+        "what does.*code do"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Executes modes/reverse.md \u2014 does not invoke named skills directly"
+    },
+    {
+      "mode": "Stabilize",
+      "trigger_signals": [
+        "add safety net",
+        "characterization tests",
+        "before refactoring",
+        "establish baseline",
+        "coverage ratchet"
+      ],
+      "trigger_patterns": [
+        "characterization tests?",
+        "before refactor",
+        "safety net",
+        "coverage ratchet",
+        "establish baseline"
+      ],
+      "skills_involved": [
+        "quality-engineer",
+        "code-reviewer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Modernize",
+      "trigger_signals": [
+        "modernize",
+        "migrate",
+        "upgrade architecture",
+        "strangler fig",
+        "migration plan",
+        "rewrite plan"
+      ],
+      "trigger_patterns": [
+        "modernize",
+        "migration plan",
+        "strangler fig",
+        "rewrite plan",
+        "upgrade.*architecture"
+      ],
+      "skills_involved": [
+        "solution-architect",
+        "compliance-engineer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Debug",
+      "trigger_signals": [
+        "debug",
+        "fix this bug",
+        "not working",
+        "broken",
+        "error",
+        "crash",
+        "failing",
+        "investigate",
+        "root cause"
+      ],
+      "trigger_patterns": [
+        "(?:fix|debug)\\s+(?:this\\s+)?bug",
+        "not working",
+        "broken",
+        "crash(?:ing)?",
+        "failing",
+        "root cause"
+      ],
+      "skills_involved": [
+        "code-reviewer",
+        "software-engineer",
+        "quality-engineer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Code Reviewer (diagnosis) \u2192 SE (fix) \u2192 QE (regression test)",
+      "tiebreaker": "Use Debug (not Test) when an active error, failure, or crash is described",
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Preview",
+      "trigger_signals": [
+        "preview",
+        "run it",
+        "start server",
+        "launch",
+        "see it running",
+        "dev server"
+      ],
+      "trigger_patterns": [
+        "preview",
+        "run it",
+        "start.*server",
+        "launch.*(?:app|server|dev)",
+        "dev server"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Executes modes/preview.md \u2014 does not invoke named skills directly"
+    },
+    {
+      "mode": "Retro",
+      "trigger_signals": [
+        "retro",
+        "retrospective",
+        "what did we ship",
+        "team metrics",
+        "weekly summary",
+        "sprint review",
+        "shipping velocity"
+      ],
+      "trigger_patterns": [
+        "retro(?:spective)?",
+        "what did we ship",
+        "team metrics",
+        "shipping velocity",
+        "sprint review"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Git history analysis \u2192 metrics \u2192 insights \u2192 trend comparison"
+    },
+    {
+      "mode": "Branch Finish",
+      "trigger_signals": [
+        "finish this branch",
+        "merge",
+        "create PR",
+        "done with this branch",
+        "ship this branch",
+        "ready to merge"
+      ],
+      "trigger_patterns": [
+        "finish.*branch",
+        "create.*pr",
+        "ready to merge",
+        "ship.*branch",
+        "done.*branch"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Doctor",
+      "trigger_signals": [
+        "doctor",
+        "diagnose",
+        "check config",
+        "validate config",
+        "is this correctly configured",
+        "synaptory doctor",
+        "check setup",
+        "verify setup",
+        "configuration check"
+      ],
+      "trigger_patterns": [
+        "\\bdoctor\\b",
+        "\\bdiagnose\\b",
+        "(?:run|check|show|validate|verify|diagnose).*(?:doctor|config(?:uration)?|setup)",
+        "hiro.?crew\\s+doctor",
+        "is.*(?:correctly|properly)\\s+configured",
+        "config.*(?:valid|correct|ok|check)"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Configuration validator: checks .synaptory.yaml correctness, plugin settings, CLI auth, CP project membership, and v2.1 cruft. Read-only \u2014 never modifies files without asking.",
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Init",
+      "trigger_signals": [
+        "initialize",
+        "configure project",
+        "set up synaptory",
+        "reconfigure",
+        "generate config"
+      ],
+      "trigger_patterns": [
+        "(?:initialize|init|set up|setup|configure|reconfigure).*(?:hiro.?crew|project|config)",
+        "generate config"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Project detection + .synaptory.yaml generation"
+    },
+    {
+      "mode": "Status",
+      "trigger_signals": [
+        "status",
+        "progress",
+        "dashboard",
+        "where are we",
+        "show pipeline",
+        "check progress"
+      ],
+      "trigger_patterns": [
+        "(?:show|check|what's).*(?:status|progress|pipeline)",
+        "dashboard",
+        "where are we"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": []
+    },
+    {
+      "mode": "Switch Spec",
+      "trigger_signals": [
+        "/switch-spec",
+        "switch spec",
+        "change active spec",
+        "set active spec",
+        "make X the active spec"
+      ],
+      "trigger_patterns": [
+        "/switch-spec(\\s+\\S+)?",
+        "(?:switch|change|set).*active.*spec",
+        "(?:switch|change).*spec.*to"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Multi-spec only (docs/multi-spec-design.md). Routes to modes/switch-spec.md to update pipeline-state.json.active_spec and re-render the CLAUDE.md sentinel rollup."
+    },
+    {
+      "mode": "Help",
+      "trigger_signals": [
+        "help",
+        "commands",
+        "what can you do",
+        "reference",
+        "how does synaptory work"
+      ],
+      "trigger_patterns": [
+        "(?:help|commands|what can you do|how does hiro.?crew work)"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": []
+    },
+    {
+      "mode": "Report",
+      "trigger_signals": [
+        "report a bug",
+        "report an issue",
+        "synaptory bug",
+        "plugin issue",
+        "something's wrong with the pipeline"
+      ],
+      "trigger_patterns": [
+        "report.*(?:bug|issue)",
+        "hiro.?crew bug",
+        "plugin issue",
+        "something.*wrong.*pipeline"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Gather context + file GitHub issue on h3tech-ai/synaptory"
+    },
+    {
+      "mode": "Context Refresh",
+      "trigger_signals": [
+        "update context",
+        "refresh context",
+        "re-analyze codebase",
+        "update codebase knowledge",
+        "refresh codebase"
+      ],
+      "trigger_patterns": [
+        "(?:update|refresh|re-analyze).*(?:context|codebase|knowledge)",
+        "update codebase"
+      ],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Discover mode incremental re-run only. Jumps directly to Re-Run Behavior section in modes/reverse.md. Analyzes only files changed since last Discover run."
+    },
+    {
+      "mode": "Story Buddy \u2014 Requirements",
+      "trigger_signals": [
+        "analyze [story]",
+        "refine requirements",
+        "AC review",
+        "PM help with [story]",
+        "BA help with [story]",
+        "help plan [feature]",
+        "what should the story include"
+      ],
+      "trigger_patterns": [
+        "analyze\\s+(?:[A-Z]+-\\d+|US-\\d+|story|requirement)",
+        "refine requirements",
+        "AC review",
+        "PM help",
+        "BA help"
+      ],
+      "skills_involved": [
+        "project-owner"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Executes modes/story-buddy.md with role=requirements. PM story-analysis mode: analyze story against codebase, optionally create follow-on stories/epics."
+    },
+    {
+      "mode": "Story Buddy \u2014 Implement",
+      "trigger_signals": [
+        "implement [US-xxx]",
+        "build [story ID]",
+        "code [story]",
+        "how to implement [story]"
+      ],
+      "trigger_patterns": [
+        "(?:implement|build|code|develop)\\s+[A-Z]+-\\d+",
+        "(?:implement|build|code|develop)\\s+US-\\d+",
+        "how to implement.*[A-Z]+-\\d+"
+      ],
+      "skills_involved": [
+        "software-engineer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [
+        "PLAN"
+      ],
+      "notes": "Executes modes/story-buddy.md with role=implement. Requires story ID in request. Skips PLAN \u2014 story already exists in tracker. SE implements with context package injection.",
+      "tiebreaker": "Use Story Buddy \u2014 Implement (not Feature) when a story ID pattern [A-Z]+-\\d+ or US-\\d+ is present",
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Story Buddy \u2014 Test",
+      "trigger_signals": [
+        "test cases for [US-xxx]",
+        "test [story]",
+        "automate [story]",
+        "QA help with [story]",
+        "write tests for [story ID]"
+      ],
+      "trigger_patterns": [
+        "(?:test cases?|write tests?|automate|QA help).*(?:[A-Z]+-\\d+|US-\\d+)",
+        "(?:test|automate)\\s+[A-Z]+-\\d+"
+      ],
+      "skills_involved": [
+        "quality-engineer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Executes modes/story-buddy.md with role=test. QE diff-aware mode: test all ACs for specific story, enforce coverage ratchet.",
+      "tiebreaker": "Use Story Buddy \u2014 Test (not Test) when a story ID is present",
+      "lifecycle": "standalone"
+    },
+    {
+      "mode": "Story Buddy \u2014 Sprint Plan",
+      "trigger_signals": [
+        "sprint planning",
+        "help plan sprint",
+        "help us plan sprint N",
+        "what stories for sprint N",
+        "prioritize backlog",
+        "backlog grooming"
+      ],
+      "trigger_patterns": [
+        "sprint planning",
+        "help.*plan.*sprint",
+        "prioritize.*backlog",
+        "backlog grooming",
+        "what stories.*sprint"
+      ],
+      "skills_involved": [
+        "project-owner"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Executes modes/story-buddy.md with role=sprint-plan. PM advisor: suggest story selection + capacity estimate. Does NOT create/modify stories unless explicitly asked."
+    },
+    {
+      "mode": "Custom",
+      "trigger_signals": [],
+      "trigger_patterns": [],
+      "skills_involved": [],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Catch-all: doesn't fit above patterns. Present skill menu, let user pick."
+    }
+  ],
+  "tiebreakers": [
+    {
+      "conflict": "review vs verify",
+      "rule": "Review if 'my code / this code'. Verify if 'before launch / audit / harden / production ready'",
+      "reason": "Verify implies multi-agent parallel audit; Review is single-agent read-only"
+    },
+    {
+      "conflict": "test vs debug",
+      "rule": "Debug if error/failure/crash/not working is described. Test if the code works and coverage is the goal",
+      "reason": "Debug = active failure; Test = proactive quality"
+    },
+    {
+      "conflict": "build vs debug",
+      "rule": "Debug if there is a specific error description. Build if it is a new behaviour request",
+      "reason": "Debug requires root-cause analysis; Build is additive"
+    },
+    {
+      "conflict": "multiple modes match",
+      "rule": "Pick the most specific: Debug > Story Buddy, Release > Code Review, Sprint > Build",
+      "reason": "Specificity beats generality"
+    },
+    {
+      "conflict": "reliability vs optimize",
+      "rule": "Reliability if SLO, error budget, chaos, runbook, incident, or on-call is mentioned. Optimize if performance or scale is the goal without operational framing",
+      "reason": "Reliability = operational engineering; Optimize = code/infra performance tuning"
+    },
+    {
+      "conflict": "implement + story ID vs Build",
+      "rule": "Story Buddy \u2014 Implement if a story ID pattern ([A-Z]+-\\d+ or US-\\d+) is present. Build (Scrum lifecycle) if no story ID.",
+      "reason": "Story ID = story already in tracker. No story ID = new project requiring Inception."
+    },
+    {
+      "conflict": "write tests + story ID vs Test",
+      "rule": "Story Buddy \u2014 Test if a story ID is present. Test (standalone) if no story ID.",
+      "reason": "Story ID enables AC-to-test traceability; standalone Test is general coverage work."
+    },
+    {
+      "conflict": "story ID anywhere in request",
+      "rule": "Story Buddy mode (role inferred from request context). Story ID overrides Build/Test/Review.",
+      "reason": "Presence of a story ID signals per-story assistance intent, not a new feature request."
+    },
+    {
+      "conflict": "doctor vs init",
+      "rule": "Doctor if 'check', 'validate', 'diagnose', 'is it configured correctly', or 'doctor' is mentioned. Init if 'initialize', 'set up', or 'generate config' is the goal.",
+      "reason": "Doctor is read-only diagnostic; Init generates/overwrites configuration."
+    }
+  ]
+}

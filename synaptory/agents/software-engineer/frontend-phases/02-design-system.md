@@ -1,0 +1,108 @@
+# Phase 2: Functional Design Foundation
+
+## Objective
+
+Establish the **minimum viable design system** so components can be built and wired. This is NOT the final design — this is defaults that work. The real design research and polish happens in Phase 5 after everything is functional.
+
+Do NOT spend time on color theory, trend research, or visual polish here. Use sensible defaults. Get to working components fast.
+
+## 2.0 Load Design Handoff (conditional)
+
+**IF a design handoff bundle exists for the current story**, the tokens and component inventory come from the approved Claude Design prototype — not from defaults. This branch bypasses the "defaults first, research later" model.
+
+The bundle path is a convention derived from the story id (see `design-grooming.md`) — resolve it directly, do not query the tracker for a `design_ref` field:
+
+```
+design_ref=".synaptory/design/${STORY_ID}-design.md"
+
+IF [ -n "$design_ref" ] AND [ -f "$design_ref" ]:
+  1. Read the handoff bundle at $design_ref (format: see design-grooming.md)
+  2. Parse the "Design Tokens (delta from project defaults)" section
+  3. Merge handoff tokens INTO frontend/app/styles/tokens/ as a delta:
+     - For each handoff token key, write to the matching token file
+     - Do NOT replace entire token files — preserve tokens the handoff does not mention
+     - New tokens that have no matching file get added to the closest-named file
+       (e.g., a new colour goes in colors.ts; a new spacing goes in spacing.ts)
+  4. Parse the "Component Inventory" table
+     - For each row, note whether Source is `new` or `existing:{path}`
+     - `existing:` components MUST be reused in Phase 3, not regenerated
+  5. Record in the Phase 2 section of the SE receipt:
+       design_tokens_applied: [list of token file paths updated]
+       design_handoff_ref: $design_ref
+ELSE:
+  Follow the default flow in 2.1–2.3 below (defaults only).
+```
+
+The tokens below (2.1) are the **fallback defaults** used when no handoff is present. When a handoff is present, treat 2.1 tokens as a base and overlay the handoff's Design Tokens on top.
+
+## 2.1 Design Tokens (Defaults)
+
+Create `frontend/app/styles/tokens/`:
+
+```
+tokens/
+├── colors.ts          # Neutral palette + one primary color (blue default)
+├── typography.ts      # System font stack, modular scale
+├── spacing.ts         # 4px base unit scale
+├── breakpoints.ts     # Standard responsive breakpoints
+├── shadows.ts         # 3-level elevation (sm, md, lg)
+├── radii.ts           # 3-level border radius (sm, md, lg)
+├── z-index.ts         # Z-index scale
+├── motion.ts          # Fast/normal/slow durations
+└── index.ts           # Unified export
+```
+
+Token standards (functional defaults — will be refined in Phase 5):
+- **Colors** — Neutral gray scale (50-950). One primary color (blue). Semantic: `success` (green), `warning` (amber), `danger` (red). WCAG AA contrast ratios.
+- **Typography** — System font stack (`-apple-system, BlinkMacSystemFont, 'Segoe UI', ...`). Modular scale (1.25). Heading levels h1-h6. Line height: 1.5 body, 1.2 headings.
+- **Spacing** — 4px base: `0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64`.
+- **Breakpoints** — `sm: 640px`, `md: 768px`, `lg: 1024px`, `xl: 1280px`, `2xl: 1536px`.
+- **Motion** — `fast: 150ms`, `normal: 300ms`, `slow: 500ms`. Respect `prefers-reduced-motion`.
+
+## 2.2 Theme Configuration (Minimal)
+
+Create `frontend/app/styles/theme/`:
+
+```
+theme/
+├── theme-provider.tsx     # React context for theme switching
+├── light-theme.ts         # Light mode (default neutral palette)
+├── dark-theme.ts          # Dark mode (inverted neutral palette)
+├── theme.css              # CSS custom properties from tokens
+└── global.css             # Reset, base styles, font loading
+```
+
+Requirements:
+- Light and dark mode with system preference detection
+- Theme toggle with localStorage persistence
+- CSS custom properties bridge tokens to components
+- No FOUC on theme load
+
+## 2.3 Tailwind Configuration (if Tailwind selected)
+
+Create `frontend/tailwind.config.ts`:
+- Extend with default design tokens
+- Standard color palette
+- Typography plugin
+- Animation utilities
+- Container queries
+
+**Keep it simple. These tokens will be upgraded in Phase 5 (Design & Polish) with researched colors, typography, and visual identity.**
+
+## Validation Loop
+
+Before moving to Phase 3:
+- All tokens defined and exported
+- Light/dark themes render
+- Theme toggle works
+- Tailwind config extends with tokens
+
+**Do NOT present design system for approval here — it's defaults. Move to components.**
+
+## Quality Bar
+
+- Every color meets WCAG 2.1 AA contrast
+- Typography scale is consistent
+- Spacing scale covers layout needs
+- No hardcoded visual values
+- This is a FUNCTIONAL foundation, not the final design — UNLESS a design handoff was loaded in Step 2.0, in which case this IS the final design foundation and Phase 5 will skip domain research (see Phase 5's handoff conditional).

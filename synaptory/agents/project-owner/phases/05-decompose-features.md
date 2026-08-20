@@ -1,0 +1,122 @@
+### Step 5: Decompose Epics into Features (Level 3)
+
+> **Anchor: You are the Product Manager. Decompose epics into features. Complete ALL features before writing ANY stories.**
+
+**THIS IS A SEPARATE STEP FROM STEP 6.** Complete ALL features for ALL epics before writing ANY stories. Do NOT merge Steps 5 and 6 into a single pass. Do NOT leave any epic with only a feature title list.
+
+**GROUND (per epic):** Before generating features for EPIC-NNN, re-read:
+1. `epics/EPIC-NNN.md` (the epic you're decomposing)
+2. `brd.md` lines 1-30 (BRD header + problem statement — anchors context)
+3. Relevant source document sections (PRD screens, data model tables referenced by this epic)
+
+This re-grounding prevents drift when generating features for the 4th, 5th, 6th epic.
+
+#### DO — Generate Features (per epic)
+
+**Every feature MUST contain ALL 11 fields below.** A feature missing any field is incomplete and must not pass the STOP gate. Do NOT delegate these fields to stories — features own this content; stories decompose it further.
+
+##### Mandatory Feature Fields (11 of 11 required)
+
+| # | Field | What to Write | Agent Rule |
+|---|-------|--------------|------------|
+| 1 | **Feature-ID + Title** | FEAT-NNN: Verb/noun title | Auto-generate. Never start with "The". |
+| 2 | **Description** | What + why it matters | 2-4 sentences. Must state user value. |
+| 3 | **User Workflow (Happy Path)** | Numbered step-by-step | "1. User does X → 2. System responds Y → 3. User sees Z". Use the Workflow Walk table below. |
+| 4 | **Business Rules** | BR-{N} numbered invariants | Each rule has Source (PRD §, data model, stakeholder). No source → `[ASSUMPTION]`. |
+| 5 | **UI/UX Requirements** | Layout, components, states | Reference mockup screens, design tokens, responsive behavior. Write `N/A — backend only` for API-only features. |
+| 6 | **Acceptance Criteria** | Given/When/Then | Min 3, max 8. Specific values, not vague. These are feature-level — stories decompose further. |
+| 7 | **Edge Cases (Four D's)** | Failure/boundary scenarios | ≥1 per D (Disconnection, Destruction, Deception, Delay). Plus: empty state, max limits, concurrent access. |
+| 8 | **Error Handling** | Error table | Each error: cause, user message, system action. |
+| 9 | **Dependencies** | Feature-IDs or external services | Distinguish "blocked by" vs "integrates with". |
+| 10 | **STEEP Validation** | 5-letter checklist | S(ized), T(estable), E(nd-to-end), E(ssential), P(rioritizable). |
+| 11 | **User Stories** | Ordered list of Story-IDs with titles | These get implemented in Step 6. List IDs + 1-line title. |
+
+**Self-check before writing the next feature:** Re-read what you just wrote. Count the sections. If you count fewer than 11 sections, you skipped a field — go back and add it. This check is mandatory, not optional.
+
+##### Method: Workflow Walk — for each feature, walk the user's workflow:
+
+| Step | What does the user SEE? | What does the user DO? | What does the system DO? | What can go WRONG? |
+|------|------------------------|----------------------|-------------------------|-------------------|
+
+- Answers to columns 1-3 → User Workflow (field 3) + happy-path AC (field 6).
+- Answers to column 4 → Edge Cases (field 7) + Error Handling (field 8).
+
+##### Method: Business Rules Extraction — for each feature:
+
+```
+BR-{N}: When {condition}, the system {action}.
+        Source: {PRD section / data model table / stakeholder decision}
+        Exception: {what happens when the rule doesn't apply}
+```
+
+Rules without a Source → mark `[ASSUMPTION]`, flag for validation.
+Rules inferred from data model (FK = rule, enum = valid transitions, nullable = empty state) → mark `[INFERRED]`.
+
+##### Method: Four D's Edge Case Sweep — for each feature, produce ≥1 edge case per D:
+
+| D | Question | Edge Case | Handling |
+|---|---------|-----------|---------|
+| **Disconnection** | Network drops mid-action? Dependent service down? | | |
+| **Destruction** | User deletes data this feature depends on? Data corrupted? | | |
+| **Deception** | Malformed input? Duplicate submission? UI bypass? | | |
+| **Delay** | API takes 10x normal? Background job hasn't completed? | | |
+
+If a D genuinely doesn't apply: write `N/A — {reason}`. Do NOT skip the analysis.
+
+**File output:** Append `<feature>` blocks to the parent epic file `epics/EPIC-NNN.md`. Each epic file contains the epic block + all its feature blocks. NO story blocks in this file.
+
+#### VALIDATE — STEEP Checklist (run per feature)
+
+| Letter | Test | Pass Criteria |
+|--------|------|--------------|
+| **S** Sized | How many stories? | 2-5 stories. < 2 = it's a story. > 5 = split. |
+| **T** Testable | Can you write 3-8 Given/When/Then with specific values? | If ACs are vague, the feature isn't defined enough. |
+| **E** End-to-end | Complete user workflow from trigger to outcome? | Must be a user flow, not a technical layer ("API endpoints"). |
+| **E** Essential | Every BR traceable to epic objective or stakeholder request? | Rules with no source = invented scope. Remove or get confirmation. |
+| **P** Prioritizable | Can this feature be deferred without breaking the epic? | Identifies core vs. nice-to-have features. |
+
+Report: `{FEAT-ID}: S✓ T✓ E✓ E✓ P✓` or flag + fix.
+
+#### VALIDATE — Completeness Matrices (per epic)
+
+**Matrix D — Objective Decomposition:**
+
+Break the epic's Objective into atomic verb-noun capabilities. Each must map to ≥1 feature.
+
+| Epic Objective Component | FEAT-X | FEAT-Y | ... | Covered? |
+|--------------------------|--------|--------|-----|----------|
+
+**Matrix E — Entity CRUD Coverage:**
+
+| Entity.Operation | FEAT-X | FEAT-Y | ... | Covered? |
+|------------------|--------|--------|-----|----------|
+
+Every entity.operation the epic claims to touch must be covered by a feature.
+
+**Matrix F — Workflow Completeness:**
+
+Walk the user workflow start-to-finish for each persona touching this epic. Every step must land in a feature. No gaps between steps.
+
+| Workflow Step | Feature | Notes |
+|--------------|---------|-------|
+
+**Matrix G — Done Criteria Coverage:**
+
+| Epic Done Criterion | Verified By Feature(s) |
+|---------------------|----------------------|
+
+Every Done Criterion must be testable through ≥1 feature.
+
+**STOP gate (per epic):**
+- All features pass STEEP.
+- **All features contain all 11 mandatory fields.** Run this check: for each feature, count the H2/H3-level sections. If any feature has fewer than 11 sections (Description, User Workflow, Business Rules, UI/UX Requirements, Acceptance Criteria, Edge Cases, Error Handling, Dependencies, STEEP Validation, User Stories, plus the title), it is incomplete — fix before proceeding.
+- Matrix D: zero uncovered objective components.
+- Matrix E: zero uncovered entity.operations.
+- Matrix F: zero workflow gaps.
+- Matrix G: zero unverifiable Done Criteria.
+
+**STOP gate (global):** ALL epics must have complete feature decomposition before proceeding to Step 6. Do NOT decompose stories for one epic while another epic still lacks features. Do NOT merge Step 5 and Step 6 into a single pass or dispatch them to the same agent call.
+
+**Persist matrices:** Write Matrices D, E, F, G (per epic) to `validation/step5-matrices.md`.
+
+---

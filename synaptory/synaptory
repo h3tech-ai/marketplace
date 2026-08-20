@@ -1,0 +1,1654 @@
+#!/usr/bin/env bash
+# Copyright 2024-2026 H3Tech Inc. CONFIDENTIAL & PROPRIETARY.
+#
+# Synaptory admin CLI
+#
+# Single build, single deploy. Two verbs:
+#
+#   ./synaptory build [--minor|--major|--version X.Y.Z]
+#       Build EVERY module (plugin tree + CLI binaries + api/web/fixture-idp/backup/git-http
+#       Docker images), all tagged with the same /VERSION. No partial builds.
+#
+#   ./synaptory deploy {local|prod}
+#       Build, then deploy. `local` brings up docker-compose on this machine
+#       and installs the CLI to ~/.local/bin. `prod` pushes images to GHCR,
+#       publishes the plugin tree to github.com/h3tech-ai/marketplace and the
+#       legacy synaptory.h3t.co compatibility mirror, ships CLI artifacts to
+#       /mnt/pgdata/web-dist/cli/, and rolls compose forward.
+#
+# Inspection / dev helpers:
+#   ./synaptory version [patch|minor|major|X.Y.Z]     Show or bump /VERSION.
+#   ./synaptory status                                 Source vs published marketplace.
+#   ./synaptory test                                   Syntax + pytest.
+#   ./synaptory dev {plugin|cli}                       Run plugin/CLI against a local CP.
+#   ./synaptory api {down|logs|ps|migrate|backup|test|projects ...}
+#                                                 Lifecycle ops on the running stack
+#                                                 (use ./synaptory deploy local to start it).
+#   ./synaptory e2e [--keep-stack] [--scenario ...]    Cross-module harness.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Prefer `docker compose` (plugin, v2) over standalone `docker-compose`.
+docker_compose() {
+  if docker compose version &>/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
+
+# Auto-load repo-root env file (signing seeds, SYNAPTORY_CP_URL, SYNAPTORY_PLUGIN_NAME,
+# etc.). Supports both .env and .envrc — .env wins when both exist. Both are
+# sourced as plain shell, so they must stick to `export KEY=value` lines.
+# Existing environment wins over either file.
+for _env_file in "${REPO_ROOT}/.env" "${REPO_ROOT}/.envrc"; do
+  if [[ -f "$_env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$_env_file"
+    set +a
+    break
+  fi
+done
+unset _env_file
+
+PLUGIN_ROOT="${REPO_ROOT}/plugin"
+# VERSION lives at the repo root so the plugin and the Go CLI share a single
+# source of truth. Bumped by `./synaptory build` and stamped into both the plugin
+# (plugin.json, marketplace entry) and the CLI binary (ldflags). The admin
+# API / UI version independently — they're operator-side services, not part
+# of what staff install.
+VERSION_FILE="${REPO_ROOT}/VERSION"
+PLUGIN_JSON="${PLUGIN_ROOT}/.claude-plugin/plugin.json"
+CURSOR_PLUGIN_JSON="${REPO_ROOT}/plugin-cursor/.cursor-plugin/plugin.json"
+CODEX_PLUGIN_JSON="${REPO_ROOT}/plugin-codex/plugins/synaptory/.codex-plugin/plugin.json"
+USER_GUIDE_BUILDER="${REPO_ROOT}/plugin/scripts/build_user_guide.py"
+# Control Plane + CLI download base URL. GitHub (h3tech-ai/marketplace) is the
+# primary marketplace for new installs. The legacy synaptory.h3t.co catalog is
+# still published as a compatibility mirror for existing Claude Code users.
+# Override SYNAPTORY_WEB_BASE_URL for staging.
+WEB_BASE_URL="${SYNAPTORY_WEB_BASE_URL:-https://synaptory.h3t.co}"
+
+# PLUGIN_NAME is the marketplace entry name. v3 retires the transitional
+# "synaptory-next" channel and consolidates back to a single canonical
+# name "synaptory". The channel-aware CLI infra (SYNAPTORY_CHANNEL ldflag,
+# ~/.synaptory-<channel>/ paths, per-channel keychain entries) remains in
+# place as latent capability — set SYNAPTORY_PLUGIN_NAME + SYNAPTORY_CHANNEL together
+# if a future migration needs another side-by-side pilot. Default:
+PLUGIN_NAME="${SYNAPTORY_PLUGIN_NAME:-synaptory}"
+
+CURRENT_VERSION=$(cat "$VERSION_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0.0.0")
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+encrypt_file() {
+  # AES-256-CBC + PBKDF2 — same parameters as the legacy
+  # access_token_manager.encrypt entrypoint, inlined here so the plugin
+  # doesn't have to ship a Python crypto module to perform a build-time
+  # operation. Args: <master_password> <input_path> <output_path>.
+  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+    -in "$2" -out "$3" -pass "pass:$1" >/dev/null
+}
+
+extract_frontmatter() {
+  awk '/^---$/{if(++c==2)exit}c' "$1"
+}
+
+generate_stub() {
+  local skill_name="$1" original_file="$2"
+  local fm
+  fm=$(extract_frontmatter "$original_file")
+  # Stub resolution order:
+  #   1. \`synaptory\` on PATH — installed standalone via the marketplace
+  #      install script (cli/install.sh on macOS/Linux, install.ps1 on
+  #      Windows). ADR-008: the CLI no longer ships bundled in the plugin.
+  #   2. A cached pointer at ~/.synaptory-next/.plugin-root or
+  #      ~/.synaptory/.plugin-root, written by SessionStart when the plugin
+  #      loads. Used when \`synaptory\` is on PATH but the skill stub needs
+  #      to call into the plugin's decrypt hook directly (e.g. mid-session
+  #      after the SessionStart handshake completed but before the user
+  #      restarts their terminal).
+  # We intentionally do NOT use \${CLAUDE_SKILL_DIR} or \${CLAUDE_PLUGIN_ROOT}
+  # in the stub body — Claude Code does not reliably expand those in \`!bash\`
+  # inline commands today (see anthropics/claude-code#9354, #48230).
+  cat <<STUB
+${fm}
+allowed-tools: Bash(bash -c *synaptory*)
+---
+
+# ${skill_name}
+
+!\`bash -c 'if command -v synaptory >/dev/null 2>&1; then synaptory skills get "${skill_name}" && exit 0; fi; for f in "\$HOME/.synaptory-next/.plugin-root" "\$HOME/.synaptory/.plugin-root"; do if [ -r "\$f" ]; then pr="\$(cat "\$f")"; if [ -x "\$pr/hooks/synaptory-decrypt-skill.sh" ]; then exec bash "\$pr/hooks/synaptory-decrypt-skill.sh" "${skill_name}"; fi; fi; done; echo "synaptory: CLI not on PATH and plugin root not cached. Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash" >&2; exit 1'\`
+STUB
+}
+
+bump_version() {
+  local bump_type="${1:-patch}" explicit=""
+  if echo "$bump_type" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    explicit="$bump_type"
+  fi
+
+  IFS='.' read -r V_MAJ V_MIN V_PAT <<< "$CURRENT_VERSION"
+
+  if [ -n "$explicit" ]; then
+    echo "$explicit"
+  elif [ "$bump_type" = "major" ]; then
+    echo "$((V_MAJ + 1)).0.0"
+  elif [ "$bump_type" = "minor" ]; then
+    echo "${V_MAJ}.$((V_MIN + 1)).0"
+  else
+    echo "${V_MAJ}.${V_MIN}.$((V_PAT + 1))"
+  fi
+}
+
+# Portable in-place sed: BSD `sed -i ''` and GNU `sed -i` are mutually
+# incompatible (BSD treats `''` as the backup suffix, GNU treats it as a
+# filename). Use the `.bak`-then-remove dance which works under both.
+_sed_inplace() {
+  sed -i.bak "$@"
+  # Remove every .bak alongside the file(s) sed touched. The file argument
+  # is always the last positional; pluck it back off the call site.
+  for arg in "$@"; do :; done
+  [[ -f "${arg}.bak" ]] && rm -f "${arg}.bak"
+}
+
+write_version() {
+  local ver="$1"
+  echo "$ver" > "$VERSION_FILE"
+  if [[ -d "${REPO_ROOT}/plugin-cursor" ]]; then
+    echo "$ver" > "${REPO_ROOT}/plugin-cursor/VERSION"
+  fi
+  if [[ -d "${REPO_ROOT}/plugin-codex" ]]; then
+    echo "$ver" > "${REPO_ROOT}/plugin-codex/VERSION"
+  fi
+  _stamp_plugin_json() {
+    local json_path="$1"
+    if [ -f "$json_path" ]; then
+      # Bump both "version" and "cli_min_version" when the field exists.
+      _sed_inplace "s/\"version\": \"[0-9]*\.[0-9]*\.[0-9]*\"/\"version\": \"$ver\"/" "$json_path"
+      if grep -q '"cli_min_version"' "$json_path" 2>/dev/null; then
+        _sed_inplace "s/\"cli_min_version\": \"[0-9]*\.[0-9]*\.[0-9]*\"/\"cli_min_version\": \"$ver\"/" "$json_path"
+      fi
+    fi
+  }
+  _stamp_plugin_json "$PLUGIN_JSON"
+  _stamp_plugin_json "$CURSOR_PLUGIN_JSON"
+  _stamp_plugin_json "$CODEX_PLUGIN_JSON"
+}
+
+# Re-compose the Cursor host plugin so generated files stay at /VERSION.
+# Authored overlay (hooks.json, MCP, Cursor SKILL.md) is never overwritten.
+_compose_cursor_plugin() {
+  echo "──── plugin-cursor compose ────"
+  local compose="${REPO_ROOT}/plugin-cursor/scripts/compose.sh"
+  if [[ ! -x "$compose" && -f "$compose" ]]; then
+    chmod +x "$compose"
+  fi
+  if [[ ! -f "$compose" ]]; then
+    echo "ERROR: $compose not found — cannot compose plugin-cursor." >&2
+    exit 1
+  fi
+  bash "$compose" || exit 1
+  _package_cursor_marketplace
+}
+
+# Copy plugin-cursor into the published marketplace tree and stub IP bodies
+# the same way Claude's dist stubs SKILL.md / agent.md (ADR-016). The private
+# working tree keeps full SKILL.md for seed + source-tree dev. Public
+# marketplace clones must never receive that copy.
+_package_cursor_marketplace() {
+  local marketplace_dir="${REPO_ROOT}/web/dist/marketplace"
+  local src="${REPO_ROOT}/plugin-cursor"
+  local dest="${marketplace_dir}/plugin-cursor"
+  local catalog_src="${REPO_ROOT}/.cursor-plugin/marketplace.json"
+  local catalog_dest="${marketplace_dir}/.cursor-plugin/marketplace.json"
+  echo "──── plugin-cursor marketplace package ────"
+  mkdir -p "$dest"
+  rsync -a --delete \
+    --exclude '__pycache__' --exclude '*.pyc' --exclude 'tests' \
+    --exclude '.pytest_cache' \
+    "$src/" "$dest/"
+  python3 "${src}/scripts/compose.py" --strip-ip --out "$dest" || exit 1
+  mkdir -p "$(dirname "$catalog_dest")"
+  cp -f "$catalog_src" "$catalog_dest"
+  echo "  Cursor plugin → ${dest} (IP-stripped)"
+  echo "  Cursor catalog → ${catalog_dest}"
+}
+
+# Validate and assemble the Codex host package into the same marketplace root.
+# The Codex catalog lives at .agents/plugins/ and resolves ./plugins/synaptory
+# from the marketplace root.
+_compose_codex_plugin() {
+  echo "──── plugin-codex compose ────"
+  local compose="${REPO_ROOT}/plugin-codex/scripts/compose.py"
+  local marketplace_dir="${REPO_ROOT}/web/dist/marketplace"
+  local output="${marketplace_dir}/plugins/synaptory"
+  local catalog_src="${REPO_ROOT}/plugin-codex/.agents/plugins/marketplace.json"
+  local catalog_dest="${marketplace_dir}/.agents/plugins/marketplace.json"
+  if [[ ! -f "$compose" ]]; then
+    echo "  skipped (plugin-codex not in this tree)"
+    return 0
+  fi
+  python3 "$compose" --out "$output" || exit 1
+  mkdir -p "$(dirname "$catalog_dest")"
+  cp -f "$catalog_src" "$catalog_dest"
+  echo "  Codex catalog → ${catalog_dest}"
+}
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+cmd_build() {
+  # Unified build: every invocation builds all runtime images and packages so
+  # a release
+  # never ships with one module stale. No sub-targets, no skip flags.
+  #
+  #   1. Bump /VERSION (patch unless --minor/--major/--version overrides).
+  #   2. Build Docker images for api, web, fixture-idp, backup, git-http — tagged
+  #      `synaptory-<svc>:v<VERSION>` (the same compose IMAGE_TAG used by
+  #      both local and prod stacks).
+  #   3. Cross-compile the CLI for 5 OS/arch pairs into cli/dist/.
+  #   4. Stage CLI binaries + sha256sums + install scripts + latest.json
+  #      into web/dist/cli/<VERSION>/  (no `v` prefix — the existing
+  #      install.sh + `synaptory update` clients fetch /cli/<version>/).
+  #   5. Package the plugin tree (stub generation, integrity manifest,
+  #      marketplace.json update) into web/dist/marketplace/<PLUGIN_NAME>/.
+  #   6. Re-compose plugin-cursor/ from plugin/ so the Cursor host stays at
+  #      the same /VERSION (GENERATED files; authored overlay is kept).
+  #   7. Validate and assemble plugin-codex into the shared marketplace root.
+  #
+  # Publish + deploy are NOT done here — see `./synaptory deploy {local|prod}`.
+
+  if [[ -z "${SYNAPTORY_CP_URL:-}" ]]; then
+    echo "ERROR: SYNAPTORY_CP_URL is required to build." >&2
+    echo "  export SYNAPTORY_CP_URL=https://your-control-plane-host" >&2
+    exit 1
+  fi
+  if [[ -z "${SYNAPTORY_CP_ENTRA_TENANT_ID:-}" || -z "${SYNAPTORY_CP_ENTRA_CLIENT_ID:-}" ]]; then
+    echo "ERROR: SYNAPTORY_CP_ENTRA_TENANT_ID and SYNAPTORY_CP_ENTRA_CLIENT_ID are required." >&2
+    echo "  Without these stamped into the CLI, staff login fails on first run." >&2
+    exit 1
+  fi
+
+  local bump_type="patch" explicit_ver=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minor) bump_type="minor"; shift ;;
+      --major) bump_type="major"; shift ;;
+      --version) explicit_ver="$2"; shift 2 ;;
+      *) echo "Unknown option: $1 (run: ./synaptory help)" >&2; exit 1 ;;
+    esac
+  done
+
+  local new_ver
+  if [ -n "$explicit_ver" ]; then
+    new_ver="$explicit_ver"
+  else
+    new_ver=$(bump_version "$bump_type")
+  fi
+  write_version "$new_ver"
+
+  echo "=========================================="
+  echo "  synaptory build — v${CURRENT_VERSION} → v${new_ver}"
+  echo "=========================================="
+  echo ""
+
+  # SYNAPTORY_BUILD_SKIP_HEAVY=1 skips docker + CLI builds. Used only by the
+  # plugin-tree unit tests (plugin/tests/build/) which exercise stub
+  # generation + integrity manifest contents and shouldn't pay the
+  # cost of full image builds or Go cross-compilation. Not a user-facing
+  # flag — runners that need a real build never set this.
+  if [[ "${SYNAPTORY_BUILD_SKIP_HEAVY:-}" != "1" ]]; then
+    _build_docker_images "$new_ver"   # 1/4 — runtime images :v<VERSION>
+    _build_cli_binaries "$new_ver"    # 2/4 — Go cross-compile 5 OS/arch
+    _stage_cli_to_dist  "$new_ver"    # 3/4 — web/dist/cli/<VERSION>/
+  fi
+  _build_plugin_tree "$new_ver"       # 4/6 — web/dist/marketplace/<plugin>/
+  _compose_cursor_plugin              # 5/6 — plugin-cursor/ from plugin/
+  _compose_codex_plugin               # 6/6 — marketplace/plugins/synaptory/
+}
+
+# _build_plugin_tree: packages the plugin into web/dist/marketplace/.
+# Called by cmd_build. Operates on the version passed in (does NOT bump).
+_build_plugin_tree() {
+  local new_ver="$1"
+  echo "──── plugin tree ────"
+
+  # ADR-008: the CLI does NOT ship bundled inside the plugin distribution.
+  # The plugin carries a stamped CP URL and its hooks; staff install the
+  # CLI once via the marketplace install script. The unified ./synaptory build
+  # produces both — they share /VERSION and ship together via deploy.
+
+  # Stamp control-plane URL into the plugin at build time.
+  # Staff cannot override this — the URL is an operator constant, not a variable.
+  local cp_url_file="${PLUGIN_ROOT}/hooks/lib/cp-url"
+  if [[ ! -f "$cp_url_file" ]]; then
+    echo "ERROR: ${cp_url_file} not found — cannot stamp control-plane URL." >&2
+    exit 1
+  fi
+  echo "${SYNAPTORY_CP_URL}" > "$cp_url_file"
+  echo "  Stamped control-plane URL → hooks/lib/cp-url"
+
+  # ── Prepare marketplace working directory (self-hosted, no GitHub) ──────
+  # `web/dist/marketplace/` is the canonical output: Caddy on the control
+  # plane bind-mounts it (or a copy of it on the prod host) and serves the
+  # contents directly at /marketplace/*. The directory persists between
+  # builds so prior plugin entries in marketplace.json are preserved.
+  local marketplace_dir="${REPO_ROOT}/web/dist/marketplace"
+  mkdir -p "${marketplace_dir}/.claude-plugin"
+
+  # Always restore the placeholder on exit so the source tree stays clean.
+  trap "echo 'SYNAPTORY_CP_URL_PLACEHOLDER' > '${cp_url_file}'" EXIT
+
+  # Ensure marketplace.json exists — initialise empty registry on first build.
+  if [[ ! -f "${marketplace_dir}/.claude-plugin/marketplace.json" ]]; then
+    cat > "${marketplace_dir}/.claude-plugin/marketplace.json" <<'INIT'
+{
+  "name": "h3tech-ai",
+  "owner": {
+    "name": "H3Tech Inc."
+  },
+  "plugins": []
+}
+INIT
+    echo "  Initialised empty marketplace.json"
+  fi
+  echo "  Output → ${marketplace_dir}"
+  echo ""
+
+  local OUTPUT_DIR="${marketplace_dir}/${PLUGIN_NAME}"
+
+  # Copy plugin source into marketplace
+  rm -rf "$OUTPUT_DIR"
+  # -L dereferences symlinks into plugin-core/ (agents, protocols) so the dist
+  # gets real files — the marketplace copy is standalone, no symlink leakage.
+  rsync -aL --exclude='__pycache__' --exclude='*.pyc' --exclude='assets/' "$PLUGIN_ROOT/" "$OUTPUT_DIR/"
+
+  echo "  Copied plugin/ → marketplace/${PLUGIN_NAME}/"
+
+  # Rewrite dist plugin.json "name" to match PLUGIN_NAME. The source tree
+  # keeps name="synaptory" so local dev (claude --plugin-dir ./plugin) is
+  # unaffected; only the marketplace-published copy is renamed. Without
+  # this, a synaptory-next build would advertise name="synaptory" and
+  # collide with the stable install at load time.
+  if [ "${PLUGIN_NAME}" != "synaptory" ] && [ -f "${OUTPUT_DIR}/.claude-plugin/plugin.json" ]; then
+    python3 -c "
+import json
+p = '${OUTPUT_DIR}/.claude-plugin/plugin.json'
+with open(p) as f:
+    data = json.load(f)
+data['name'] = '${PLUGIN_NAME}'
+with open(p, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+    echo "  Rewrote dist plugin.json name → ${PLUGIN_NAME}"
+  fi
+
+  # Stamp version + plugin name into dist README. PLUGIN_NAME varies by
+  # channel (synaptory vs synaptory-next), and the README's install snippets
+  # reference the plugin directory under ~/.claude/plugins — hard-coding
+  # "synaptory" would break the pilot channel.
+  if [ -f "${OUTPUT_DIR}/README.md" ]; then
+    _sed_inplace -e "s/{{VERSION}}/${new_ver}/g" -e "s/{{PLUGIN_NAME}}/${PLUGIN_NAME}/g" "${OUTPUT_DIR}/README.md"
+    echo "  Stamped README.md with v${new_ver} (${PLUGIN_NAME})"
+  fi
+
+  # ADR-008: the legacy auth/token Python modules
+  # (access_token_manager.py et al.) were deleted from the source tree
+  # along with the v2.1 access-token format. The CLI owns all auth and
+  # skill delivery now — there is nothing to scrub from the dist.
+
+  # Copy legal files from repo root into dist
+  cp "${REPO_ROOT}/LICENSE" "${OUTPUT_DIR}/LICENSE"
+  cp "${REPO_ROOT}/NOTICE" "${OUTPUT_DIR}/NOTICE"
+  echo "  Copied LICENSE + NOTICE"
+
+  # Build single-file HTML user guide. Pass the version explicitly so the
+  # hero stamps are consistent with the rest of the release (CLI, plugin,
+  # marketplace.json, container images all carry the same /VERSION). The
+  # builder also writes web/dist/docs/user-guide.html as a side effect —
+  # that's the file the prod-fs publish step copies to /mnt/pgdata/web-dist/docs/.
+  SYNAPTORY_VERSION="${new_ver}" python3 "$USER_GUIDE_BUILDER" \
+    --output "${OUTPUT_DIR}/GUIDE.html" \
+    --version "${new_ver}"
+  echo "  Built GUIDE.html (v${new_ver})"
+  echo ""
+
+  # ── Stub generation + IP-content removal ───────────────────────────────────
+  #
+  # Distribution model post-redesign (ADR-016): IP-sensitive bodies are NOT
+  # shipped in the marketplace tree. They live on the control plane,
+  # envelope-encrypted (ADR-003), and are delivered at runtime by
+  # `synaptory skills get <name>` with per-UPN watermarking.
+  #
+  # What we do here:
+  #   * Replace top-level skill SKILL.md and agent.md with stubs that call
+  #     the CLI. Claude Code's loader expands the !`bash …` backtick at
+  #     load time and embeds the watermarked body.
+  #   * Drop directories that are CP-served end-to-end: protocols/, rules/,
+  #     hooks/data/, _shared/protocols/, _shared/templates/.
+  #   * Keep agent SKILL.md + phases/modes/tech-packs PLAINTEXT for now —
+  #     these are loaded inside the agent prompt via Read or `!cat`, both
+  #     of which need the file on local disk. Rewriting those references
+  #     to use Bash/CLI is a follow-up slice; stripping them here would
+  #     break agent dispatch.
+  #   * Keep _shared/scripts/ plaintext .py (runtime helpers). The .pyc
+  #     bytecode obfuscation is dropped — separate hardening task.
+  local stubs=0
+  local dist_skills="${OUTPUT_DIR}/skills"
+
+  # Top-level skill stubs (orchestrator etc.). _shared has no SKILL.md.
+  for skill_dir in "$dist_skills"/*/; do
+    [ -d "$skill_dir" ] || continue
+    local sname=$(basename "$skill_dir")
+    [ "$sname" = "_shared" ] && continue
+
+    local smd="${skill_dir}SKILL.md"
+    [ -f "$smd" ] || continue
+
+    echo "  skill stub: $sname"
+    generate_stub "$sname" "$smd" > "${smd}.tmp"
+    mv "${smd}.tmp" "$smd"
+    stubs=$((stubs + 1))
+  done
+
+  # Agent stubs — agent.md is the Claude Code subagent entry point;
+  # stubbing it routes the subagent's body fetch through the CP. The
+  # seeder stores it at name "<agent>/agent" (api/synaptory_api/seed.py
+  # _skill_name_for: agents/<n>/agent.md → <n>/agent). We do NOT stub
+  # SKILL.md here because the agent's first action is "Read SKILL.md",
+  # and Read returns text without expanding `!` backticks — a SKILL.md
+  # stub would just embed the literal command string in the agent's
+  # context. Until agent.md is rewritten to call Bash instead of Read,
+  # SKILL.md must remain plaintext.
+  local dist_agents="${OUTPUT_DIR}/agents"
+  if [ -d "$dist_agents" ]; then
+    for agent_dir in "$dist_agents"/*/; do
+      [ -d "$agent_dir" ] || continue
+      local aname=$(basename "$agent_dir")
+      local amd="${agent_dir}agent.md"
+      [ -f "$amd" ] || continue
+      echo "  agent stub: $aname"
+      generate_stub "${aname}/agent" "$amd" > "${amd}.tmp"
+      mv "${amd}.tmp" "$amd"
+      stubs=$((stubs + 1))
+    done
+  fi
+
+  # Drop CP-served content directories from the dist tree entirely.
+  # Bodies are delivered at runtime via `synaptory skills get`; shipping
+  # them here would defeat the IP wall and create stale-content drift.
+  local dropped=0
+  for purge in \
+    "${OUTPUT_DIR}/rules" \
+    "${OUTPUT_DIR}/skills/_shared/protocols" \
+    "${OUTPUT_DIR}/skills/_shared/templates"; do
+    if [ -d "$purge" ]; then
+      rm -rf "$purge"
+      dropped=$((dropped + 1))
+    fi
+  done
+  # Compacted rules live under hooks/data/ — purge .md but keep the dir
+  # in case hooks/data/ ever gains non-IP runtime config files.
+  if [ -d "${OUTPUT_DIR}/hooks/data" ]; then
+    find "${OUTPUT_DIR}/hooks/data" -name "*.md" -type f -delete 2>/dev/null || true
+  fi
+
+  # _shared/design-assets is build-time documentation, not runtime.
+  if [ -d "${OUTPUT_DIR}/skills/_shared/design-assets" ]; then
+    rm -rf "${OUTPUT_DIR}/skills/_shared/design-assets"
+  fi
+
+  echo "  Generated ${stubs} stubs; dropped ${dropped} CP-served dirs"
+
+  # ── Phase 4.2: Generate integrity manifest ──────────────────────────────
+  echo ""
+  echo "  Generating integrity manifest..."
+  local manifest="${OUTPUT_DIR}/hooks/.integrity-manifest"
+  local manifest_count=0
+  : > "$manifest"
+  for hook_file in \
+    "${OUTPUT_DIR}/hooks/hooks.json" \
+    "${OUTPUT_DIR}/hooks/synaptory-decrypt-skill.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-inject-protocols.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-access-token-check.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-access-token-cleanup.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-load-rules.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-verify-receipt.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-session-start.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-reanchor.sh" \
+    "${OUTPUT_DIR}/hooks/session-guard.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-pipeline-snapshot.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-session-end.sh" \
+    "${OUTPUT_DIR}/hooks/synaptory-config-fetch.sh"; do
+    if [ -f "$hook_file" ]; then
+      shasum -a 256 "$hook_file" | sed "s|${OUTPUT_DIR}/||g" >> "$manifest"
+      manifest_count=$((manifest_count + 1))
+    fi
+  done
+  # AST01-F1 (post-ADR-016): manifest covers what the dist actually carries
+  # — stubs (SKILL.md, agent.md), plaintext agent bodies, plugin.json, and
+  # any plain .md still shipped under skills/. The encrypted .enc form is
+  # gone; runtime can compare on-disk bytes against this manifest to detect
+  # tamper of the bits we still ship.
+  while IFS= read -r -d '' f; do
+    shasum -a 256 "$f" | sed "s|${OUTPUT_DIR}/||g" >> "$manifest"
+    manifest_count=$((manifest_count + 1))
+  done < <(find "${OUTPUT_DIR}/skills" "${OUTPUT_DIR}/agents" \
+             -type f \( -name "*.md" -o -name "*.json" \) -print0 2>/dev/null)
+
+  # AST02-F1: compute aggregate build_hash (SHA-256 of the manifest itself)
+  # and write build-metadata.json so runtime can detect version drift.
+  local build_hash
+  build_hash=$(shasum -a 256 "$manifest" | cut -d' ' -f1)
+  local build_meta="${OUTPUT_DIR}/.claude-plugin/build-metadata.json"
+  local model_pins_src="${PLUGIN_ROOT}/skills/_shared/backends/model-pins.json"
+  mkdir -p "$(dirname "$build_meta")"
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+
+# HC0-F3: embed an AI-BOM (model-pins contents) into build metadata so the
+# distribution carries a verifiable record of exactly which models the plugin
+# dispatches to. (Per-model USD rates are no longer a pinned file — since #162
+# they are derived from this org's Anthropic billing at runtime; see
+# api/synaptory_api/anthropic_billing.py.)
+try:
+    with open('${model_pins_src}', 'r') as f:
+        model_pins = json.load(f)
+except FileNotFoundError:
+    model_pins = {'error': 'model-pins.json not found at build time'}
+ai_bom = {'model_pins': model_pins}
+
+meta = {
+    'version': '${new_ver}',
+    'build_hash': '${build_hash}',
+    'built_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'manifest_file_count': ${manifest_count},
+    'ai_bom': ai_bom,
+    'provenance': {
+        'builder_user': __import__('os').environ.get('USER', 'unknown'),
+        'builder_host': __import__('platform').node(),
+        'git_commit': __import__('subprocess').run(
+            ['git', 'rev-parse', 'HEAD'], capture_output=True, text=True,
+            cwd='${PLUGIN_ROOT}',
+        ).stdout.strip() or 'unknown',
+        'git_dirty': bool(__import__('subprocess').run(
+            ['git', 'status', '--porcelain'], capture_output=True, text=True,
+            cwd='${PLUGIN_ROOT}',
+        ).stdout.strip()),
+    },
+}
+with open('${build_meta}', 'w') as f:
+    json.dump(meta, f, indent=2)
+"
+  # The plaintext manifest stays at hooks/.integrity-manifest in the dist —
+  # runtime tamper-detection reads it to verify on-disk bytes. Pre-ADR-016
+  # this was encrypted and removed; now it ships as-is.
+  echo "  Integrity manifest: ${manifest_count} files checksummed"
+  echo "  Build hash: ${build_hash:0:16}…  (${build_meta})"
+
+  # ── Update marketplace metadata ─────────────────────────────────────────
+  echo ""
+  echo "  Updating marketplace metadata..."
+
+  # Update marketplace.json — upsert the ${PLUGIN_NAME} entry, preserve
+  # every other plugin (e.g. tracker, or the sibling synaptory/synaptory-next
+  # entry during the v2.5 pilot when both lines ship in parallel).
+  python3 -c "
+import json, sys
+
+mp_path = '${marketplace_dir}/.claude-plugin/marketplace.json'
+plugin_name = '${PLUGIN_NAME}'
+with open(mp_path, 'r') as f:
+    data = json.load(f)
+
+entry = {
+    'name': plugin_name,
+    # Claude Code's marketplace schema uses a string for relative paths
+    # within a marketplace repo (resolved from the marketplace root, i.e.
+    # the dir containing .claude-plugin/marketplace.json). The object form
+    # is reserved for external sources like {source:'github',repo:'…'}.
+    # See https://code.claude.com/docs/en/plugin-marketplaces.
+    'source': f'./{plugin_name}',
+    'version': '${new_ver}',
+    'author': {'name': 'H3Tech Inc.', 'url': 'https://h3t.co'},
+    'license': 'PROPRIETARY'
+}
+
+plugins = data.get('plugins', [])
+replaced = False
+for i, p in enumerate(plugins):
+    if p.get('name') == plugin_name:
+        plugins[i] = entry
+        replaced = True
+        break
+if not replaced:
+    plugins.append(entry)
+data['plugins'] = plugins
+
+with open(mp_path, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+
+  echo "  marketplace.json updated"
+
+  # Friendly top-level alias served at /marketplace/plugin.json so the URL
+  # surface matches the Caddy file_server layout (saves a deeper path).
+  cp -f "${marketplace_dir}/.claude-plugin/marketplace.json" "${marketplace_dir}/plugin.json"
+
+  echo "  plugin tree → ${marketplace_dir}/${PLUGIN_NAME}/  (v${new_ver}, ${stubs} stubs)"
+  echo ""
+  echo "=========================================="
+  echo "  Build complete — v${new_ver}"
+  echo "=========================================="
+  echo "  Images:  synaptory-{api,web,fixture-idp,backup,git-http}:v${new_ver}"
+  echo "  CLI:     ${REPO_ROOT}/web/dist/cli/${new_ver}/"
+  echo "  Plugin:  ${marketplace_dir}/${PLUGIN_NAME}/"
+  echo ""
+  echo "  Next:    ./synaptory deploy local      # bring up local stack"
+  echo "           ./synaptory deploy prod       # ship to production"
+  echo ""
+}
+
+# _publish_plugin_to_git: commits the built marketplace tree and pushes it
+# to a git remote. Used by cmd_deploy prod for both marketplace mirrors and by
+# publish-path tests (file:// fake remotes). Operates on
+# web/dist/marketplace/ (already populated by _build_plugin_tree).
+#
+# Args:
+#   $1 = git remote URL (https://, file://, …). MUST NOT be logged if it
+#        embeds a token.
+#   $2 = human-readable label for log output (never a credential URL)
+_publish_plugin_to_git() {
+  local remote_url="$1" label="$2"
+  local marketplace_dir="${REPO_ROOT}/web/dist/marketplace"
+  local worktree="${REPO_ROOT}/infra/git/marketplace-worktree"
+  local ver="$CURRENT_VERSION"
+
+  if [[ ! -d "${marketplace_dir}" ]]; then
+    echo "  ERROR: ${marketplace_dir} not found — run ./synaptory build first." >&2
+    exit 1
+  fi
+
+  # Always clone fresh so each mirror publishes on top of its own main,
+  # not a leftover worktree from the other marketplace transport.
+  export GIT_TERMINAL_PROMPT=0
+  # Origin URL must never embed a PAT. Callers that need GitHub auth set
+  # GIT_ASKPASS + SYNAPTORY_MARKETPLACE_TOKEN around this function.
+  local origin_url
+  origin_url="$(printf '%s' "${remote_url}" | sed -E 's#^(https?://)[^/@]+@#\1#')"
+  rm -rf "${worktree}"
+  mkdir -p "$(dirname "${worktree}")"
+  if git clone --quiet "${origin_url}" "${worktree}" 2>/dev/null; then
+    echo "  Cloned worktree from ${label}"
+  else
+    mkdir -p "${worktree}"
+    (cd "${worktree}" && git init -b main >/dev/null && git remote add origin "${origin_url}")
+    echo "  Bootstrapped empty worktree (${label} has no history yet)"
+  fi
+  (cd "${worktree}" && \
+    git checkout -B main >/dev/null 2>&1 || true
+    git remote set-url origin "${origin_url}"
+    git config --local credential.helper ""
+    git config --local user.email "synaptory@h3t.co" && \
+    git config --local user.name  "synaptory") || true
+
+  echo "  Publishing plugin → ${label}"
+  rsync -a --no-perms --omit-dir-times --delete --exclude='.git' \
+    "${marketplace_dir}/" "${worktree}/"
+
+  (
+    cd "${worktree}" || exit 1
+    git add -A || exit 1
+    if git diff --cached --quiet; then
+      echo "    No changes vs the previous publish — skipping commit."
+      exit 0
+    fi
+    if ! git commit -m "build v${ver} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null; then
+      echo "    ERROR: git commit failed in ${worktree}" >&2
+      exit 1
+    fi
+    if ! git push origin HEAD:refs/heads/main >/dev/null; then
+      echo "    ERROR: push to ${label} failed — nothing was published." >&2
+      if [[ "$label" == github.com/* ]]; then
+        echo "           Set RELEASE_BOT_PAT (or MARKETPLACE_GITHUB_TOKEN)" >&2
+        echo "           with contents:write on ${SYNAPTORY_MARKETPLACE_GITHUB_REPO:-h3tech-ai/marketplace}." >&2
+      else
+        echo "           Verify the legacy bare repo exists and is writable by the release user." >&2
+      fi
+      exit 1
+    fi
+    echo "    Published commit $(git rev-parse --short HEAD) → ${label}"
+  ) || exit 1
+}
+
+_marketplace_github_repo() {
+  echo "${SYNAPTORY_MARKETPLACE_GITHUB_REPO:-h3tech-ai/marketplace}"
+}
+
+_marketplace_origin_url() {
+  local repo
+  repo="$(_marketplace_github_repo)"
+  echo "https://github.com/${repo}.git"
+}
+
+_publish_plugin_to_github() {
+  local repo token
+  repo="$(_marketplace_github_repo)"
+  token="${MARKETPLACE_GITHUB_TOKEN:-${RELEASE_BOT_PAT:-}}"
+  if [[ -z "$token" ]]; then
+    echo "  ERROR: RELEASE_BOT_PAT or MARKETPLACE_GITHUB_TOKEN is required to push to github.com/${repo}." >&2
+    echo "         The PAT needs contents:write on that repository." >&2
+    exit 1
+  fi
+  # Subshell so EXIT cleanup cannot clobber the build's cp-url trap and
+  # cannot leave `askpass` unbound under `set -u` after this function returns.
+  (
+    askpass="$(mktemp "${TMPDIR:-/tmp}/synaptory-askpass.XXXXXX")"
+    chmod 700 "$askpass"
+    cat > "$askpass" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *[Uu]sername*) printf '%s\n' "x-access-token" ;;
+  *) printf '%s\n' "${SYNAPTORY_MARKETPLACE_TOKEN:-}" ;;
+esac
+EOF
+    cleanup() {
+      rm -f "$askpass"
+      unset SYNAPTORY_MARKETPLACE_TOKEN GIT_ASKPASS GIT_TERMINAL_PROMPT
+    }
+    trap cleanup EXIT
+    export SYNAPTORY_MARKETPLACE_TOKEN="$token"
+    export GIT_ASKPASS="$askpass"
+    export GIT_TERMINAL_PROMPT=0
+    _publish_plugin_to_git "$(_marketplace_origin_url)" "github.com/${repo}"
+  )
+}
+
+_legacy_marketplace_origin_url() {
+  echo "${SYNAPTORY_LEGACY_MARKETPLACE_ORIGIN:-file:///mnt/pgdata/git/marketplace.git}"
+}
+
+_publish_plugin_to_legacy() {
+  _publish_plugin_to_git \
+    "$(_legacy_marketplace_origin_url)" \
+    "legacy synaptory.h3t.co/marketplace.git"
+}
+
+# Back-compat alias used by older publish-path callers/tests (#232).
+_publish_plugin_to_bare() {
+  _publish_plugin_to_git "$@"
+}
+
+# NOTE — ADR-008: the v2.1 admin subcommands (access-token, validate,
+# info, reissue-all, gen-keypair, gen-seal-key, rotate-key, doctor) were
+# removed. They operated on the legacy bundled-plugin access-token
+# format (SYNAPTORY1.<payload>.<sig>) which v2.5 replaced with control-plane-
+# minted user-scoped sessions. The equivalent operator workflow is now:
+#
+#   - Provision staff:   admin UI → projects → add member
+#   - Verify a session:  synaptory whoami / synaptory status
+#   - Rotate signing key: rotate the CP signing key in Azure Key Vault
+#                         (api/synaptory_api/tokens.py KeyVaultSigner picks
+#                         it up; CLI fetches the new public key on its
+#                         next config refresh).
+
+cmd_version() {
+  if [ $# -eq 0 ]; then
+    echo "$CURRENT_VERSION"
+    return
+  fi
+
+  local new_ver
+  new_ver=$(bump_version "$1")
+  write_version "$new_ver"
+  echo "${CURRENT_VERSION} → ${new_ver}"
+}
+
+cmd_status() {
+  echo ""
+  echo "  synaptory — v${CURRENT_VERSION}"
+  echo "  ──────────────────────────────"
+  echo ""
+
+  # Source
+  local skill_count=$(find "$PLUGIN_ROOT/skills" -name "SKILL.md" -not -path "*/_shared/*" 2>/dev/null | wc -l | tr -d ' ')
+  local protocol_count=$(find "$PLUGIN_ROOT/skills/_shared/protocols" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+  local hook_count=$(find "$PLUGIN_ROOT/hooks" -name "*.sh" 2>/dev/null | wc -l | tr -d ' ')
+  echo "  Source (plugin/)"
+  echo "    Skills:    ${skill_count}"
+  echo "    Protocols: ${protocol_count}"
+  echo "    Hooks:     ${hook_count}"
+  echo ""
+
+  # Marketplace (public GitHub catalog)
+  echo "  Marketplace"
+  echo "    URL: https://github.com/$(_marketplace_github_repo)"
+  local mp_ver
+  mp_ver=$(curl -fsSL --max-time 5 "https://raw.githubusercontent.com/$(_marketplace_github_repo)/main/.claude-plugin/marketplace.json" 2>/dev/null \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data.get('plugins', []):
+    if p.get('name') == '${PLUGIN_NAME}':
+        print(p.get('version', ''))
+        break
+" 2>/dev/null)
+  if [ -n "$mp_ver" ]; then
+    echo "    Published: v${mp_ver} (${PLUGIN_NAME})"
+    if [ "$mp_ver" != "$CURRENT_VERSION" ]; then
+      echo "    WARNING:   marketplace is v${mp_ver}, source is v${CURRENT_VERSION} — rebuild needed"
+    fi
+  else
+    echo "    Published: (unable to fetch — check https://github.com/$(_marketplace_github_repo))"
+  fi
+  echo ""
+}
+
+cmd_test() {
+  # Test layers (Workstream C of the v2.5 test plan):
+  #   syntax  : bash -n / py_compile / JSON parse
+  #   pytest  : plugin/tests/ (Layer 1 unit + Layer 2 hook integration)
+  #
+  # Default runs both. Flags select a single layer:
+  #   --syntax  : legacy syntax-only mode
+  #   --pytest  : pytest-only (skip syntax)
+  local mode="all"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --syntax) mode="syntax"; shift ;;
+      --pytest) mode="pytest"; shift ;;
+      *) echo "Unknown ./synaptory test flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local failed=0
+
+  if [ "$mode" = "all" ] || [ "$mode" = "syntax" ]; then
+    echo "  Running syntax validations..."
+    echo ""
+  fi
+
+  if [ "$mode" = "pytest" ]; then
+    # Skip the syntax block entirely.
+    failed=0
+  fi
+
+  if [ "$mode" = "all" ] || [ "$mode" = "syntax" ]; then
+  # Python syntax
+  for py_file in \
+    plugin/hooks/lib/state_machine.py \
+    plugin/hooks/lib/scrum_state_machine.py \
+    plugin/hooks/lib/kanban_state_machine.py \
+    plugin/hooks/lib/story_pipeline.py \
+    plugin/hooks/lib/receipt_validator.py \
+    plugin/hooks/lib/verification_runner.py \
+    plugin/hooks/lib/mode_reader.py \
+    plugin/hooks/lib/update_claude_md.py \
+    plugin/skills/_shared/scripts/backend/backend_config.py \
+    plugin/skills/_shared/scripts/backend/prompt_translator.py \
+    plugin/skills/_shared/scripts/tracker/tracker_cli.py \
+    plugin/scripts/build_user_guide.py \
+    plugin-cursor/hooks/lib/cursor_hook.py \
+    plugin-cursor/mcp/server.py \
+    plugin-cursor/scripts/compose.py \
+    plugin-codex/plugins/synaptory/hooks/codex_hook.py \
+    plugin-codex/plugins/synaptory/scripts/mcp_server.py \
+    plugin-codex/scripts/compose.py; do
+    if [ -f "$py_file" ]; then
+      if python3 -c "import py_compile; py_compile.compile('$py_file', doraise=True)" 2>/dev/null; then
+        echo "  OK  $py_file"
+      else
+        echo "  FAIL  $py_file"
+        failed=$((failed + 1))
+      fi
+    fi
+  done
+
+  # JSON syntax
+  for json_file in plugin/hooks/hooks.json plugin/.claude-plugin/plugin.json \
+                   plugin-cursor/hooks/hooks.json \
+                   plugin-cursor/.cursor-plugin/plugin.json \
+                   plugin-cursor/mcp.json \
+                   .cursor-plugin/marketplace.json \
+                   plugin-codex/plugins/synaptory/hooks/hooks.json \
+                   plugin-codex/plugins/synaptory/.codex-plugin/plugin.json \
+                   plugin-codex/plugins/synaptory/.mcp.json \
+                   plugin-codex/plugins/synaptory/assets/model-pins-codex.json \
+                   plugin-codex/.agents/plugins/marketplace.json; do
+    if [ -f "$json_file" ]; then
+      if python3 -c "import json; json.load(open('$json_file'))" 2>/dev/null; then
+        echo "  OK  $json_file"
+      else
+        echo "  FAIL  $json_file"
+        failed=$((failed + 1))
+      fi
+    fi
+  done
+
+  # Shell syntax
+  for sh_file in plugin/hooks/*.sh plugin-cursor/hooks/*.sh plugin-cursor/scripts/*.sh \
+                 plugin-codex/plugins/synaptory/hooks/*.sh; do
+    if [ -f "$sh_file" ]; then
+      if bash -n "$sh_file" 2>/dev/null; then
+        echo "  OK  $sh_file"
+      else
+        echo "  FAIL  $sh_file"
+        failed=$((failed + 1))
+      fi
+    fi
+  done
+
+  fi  # end syntax block
+
+  if [ "$mode" = "all" ] || [ "$mode" = "pytest" ]; then
+    # Layer 1 (unit) + Layer 2 (hook integration). The full e2e suite
+    # ([Layer 3](e2e/scenarios/)) runs separately via ./synaptory e2e.
+    echo ""
+    echo "  Running pytest (plugin/tests/ + plugin-cursor/tests/)..."
+    echo ""
+    local pytest_dirs=(plugin/tests plugin-cursor/tests)
+    if [[ -d plugin-codex/tests ]]; then
+      pytest_dirs+=(plugin-codex/tests)
+    fi
+    if python3 -m pytest "${pytest_dirs[@]}" -q --no-header 2>&1; then
+      :
+    else
+      failed=$((failed + 1))
+    fi
+  fi
+
+  echo ""
+  if [ "$failed" -eq 0 ]; then
+    echo "  All checks passed."
+  else
+    echo "  ${failed} check(s) failed."
+    exit 1
+  fi
+}
+
+# ── v2.5 stub commands (phases V1.0 / V1.1) ───────────────────────────────────
+# These subcommands are reserved for the v2.5 control-plane + CLI work. They
+# print a "not yet implemented" notice today so operators get a helpful error
+# instead of "Unknown command". Each stub is replaced with a real implementation
+# during its corresponding phase — see docs/synaptory-v2.5-implementation-plan.md.
+
+_not_implemented() {
+  local subcmd="$1" phase="$2"
+  echo "  [v2.5] \`./synaptory ${subcmd}\` is not yet implemented." >&2
+  echo "  Scheduled for phase ${phase} — see docs/synaptory-v2.5-implementation-plan.md." >&2
+  exit 2
+}
+
+_build_docker_images() {
+  local ver="$1"
+  echo "──── docker images (v${ver}) ────"
+  # `set -e` is on (set -euo pipefail at top), so any docker build failure
+  # aborts the whole ./synaptory build. Serial builds keep peak RAM under the
+  # Docker Desktop VM cap (parallel builds OOMed during `apt-get install
+  # build-essential`).
+  local images=(
+    "api:infra/docker/Dockerfile.api:api"
+    "web:web/Dockerfile:web"
+    "fixture-idp:infra/docker/Dockerfile.fixture-idp:api"
+    "backup:infra/docker/Dockerfile.backup:infra/docker"
+    "git-http:infra/docker/Dockerfile.git-http:infra/docker"
+  )
+  for spec in "${images[@]}"; do
+    IFS=':' read -r svc dockerfile ctx <<< "$spec"
+    local tag="synaptory-${svc}:v${ver}"
+    echo "  building ${tag}  (-f ${dockerfile})"
+    (cd "${REPO_ROOT}" && DOCKER_BUILDKIT=1 docker build \
+      -f "${dockerfile}" \
+      -t "${tag}" \
+      --build-arg VERSION="${ver}" \
+      "${ctx}") >/dev/null
+  done
+  echo "  ✓ images: ${#images[@]} tagged :v${ver}"
+  echo ""
+}
+
+_build_cli_binaries() {
+  local ver="$1"
+  echo "──── CLI binaries (v${ver}) ────"
+  local cli_dir="${REPO_ROOT}/cli"
+  # Channel: SYNAPTORY_CHANNEL override (e2e harness) wins; otherwise infer from
+  # PLUGIN_NAME suffix ("synaptory" → stable, "synaptory-next" → "next").
+  local channel=""
+  if [[ -n "${SYNAPTORY_CHANNEL:-}" ]]; then
+    channel="${SYNAPTORY_CHANNEL}"
+  elif [[ "${PLUGIN_NAME}" != "synaptory" ]]; then
+    channel="${PLUGIN_NAME#synaptory-}"
+  fi
+  (cd "$cli_dir" && \
+    VERSION="${ver}" \
+    SYNAPTORY_CP_URL="${SYNAPTORY_CP_URL}" \
+    SYNAPTORY_CHANNEL="${channel}" \
+    SYNAPTORY_CP_ENTRA_TENANT_ID="${SYNAPTORY_CP_ENTRA_TENANT_ID}" \
+    SYNAPTORY_CP_ENTRA_CLIENT_ID="${SYNAPTORY_CP_ENTRA_CLIENT_ID}" \
+    ./scripts/build-all.sh)
+  echo "  ✓ CLI binaries in ${cli_dir}/dist/  (channel=${channel:-stable})"
+  echo ""
+}
+
+_stage_cli_to_dist() {
+  local ver="$1"
+  # Layout MUST be /cli/<ver>/binary (no `v` prefix). Both cli/scripts/
+  # install.sh (line ~65) and cli/internal/cli/update.go (line ~119) fetch
+  # `${BASE}/${version}/${asset}` — any older CLI in the field uses this
+  # contract. Don't add a `v` prefix here without coordinating a CLI
+  # release that knows the new path.
+  echo "──── stage CLI → web/dist/cli/${ver}/ ────"
+  local cli_dir="${REPO_ROOT}/cli"
+  local web_cli_dir="${REPO_ROOT}/web/dist/cli"
+  local out_dir="${web_cli_dir}/${ver}"
+  mkdir -p "$out_dir"
+  cp -f "$cli_dir"/dist/synaptory-* "$out_dir/"
+  (cd "$out_dir" && shasum -a 256 synaptory-* | sed 's| \*\?| |' > sha256sums.txt)
+  # C1 (#98): sign the checksum manifest with the CP Ed25519 key so the
+  # in-field CLI can verify it against /v1/public-key — defends against a
+  # compromised mirror serving a matching binary+sums pair (both would come
+  # from the same host under TLS-only).
+  #
+  # #200: this used to be `if python3 sign-artifact.py … >/dev/null 2>&1`,
+  # which threw away the reason signing failed. Releases 1.0.17 and 1.0.18
+  # both silently shipped without a .sig because of it. The helper now owns
+  # method selection (local key, else the running api container, which is the
+  # only one that works on the prod runner), checks the signing key against
+  # the CP's published one, and reports why it failed. Exit 1 means "required
+  # and unavailable" and MUST abort the build; exit 2 is the best-effort skip
+  # a dev laptop takes.
+  local sign_rc=0
+  bash "${REPO_ROOT}/infra/scripts/sign-release-checksums.sh" \
+    "${out_dir}/sha256sums.txt" || sign_rc=$?
+  if [[ "$sign_rc" -eq 1 ]]; then
+    echo "  ✗ aborting: checksum signing is required and did not succeed." >&2
+    exit 1
+  fi
+  cp -f "${REPO_ROOT}/cli/scripts/install.sh"  "${web_cli_dir}/install.sh"
+  cp -f "${REPO_ROOT}/cli/scripts/install.ps1" "${web_cli_dir}/install.ps1"
+  chmod +x "${web_cli_dir}/install.sh"
+  # Enriched manifest (ADR-018 §C.5): `version` is the contract every older
+  # CLI/install script reads; the extra fields drive the version-notify
+  # banner (`synaptory version --check`). cli_min_version mirrors plugin.json
+  # (bumped together). `critical` flags a security/forced update — set
+  # SYNAPTORY_RELEASE_CRITICAL=true on the release to escalate the nag.
+  local cli_min released_at notes_url critical
+  cli_min=$(sed -n 's/.*"cli_min_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "${REPO_ROOT}/plugin/.claude-plugin/plugin.json" 2>/dev/null | head -n1)
+  cli_min="${cli_min:-$ver}"
+  released_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  notes_url="https://github.com/h3tech-ai/synaptory/releases/tag/v${ver}"
+  case "$(printf '%s' "${SYNAPTORY_RELEASE_CRITICAL:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) critical=true ;;
+    *)             critical=false ;;
+  esac
+  # Checksum-signing cutover (#98): once every published mirror signs
+  # sha256sums.txt, set SYNAPTORY_RELEASE_REQUIRE_SIG=true so latest.json
+  # advertises signature_required — CLIs then refuse unsigned/unverifiable
+  # checksums (fail closed). Default false during rollout so unsigned mirrors
+  # keep working. This flag can only STRENGTHEN enforcement client-side.
+  local sig_required
+  case "$(printf '%s' "${SYNAPTORY_RELEASE_REQUIRE_SIG:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) sig_required=true ;;
+    *)             sig_required=false ;;
+  esac
+  printf '{"version":"%s","cli_min_version":"%s","released_at":"%s","notes_url":"%s","critical":%s,"signature_required":%s}\n' \
+    "$ver" "$cli_min" "$released_at" "$notes_url" "$critical" "$sig_required" > "${web_cli_dir}/latest.json"
+  echo "  ✓ ${web_cli_dir}/  (latest.json → v${ver}, cli_min ${cli_min}, critical ${critical}, sig_required ${sig_required})"
+  echo ""
+}
+
+# cmd_deploy — build + deploy. Two targets:
+#
+#   ./synaptory deploy local
+#       1. Run `cmd_build` (ensures every module is fresh).
+#       2. Install the CLI binary for this host's OS/arch into ~/.local/bin.
+#       3. docker compose -f docker-compose.local.yml up -d (uses IMAGE_TAG
+#          from .env, which we rewrite to v<VERSION> first).
+#       4. Wait for healthchecks and print verification URLs.
+#       Plugin install for local testing uses web/dist/marketplace/ (path
+#       transport) or the public GitHub repo after a prod publish.
+#
+#   ./synaptory deploy prod
+#       0. Reclaim disk (docker build cache + unused images >72h) before the
+#          build so a near-full root can't abort it mid-way (issue #119).
+#          Skip with SYNAPTORY_DEPLOY_NO_PRUNE=1.
+#       1. Run `cmd_build`.
+#       2. Push images to GHCR (requires GHCR_OWNER + docker login).
+#       3. Publish plugin tree to github.com/h3tech-ai/marketplace.
+#       4. Publish CLI artifacts to /mnt/pgdata/web-dist/cli/ (filesystem).
+#       5. Roll docker-compose.yml forward with IMAGE_TAG=v<VERSION>.
+#       6. Healthcheck gate + rollback on failure (delegates to deploy.sh).
+#
+# Both targets always run a full ./synaptory build first — there is no
+# "deploy without build". This is the property that prevents a release
+# from shipping with one module stale.
+cmd_deploy() {
+  local target="${1:-}"
+  shift 2>/dev/null || true
+  case "$target" in
+    local) _deploy_local "$@" ;;
+    prod)  _deploy_prod  "$@" ;;
+    "")    echo "Usage: ./synaptory deploy {local|prod}" >&2; exit 1 ;;
+    *)     echo "Unknown deploy target: $target  (expected: local|prod)" >&2; exit 1 ;;
+  esac
+}
+
+_deploy_local() {
+  # Always rebuild every module first so a deploy can never ship a stale
+  # artifact. cmd_build bumps /VERSION (patch) by default; pass --version
+  # X.Y.Z (or --minor / --major) before the verb to override.
+  cmd_build "$@"
+
+  local ver
+  ver=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+  local infra_dir="${REPO_ROOT}/infra"
+  local compose_file="${infra_dir}/compose/docker-compose.local.yml"
+  local env_file="${infra_dir}/compose/.env"
+
+  echo "──── deploy local (v${ver}) ────"
+
+  if [[ ! -f "$env_file" ]]; then
+    echo "  copying .env.example → .env"
+    cp "${infra_dir}/compose/.env.example" "$env_file"
+  fi
+  mkdir -p "${infra_dir}/dev-keys" "${infra_dir}/backups"
+
+  # Stamp IMAGE_TAG=v<VERSION> into .env so compose pulls the freshly-built
+  # images. Idempotent — if the line already matches, no rewrite.
+  _stamp_image_tag "$env_file" "v${ver}"
+
+  # Plugin transport is GitHub (h3tech-ai/marketplace), published on
+  # `./synaptory deploy prod`. Local testing uses the dist tree on disk:
+  #   /plugin marketplace add ./web/dist/marketplace
+
+  # Bring the stack up. Compose pulls the just-built images by tag.
+  echo "  starting compose stack"
+  (cd "${REPO_ROOT}/api" && docker_compose -f "$compose_file" --env-file "$env_file" up -d)
+
+  # Wait for at least api+web to be healthy (Caddy depends on web, web on api).
+  echo "  waiting for healthchecks..."
+  local waited=0
+  while [ "$waited" -lt 120 ]; do
+    local api_status web_status
+    api_status=$(docker_compose -f "$compose_file" --env-file "$env_file" ps api --format json 2>/dev/null)
+    web_status=$(docker_compose -f "$compose_file" --env-file "$env_file" ps web --format json 2>/dev/null)
+    if echo "$api_status" | grep -q '"Health":"healthy"' \
+       && echo "$web_status" | grep -q '"Health":"healthy"'; then
+      break
+    fi
+    sleep 3; waited=$((waited+3))
+  done
+  if [ "$waited" -ge 120 ]; then
+    echo "ERROR: local api/web services did not become healthy within 120 seconds" >&2
+    docker_compose -f "$compose_file" --env-file "$env_file" ps >&2 || true
+    return 1
+  fi
+
+  # Install the CLI to ~/.local/bin for this host's OS/arch. Skip if a
+  # binary of the same version is already there (re-deploys don't churn).
+  _install_cli_local "$ver"
+
+  local caddy_port
+  caddy_port=$(grep -E '^CADDY_HTTP_PORT=' "$env_file" | tail -1 | cut -d= -f2 | tr -d ' "')
+  caddy_port="${caddy_port:-8080}"
+  echo ""
+  echo "=========================================="
+  echo "  Local deploy complete — v${ver}"
+  echo "=========================================="
+  echo "  Web:         http://localhost:${caddy_port}/"
+  echo "  API health:  http://localhost:${caddy_port}/healthz"
+  echo "  Marketplace: https://github.com/$(_marketplace_github_repo) (prod publish)"
+  echo "  Dist tree:   ${REPO_ROOT}/web/dist/marketplace"
+  echo "  CLI:         $(command -v synaptory 2>/dev/null || echo '~/.local/bin/synaptory (ensure ~/.local/bin is on PATH)')"
+  echo ""
+  echo "  Install plugin in Claude Code (local path transport):"
+  echo "    /plugin marketplace add ${REPO_ROOT}/web/dist/marketplace"
+  echo "    /plugin install ${PLUGIN_NAME}@h3tech-ai"
+  echo ""
+  echo "  After a prod release, staff install from GitHub:"
+  echo "    /plugin marketplace add https://github.com/$(_marketplace_github_repo).git"
+  echo ""
+}
+
+_deploy_prod() {
+  # Reclaim disk BEFORE the build (issues #119, #183). The prod VM's root disk
+  # is small and Docker's data-root lives on it; every release builds 5 images
+  # (4 production images plus the local-only fixture IdP) +
+  # CLI cross-compile, so build cache + old layers + buildx state creep toward
+  # full and a release can abort mid-build (1.0.8 died after the api image with
+  # 365 MB free; 1.0.16 died at 100% / 332 KB free).
+  #
+  # #183: the dominant accumulator turned out NOT to be image/build cache but
+  # orphaned `buildx_buildkit_builder-*_state` *volumes* — 8.36 GB (99% of
+  # reclaimable) on the 1.0.16 cut. `docker builder/image prune` never touch
+  # those, so we also drop inactive buildx builders and remove any lingering
+  # buildx state volumes by name. The volume reclaim is name-scoped to
+  # `buildx_buildkit*` so it can NEVER remove a data volume (postgres / grafana
+  # / backup); volumes still attached to a running builder simply error out of
+  # `volume rm` and are skipped. Everything here is best-effort and never fails
+  # the deploy — rollback re-pulls images from GHCR, so pruned local layers are
+  # fine. Skipped when SYNAPTORY_DEPLOY_NO_PRUNE=1. Local dev goes through
+  # _deploy_local, so this only runs on the prod path.
+  if [[ "${SYNAPTORY_DEPLOY_NO_PRUNE:-}" != "1" ]] && command -v docker >/dev/null 2>&1; then
+    echo "──── pre-build disk reclaim (issues #119, #183) ────"
+    docker buildx prune -af >/dev/null 2>&1 || true
+    docker buildx rm --all-inactive -f >/dev/null 2>&1 || true
+    docker volume ls -q --filter name=buildx_buildkit 2>/dev/null \
+      | xargs -r docker volume rm >/dev/null 2>&1 || true
+    docker image prune -af --filter "until=72h" >/dev/null 2>&1 || true
+    df -h / 2>/dev/null | awk 'NR==2{printf "  root fs: %s used, %s free (%s)\n",$3,$4,$5}' || true
+  fi
+
+  cmd_build "$@"
+
+  local ver
+  ver=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+  local infra_dir="${REPO_ROOT}/infra"
+  local compose_file="${infra_dir}/compose/docker-compose.yml"
+  local env_file="${infra_dir}/compose/.env"
+
+  echo "──── deploy prod (v${ver}) ────"
+
+  : "${GHCR_OWNER:?GHCR_OWNER is required for prod deploy (e.g. h3tech-ai)}"
+
+  # 1. Tag + push images to GHCR. Requires `docker login ghcr.io` already done.
+  local services=(api web backup git-http)
+  for svc in "${services[@]}"; do
+    local local_tag="synaptory-${svc}:v${ver}"
+    local remote_tag="ghcr.io/${GHCR_OWNER}/synaptory-${svc}:v${ver}"
+    docker tag "$local_tag" "$remote_tag"
+    echo "  pushing ${remote_tag}"
+    docker push "$remote_tag" >/dev/null
+  done
+  echo "  ✓ images pushed"
+
+  # 2. Publish the same IP-stripped plugin tree to both marketplace transports.
+  # GitHub is primary for new installs. The legacy mirror remains mandatory so
+  # existing Claude Code users update normally without changing marketplace.
+  # Publish GitHub first: if the compatibility mirror then fails, the release
+  # stops before CLI/API rollout and existing users remain on the prior version.
+  _publish_plugin_to_github
+  _publish_plugin_to_legacy
+
+  # 3. Publish CLI artifacts to /mnt/pgdata/web-dist/cli/ only after both
+  # marketplace pushes succeeded.
+  echo "  publishing CLI → /mnt/pgdata/web-dist/cli/"
+  cp -av "${REPO_ROOT}/web/dist/cli/." /mnt/pgdata/web-dist/cli/ >/dev/null
+
+  # 4. Publish single-page user guide.
+  local guide_src="${REPO_ROOT}/web/dist/docs/user-guide.html"
+  if [ -f "$guide_src" ]; then
+    mkdir -p /mnt/pgdata/web-dist/docs/
+    cp -f "$guide_src" /mnt/pgdata/web-dist/docs/user-guide.html
+  fi
+
+  # 5. Roll compose forward via infra/scripts/deploy.sh.
+  #
+  # On the prod VM, the canonical checkout is /opt/synaptory (cloud-init
+  # creates it). Start with the deploy.sh from the release workspace so a
+  # checkout stranded on an older/broken deploy script can still bootstrap.
+  # The script fetches main into /opt/synaptory and then re-execs the freshly
+  # checked-out copy before changing compose state. REPO_DIR ensures all
+  # persistent env/compose paths still resolve under /opt/synaptory.
+  #
+  # SYNAPTORY_DEPLOY_PROD_REPO_DIR lets a non-standard prod VM layout override
+  # the default. Most operators leave it unset.
+  local prod_repo_dir="${SYNAPTORY_DEPLOY_PROD_REPO_DIR:-/opt/synaptory}"
+  local deploy_sh="${REPO_ROOT}/infra/scripts/deploy.sh"
+  if [ -x "$deploy_sh" ] || [ -f "$deploy_sh" ]; then
+    REPO_DIR="${prod_repo_dir}" IMAGE_TAG="v${ver}" \
+      HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-180}" \
+      bash "$deploy_sh"
+  else
+    echo "  skipped compose roll: ${deploy_sh} not present (not on the prod VM)"
+    echo "  hint: ensure /opt/synaptory is a checkout of this repo, or"
+    echo "        set SYNAPTORY_DEPLOY_PROD_REPO_DIR to override the path."
+  fi
+
+  echo ""
+  echo "=========================================="
+  echo "  Prod deploy complete — v${ver}"
+  echo "=========================================="
+  echo "  Marketplace: https://github.com/$(_marketplace_github_repo)"
+  echo "  CLI:         ${WEB_BASE_URL}/cli/install.sh"
+  echo ""
+}
+
+# Stamp IMAGE_TAG=<tag> into an .env file in place. Idempotent.
+_stamp_image_tag() {
+  local env_file="$1" tag="$2"
+  if grep -qE '^IMAGE_TAG=' "$env_file"; then
+    if ! grep -qE "^IMAGE_TAG=${tag}\$" "$env_file"; then
+      _sed_inplace -E "s|^IMAGE_TAG=.*$|IMAGE_TAG=${tag}|" "$env_file"
+      echo "  stamped IMAGE_TAG=${tag} in $(basename "$env_file")"
+    fi
+  else
+    echo "IMAGE_TAG=${tag}" >> "$env_file"
+    echo "  appended IMAGE_TAG=${tag} to $(basename "$env_file")"
+  fi
+}
+
+# Install the freshly-built CLI binary for this host into ~/.local/bin.
+# Skip if the same version is already installed there.
+_install_cli_local() {
+  local ver="$1"
+  local os arch suffix=""
+  case "$(uname -s)" in
+    Darwin) os="darwin" ;;
+    Linux)  os="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) os="windows"; suffix=".exe" ;;
+    *) echo "  WARN: unsupported OS $(uname -s) — skip CLI install"; return 0 ;;
+  esac
+  case "$(uname -m)" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64)  arch="amd64" ;;
+    *) echo "  WARN: unsupported arch $(uname -m) — skip CLI install"; return 0 ;;
+  esac
+  local src="${REPO_ROOT}/web/dist/cli/${ver}/synaptory-${os}-${arch}${suffix}"
+  if [ ! -f "$src" ]; then
+    echo "  WARN: ${src} not found — skip CLI install"
+    return 0
+  fi
+  local dest="${HOME}/.local/bin/synaptory${suffix}"
+  mkdir -p "${HOME}/.local/bin"
+  install -m 755 "$src" "$dest"
+  echo "  ✓ installed CLI → ${dest}  (v${ver})"
+}
+
+cmd_dev() {
+  case "${1:-}" in
+    cli)
+      shift
+      (cd "${REPO_ROOT}/cli" && go run ./cmd/synaptory "$@")
+      ;;
+    plugin)
+      shift
+      echo "  Launching: claude --plugin-dir ${PLUGIN_ROOT} $*"
+      exec claude --plugin-dir "${PLUGIN_ROOT}" "$@"
+      ;;
+    *) echo "Usage: $0 dev {cli|plugin} [args…]" >&2; exit 1 ;;
+  esac
+}
+
+cmd_cli() {
+  # CLI dev helpers. The `build` subcommand is gone — `./synaptory build` builds
+  # the CLI as part of the unified build.
+  local cli_dir="${REPO_ROOT}/cli"
+  case "${1:-}" in
+    test)
+      (cd "$cli_dir" && go test ./... "${@:2}")
+      ;;
+    smoke)
+      "${cli_dir}/scripts/cli-smoke.sh"
+      ;;
+    run)
+      shift
+      (cd "$cli_dir" && go run ./cmd/synaptory "$@")
+      ;;
+    build)
+      echo "ERROR: 'crew cli build' is removed. Use './synaptory build' (builds the CLI as part of the unified build)." >&2
+      exit 1
+      ;;
+    *) echo "Usage: $0 cli {test|smoke|run [args...]}" >&2; exit 1 ;;
+  esac
+}
+
+cmd_api() {
+  # Lifecycle verbs against the running compose stack.
+  # `up` is intentionally absent — use `./synaptory deploy local` (or `deploy prod`)
+  # to (re)build everything and bring the stack up in one step.
+  local cp_dir="${REPO_ROOT}/api"
+  local infra_dir="${REPO_ROOT}/infra"
+  local compose_file="${infra_dir}/compose/docker-compose.local.yml"
+  local compose_args=(-f "$compose_file" --env-file "${infra_dir}/compose/.env")
+
+  case "${1:-}" in
+    down)
+      shift
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" down "$@")
+      ;;
+    logs)
+      shift
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" logs -f "$@")
+      ;;
+    ps)
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" ps)
+      ;;
+    migrate)
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" run --rm --entrypoint "" api \
+        alembic upgrade head)
+      ;;
+    backup)
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" run --rm backup \
+        /usr/local/bin/backup.sh --run-once)
+      ;;
+    smoke)
+      local caddy_port="8080"
+      if [[ -f "${infra_dir}/compose/.env" ]]; then
+        caddy_port=$(grep -E '^CADDY_HTTP_PORT=' "${infra_dir}/compose/.env" | tail -1 | cut -d= -f2 | tr -d ' "')
+        caddy_port="${caddy_port:-8080}"
+      fi
+      CP_URL="http://localhost:${caddy_port}" "${infra_dir}/smoke/run-all.sh"
+      ;;
+    test)
+      (cd "$cp_dir" && python3 -m pytest tests -q)
+      ;;
+    projects)
+      shift
+      cmd_api_projects "$cp_dir" "$compose_file" "$@"
+      ;;
+    up)
+      echo "ERROR: 'crew api up' is removed. Use './synaptory deploy local' (or 'deploy prod')." >&2
+      exit 1
+      ;;
+    *) echo "Usage: $0 api {down|logs [service]|ps|migrate|backup|smoke|test|projects ...}" >&2; exit 1 ;;
+  esac
+}
+
+# V1.5.E: operator-side project admin verbs. Shells out to the FastAPI admin
+# CLI inside the api container (which runs with DB creds already wired up).
+cmd_api_projects() {
+  local cp_dir="$1"; shift
+  local compose_file="$1"; shift
+  local infra_dir="${REPO_ROOT}/infra"
+  local compose_args=(-f "$compose_file" --env-file "${infra_dir}/compose/.env")
+  local sub="${1:-}"; shift 2>/dev/null || true
+  case "$sub" in
+    create)
+      local slug="${1:-}"; local name="${2:-$slug}"; local admin="${3:-}"
+      if [[ -z "$slug" || -z "$admin" ]]; then
+        echo "Usage: $0 api projects create <slug> <name> <initial-admin-upn> [--baa] [--policy-profile <id>]" >&2
+        exit 1
+      fi
+      shift 3 2>/dev/null || true
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" exec -T api \
+        python -m synaptory_api.admin.projects create --slug "$slug" --name "$name" \
+          --initial-admin "$admin" "$@")
+      ;;
+    add-member)
+      local slug="${1:-}"; local upn="${2:-}"; local role="${3:-member}"
+      if [[ -z "$slug" || -z "$upn" ]]; then
+        echo "Usage: $0 api projects add-member <slug> <upn> [role]" >&2; exit 1
+      fi
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" exec -T api \
+        python -m synaptory_api.admin.projects add-member --slug "$slug" --upn "$upn" --role "$role")
+      ;;
+    revoke)
+      local slug="${1:-}"; local upn="${2:-}"
+      if [[ -z "$slug" || -z "$upn" ]]; then
+        echo "Usage: $0 api projects revoke <slug> <upn>" >&2; exit 1
+      fi
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" exec -T api \
+        python -m synaptory_api.admin.projects revoke --slug "$slug" --upn "$upn")
+      ;;
+    list)
+      (cd "$cp_dir" && docker_compose "${compose_args[@]}" exec -T api \
+        python -m synaptory_api.admin.projects list)
+      ;;
+    *) echo "Usage: $0 api projects {create|list|add-member|revoke}" >&2; exit 1 ;;
+  esac
+}
+
+cmd_release() {
+  echo "ERROR: 'crew release' is removed. The unified flow is:" >&2
+  echo "  ./synaptory build              # build every module at the new /VERSION" >&2
+  echo "  ./synaptory deploy local       # bring up local stack" >&2
+  echo "  ./synaptory deploy prod        # ship to production (requires GHCR creds + prod-VM context)" >&2
+  exit 1
+}
+
+cmd_e2e() {
+  # Cross-module end-to-end harness. See docs/BRD.md §11 + e2e/README.md.
+  #
+  # Brings up the local control-plane stack, runs e2e/run-e2e.sh against it,
+  # then unconditionally tears the stack down (via trap) so a failed test
+  # never leaves a stack running. Pass --keep-stack to skip teardown.
+  local keep_stack=false
+  local scenario=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-stack) keep_stack=true; shift ;;
+      --scenario) scenario="$2"; shift 2 ;;
+      --help|-h)
+        cat <<'USAGE'
+Usage: ./synaptory e2e [--keep-stack] [--scenario test_NN_name.py]
+
+Drives the cross-module end-to-end harness against a fresh local stack.
+See docs/BRD.md §11 for the full scenario catalogue and FR coverage map.
+USAGE
+        return 0
+        ;;
+      *) echo "Unknown flag: $1" >&2; return 1 ;;
+    esac
+  done
+
+  # E2E exercises the real exchange + refresh endpoints without contacting
+  # Entra. The local compose file includes a fixture IdP, but normal local
+  # development may still point at a real tenant through compose/.env. Export
+  # explicit test-only overrides so Docker Compose configures the API and IdP
+  # with one matching issuer, audience, and group vocabulary.
+  export SYNAPTORY_CP_ENTRA_ISSUER="http://fixture-idp:9000"
+  export SYNAPTORY_CP_ENTRA_JWKS_URL="http://fixture-idp:9000/.well-known/jwks.json"
+  export SYNAPTORY_CP_ENTRA_USERS_GROUP="synaptory-users"
+  export SYNAPTORY_CP_ENTRA_ADMINS_GROUP="synaptory-admins"
+  export FIXTURE_URL="http://localhost:9000"
+
+  local infra_dir="${REPO_ROOT}/infra"
+  local compose_file="${infra_dir}/compose/docker-compose.local.yml"
+  local compose_args=(-f "$compose_file" --env-file "${infra_dir}/compose/.env")
+
+  _e2e_teardown() {
+    # `keep_stack` is `local`-scoped to cmd_e2e; the EXIT trap may fire
+    # after the function returns (or before the variable is set, if the
+    # arg parser bails first under `set -u`). Default-substitute so the
+    # trap is robust to either timing.
+    if [[ "${keep_stack:-false}" == "true" ]]; then
+      echo "[e2e] --keep-stack set; leaving stack up. Use './synaptory api down -v' when done."
+      return 0
+    fi
+    echo "[e2e] tearing down local stack"
+    (cd "${REPO_ROOT}/api" && docker_compose "${compose_args[@]}" down -v) || true
+  }
+  trap _e2e_teardown EXIT INT TERM
+
+  echo "[e2e] bringing up local stack"
+  # Keep this as a simple command. Wrapping a Bash function in `||` disables
+  # errexit throughout that function, which previously let failed Docker
+  # builds continue and report a false successful build.
+  cmd_deploy local
+
+  echo "[e2e] running scenarios"
+  if [[ -n "$scenario" ]]; then
+    E2E_SCENARIO="$scenario" "${REPO_ROOT}/e2e/run-e2e.sh"
+  else
+    "${REPO_ROOT}/e2e/run-e2e.sh"
+  fi
+}
+
+cmd_help() {
+  cat <<'HELP'
+
+  synaptory admin CLI
+
+  Usage: ./synaptory <command> [arguments]
+
+  Required env vars (read from .env or .envrc at the repo root):
+    SYNAPTORY_CP_URL=https://...        Control-plane URL stamped into the plugin
+                                   and CLI binary at build time.
+    SYNAPTORY_CP_ENTRA_TENANT_ID=...    Entra tenant for OAuth login.
+    SYNAPTORY_CP_ENTRA_CLIENT_ID=...    Entra application (client) ID.
+
+  Optional env vars:
+    SYNAPTORY_WEB_BASE_URL=https://...  Self-hosted base URL (default synaptory.h3t.co).
+    GHCR_OWNER=h3tech-ai           GitHub org for image registry (deploy prod).
+
+  Commands:
+    build [--minor|--major|--version X.Y.Z]
+                                 Build EVERY module at the new /VERSION:
+                                   1. Docker images: api, web, fixture-idp (local only), backup, git-http
+                                      (tagged synaptory-<svc>:v<VERSION>)
+                                   2. CLI binaries (5 OS/arch into cli/dist/)
+                                   3. CLI staged into web/dist/cli/<VERSION>/
+                                   4. Plugin tree into web/dist/marketplace/
+
+    deploy local                 Build, then bring up the local docker-compose
+                                 stack and install the CLI to ~/.local/bin.
+                                 Plugin install uses ./web/dist/marketplace
+                                 (GitHub publish happens on deploy prod).
+
+    deploy prod                  Build, then push images to GHCR, publish the
+                                 plugin tree to github.com/h3tech-ai/marketplace,
+                                 ship CLI artifacts to /mnt/pgdata/web-dist/cli/,
+                                 and roll the prod compose stack forward with
+                                 healthcheck gate + rollback. Run on the prod VM
+                                 (self-hosted runner).
+
+    version [bump_type]          Show or bump /VERSION without building.
+    status                       Source vs live-marketplace version state.
+    test                         Plugin syntax + pytest (Layer 1 + Layer 2).
+    dev plugin                   Launch `claude --plugin-dir plugin`.
+    dev cli                      Run CLI against a local control-plane.
+    cli {test|smoke|run}         CLI dev helpers (go test, e2e, go run).
+    api {down|logs|ps|migrate|backup|smoke|test|projects ...}
+                                 Lifecycle ops on the running compose stack
+                                 (use `deploy local` to start it).
+    e2e [--keep-stack] [--scenario test_NN_name.py]
+                                 Cross-module end-to-end harness against a
+                                 fresh local stack.
+    help                         Show this help message.
+
+  Examples:
+    ./synaptory build                         # patch bump, build all 4 modules
+    ./synaptory build --minor                 # minor bump
+    ./synaptory build --version 3.0.0         # explicit version
+    ./synaptory deploy local                  # build + start local stack
+    ./synaptory deploy prod                   # build + ship to production
+
+HELP
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────────
+
+COMMAND="${1:-help}"
+shift 2>/dev/null || true
+
+case "$COMMAND" in
+  build)        cmd_build "$@" ;;
+  deploy)       cmd_deploy "$@" ;;
+  version)      cmd_version "$@" ;;
+  status)       cmd_status "$@" ;;
+  test)         cmd_test "$@" ;;
+  dev)          cmd_dev "$@" ;;
+  cli)          cmd_cli "$@" ;;
+  api)          cmd_api "$@" ;;
+  release)      cmd_release "$@" ;;
+  e2e)          cmd_e2e "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *) echo "Unknown command: $COMMAND (run: ./synaptory help)" >&2; exit 1 ;;
+esac

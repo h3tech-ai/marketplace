@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Schema backward-compatibility checker.
+
+Compares the current sprint's schema files against HEAD~1 and flags breaking changes.
+Covers: Prisma schema, JSON Schema files, GraphQL schema.
+
+Usage:
+  python3 schema_compat_check.py [--sprint N] [--base-ref HEAD~1]
+
+Exit codes:
+  0 — no breaking changes
+  1 — breaking changes detected (BLOCK)
+  2 — warnings only (WARN)
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def git_show(ref: str, path: str) -> str | None:
+    """Return file content at the given git ref, or None if it didn't exist."""
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{path}"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def find_files(patterns: list[str]) -> list[str]:
+    """Return relative paths for files matching any of the glob patterns."""
+    found = []
+    for pattern in patterns:
+        result = subprocess.run(
+            ["git", "ls-files", "--", pattern],
+            capture_output=True, text=True
+        )
+        found.extend(result.stdout.splitlines())
+    return list(set(found))
+
+
+# ── Prisma ──────────────────────────────────────────────────────────────────
+
+def parse_prisma_fields(content: str) -> dict[str, dict[str, str]]:
+    """Parse Prisma schema into {ModelName: {fieldName: type_str}}."""
+    models: dict[str, dict[str, str]] = {}
+    current_model = None
+    for line in content.splitlines():
+        line = line.strip()
+        m = re.match(r'^model\s+(\w+)\s*\{', line)
+        if m:
+            current_model = m.group(1)
+            models[current_model] = {}
+            continue
+        if line == '}':
+            current_model = None
+            continue
+        if current_model and line and not line.startswith('//') and not line.startswith('@'):
+            parts = line.split()
+            if len(parts) >= 2:
+                field_name = parts[0]
+                field_type = parts[1]
+                models[current_model][field_name] = field_type
+    return models
+
+
+def check_prisma(base_ref: str) -> tuple[list[str], list[str]]:
+    """Return (breaking_changes, warnings) for Prisma schema."""
+    breaking = []
+    warnings = []
+    prisma_files = find_files(["prisma/schema.prisma", "*/prisma/schema.prisma"])
+    for path in prisma_files:
+        old_content = git_show(base_ref, path)
+        if old_content is None:
+            continue  # New file — nothing to compare
+        with open(path) as f:
+            new_content = f.read()
+
+        old_models = parse_prisma_fields(old_content)
+        new_models = parse_prisma_fields(new_content)
+
+        for model, old_fields in old_models.items():
+            if model not in new_models:
+                breaking.append(f"BREAKING [{path}] Model '{model}' removed")
+                continue
+            new_fields = new_models[model]
+            for field, old_type in old_fields.items():
+                if field not in new_fields:
+                    breaking.append(f"BREAKING [{path}] {model}.{field} removed (type was {old_type})")
+                elif new_fields[field] != old_type:
+                    # Type changed — breaking only if removing optionality (? removed) or changing base type
+                    old_optional = old_type.endswith('?')
+                    new_optional = new_fields[field].endswith('?')
+                    old_base = old_type.rstrip('?[]')
+                    new_base = new_fields[field].rstrip('?[]')
+                    if old_base != new_base:
+                        breaking.append(
+                            f"BREAKING [{path}] {model}.{field} type changed {old_type} → {new_fields[field]}"
+                        )
+                    elif old_optional and not new_optional:
+                        breaking.append(
+                            f"BREAKING [{path}] {model}.{field} made required (was optional)"
+                        )
+            # New required fields (no ?)
+            for field, new_type in new_fields.items():
+                if field not in old_fields and not new_type.endswith('?') and '[]' not in new_type:
+                    breaking.append(
+                        f"BREAKING [{path}] {model}.{field} added as required (no default — existing rows will fail)"
+                    )
+    return breaking, warnings
+
+
+# ── JSON Schema ──────────────────────────────────────────────────────────────
+
+def check_json_schema(base_ref: str) -> tuple[list[str], list[str]]:
+    """Return (breaking_changes, warnings) for JSON Schema files."""
+    breaking = []
+    warnings = []
+    schema_files = find_files(["**/*.schema.json", "schemas/*.json"])
+    for path in schema_files:
+        old_content = git_show(base_ref, path)
+        if old_content is None:
+            continue
+        try:
+            with open(path) as f:
+                new_schema = json.load(f)
+            old_schema = json.loads(old_content)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        old_props = set(old_schema.get("properties", {}).keys())
+        new_props = set(new_schema.get("properties", {}).keys())
+        old_required = set(old_schema.get("required", []))
+        new_required = set(new_schema.get("required", []))
+
+        removed = old_props - new_props
+        for prop in removed:
+            breaking.append(f"BREAKING [{path}] property '{prop}' removed")
+
+        newly_required = (new_required - old_required) & old_props
+        for prop in newly_required:
+            breaking.append(f"BREAKING [{path}] property '{prop}' made required (existing consumers missing it will fail)")
+
+        new_required_additions = new_required - old_required - old_props
+        for prop in new_required_additions:
+            breaking.append(f"BREAKING [{path}] new required property '{prop}' added (old consumers won't send it)")
+
+        # Type changes on existing properties
+        old_p = old_schema.get("properties", {})
+        new_p = new_schema.get("properties", {})
+        for prop in old_props & new_props:
+            old_type = old_p.get(prop, {}).get("type")
+            new_type = new_p.get(prop, {}).get("type")
+            if old_type and new_type and old_type != new_type:
+                breaking.append(f"BREAKING [{path}] property '{prop}' type changed {old_type} → {new_type}")
+
+    return breaking, warnings
+
+
+# ── GraphQL ──────────────────────────────────────────────────────────────────
+
+def parse_graphql_fields(content: str) -> dict[str, set[str]]:
+    """Parse GraphQL SDL into {TypeName: {field_name}}."""
+    types: dict[str, set[str]] = {}
+    current_type = None
+    for line in content.splitlines():
+        line = line.strip()
+        m = re.match(r'^(?:type|interface)\s+(\w+)', line)
+        if m:
+            current_type = m.group(1)
+            types[current_type] = set()
+            continue
+        if line == '}':
+            current_type = None
+            continue
+        if current_type and line and not line.startswith('#'):
+            field_m = re.match(r'^(\w+)\s*[\(:!]', line)
+            if field_m:
+                types[current_type].add(field_m.group(1))
+    return types
+
+
+def check_graphql(base_ref: str) -> tuple[list[str], list[str]]:
+    """Return (breaking_changes, warnings) for GraphQL schema files."""
+    breaking = []
+    warnings = []
+    gql_files = find_files(["**/*.graphql", "schema.graphql", "**/schema.gql"])
+    for path in gql_files:
+        old_content = git_show(base_ref, path)
+        if old_content is None:
+            continue
+        try:
+            with open(path) as f:
+                new_content = f.read()
+        except OSError:
+            continue
+
+        old_types = parse_graphql_fields(old_content)
+        new_types = parse_graphql_fields(new_content)
+
+        for type_name, old_fields in old_types.items():
+            if type_name not in new_types:
+                breaking.append(f"BREAKING [{path}] type '{type_name}' removed")
+                continue
+            new_fields = new_types[type_name]
+            for field in old_fields - new_fields:
+                breaking.append(f"BREAKING [{path}] {type_name}.{field} removed")
+
+    return breaking, warnings
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Schema backward-compatibility checker")
+    parser.add_argument("--sprint", type=int, default=0, help="Current sprint number")
+    parser.add_argument("--base-ref", default="HEAD~1", help="Git ref to compare against")
+    args = parser.parse_args()
+
+    all_breaking: list[str] = []
+    all_warnings: list[str] = []
+
+    for checker in [check_prisma, check_json_schema, check_graphql]:
+        b, w = checker(args.base_ref)
+        all_breaking.extend(b)
+        all_warnings.extend(w)
+
+    for msg in all_warnings:
+        print(f"WARN  {msg}")
+    for msg in all_breaking:
+        print(f"BREAKING  {msg}")
+
+    if not all_breaking and not all_warnings:
+        print("Schema compat OK — no breaking changes detected")
+
+    if all_breaking:
+        return 1
+    if all_warnings:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

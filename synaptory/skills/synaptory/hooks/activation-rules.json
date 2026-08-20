@@ -1,0 +1,355 @@
+{
+  "description": "Skill activation rules for UserPromptSubmit hook. Pattern-match user prompts to recommend synaptory skill activation.",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "skill": "synaptory",
+      "keywords": [
+        "production grade",
+        "production ready",
+        "build a saas",
+        "build me a",
+        "build a platform",
+        "build a service",
+        "full stack project",
+        "end to end",
+        "from scratch",
+        "production pipeline"
+      ],
+      "intent_patterns": [
+        "build.*(?:saas|platform|service|app|system|product)",
+        "(?:production|prod).*(?:grade|ready|quality)",
+        "(?:full|complete).*(?:stack|pipeline|system)",
+        "(?:from scratch|greenfield|new project).*(?:build|create|develop)",
+        "(?:plan|build|verify|deploy|operate).*pipeline"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a synaptory project. Use /synaptory to run adaptive delivery (Inception > Sprint ceremonies > Release)."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": [
+        "understand this codebase",
+        "reverse engineer",
+        "map dependencies",
+        "what does this code do",
+        "legacy system",
+        "legacy code",
+        "analyze this codebase",
+        "map the system",
+        "brownfield",
+        "characterization tests",
+        "coverage baseline"
+      ],
+      "intent_patterns": [
+        "(?:understand|map|analyze|reverse).*(?:codebase|system|architecture|dependencies)",
+        "(?:legacy|brownfield|existing).*(?:code|system|project|codebase)",
+        "(?:characterize|baseline|coverage).*(?:test|code|system)",
+        "what does (?:this|the) (?:code|system|codebase) (?:do|look like)"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a legacy/brownfield codebase. Use /synaptory to reverse-engineer its architecture, business rules, dependencies, and risks before making changes."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["modernize", "migration plan", "strangler fig", "modernization", "stabilize", "safety net"],
+      "intent_patterns": [
+        "(?:modernize|migrate|upgrade|refactor).*(?:architecture|codebase|system|code)",
+        "(?:stabilize|safety net|before refactoring).*(?:code|system|codebase)"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory to modernize or stabilize this codebase. Requires context packages from /synaptory."
+    },
+    {
+      "skill": "project-owner",
+      "keywords": ["brd", "business requirements", "user stories", "product spec", "feature request"],
+      "intent_patterns": [
+        "(?:write|create|draft).*(?:brd|requirements|spec)",
+        "(?:define|describe).*(?:product|feature|requirement)"
+      ],
+      "priority": "medium"
+    },
+    {
+      "skill": "solution-architect",
+      "keywords": ["architecture", "system design", "tech stack", "api design", "erd"],
+      "intent_patterns": [
+        "(?:design|architect).*(?:system|api|service)",
+        "(?:choose|select).*(?:tech stack|framework|database)"
+      ],
+      "priority": "medium"
+    },
+    {
+      "skill": "software-engineer",
+      "keywords": ["implement", "build backend", "write services", "code the api", "frontend", "ui", "dashboard", "react", "next.js", "web app", "code review", "review code", "arch conformance", "ml", "llm optimization", "a/b test", "data pipeline", "prompt engineering", "agent framework", "mcp", "a2a", "observability"],
+      "intent_patterns": [
+        "(?:implement|build|write|code).*(?:service|backend|api|handler)",
+        "(?:build|create|implement).*(?:frontend|ui|dashboard|web app)",
+        "(?:review|check|audit).*(?:code|architecture|conformance)",
+        "(?:optimize|tune|analyze).*(?:llm|ml|model|prompt|token|agent)"
+      ],
+      "priority": "medium"
+    },
+    {
+      "skill": "quality-engineer",
+      "keywords": ["test", "testing", "qa", "coverage", "e2e"],
+      "intent_patterns": [
+        "(?:write|run|create).*(?:test|spec|e2e|integration)"
+      ],
+      "priority": "medium"
+    },
+    {
+      "skill": "compliance-engineer",
+      "keywords": ["security audit", "owasp", "threat model", "vulnerability", "hipaa", "phi", "compliance", "regulatory"],
+      "intent_patterns": [
+        "(?:audit|review|check).*(?:security|vulnerability|owasp|compliance|regulatory)"
+      ],
+      "priority": "medium"
+    },
+    {
+      "skill": "platform-engineer",
+      "keywords": ["devops", "ci/cd", "terraform", "opentofu", "tofu", "pulumi", "iac", "docker", "kubernetes", "k8s", "deploy", "infrastructure", "monitoring", "sre", "slo", "reliability", "runbook", "chaos", "capacity"],
+      "intent_patterns": [
+        "(?:setup|configure|create).*(?:ci|cd|pipeline|docker|terraform|opentofu|tofu|pulumi|k8s)",
+        "(?:production|readiness|operational).*(?:review|check|readiness)"
+      ],
+      "priority": "medium"
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["debug", "fix bug", "not working", "broken", "error", "crash", "failing", "investigate", "root cause", "diagnose"],
+      "intent_patterns": [
+        "(?:debug|fix|investigate|diagnose).*(?:bug|error|crash|issue|problem|failure)",
+        "(?:not working|broken|failing|crashed|throws?).*(?:error|exception)?",
+        "(?:root cause|why does|why is).*(?:failing|broken|error|crash)"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a debugging task. Use /synaptory to run structured root-cause analysis with diagnosis, fix, and regression testing."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["finish branch", "merge branch", "create pr", "create pull request", "done with branch", "ship branch", "ready to merge", "clean up branch"],
+      "intent_patterns": [
+        "(?:finish|done|ship|merge|close).*(?:branch|pr|pull request)",
+        "(?:create|open|push).*(?:pr|pull request)",
+        "(?:ready|prepared).*(?:merge|ship|deploy)"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like you want to finish a development branch. Use /synaptory to verify, merge or create a PR, and clean up."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": [
+        "build sprint",
+        "next sprint",
+        "continue sprint",
+        "resume sprint",
+        "run sprint",
+        "start sprint",
+        "sprint 1", "sprint 2", "sprint 3", "sprint 4",
+        "sprint 5", "sprint 6", "sprint 7", "sprint 8"
+      ],
+      "intent_patterns": [
+        "(?:build|run|execute|start|continue|resume)\\s+sprint\\s*\\d*",
+        "(?:next|current)\\s+sprint",
+        "sprint\\s+\\d+\\s*(?:build|start|run)?"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a sprint-scoped build. Use /synaptory to build and verify a specific sprint's stories."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["retro", "retrospective", "what did we ship", "team metrics", "weekly summary", "sprint review", "shipping velocity", "code health"],
+      "intent_patterns": [
+        "(?:retro|retrospective|weekly).*(?:summary|review|metrics)",
+        "(?:what|how).*(?:did we|are we).*(?:ship|doing|build)",
+        "(?:team|shipping|code).*(?:metrics|velocity|health|activity)"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a retrospective request. Use /synaptory to analyze git history, team metrics, and pipeline activity."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["preview", "run it", "start server", "launch", "dev server", "see it running", "localhost"],
+      "intent_patterns": [
+        "(?:preview|launch|start|run).*(?:app|server|dev|project|site)",
+        "(?:see|show|open).*(?:running|browser|localhost)",
+        "(?:dev|development).*(?:server|mode)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory to auto-detect your framework and launch the dev server."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["initialize", "configure project", "set up synaptory", "generate config", "reconfigure", "crew-init"],
+      "intent_patterns": [
+        "(?:initialize|configure|set up|setup).*(?:project|hiro|crew|config)",
+        "(?:generate|create).*(?:config|synaptory\\.yaml)"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory to initialize your project configuration."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["status", "progress", "dashboard", "pipeline state", "where are we", "check progress", "crew-status"],
+      "intent_patterns": [
+        "(?:show|check|view|what).*(?:status|progress|dashboard|state|pipeline)",
+        "where (?:are we|am i).*(?:pipeline|build|sprint)?"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory to show pipeline status and progress."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["report bug", "report issue", "synaptory bug", "plugin issue", "plugin bug", "file a bug", "something wrong with synaptory"],
+      "intent_patterns": [
+        "(?:report|file|submit|log).*(?:bug|issue|problem).*(?:hiro|crew|plugin)?",
+        "(?:hiro|crew|plugin).*(?:bug|broken|issue|problem)",
+        "something.*(?:wrong|broken).*(?:pipeline|plugin|hiro|crew)"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory to report an issue — it will gather context and file a GitHub issue automatically."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["add feature", "new endpoint", "integrate service", "new page", "implement feature", "add functionality"],
+      "intent_patterns": [
+        "(?:add|implement|create|build).*(?:feature|endpoint|page|integration|functionality)",
+        "(?:new|additional).*(?:feature|endpoint|page|route|module)"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a feature addition. Use /synaptory to scope, design, implement, and test the feature with the right agents."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["audit code", "harden", "before launch", "security review", "production ready check", "security audit"],
+      "intent_patterns": [
+        "(?:audit|harden|secure).*(?:code|app|before launch|before prod)",
+        "(?:is|make).*(?:this|it).*(?:secure|safe|production.?ready)",
+        "(?:before|prior to).*(?:launch|production|release|deploy)"
+      ],
+      "priority": "high",
+      "recommendation": "This looks like a pre-launch hardening task. Use /synaptory Verify mode to run parallel security, QA, and code review."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["deploy", "CI/CD setup", "containerize", "terraform setup", "docker setup", "infrastructure setup"],
+      "intent_patterns": [
+        "(?:deploy|containerize|set up|setup).*(?:CI|CD|docker|terraform|infra|kubernetes|k8s)",
+        "(?:get|make).*(?:deployed|running|live|containerized)"
+      ],
+      "priority": "medium",
+      "recommendation": "This looks like a deployment task. Use /synaptory Deploy mode to set up Docker, CI/CD, and infrastructure."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["write tests", "add tests", "test coverage", "test this code", "generate tests"],
+      "intent_patterns": [
+        "(?:write|add|generate|create).*tests?",
+        "(?:increase|improve|add).*(?:coverage|test coverage)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory Test mode to have the Quality Engineer write and run tests for your code."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["review my code", "code review", "code quality", "check my code", "look at my code"],
+      "intent_patterns": [
+        "(?:review|check|look at).*(?:my\\s+)?code",
+        "(?:code|architecture).*(?:review|quality|conformance)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory Review mode for a structured code quality review."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["design the architecture", "API design", "data model", "tech stack choice", "system architecture", "how should I structure"],
+      "intent_patterns": [
+        "(?:design|plan|architect).*(?:architecture|API|data model|tech stack|system)",
+        "(?:how should I|what's the best way to).*(?:structure|design|architect|build)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory Architect mode to design the system with ADRs, API contracts, and a tech stack recommendation."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["document this", "write docs", "API docs", "README", "developer guide", "write documentation"],
+      "intent_patterns": [
+        "(?:write|generate|create).*(?:docs?|documentation|README|API reference|dev guide)",
+        "(?:document|document).*(?:this|the|my).*(?:code|API|system|service)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory Document mode to generate API docs, developer guides, and architecture overviews."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["help me think", "not sure what to build", "explain trade-offs", "brainstorm", "thinking partner", "explore options"],
+      "intent_patterns": [
+        "(?:help me think|not sure|what should I|I'm unsure).*(?:build|do|choose|decide|approach)",
+        "(?:explore|brainstorm|discuss).*(?:options|approaches|trade.?offs|ideas)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory Explore mode for a thinking-partner conversation about your project."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": ["slow", "performance issue", "optimize performance", "scale this", "reliability issue", "bottleneck"],
+      "intent_patterns": [
+        "(?:slow|optimize|performance|scale|reliability).*(?:code|app|service|system|database|query)",
+        "(?:bottleneck|latency|throughput|memory leak|N\\+1|n plus 1)"
+      ],
+      "priority": "medium",
+      "recommendation": "Use /synaptory Optimize mode for performance analysis and reliability recommendations."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": [
+        "daily standup", "daily scrum", "standup update", "standup",
+        "what did we ship today", "what did we do today", "sync update"
+      ],
+      "intent_patterns": [
+        "(?:daily|today's?)\\s+(?:standup|scrum|sync|update)",
+        "what\\s+(?:did|have)\\s+we\\s+(?:ship|build|done|finish)\\s+(?:today|this sprint)?",
+        "(?:morning|team)\\s+(?:sync|standup|scrum)"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory status to see the Daily Scrum dashboard — per-story status board, impediments log, and open PR CI gate status."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": [
+        "backlog grooming", "groom the backlog", "refine backlog",
+        "backlog refinement", "refine the backlog", "refine stories",
+        "story refinement", "groom stories"
+      ],
+      "intent_patterns": [
+        "(?:backlog|stories?)\\s+(?:grooming|refinement|groom|refine)",
+        "(?:groom|refine)\\s+(?:the\\s+)?(?:backlog|stories?)",
+        "(?:which|what)\\s+stories?\\s+(?:are|should be)\\s+(?:ready|refined|groomed)"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory story buddy (sprint-plan role) to apply DoR criteria, flag NOT READY stories, and recommend sprint scope."
+    },
+    {
+      "skill": "synaptory",
+      "keywords": [
+        "sprint review", "sprint demo", "demo the sprint",
+        "show what we built", "demo this sprint", "sprint showcase"
+      ],
+      "intent_patterns": [
+        "(?:sprint|demo)\\s+(?:review|demo|showcase|presentation)",
+        "(?:demo|showcase|show|present)\\s+(?:the|this|our)\\s+(?:sprint|work|features?)",
+        "what\\s+(?:did|have)\\s+we\\s+(?:ship|built|completed)\\s+(?:this|last)\\s+sprint"
+      ],
+      "priority": "high",
+      "recommendation": "Use /synaptory Retro mode to generate sprint metrics and retrospective insights for your sprint review or demo."
+    }
+  ],
+  "hook_config": {
+    "event": "UserPromptSubmit",
+    "matching_strategy": "keyword_then_intent",
+    "max_recommendations_per_prompt": 2,
+    "session_tracking": true,
+    "session_tracking_file": ".synaptory/.orchestrator/activation-log.json",
+    "deduplicate_window_minutes": 30
+  }
+}

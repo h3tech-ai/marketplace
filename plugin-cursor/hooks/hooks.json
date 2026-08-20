@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "bash ./hooks/cursor-run.sh session-start",
+        "type": "command",
+        "timeout": 25
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "bash ./hooks/cursor-run.sh session-end",
+        "type": "command",
+        "timeout": 10
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "bash ./hooks/cursor-run.sh before-submit",
+        "type": "command",
+        "matcher": "UserPromptSubmit",
+        "failClosed": true,
+        "timeout": 8
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "bash ./hooks/cursor-run.sh subagent-start",
+        "type": "command",
+        "failClosed": true,
+        "timeout": 20
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "bash ./hooks/cursor-run.sh subagent-stop",
+        "type": "command",
+        "timeout": 20,
+        "loop_limit": 20
+      }
+    ],
+    "stop": [
+      {
+        "command": "bash ./hooks/cursor-run.sh stop",
+        "type": "command",
+        "timeout": 8,
+        "loop_limit": 50
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "bash ./hooks/cursor-run.sh boundary",
+        "type": "command",
+        "matcher": "Write|Delete|Edit|Task|StrReplace",
+        "failClosed": true,
+        "timeout": 5
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "bash ./hooks/cursor-run.sh boundary",
+        "type": "command",
+        "failClosed": true,
+        "timeout": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "bash ./hooks/cursor-run.sh activity",
+        "type": "command",
+        "timeout": 5
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "bash ./hooks/cursor-run.sh tool-failure",
+        "type": "command",
+        "timeout": 5
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "bash ./hooks/cursor-run.sh reanchor",
+        "type": "command",
+        "timeout": 8
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "bash ./hooks/cursor-run.sh after-file-edit",
+        "type": "command",
+        "timeout": 5
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "bash ./hooks/cursor-run.sh before-mcp",
+        "type": "command",
+        "failClosed": true,
+        "timeout": 5
+      }
+    ],
+    "workspaceOpen": [
+      {
+        "command": "bash ./hooks/cursor-run.sh workspace-open",
+        "type": "command",
+        "timeout": 5
+      }
+    ]
+  }
+}

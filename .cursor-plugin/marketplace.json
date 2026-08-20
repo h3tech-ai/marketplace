@@ -1,0 +1,20 @@
+{
+  "name": "synaptory",
+  "owner": {
+    "name": "H3Tech Inc.",
+    "email": "engineering@h3t.co"
+  },
+  "metadata": {
+    "description": "H3Tech Synaptory — Cursor host plugin. Publish the IP-stripped dist tree (./synaptory build), not the private working copy.",
+    "version": "1.1.1"
+  },
+  "plugins": [
+    {
+      "name": "synaptory",
+      "source": "plugin-cursor",
+      "description": "Multi-agent adaptive delivery for Cursor: Scrum, Kanban, SPQ, nine roles, receipts, control-plane CLI.",
+      "tags": ["synaptory", "orchestrator", "scrum", "kanban", "multi-agent"],
+      "category": "developer-tools"
+    }
+  ]
+}

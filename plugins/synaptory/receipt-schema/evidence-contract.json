@@ -1,0 +1,411 @@
+{
+  "contract_version": 1,
+  "receipt": {
+    "required_fields": [
+      "story_id",
+      "role",
+      "backend",
+      "model",
+      "artifacts",
+      "verification_commands",
+      "metrics",
+      "completed_at"
+    ],
+    "soft_required": [
+      "token_usage",
+      "story_dod"
+    ],
+    "valid_roles": [
+      "software-engineer",
+      "quality-engineer",
+      "code-reviewer",
+      "compliance-engineer",
+      "project-owner",
+      "solution-architect",
+      "platform-engineer",
+      "technical-writer",
+      "research-advisor",
+      "orchestrator"
+    ],
+    "role_aliases": {
+      "product-manager": "project-owner"
+    },
+    "valid_backends": [
+      "claude",
+      "cursor",
+      "codex",
+      "gemini"
+    ],
+    "role_abbrevs": {
+      "software-engineer": "se",
+      "quality-engineer": "qe",
+      "code-reviewer": "cr",
+      "compliance-engineer": "ce",
+      "platform-engineer": "pe",
+      "project-owner": "po",
+      "solution-architect": "sa",
+      "technical-writer": "tw",
+      "research-advisor": "ra"
+    },
+    "story_id_pattern": "^[A-Z][A-Z0-9]*-\\d+$",
+    "filename_template": "{story_id}-{role_abbrev}.json"
+  },
+  "stages": {
+    "valid": [
+      "pro-discovery",
+      "pro-brd",
+      "pro-ux-spec",
+      "sa-architecture",
+      "se-implementation",
+      "qe-verification",
+      "cr-review",
+      "ce-compliance",
+      "pe-infra",
+      "tw-docs",
+      "orchestrator"
+    ],
+    "role_to_stage": {
+      "solution-architect": "sa-architecture",
+      "software-engineer": "se-implementation",
+      "quality-engineer": "qe-verification",
+      "code-reviewer": "cr-review",
+      "compliance-engineer": "ce-compliance",
+      "platform-engineer": "pe-infra",
+      "technical-writer": "tw-docs",
+      "orchestrator": "orchestrator"
+    },
+    "role_to_stage_multi": {
+      "project-owner": [
+        "pro-discovery",
+        "pro-brd",
+        "pro-ux-spec"
+      ]
+    }
+  },
+  "verification_commands": {
+    "executed_form": {
+      "fields": [
+        "command",
+        "exit_code",
+        "summary"
+      ],
+      "meaning": "proof \u2014 the command was run and its exit code recorded; ONLY this form scores tests_pass/build_succeeds"
+    },
+    "declared_form": {
+      "type": "string",
+      "meaning": "replay instruction \u2014 the SubagentStop hook re-runs it; NOT proof"
+    },
+    "replayability": {
+      "allowlist": [
+        "python",
+        "python3",
+        "pytest",
+        "ruff",
+        "mypy",
+        "pyright",
+        "black",
+        "flake8",
+        "node",
+        "npm",
+        "npx",
+        "pnpm",
+        "yarn",
+        "tsc",
+        "eslint",
+        "prettier",
+        "vitest",
+        "jest",
+        "go",
+        "gofmt",
+        "golangci-lint",
+        "cargo",
+        "rustc",
+        "clippy",
+        "make",
+        "cmake",
+        "ctest",
+        "mvn",
+        "gradle",
+        "bundle",
+        "rspec",
+        "rake",
+        "bash",
+        "sh",
+        "shellcheck",
+        "./synaptory",
+        "test",
+        "grep",
+        "ls",
+        "wc",
+        "diff",
+        "jq",
+        "stat",
+        "head",
+        "tail",
+        "find"
+      ],
+      "find_flag_denylist": [
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-delete",
+        "-fprintf"
+      ],
+      "interpreter_flag_denylist": {
+        "bash": [
+          "-c",
+          "-s",
+          "-i"
+        ],
+        "sh": [
+          "-c",
+          "-s",
+          "-i"
+        ],
+        "python": [
+          "-c"
+        ],
+        "python3": [
+          "-c"
+        ],
+        "node": [
+          "-e",
+          "--eval",
+          "-p",
+          "--print",
+          "-r",
+          "--require",
+          "--import",
+          "--loader",
+          "--experimental-loader"
+        ]
+      },
+      "interpreter_script_must_be_repo_relative": true,
+      "interpreter_module_ok": [
+        "python",
+        "python3"
+      ],
+      "interpreter_require_repo_relative_script": [
+        "bash",
+        "sh"
+      ],
+      "forbidden_tokens": [
+        "|",
+        "||",
+        "&",
+        "&&",
+        ";",
+        ">",
+        ">>",
+        "<",
+        "<<"
+      ],
+      "no_command_substitution": true,
+      "no_env_prefix": true,
+      "must_be": [
+        "idempotent",
+        "non-interactive",
+        "non-blocking (no watch modes or dev servers)"
+      ],
+      "per_command_timeout_s": 60,
+      "total_timeout_s": 300
+    }
+  },
+  "dod_checks": {
+    "tests_pass": {
+      "label": "All acceptance criteria tests passing",
+      "category": "critical",
+      "receipt_role": "qe",
+      "receipt_field": "verification_commands",
+      "preferred_roles": [
+        "qe",
+        "se"
+      ],
+      "fallback": "any_with_proof",
+      "waivable": false,
+      "command_terms": [
+        "test",
+        "pytest",
+        "vitest",
+        "jest",
+        "spec"
+      ],
+      "evidence": {
+        "field": "verification_commands",
+        "shape": "list containing executed objects {command, exit_code, summary}",
+        "predicate": "at least one executed object present AND every executed object has exit_code == 0; plain-string entries are unverifiable (intent, not proof)"
+      }
+    },
+    "build_succeeds": {
+      "label": "Build compiles and dev server boots (not proof a feature renders)",
+      "category": "critical",
+      "receipt_role": "se",
+      "receipt_field": "verification_commands",
+      "preferred_roles": [
+        "se",
+        "pe"
+      ],
+      "fallback": "any_with_proof",
+      "waivable": true,
+      "command_terms": [
+        "build",
+        "compile",
+        "tsc",
+        "typecheck",
+        "type-check",
+        "dev server",
+        "npm run dev",
+        "pnpm dev",
+        "yarn dev",
+        "next dev"
+      ],
+      "evidence": {
+        "field": "verification_commands",
+        "shape": "list containing executed objects {command, exit_code, summary}",
+        "predicate": "at least one executed object whose command matches a build command_term AND every such object has exit_code == 0; plain-string entries are unverifiable"
+      }
+    },
+    "no_critical_findings": {
+      "label": "Zero critical security findings",
+      "category": "critical",
+      "receipt_role": "ce",
+      "receipt_field": "metrics",
+      "preferred_roles": [
+        "ce"
+      ],
+      "fallback": "review_roles_only",
+      "fallback_roles": [
+        "ce",
+        "cr"
+      ],
+      "waivable": false,
+      "evidence": {
+        "field": "metrics.findings_critical",
+        "shape": "integer",
+        "predicate": "equals 0 (absent key defaults to 0)"
+      }
+    },
+    "code_reviewed": {
+      "label": "Story code reviewed",
+      "category": "adaptive",
+      "receipt_role": "cr",
+      "receipt_field": "status",
+      "preferred_roles": [
+        "cr"
+      ],
+      "fallback": "none",
+      "waivable": false,
+      "evidence": {
+        "any_of": [
+          {
+            "field": "status",
+            "equals": "complete"
+          },
+          {
+            "field": "story_dod.code_reviewed",
+            "equals": true
+          }
+        ]
+      }
+    },
+    "coverage_no_decrease": {
+      "label": "Test coverage did not decrease",
+      "category": "adaptive",
+      "receipt_role": "qe",
+      "receipt_field": "metrics",
+      "preferred_roles": [
+        "qe"
+      ],
+      "fallback": "any_with_proof",
+      "waivable": false,
+      "evidence": {
+        "field": "metrics.coverage_delta",
+        "shape": "number or percent string (e.g. \"+3.2%\")",
+        "predicate": "numeric value >= 0; absent or unparseable delta is assumed to pass"
+      }
+    },
+    "runtime_verified": {
+      "label": "Deployed live and exercised end-to-end (logs/URLs/audit inspected)",
+      "category": "critical",
+      "receipt_role": "qe",
+      "receipt_field": "metrics",
+      "preferred_roles": [
+        "qe"
+      ],
+      "fallback": "any_with_proof",
+      "waivable": false,
+      "evidence": {
+        "field": "metrics.runtime_verification",
+        "shape": "{deployed: bool, logs_inspected: bool}",
+        "predicate": "deployed AND logs_inspected both true; non-dict value is unverifiable (a prose note is intent, not proof)"
+      }
+    },
+    "ui_acceptance": {
+      "label": "User-facing AC verified through the UI (browser-qa / e2e)",
+      "category": "critical",
+      "receipt_role": "qe",
+      "receipt_field": "metrics",
+      "preferred_roles": [
+        "qe"
+      ],
+      "fallback": "any_with_proof",
+      "waivable": false,
+      "evidence": {
+        "field": "metrics.ui_verification",
+        "shape": "{rendered: bool, routes_tested: int, flows_failed: int}",
+        "predicate": "rendered true AND flows_failed == 0; legacy shape metrics.routes_tested > 0 with metrics.flows_failed == 0 also accepted; otherwise unverifiable"
+      }
+    },
+    "integration_verified": {
+      "label": "External integration proven live (smoke check reached the real service)",
+      "category": "critical",
+      "receipt_role": "se",
+      "receipt_field": "integrations",
+      "preferred_roles": [
+        "se",
+        "qe"
+      ],
+      "fallback": "any_with_proof",
+      "waivable": false,
+      "evidence": {
+        "field": "integrations",
+        "shape": "list of {name, status, evidence}",
+        "predicate": "every declared entry has status == \"live\" backed by an executed smoke verification command with exit_code == 0; evaluated across ALL story receipts"
+      }
+    }
+  },
+  "dod_tiers": {
+    "tiers": {
+      "early": [
+        "tests_pass",
+        "build_succeeds"
+      ],
+      "growing": [
+        "tests_pass",
+        "build_succeeds",
+        "code_reviewed"
+      ],
+      "mature": [
+        "tests_pass",
+        "build_succeeds",
+        "code_reviewed",
+        "coverage_no_decrease"
+      ],
+      "release": [
+        "tests_pass",
+        "build_succeeds",
+        "code_reviewed",
+        "coverage_no_decrease"
+      ]
+    },
+    "default_thresholds": {
+      "early_max": 1,
+      "growing_max": 3
+    },
+    "tier_deltas": {
+      "growing": "adds code_reviewed \u2014 every story gets a CR dispatch",
+      "mature": "adds coverage_no_decrease"
+    }
+  }
+}

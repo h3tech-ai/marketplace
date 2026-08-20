@@ -1,0 +1,37 @@
+# Receipt Protocol — Platform Engineer
+
+The full schema and required fields live in the shared
+`protocols/receipt-protocol.md`, which is auto-injected into your
+SubagentStart `additional_context`. This file is the PE-specific
+checklist.
+
+## Before you stop
+
+1. Complete the infra work (CI/CD, Docker, IaC, monitoring).
+2. Verify outputs exist (`docker compose config -q`, `terraform plan`,
+   pipeline lint, etc.).
+3. **Write the receipt** to:
+
+   ```
+   .synaptory/.orchestrator/receipts/{story_id}-pe.json
+   ```
+
+   Use the canonical short code `pe`. Do **not** use the full role
+   name (`platform-engineer`) or append a timestamp.
+
+4. THEN call `TaskUpdate(status="completed")`.
+
+## Required fields for PE
+
+- `role` — `"platform-engineer"`
+- `token_usage.stage` — `"pe-infra"`
+- `artifacts` — every IaC / pipeline / Dockerfile / monitoring config
+  path you touched.
+- `verification_commands` — at minimum the lint / dry-run command
+  proving each artefact is syntactically valid.
+
+## Anti-patterns the hook will reject
+
+- ❌ Improvised filenames (`{story}-platform-engineer-...Z.json`)
+- ❌ Receipt JSON only in response text (no `Write` call)
+- ❌ `TaskUpdate(completed)` before the receipt file exists

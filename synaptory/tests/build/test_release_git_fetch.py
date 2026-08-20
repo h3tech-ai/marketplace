@@ -33,7 +33,14 @@ fi
     return bin_dir, capture
 
 
-def _run(repo_root: Path, tmp_path: Path, *, origin: str, token: str = ""):
+def _run(
+    repo_root: Path,
+    tmp_path: Path,
+    *,
+    origin: str,
+    token: str = "",
+    repo_token: str = "",
+):
     bin_dir, capture = _fake_git(tmp_path)
     env = {
         "PATH": f"{bin_dir}:/usr/bin:/bin",
@@ -44,6 +51,8 @@ def _run(repo_root: Path, tmp_path: Path, *, origin: str, token: str = ""):
     }
     if token:
         env["RELEASE_BOT_PAT"] = token
+    if repo_token:
+        env["SYNAPTORY_REPO_TOKEN"] = repo_token
     script = repo_root / "infra" / "scripts" / "git-fetch-authenticated.sh"
     result = subprocess.run(
         ["bash", str(script), "origin", "main"],
@@ -85,6 +94,32 @@ def test_fetch_without_token_uses_normal_git_behavior(repo_root: Path, tmp_path:
     assert "argv=fetch --prune origin main" in capture
     assert "askpass=" in capture
     assert "username=" not in capture
+
+
+def test_current_repo_token_wins_over_marketplace_release_pat(
+    repo_root: Path, tmp_path: Path
+):
+    repo_secret = "current-repo-token"
+    marketplace_secret = "marketplace-release-token"
+    result, capture = _run(
+        repo_root,
+        tmp_path,
+        origin="https://github.com/h3tech-ai/synaptory.git",
+        token=marketplace_secret,
+        repo_token=repo_secret,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"password={repo_secret}" in capture
+    assert marketplace_secret not in capture + result.stdout + result.stderr
+
+
+def test_release_workflow_passes_scoped_repo_token(repo_root: Path):
+    workflow = (repo_root / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'SYNAPTORY_REPO_TOKEN="${{ github.token }}"' in workflow
 
 
 def test_non_github_remote_never_receives_pat(repo_root: Path, tmp_path: Path):

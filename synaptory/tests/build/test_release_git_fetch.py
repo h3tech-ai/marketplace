@@ -74,7 +74,11 @@ def test_https_github_fetch_uses_ephemeral_askpass(repo_root: Path, tmp_path: Pa
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "argv=-c credential.helper= fetch --prune origin main" in capture
+    assert (
+        "argv=-c credential.helper= "
+        "-c http.https://github.com/.extraheader= fetch --prune origin main"
+        in capture
+    )
     assert "prompt=0" in capture
     assert "username=x-access-token" in capture
     assert f"password={secret}" in capture
@@ -112,6 +116,20 @@ def test_current_repo_token_wins_over_marketplace_release_pat(
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"password={repo_secret}" in capture
     assert marketplace_secret not in capture + result.stdout + result.stderr
+
+
+def test_https_github_fetch_clears_persisted_authorization_header(
+    repo_root: Path, tmp_path: Path
+):
+    result, capture = _run(
+        repo_root,
+        tmp_path,
+        origin="https://github.com/h3tech-ai/synaptory.git",
+        repo_token="current-repo-token",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "-c http.https://github.com/.extraheader=" in capture
 
 
 def test_release_workflow_passes_scoped_repo_token(repo_root: Path):

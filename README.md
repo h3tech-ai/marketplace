@@ -1,0 +1,115 @@
+# Synaptory plugin catalog
+
+**Multi-agent adaptive delivery for Claude Code, Cursor, and Codex.**
+Published and maintained by [H3Tech Inc.](https://h3t.co)
+
+> **Catalog version: `1.1.3`** — this repository is a **generated
+> distribution tree**. It is rebuilt and force-synced by
+> `./synaptory deploy prod` on every release. Do not open pull requests or
+> edit files here; changes are overwritten on the next publish.
+
+Synaptory turns one AI coding assistant into a coordinated delivery team:
+nine specialized agents, Scrum / Kanban lifecycles, a per-story SE→QE→CR
+pipeline, story-level Definition of Done, and pluggable tracker
+integrations (local, GitHub, Jira, Teamwork, Linear).
+
+## Requirements
+
+Synaptory is licensed software for H3Tech staff and customers. You need:
+
+1. An H3Tech account with membership in at least one Synaptory project.
+2. The `synaptory` CLI, installed once per laptop and shared across every
+   project you belong to:
+
+   ```bash
+   # macOS / Linux
+   curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+
+   # Windows (PowerShell)
+   iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex
+   ```
+
+3. A signed-in session:
+
+   ```bash
+   synaptory login
+   ```
+
+Without a valid session the plugin installs but refuses to run — its
+instruction bodies are served from the control plane, not from this
+repository (see [What is in this tree](#what-is-in-this-tree)).
+
+## Install
+
+### Claude Code
+
+```
+/plugin marketplace add https://github.com/h3tech-ai/marketplace
+/plugin install synaptory@h3tech-ai
+```
+
+Then start with a natural-language request:
+
+```
+/synaptory
+Build me a SaaS for managing restaurant reservations
+```
+
+### Cursor
+
+Import this repository as a Team marketplace (Settings → Team marketplace →
+Import from Repo), then install **synaptory** from the team catalog. The
+plugin body lives at `plugin-cursor/`.
+
+```bash
+synaptory skills sync --host cursor
+```
+
+Reload Cursor and use `/synaptory`.
+
+### Codex
+
+Requires Codex CLI `0.147.0` or newer.
+
+```bash
+codex plugin marketplace add https://github.com/h3tech-ai/marketplace
+codex plugin add synaptory@synaptory-dev
+```
+
+Invoke it as `$synaptory`. Bootstrap is dry-run first and asks for explicit
+confirmation before writing anything to your project. The current Codex
+package certifies standard-project SE→QE→CR execution; full ceremony parity
+and regulated (HIPAA / BAA) operation are not yet in scope, and regulated
+projects are refused rather than silently downgraded.
+
+## What is in this tree
+
+| Path | Host | Contents |
+|---|---|---|
+| `.claude-plugin/marketplace.json` | Claude Code | Catalog `h3tech-ai`, resolves `./synaptory` |
+| `synaptory/` | Claude Code | Agents, hooks, skills, plugin runtime |
+| `.cursor-plugin/marketplace.json` | Cursor | Catalog `synaptory`, resolves `plugin-cursor` |
+| `plugin-cursor/` | Cursor | Composed Cursor overlay — agents, `.mdc` rules, hooks, MCP |
+| `.agents/plugins/marketplace.json` | Codex | Catalog `synaptory-dev`, resolves `./plugins/synaptory` |
+| `plugins/synaptory/` | Codex | Codex host package — MCP server, hooks, role profiles |
+| `plugin.json` | — | Convenience copy of the Claude Code catalog |
+
+All three hosts are published from the same build at the same version, so a
+mixed-host team is never split across plugin releases.
+
+**This tree ships stubs and plumbing only.** Skill bodies, agent protocols,
+and rule sets are not stored here. They are delivered at runtime by the
+control plane over an authenticated session, decrypted per request, and
+watermarked to the fetching user. That is why a signed-in `synaptory` CLI is
+a hard requirement rather than a convenience.
+
+## Support
+
+- In-session: `/synaptory report` files a request from inside Claude Code or Cursor.
+- Email: engineering@h3t.co
+- Control plane: https://synaptory.h3t.co
+
+## License
+
+Proprietary. Copyright © H3Tech Inc. All rights reserved. Redistribution or
+use outside a valid H3Tech license agreement is prohibited.

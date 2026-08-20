@@ -14,11 +14,15 @@ def _fake_git(tmp_path: Path) -> tuple[Path, Path]:
     git.write_text(
         """#!/bin/bash
 set -eu
-if [ "${1:-}" = remote ]; then
+if [ "${1:-}" = remote ] && [ "${2:-}" = get-url ]; then
   printf '%s\\n' "${FAKE_ORIGIN_URL:?}"
   exit 0
 fi
-printf 'argv=%s\\n' "$*" > "${FAKE_CAPTURE:?}"
+if [ "${1:-}" = remote ] && [ "${2:-}" = set-url ]; then
+  printf 'set_url=%s\\n' "${4:-}" >> "${FAKE_CAPTURE:?}"
+  exit 0
+fi
+printf 'argv=%s\\n' "$*" >> "${FAKE_CAPTURE:?}"
 printf 'askpass=%s\\n' "${GIT_ASKPASS:-}" >> "${FAKE_CAPTURE:?}"
 printf 'prompt=%s\\n' "${GIT_TERMINAL_PROMPT:-}" >> "${FAKE_CAPTURE:?}"
 if [ -n "${GIT_ASKPASS:-}" ]; then
@@ -130,6 +134,48 @@ def test_https_github_fetch_clears_persisted_authorization_header(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "-c http.https://github.com/.extraheader=" in capture
+
+
+def test_credentialed_github_origin_is_sanitized_before_askpass(
+    repo_root: Path, tmp_path: Path
+):
+    stale_secret = "stale-embedded-token"
+    repo_secret = "current-repo-token"
+    result, capture = _run(
+        repo_root,
+        tmp_path,
+        origin=(
+            "https://release-bot:"
+            f"{stale_secret}@github.com/h3tech-ai/synaptory.git"
+        ),
+        repo_token=repo_secret,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "set_url=https://github.com/h3tech-ai/synaptory.git" in capture
+    assert "argv=-c credential.helper=" in capture
+    assert f"password={repo_secret}" in capture
+    assert stale_secret not in capture + result.stdout + result.stderr
+
+
+def test_credentialed_github_origin_is_sanitized_without_replacement_token(
+    repo_root: Path, tmp_path: Path
+):
+    stale_secret = "stale-embedded-token"
+    result, capture = _run(
+        repo_root,
+        tmp_path,
+        origin=(
+            "https://release-bot:"
+            f"{stale_secret}@github.com/h3tech-ai/synaptory.git"
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "set_url=https://github.com/h3tech-ai/synaptory.git" in capture
+    assert "argv=fetch --prune origin main" in capture
+    assert "username=" not in capture
+    assert stale_secret not in capture + result.stdout + result.stderr
 
 
 def test_release_workflow_passes_scoped_repo_token(repo_root: Path):

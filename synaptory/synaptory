@@ -698,7 +698,11 @@ _publish_plugin_to_git() {
     git config --local user.name  "synaptory") || true
 
   echo "  Publishing plugin → ${label}"
-  rsync -a --no-perms --omit-dir-times --delete --exclude='.git' \
+  # Preserve the built artifact's file modes. Keeping destination permissions
+  # lets independent marketplace histories drift (for example, a legacy
+  # mirror can retain 0644 for hook scripts that are 0755 in the primary),
+  # producing different Git trees and breaking direct hook execution.
+  rsync -a --omit-dir-times --delete --exclude='.git' \
     "${marketplace_dir}/" "${worktree}/"
 
   (

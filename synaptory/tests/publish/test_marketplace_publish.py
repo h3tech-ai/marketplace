@@ -31,8 +31,56 @@ def _fake_repo_root(tmp_path: Path) -> Path:
     dist = root / "web" / "dist" / "marketplace" / "synaptory"
     dist.mkdir(parents=True)
     (dist / "README.md").write_text("published body\n", encoding="utf-8")
+    hook = dist / "hooks" / "release-hook.sh"
+    hook.parent.mkdir()
+    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hook.chmod(0o755)
     (root / "infra" / "git").mkdir(parents=True)
     return root
+
+
+def _init_bare_remote(remote: Path) -> None:
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _seed_remote_with_hook_mode(
+    tmp_path: Path, remote: Path, *, mode: int
+) -> None:
+    seed = tmp_path / f"seed-{remote.stem}"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(seed)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "config", "user.name", "Test"], check=True
+    )
+    hook = seed / "synaptory" / "hooks" / "release-hook.sh"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hook.chmod(mode)
+    subprocess.run(["git", "-C", str(seed), "add", "--all"], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "commit", "-m", "seed"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "remote", "add", "origin", str(remote)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "origin", "main"],
+        check=True,
+        capture_output=True,
+    )
 
 
 def _publish(root: Path, remote: Path) -> subprocess.CompletedProcess[str]:
@@ -91,12 +139,7 @@ def test_publish_succeeds_and_the_remote_receives_the_tree(tmp_path: Path) -> No
     """The happy path, so the test above cannot pass by publishing never working."""
     root = _fake_repo_root(tmp_path)
     remote = root / "infra" / "git" / "marketplace-remote.git"
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
-        check=True,
-        capture_output=True,
-    )
+    _init_bare_remote(remote)
 
     result = _publish(root, remote)
 
@@ -141,14 +184,7 @@ def test_marketplace_mirrors_receive_identical_trees(tmp_path: Path) -> None:
     primary = root / "infra" / "git" / "primary.git"
     legacy = root / "infra" / "git" / "legacy.git"
     for remote in (primary, legacy):
-        subprocess.run(
-            ["git", "init", "--bare", str(remote)], check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
-            check=True,
-            capture_output=True,
-        )
+        _init_bare_remote(remote)
 
     primary_result = _publish(root, primary)
     assert primary_result.returncode == 0, primary_result.stdout + primary_result.stderr
@@ -188,6 +224,50 @@ _publish_plugin_to_legacy || exit $?
         text=True,
     ).stdout.strip()
     assert primary_tree == legacy_tree
+
+
+def test_marketplace_mirrors_normalize_existing_hook_mode_drift(
+    tmp_path: Path,
+) -> None:
+    """Publishing must repair stale modes and produce identical executable hooks."""
+    root = _fake_repo_root(tmp_path)
+    primary = root / "infra" / "git" / "primary-mode.git"
+    legacy = root / "infra" / "git" / "legacy-mode.git"
+    for remote in (primary, legacy):
+        _init_bare_remote(remote)
+    _seed_remote_with_hook_mode(tmp_path, primary, mode=0o755)
+    _seed_remote_with_hook_mode(tmp_path, legacy, mode=0o644)
+
+    for remote in (primary, legacy):
+        result = _publish(root, remote)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    trees = [
+        subprocess.run(
+            ["git", "-C", str(remote), "rev-parse", "refs/heads/main^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        for remote in (primary, legacy)
+    ]
+    assert trees[0] == trees[1]
+
+    for remote in (primary, legacy):
+        entry = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(remote),
+                "ls-tree",
+                "refs/heads/main",
+                "synaptory/hooks/release-hook.sh",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert entry.split()[0] == "100755", entry
 
 
 def test_deploy_local_does_not_publish_to_marketplace_git() -> None:

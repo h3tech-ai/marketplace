@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.2",
+  "description": "Exact Claude model IDs pinned per tier for plugin-claude/. HC0-F2: healthcare customers require reproducible behavior — 'opus' or 'sonnet' aliases can drift as Anthropic releases new versions. This file is the source of truth; ./synaptory build copies it into the distribution and the AI-BOM generator reads it.",
+  "last_reviewed": "2026-07-07",
+  "pinned_by": "H3Tech Inc.",
+  "runtime_variants_note": "Claude Code surfaces 1M-context variants via suffixes like '-1m' or '[1m]' in the SDK Usage.model field (e.g. 'claude-opus-4-7-1m'). Per Anthropic's Long-context-pricing policy these variants bill at IDENTICAL per-token rates as the base model — they are NOT separate SKUs. The control-plane pricing logic strips known suffixes before lookup; see api/synaptory_api/routers/analytics.py::_normalise_model_id and ::_PRICED_VARIANT_SUFFIXES. Adding new variants here is informational only; cost computation is automatic once the suffix is in _PRICED_VARIANT_SUFFIXES.",
+  "tiers": {
+    "opus": {
+      "model_id": "claude-opus-4-8",
+      "family": "claude-4.8",
+      "cost_tier": "premium",
+      "baa_covered": true,
+      "runtime_variants": ["claude-opus-4-8-1m", "claude-opus-4-8[1m]"],
+      "notes": "Used by strategic roles: project-owner, solution-architect, compliance-engineer, research-advisor. The 1M variants run when Claude Code is configured for >200K context; they bill identically to the base model."
+    },
+    "sonnet": {
+      "model_id": "claude-sonnet-5",
+      "family": "claude-5",
+      "cost_tier": "standard",
+      "baa_covered": true,
+      "runtime_variants": ["claude-sonnet-5-1m", "claude-sonnet-5[1m]"],
+      "notes": "Used by executor roles: software-engineer, quality-engineer, platform-engineer, technical-writer, code-reviewer. Anthropic is running a $2/$10 per-MTok intro rate through 2026-08-31; the control-plane cost table pins the $3/$15 list rate."
+    },
+    "haiku": {
+      "model_id": "claude-haiku-4-5",
+      "family": "claude-4.5",
+      "cost_tier": "economy",
+      "baa_covered": true,
+      "runtime_variants": [],
+      "notes": "Not currently used by synaptory roles; reserved for future low-latency auxiliaries. Anthropic does NOT publish a 1M variant for Haiku 4.5 — treat 'claude-haiku-4-5-1m' model IDs as unsupported."
+    }
+  }
+}

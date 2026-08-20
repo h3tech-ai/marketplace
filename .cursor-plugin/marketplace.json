@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "synaptory",
-      "source": "plugin-cursor",
+      "source": "plugins/cursor",
       "description": "Multi-agent adaptive delivery for Cursor: Scrum, Kanban, SPQ, nine roles, receipts, control-plane CLI.",
       "tags": ["synaptory", "orchestrator", "scrum", "kanban", "multi-agent"],
       "category": "developer-tools"

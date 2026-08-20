@@ -3,7 +3,7 @@
 **Multi-agent adaptive delivery for Claude Code, Cursor, and Codex.**
 Published and maintained by [H3Tech Inc.](https://h3t.co)
 
-> **Catalog version: `1.1.3`** — this repository is a **generated
+> **Catalog version: `1.1.4`** — this repository is a **generated
 > distribution tree**. It is rebuilt and force-synced by
 > `./synaptory deploy prod` on every release. Do not open pull requests or
 > edit files here; changes are overwritten on the next publish.
@@ -59,7 +59,7 @@ Build me a SaaS for managing restaurant reservations
 
 Import this repository as a Team marketplace (Settings → Team marketplace →
 Import from Repo), then install **synaptory** from the team catalog. The
-plugin body lives at `plugin-cursor/`.
+plugin body lives at `plugins/cursor/`.
 
 ```bash
 synaptory skills sync --host cursor
@@ -84,15 +84,21 @@ projects are refused rather than silently downgraded.
 
 ## What is in this tree
 
+Every host package lives at `plugins/<host>/` so the three share one
+convention. Each host's catalog manifest stays where that host requires it.
+
 | Path | Host | Contents |
 |---|---|---|
-| `.claude-plugin/marketplace.json` | Claude Code | Catalog `h3tech-ai`, resolves `./synaptory` |
-| `synaptory/` | Claude Code | Agents, hooks, skills, plugin runtime |
-| `.cursor-plugin/marketplace.json` | Cursor | Catalog `synaptory`, resolves `plugin-cursor` |
-| `plugin-cursor/` | Cursor | Composed Cursor overlay — agents, `.mdc` rules, hooks, MCP |
-| `.agents/plugins/marketplace.json` | Codex | Catalog `synaptory-dev`, resolves `./plugins/synaptory` |
-| `plugins/synaptory/` | Codex | Codex host package — MCP server, hooks, role profiles |
+| `.claude-plugin/marketplace.json` | Claude Code | Catalog `h3tech-ai`, resolves `./plugins/claude` |
+| `plugins/claude/` | Claude Code | Agents, hooks, skills, plugin runtime |
+| `.cursor-plugin/marketplace.json` | Cursor | Catalog `synaptory`, resolves `plugins/cursor` |
+| `plugins/cursor/` | Cursor | Composed Cursor overlay — agents, `.mdc` rules, hooks, MCP |
+| `.agents/plugins/marketplace.json` | Codex | Catalog `synaptory-dev`, resolves `./plugins/codex` |
+| `plugins/codex/` | Codex | Codex host package — MCP server, hooks, role profiles |
 | `plugin.json` | — | Convenience copy of the Claude Code catalog |
+
+The plugin is named `synaptory` on every host regardless of which directory
+holds it, so these paths are an implementation detail — you install by name.
 
 All three hosts are published from the same build at the same version, so a
 mixed-host team is never split across plugin releases.

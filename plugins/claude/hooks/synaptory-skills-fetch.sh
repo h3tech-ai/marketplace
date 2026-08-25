@@ -4,34 +4,23 @@
 # Hook: SessionStart
 # Purpose: Warm the CLI skill cache so agents can resolve SKILL.md bodies offline.
 #
-# The control-plane URL is stamped at build time into hooks/lib/cp-url.
-# In dev mode (SYNAPTORY_CP_ENV=dev), SYNAPTORY_CONTROL_PLANE_URL env overrides it.
+# The control-plane URL is stamped at build time into hooks/lib/cp-url
+# (or gitignored hooks/lib/cp-url.local after `./synaptory deploy local`).
+# SYNAPTORY_CONTROL_PLANE_URL / SYNAPTORY_CP_ENV are ignored.
 
 set -euo pipefail
 
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 # shellcheck source=./_plugin-env.sh
 source "${PLUGIN_ROOT}/hooks/_plugin-env.sh"
+# shellcheck source=./_cp-url.sh
+source "${PLUGIN_ROOT}/hooks/_cp-url.sh"
 
-# Resolve the control-plane URL.
-_cp_url_file="${PLUGIN_ROOT}/hooks/lib/cp-url"
-_cp_url=""
-if [[ -f "$_cp_url_file" ]]; then
-  _cp_url=$(tr -d '[:space:]' < "$_cp_url_file")
-fi
-if [[ "${SYNAPTORY_CP_ENV:-}" == "dev" ]] && [[ -n "${SYNAPTORY_CONTROL_PLANE_URL:-}" ]]; then
-  _cp_url="${SYNAPTORY_CONTROL_PLANE_URL}"
-fi
-if [[ -z "$_cp_url" ]] || [[ "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
-  if [[ -n "${CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL:-}" ]]; then
-    _cp_url="${CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL}"
-  fi
-fi
 if [[ -z "$_cp_url" ]] || [[ "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
   echo "synaptory: control-plane URL not stamped in this build; cannot fetch skills." >&2
+  echo "  Run ./synaptory deploy local or install a marketplace build." >&2
   exit 1
 fi
-export SYNAPTORY_CONTROL_PLANE_URL="$_cp_url"
 
 cli=$("${PLUGIN_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
 if [[ -z "$cli" ]] || [[ ! -x "$cli" ]]; then

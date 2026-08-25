@@ -99,6 +99,7 @@ def stub_cli(tmp_path: Path, stub_cli_path: Path) -> StubCli:
     # Symlink keeps the shebang intact and means `command -v synaptory`
     # resolves to a real executable.
     (bin_dir / "synaptory").symlink_to(stub_cli_path)
+    (bin_dir / "synaptory-local").symlink_to(stub_cli_path)
 
     env = {
         # Minimal sanitised env — hooks shouldn't need anything else.
@@ -186,15 +187,29 @@ def parse_output():
 
 
 @pytest.fixture
-def hook_env(plugin_root: Path, stub_cli: StubCli, tmp_path: Path) -> dict[str, str]:
-    """Default hook env: stub CLI on PATH + plugin root + tmp project dir."""
+def hook_env(plugin_root: Path, stub_cli: StubCli, tmp_path: Path):
+    """Default hook env: stub CLI on PATH + plugin root + tmp project dir.
+
+    Writes gitignored hooks/lib/cp-url.local so hooks resolve a URL without
+    honouring SYNAPTORY_CONTROL_PLANE_URL. Restored after the test.
+    """
     project_dir = tmp_path / "project"
     project_dir.mkdir(exist_ok=True)
-    return {
-        **stub_cli.env,
-        "CLAUDE_PLUGIN_ROOT": str(plugin_root),
-        "CLAUDE_PROJECT_DIR": str(project_dir),
-    }
+    local_url = plugin_root / "hooks" / "lib" / "cp-url.local"
+    local_url.parent.mkdir(parents=True, exist_ok=True)
+    previous = local_url.read_text(encoding="utf-8") if local_url.exists() else None
+    local_url.write_text("https://cp.test\n", encoding="utf-8")
+    try:
+        yield {
+            **stub_cli.env,
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "CLAUDE_PROJECT_DIR": str(project_dir),
+        }
+    finally:
+        if previous is None:
+            local_url.unlink(missing_ok=True)
+        else:
+            local_url.write_text(previous, encoding="utf-8")
 
 
 @pytest.fixture

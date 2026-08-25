@@ -55,17 +55,19 @@ def _pubkey_info() -> str:
 
 
 def _cp_info() -> str:
-    import shutil
-
-    url = os.environ.get("SYNAPTORY_CONTROL_PLANE_URL", "").strip()
+    url = sm._control_plane_url()
     offline = os.environ.get("SYNAPTORY_OFFLINE") == "1"
     if not url:
         return "unset (using local mode)"
     if offline:
         return f"{url} (SYNAPTORY_OFFLINE=1 — using local mode)"
-    cli = shutil.which("synaptory")
+    cli = sm._resolve_cli_binary(url)
     if not cli:
-        return f"{url} (CLI missing — falling back to local; install synaptory binary to enable)"
+        kind = "synaptory-local" if sm._cli_url_is_local(url) else "synaptory"
+        return (
+            f"{url} (CLI missing — falling back to local; "
+            f"install {kind} to enable)"
+        )
     if sm._control_plane_reachable(url):
         return f"{url} (reachable; CLI at {cli})"
     return f"{url} (UNREACHABLE — falling back to local; CLI at {cli})"

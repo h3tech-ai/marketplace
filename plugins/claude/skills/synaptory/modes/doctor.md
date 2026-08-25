@@ -66,7 +66,14 @@ except Exception:
     plugin_version = "?"
 
 # --- 1d. CLI & control plane ---
-cp_url         = os.environ.get("SYNAPTORY_CONTROL_PLANE_URL", "")
+# URL comes from the stamped CLI (`synaptory status`), not from env.
+# SYNAPTORY_CONTROL_PLANE_URL / SYNAPTORY_CP_ENV are ignored at runtime.
+status_out     = Bash("synaptory status 2>&1")
+cp_url         = ""
+for line in status_out.splitlines():
+    if line.strip().startswith("control_plane_url:"):
+        cp_url = line.split(":", 1)[-1].strip()
+        break
 whoami_out     = Bash("synaptory whoami 2>&1")
 whoami_ok      = "upn:" in whoami_out or "email:" in whoami_out
 whoami_upn     = ""
@@ -91,6 +98,7 @@ has_enc        = bool(enc_files)
 
 env_project_id = os.environ.get("SYNAPTORY_PROJECT_ID", "")
 env_cp_url     = os.environ.get("SYNAPTORY_CONTROL_PLANE_URL", "")
+env_cp_env     = os.environ.get("SYNAPTORY_CP_ENV", "")
 ```
 
 ## Step 2: Evaluate Each Check
@@ -226,11 +234,19 @@ if plugin_installed and plugin_version != "?":
 
 checks.append({
     "group": "Control plane",
-    "check": "SYNAPTORY_CONTROL_PLANE_URL set",
+    "check": "CLI stamped control-plane URL",
     "result": "PASS" if cp_url else "FAIL",
     "detail": cp_url or "(empty)",
-    "fix": "Add SYNAPTORY_CONTROL_PLANE_URL=https://synaptory.h3t.co to your shell profile (.zshrc / .bashrc / .envrc)."
+    "fix": "Prod: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash\nLocal: ./synaptory deploy local (installs synaptory-local). Do not export SYNAPTORY_CONTROL_PLANE_URL."
 })
+if env_cp_url or env_cp_env:
+    checks.append({
+        "group": "Control plane",
+        "check": "No leftover SYNAPTORY_CONTROL_PLANE_URL / SYNAPTORY_CP_ENV",
+        "result": "WARN",
+        "detail": f"CONTROL_PLANE_URL={env_cp_url!r} CP_ENV={env_cp_env!r}",
+        "fix": "unset SYNAPTORY_CONTROL_PLANE_URL SYNAPTORY_CP_ENV — they are ignored and mix local/prod installs."
+    })
 checks.append({
     "group": "Control plane",
     "check": "CLI authenticated (synaptory whoami)",
@@ -363,7 +379,7 @@ if not synaptory_enabled and settings_ok:
 
 manual_steps = []
 if not cp_url:
-    manual_steps.append("export SYNAPTORY_CONTROL_PLANE_URL=https://synaptory.h3t.co  (add to ~/.zshrc or .envrc)")
+    manual_steps.append("Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash  (or ./synaptory deploy local for synaptory-local)")
 if not whoami_ok:
     manual_steps.append("synaptory login")
 if not plugin_installed:

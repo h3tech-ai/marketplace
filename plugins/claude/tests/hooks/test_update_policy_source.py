@@ -32,8 +32,6 @@ def _env(hook_env: dict, *, cp_value: str | None = None, env_policy: str | None 
          update_log: Path | None = None) -> dict:
     env = {
         **hook_env,
-        "SYNAPTORY_CP_ENV": "dev",
-        "SYNAPTORY_CONTROL_PLANE_URL": "http://localhost:8080",
         "SYNAPTORY_STUB_VERSION_JSON": json.dumps(_CLI_UPDATE),
     }
     if cp_value is not None:

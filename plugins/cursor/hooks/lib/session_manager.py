@@ -8,8 +8,9 @@ access token, verifies its Ed25519 signature, mints a session token, decrypts
 the `.enc` skill tree, and caches a `SessionRecord` on disk.
 
 In v2.1.18 the `ControlPlaneBackend` will be wired, and `SessionManager`
-selects between them based on `SYNAPTORY_CONTROL_PLANE_URL` (or `.synaptory.yaml`
-`auth.mode`), with unreachable CP → fall back to local per user directive.
+selects between them based on the stamped URL in `hooks/lib/cp-url.local`
+(or `hooks/lib/cp-url`), with unreachable CP → fall back to local per user
+directive. Runtime SYNAPTORY_CONTROL_PLANE_URL is ignored.
 
 In v2.5 the `LocalBackend` is deleted; the dispatcher always calls the Go
 CLI (`synaptory login --if-needed`) which populates the OS keychain with a
@@ -164,11 +165,29 @@ class LocalBackend(Backend):
 
 # ── Control-plane backend (wired in v2.1.18, body filled in by v2.5 merge) ──
 
+def _cli_url_is_local(url: str) -> bool:
+    u = (url or "").lower()
+    return "localhost" in u or "127." in u or "::1" in u
+
+
+def _resolve_cli_binary(url: str = "") -> str | None:
+    """Match hooks/_resolve-cli.sh. Never fall through from synaptory-local to synaptory."""
+    import shutil
+
+    override = os.environ.get("SYNAPTORY_CLI_BIN")
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+    if _cli_url_is_local(url):
+        return shutil.which("synaptory-local")
+    return shutil.which("synaptory")
+
+
 class ControlPlaneBackend(Backend):
     """Talks to the v2.5 control-plane via the `synaptory` Go CLI.
 
-    v2.1.18+: when SYNAPTORY_CONTROL_PLANE_URL is set + reachable AND the
-    `synaptory` binary is on PATH, this backend invokes:
+    v2.1.18+: when hooks/lib/cp-url(.local) is set + reachable AND the
+    matching CLI (`synaptory` or `synaptory-local`) is on PATH, this backend
+    invokes:
 
         synaptory login --if-needed --project <project> --json
         synaptory skills get <name>
@@ -184,13 +203,7 @@ class ControlPlaneBackend(Backend):
 
     def __init__(self, control_plane_url: str, cli_path: str | None = None):
         self.url = control_plane_url
-        self.cli_path = cli_path or self._find_cli()
-
-    @staticmethod
-    def _find_cli() -> str | None:
-        import shutil
-
-        return shutil.which("synaptory")
+        self.cli_path = cli_path or _resolve_cli_binary(control_plane_url)
 
     def name(self) -> str:
         return f"control-plane ({self.url})"
@@ -198,9 +211,9 @@ class ControlPlaneBackend(Backend):
     def _run_cli(self, args: list[str], timeout: float = 30.0) -> tuple[int, str, str]:
         if not self.cli_path:
             raise SessionError(
-                "synaptory CLI binary not found on PATH. SYNAPTORY_CONTROL_PLANE_URL "
-                "is set but the v2.5 CLI isn't installed. Install it from the "
-                "marketplace or unset SYNAPTORY_CONTROL_PLANE_URL to use local mode."
+                "synaptory CLI binary not found on PATH. Install the CLI that "
+                "matches this plugin: `synaptory` for prod, `synaptory-local` "
+                "after `./synaptory deploy local`."
             )
         import subprocess
 
@@ -210,7 +223,7 @@ class ControlPlaneBackend(Backend):
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=dict(os.environ, SYNAPTORY_CONTROL_PLANE_URL=self.url),
+                env=dict(os.environ),
             )
             return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
@@ -281,9 +294,24 @@ def _discover_access_token() -> str | None:
 
 
 def _control_plane_url() -> str:
-    """Env var wins; later releases will also read .synaptory.yaml
-    auth.control_plane_url."""
-    return (os.environ.get("SYNAPTORY_CONTROL_PLANE_URL") or "").strip()
+    """Read the plugin-stamped URL. Env overrides are ignored."""
+    root = (
+        os.environ.get("PLUGIN_ROOT")
+        or os.environ.get("PLUGIN_ROOT")
+        or os.environ.get("CURSOR_PLUGIN_ROOT")
+        or ""
+    )
+    if not root:
+        return ""
+    for name in ("cp-url.local", "cp-url"):
+        path = os.path.join(root, "hooks", "lib", name)
+        try:
+            value = open(path).read().strip()
+        except OSError:
+            continue
+        if value and value != "SYNAPTORY_CP_URL_PLACEHOLDER":
+            return value
+    return ""
 
 
 def _control_plane_reachable(url: str, timeout: float = 2.0) -> bool:

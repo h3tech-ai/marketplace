@@ -20,15 +20,9 @@ if [[ -z "$SKILL_NAME" ]]; then
   exit 1
 fi
 
-# Resolve the control-plane URL.
-_cp_url_file="${PLUGIN_ROOT}/hooks/lib/cp-url"
-_cp_url=""
-if [[ -f "$_cp_url_file" ]]; then
-  _cp_url=$(tr -d '[:space:]' < "$_cp_url_file")
-fi
-if [[ "${SYNAPTORY_CP_ENV:-}" == "dev" ]] && [[ -n "${SYNAPTORY_CONTROL_PLANE_URL:-}" ]]; then
-  _cp_url="${SYNAPTORY_CONTROL_PLANE_URL}"
-fi
+# Resolve the control-plane URL (stamped file only; env overrides ignored).
+# shellcheck source=./_cp-url.sh
+source "${PLUGIN_ROOT}/hooks/_cp-url.sh"
 if [[ -z "$_cp_url" ]] || [[ "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
   if [[ -n "${CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL:-}" ]]; then
     _cp_url="${CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL}"
@@ -48,7 +42,6 @@ or contact your H3Tech operator for a correctly built distribution.
 MSG
   exit 1
 fi
-export SYNAPTORY_CONTROL_PLANE_URL="$_cp_url"
 
 cli=$("${PLUGIN_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
 if [[ -z "$cli" ]] || [[ ! -x "$cli" ]]; then
@@ -129,7 +122,7 @@ ${err_content:-(no error output)}
 \`\`\`
 
 Troubleshooting:
-- Check that the control plane is reachable: \`curl ${SYNAPTORY_CONTROL_PLANE_URL}/healthz\`
+- Check that the control plane is reachable: \`curl ${_cp_url}/healthz\`
 - Refresh the local skill cache: \`synaptory skills sync\`
 - If the issue persists, contact your H3Tech operator.
 ERR

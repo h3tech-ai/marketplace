@@ -1,7 +1,7 @@
 {
   "name": "synaptory",
-  "version": "1.1.4",
-  "cli_min_version": "1.1.4",
+  "version": "1.1.5",
+  "cli_min_version": "1.1.5",
   "description": "Synaptory \u2014 multi-agent adaptive delivery for Cursor, backed by the H3Tech control plane. Nine delivery roles, Scrum + Kanban + SPQ lifecycle, story-scoped receipts. /synaptory \u2014 build, discover, preview, and more.",
   "author": {
     "name": "H3Tech Inc."

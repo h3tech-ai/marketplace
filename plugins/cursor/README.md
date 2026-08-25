@@ -46,12 +46,21 @@ Do **not** copy the private `synaptory` repo's `plugin-cursor/` into the public 
 
 ## Dev install (private synaptory checkout)
 
+Bring up the local stack first so this tree gets a gitignored
+`hooks/lib/cp-url.local` and `~/.local/bin/synaptory-local` is installed
+without overwriting prod `synaptory`:
+
 ```bash
+./synaptory deploy local
 mkdir -p ~/.cursor/plugins/local
 ln -sfn /absolute/path/to/synaptory/plugin-cursor ~/.cursor/plugins/local/synaptory
 ```
 
 Reload Window. After editing `plugin-claude/`, run `plugin-cursor/scripts/compose.sh` (or `./synaptory build`) and Reload.
+
+Do **not** export `SYNAPTORY_CONTROL_PLANE_URL` or `SYNAPTORY_CP_ENV`. Cursor
+hooks read `hooks/lib/cp-url.local` then the stamped `hooks/lib/cp-url`, and
+resolve `synaptory-local` when that URL is loopback.
 
 CLI / CI: `agent --plugin-dir ./plugin-cursor`. Optional per-checkout sideload: the `workspaceOpen` hook may return `pluginPaths`.
 

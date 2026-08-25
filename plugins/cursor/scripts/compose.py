@@ -460,7 +460,8 @@ def compose(src_plugin: Path, dest: Path, version: str) -> None:
         overlay_hook_py.write_text(keep_overlay, encoding="utf-8")
 
     # Default CP URL for the committed tree (Team marketplace IS this git
-    # folder). Runtime override: SYNAPTORY_CP_ENV=dev + SYNAPTORY_CONTROL_PLANE_URL.
+    # folder). Local testing writes gitignored hooks/lib/cp-url.local via
+    # `./synaptory deploy local` — do not honour runtime URL env vars.
     (lib_dst / "cp-url").write_text(DEFAULT_CP_URL + "\n", encoding="utf-8")
 
     # --- Claude hook scripts (adapters wrap these) ---
@@ -469,7 +470,7 @@ def compose(src_plugin: Path, dest: Path, version: str) -> None:
             continue
         rewrite = _patch_plugin_env if sh.name == "_plugin-env.sh" else rewrite_cursor_host
         copy_text(sh, dest / "hooks" / sh.name, rewrite=rewrite)
-    for extra in ("_plugin-env.sh", "_resolve-cli.sh"):
+    for extra in ("_plugin-env.sh", "_resolve-cli.sh", "_cp-url.sh"):
         src = src_plugin / "hooks" / extra
         if src.is_file():
             rewrite = _patch_plugin_env if extra == "_plugin-env.sh" else rewrite_cursor_host

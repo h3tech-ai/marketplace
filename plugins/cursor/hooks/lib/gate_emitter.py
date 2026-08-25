@@ -46,15 +46,18 @@ _DECISION_ROLES = {"delivery_owner", "compliance_reviewer", "global_admin"}
 def _resolve_cli() -> str | None:
     """Resolve the synaptory CLI path.
 
-    Mirrors hooks/_resolve-cli.sh: explicit override via
-    ``SYNAPTORY_CLI_BIN``, else search ``PATH`` for ``synaptory``. Returns
-    ``None`` if neither resolves — caller decides whether to warn or
-    silently skip (gate emission is best-effort).
+    Mirrors hooks/_resolve-cli.sh: ``SYNAPTORY_CLI_BIN``, then
+    ``synaptory-local`` when this plugin is loopback-stamped, else
+    ``synaptory``. Never falls through from the local binary to prod.
     """
     override = os.environ.get("SYNAPTORY_CLI_BIN")
     if override and os.path.isfile(override) and os.access(override, os.X_OK):
         return override
-    return shutil.which("synaptory")
+    try:
+        from session_manager import _control_plane_url, _resolve_cli_binary
+    except ImportError:
+        return shutil.which("synaptory")
+    return _resolve_cli_binary(_control_plane_url())
 
 
 def emit_gate_event(

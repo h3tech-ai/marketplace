@@ -30,10 +30,6 @@ def _env(hook_env: dict, *, version_json: dict | None = None,
          policy: str | None = None, update_log: Path | None = None) -> dict:
     env = {
         **hook_env,
-        # Force cp-url resolution regardless of the (possibly placeholder)
-        # build-stamped hooks/lib/cp-url in the source tree.
-        "SYNAPTORY_CP_ENV": "dev",
-        "SYNAPTORY_CONTROL_PLANE_URL": "http://localhost:8080",
     }
     if version_json is not None:
         env["SYNAPTORY_STUB_VERSION_JSON"] = json.dumps(version_json)

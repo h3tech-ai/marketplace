@@ -2,7 +2,7 @@
 
 **Multi-agent adaptive delivery for Claude Code.** Synaptory gives your team 9 specialized agents, Scrum and Kanban delivery paths, story-scoped DoD, Claude-native dispatch with tier routing (Opus/Sonnet/Haiku), and tracker integration in one orchestrated workflow.
 
-> **Version:** 1.1.4 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
+> **Version:** 1.1.5 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
 
 ## Requirements
 

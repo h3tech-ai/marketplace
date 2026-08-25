@@ -1,20 +1,45 @@
 #!/usr/bin/env bash
-# Resolve the right synaptory CLI binary for the current OS/arch.
-# Prints the absolute path on stdout. Sourced by every v2.5 hook.
+# Resolve the synaptory CLI that matches this plugin tree.
 #
-# ADR-008: the CLI is shipped standalone (not bundled in the plugin).
 # Search order:
-#  1. $SYNAPTORY_CLI_BIN — explicit override (CI, dev loops).
-#  2. A `synaptory` binary on $PATH (installed via the marketplace
-#     install script: cli/install.sh on macOS/Linux, install.ps1 on Win).
+#  1. $SYNAPTORY_CLI_BIN — explicit override (CI, e2e).
+#  2. synaptory-local on PATH when this plugin is stamped for loopback
+#     (./synaptory deploy local). Never fall through to `synaptory`.
+#  3. synaptory on PATH for production / marketplace plugins.
 #
-# If neither resolves, the hook prints an installer pointer and exits 1.
+# A localhost-stamped CLI must not live at the `synaptory` name — that is
+# what sent prod-plugin projects to the local stack.
 
 set -euo pipefail
 
-if [[ -n "${SYNAPTORY_CLI_BIN:-}" ]] && [[ -x "$SYNAPTORY_CLI_BIN" ]]; then
+_HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-$(cd "${_HOOK_DIR}/.." && pwd)}}"
+# shellcheck source=./_cp-url.sh
+source "${_HOOK_DIR}/_cp-url.sh"
+
+if [[ -n "${SYNAPTORY_CLI_BIN:-}" ]] && [[ -x "${SYNAPTORY_CLI_BIN}" ]]; then
   printf '%s' "$SYNAPTORY_CLI_BIN"
   exit 0
+fi
+
+if _synaptory_cp_url_is_local "${_cp_url:-}"; then
+  if command -v synaptory-local >/dev/null 2>&1; then
+    command -v synaptory-local
+    exit 0
+  fi
+  cat >&2 <<'EOF'
+synaptory: local CLI not found (synaptory-local).
+
+This plugin is pointed at a local control plane (hooks/lib/cp-url.local).
+Install the local-channel CLI without overwriting prod:
+
+  ./synaptory deploy local
+
+That writes ~/.local/bin/synaptory-local and leaves ~/.local/bin/synaptory
+(the prod CLI) alone. Do not export SYNAPTORY_CP_ENV or
+SYNAPTORY_CONTROL_PLANE_URL — they are ignored and mix installs.
+EOF
+  exit 1
 fi
 
 if command -v synaptory >/dev/null 2>&1; then
@@ -22,13 +47,11 @@ if command -v synaptory >/dev/null 2>&1; then
   exit 0
 fi
 
-# No bundled fallback — the CLI ships standalone now. Direct the user
-# at the marketplace install one-liner so the next session works.
 cat >&2 <<'EOF'
 synaptory: CLI not found on $PATH.
 
-The Synaptory CLI is now installed separately from the plugin (one install
-per laptop, shared across every project). Pick the line that matches your OS:
+The Synaptory CLI is installed separately from the plugin (one prod install
+per laptop). Pick the line that matches your OS:
 
   macOS / Linux:
     curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
@@ -36,11 +59,7 @@ per laptop, shared across every project). Pick the line that matches your OS:
   Windows (PowerShell):
     iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex
 
-If the marketplace repo is private (private pilot), the installer will
-fall back to `gh` automatically. Install GitHub CLI first and run:
-    gh auth login
-
-After installing the CLI, open a new terminal so $PATH picks up ~/.local/bin
-(or %USERPROFILE%\bin on Windows), then start a new Claude Code session.
+After installing, open a new terminal so $PATH picks up ~/.local/bin
+(or %USERPROFILE%\bin on Windows).
 EOF
 exit 1

@@ -11,7 +11,8 @@
 #
 #   ./synaptory deploy {local|prod}
 #       Build, then deploy. `local` brings up docker-compose on this machine
-#       and installs the CLI to ~/.local/bin. `prod` pushes images to GHCR,
+#       and installs ~/.local/bin/synaptory-local (never overwrites prod
+#       `synaptory`). `prod` pushes images to GHCR,
 #       publishes the plugin tree to github.com/h3tech-ai/marketplace and the
 #       legacy synaptory.h3t.co compatibility mirror, ships CLI artifacts to
 #       /mnt/pgdata/web-dist/cli/, and rolls compose forward.
@@ -1185,21 +1186,34 @@ _deploy_local() {
   # Always rebuild every module first so a deploy can never ship a stale
   # artifact. cmd_build bumps /VERSION (patch) by default; pass --version
   # X.Y.Z (or --minor / --major) before the verb to override.
-  cmd_build "$@"
-
-  local ver
-  ver=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+  #
+  # Local vs prod isolation: this path stamps localhost into the CLI as
+  # channel=local and writes gitignored hooks/lib/cp-url.local. It installs
+  # ~/.local/bin/synaptory-local and never overwrites the prod `synaptory`
+  # binary. Runtime SYNAPTORY_CONTROL_PLANE_URL / SYNAPTORY_CP_ENV are ignored.
   local infra_dir="${REPO_ROOT}/infra"
   local compose_file="${infra_dir}/compose/docker-compose.local.yml"
   local env_file="${infra_dir}/compose/.env"
-
-  echo "──── deploy local (v${ver}) ────"
 
   if [[ ! -f "$env_file" ]]; then
     echo "  copying .env.example → .env"
     cp "${infra_dir}/compose/.env.example" "$env_file"
   fi
   mkdir -p "${infra_dir}/dev-keys" "${infra_dir}/backups"
+
+  local local_url
+  local_url="$(_local_stack_url)"
+  export SYNAPTORY_CP_URL="${local_url}"
+  export SYNAPTORY_CHANNEL=local
+
+  cmd_build "$@"
+
+  local ver
+  ver=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+
+  _write_cp_url_local "$local_url"
+
+  echo "──── deploy local (v${ver}) ────"
 
   # Stamp IMAGE_TAG=v<VERSION> into .env so compose pulls the freshly-built
   # images. Idempotent — if the line already matches, no rewrite.
@@ -1247,7 +1261,9 @@ _deploy_local() {
   echo "  API health:  http://localhost:${caddy_port}/healthz"
   echo "  Marketplace: https://github.com/$(_marketplace_github_repo) (prod publish)"
   echo "  Dist tree:   ${REPO_ROOT}/web/dist/marketplace"
-  echo "  CLI:         $(command -v synaptory 2>/dev/null || echo '~/.local/bin/synaptory (ensure ~/.local/bin is on PATH)')"
+  echo "  CLI (local): ${HOME}/.local/bin/synaptory-local  (v${ver}, ${local_url})"
+  echo "  CLI (prod):  ~/.local/bin/synaptory left untouched"
+  echo "  Plugin URL:  hooks/lib/cp-url.local (gitignored)"
   echo ""
   echo "  Install plugin in Claude Code (local path transport):"
   echo "    /plugin marketplace add ${REPO_ROOT}/web/dist/marketplace"
@@ -1376,8 +1392,35 @@ _stamp_image_tag() {
   fi
 }
 
-# Install the freshly-built CLI binary for this host into ~/.local/bin.
-# Skip if the same version is already installed there.
+# Local stack URL from compose .env (CADDY_HTTP_PORT, default 8080).
+_local_stack_url() {
+  local env_file="${REPO_ROOT}/infra/compose/.env"
+  local port=8080
+  if [[ -f "$env_file" ]]; then
+    port=$(grep -E '^CADDY_HTTP_PORT=' "$env_file" | tail -1 | cut -d= -f2 | tr -d ' "' || true)
+    port="${port:-8080}"
+  fi
+  printf 'http://localhost:%s' "$port"
+}
+
+# Gitignored per-plugin URL so a source-tree / sideloaded plugin talks to the
+# local stack without stamping localhost into committed hooks/lib/cp-url.
+_write_cp_url_local() {
+  local url="$1"
+  local f
+  for f in \
+    "${REPO_ROOT}/plugin-claude/hooks/lib/cp-url.local" \
+    "${REPO_ROOT}/plugin-cursor/hooks/lib/cp-url.local" \
+    "${REPO_ROOT}/plugin-codex/plugins/synaptory/hooks/lib/cp-url.local"
+  do
+    mkdir -p "$(dirname "$f")"
+    printf '%s\n' "$url" > "$f"
+    echo "  ✓ wrote ${f#"$REPO_ROOT"/}"
+  done
+}
+
+# Install the local-channel CLI as synaptory-local. Never overwrite the prod
+# `synaptory` binary — that mix is what sent prod plugin sessions to localhost.
 _install_cli_local() {
   local ver="$1"
   local os arch suffix=""
@@ -1397,17 +1440,21 @@ _install_cli_local() {
     echo "  WARN: ${src} not found — skip CLI install"
     return 0
   fi
-  local dest="${HOME}/.local/bin/synaptory${suffix}"
+  local dest="${HOME}/.local/bin/synaptory-local${suffix}"
   mkdir -p "${HOME}/.local/bin"
   install -m 755 "$src" "$dest"
-  echo "  ✓ installed CLI → ${dest}  (v${ver})"
+  echo "  ✓ installed local CLI → ${dest}  (v${ver})"
+  echo "    prod ~/.local/bin/synaptory was not overwritten"
 }
 
 cmd_dev() {
   case "${1:-}" in
     cli)
       shift
-      (cd "${REPO_ROOT}/cli" && go run ./cmd/synaptory "$@")
+      local url="${SYNAPTORY_CP_URL:-$(_local_stack_url)}"
+      (cd "${REPO_ROOT}/cli" && go run -ldflags \
+        "-X github.com/h3tech-ai/synaptory/cli/internal/cli.ControlPlaneURL=${url} -X github.com/h3tech-ai/synaptory/cli/internal/cli.Channel=local" \
+        ./cmd/synaptory "$@")
       ;;
     plugin)
       shift
@@ -1431,7 +1478,10 @@ cmd_cli() {
       ;;
     run)
       shift
-      (cd "$cli_dir" && go run ./cmd/synaptory "$@")
+      local url="${SYNAPTORY_CP_URL:-$(_local_stack_url)}"
+      (cd "$cli_dir" && go run -ldflags \
+        "-X github.com/h3tech-ai/synaptory/cli/internal/cli.ControlPlaneURL=${url} -X github.com/h3tech-ai/synaptory/cli/internal/cli.Channel=local" \
+        ./cmd/synaptory "$@")
       ;;
     build)
       echo "ERROR: 'crew cli build' is removed. Use './synaptory build' (builds the CLI as part of the unified build)." >&2

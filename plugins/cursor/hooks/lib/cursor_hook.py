@@ -241,12 +241,13 @@ def session_start(data: dict[str, Any], project: str, root: Path) -> dict[str, A
     extra = os.environ.get("CURSOR_CONTROL_PLANE_URL") or os.environ.get(
         "CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL"
     )
-    # Plugin variables substitute into env as the schema name.
     var = os.environ.get("control_plane_url")
+    # Marketplace onboarding URL is only used when the stamp is still a
+    # placeholder. Do not export SYNAPTORY_CONTROL_PLANE_URL — the CLI ignores it.
     if extra:
-        env["SYNAPTORY_CONTROL_PLANE_URL"] = extra
+        env["CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL"] = extra
     if var:
-        env["SYNAPTORY_CONTROL_PLANE_URL"] = var
+        env["CLAUDE_PLUGIN_OPTION_CONTROL_PLANE_URL"] = var
     out: dict[str, Any] = {"env": env}
     if auth_failed:
         chunks.insert(

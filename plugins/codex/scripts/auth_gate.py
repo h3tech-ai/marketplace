@@ -14,34 +14,39 @@ STAMPED_CP_URL_FILE = Path(__file__).resolve().parent.parent / "hooks" / "lib" /
 
 
 def _control_plane_url(cp_url_file: Path | None = None) -> tuple[str | None, str]:
-    """Resolve the operator-stamped URL, with the established dev-only override."""
+    """Resolve the operator-stamped URL. Runtime env overrides are ignored."""
 
     stamped_file = cp_url_file or STAMPED_CP_URL_FILE
-    try:
-        stamped = stamped_file.read_text(encoding="utf-8").strip()
-    except OSError:
-        stamped = ""
-
-    env_url = os.environ.get("SYNAPTORY_CONTROL_PLANE_URL", "").strip()
-    if os.environ.get("SYNAPTORY_CP_ENV") == "dev" and env_url:
-        candidate = env_url
-        source = "development environment override"
-    else:
-        candidate = stamped
-        source = "build-stamped hooks/lib/cp-url"
-
-    if not candidate or candidate == CP_URL_PLACEHOLDER:
-        return None, source
-    return candidate, source
+    candidates = (
+        (stamped_file.with_name("cp-url.local"), "hooks/lib/cp-url.local"),
+        (stamped_file, "build-stamped hooks/lib/cp-url"),
+    )
+    last_source = candidates[-1][1]
+    for path, source in candidates:
+        try:
+            candidate = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        last_source = source
+        if candidate and candidate != CP_URL_PLACEHOLDER:
+            return candidate, source
+    return None, last_source
 
 
-def _cli_path() -> str | None:
+def _is_local_url(url: str) -> bool:
+    lowered = url.lower()
+    return "localhost" in lowered or "127." in lowered or "::1" in lowered
+
+
+def _cli_path(control_plane: str | None = None) -> str | None:
     override = os.environ.get("SYNAPTORY_CLI_BIN", "").strip()
     if override:
         path = Path(override).expanduser()
         if path.is_file() and os.access(path, os.X_OK):
             return str(path)
         return None
+    if control_plane and _is_local_url(control_plane):
+        return shutil.which("synaptory-local")
     return shutil.which("synaptory")
 
 
@@ -80,7 +85,7 @@ def authentication_status(
             "reason": "build-stamped hooks/lib/cp-url is blank or still a placeholder",
         }
 
-    cli = _cli_path()
+    cli = _cli_path(control_plane)
     if not cli:
         return {
             "ready": False,
@@ -93,7 +98,6 @@ def authentication_status(
         }
 
     command_env = os.environ.copy()
-    command_env["SYNAPTORY_CONTROL_PLANE_URL"] = control_plane
     try:
         result = subprocess.run(
             [cli, "whoami", "--check"],

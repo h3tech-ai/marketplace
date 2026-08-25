@@ -7,7 +7,7 @@
     {
       "name": "synaptory",
       "source": "./plugins/claude",
-      "version": "1.1.4",
+      "version": "1.1.5",
       "author": {
         "name": "H3Tech Inc.",
         "url": "https://h3t.co"

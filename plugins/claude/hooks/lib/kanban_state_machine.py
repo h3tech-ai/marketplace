@@ -13,7 +13,7 @@ CLI:
     python3 kanban_state_machine.py transition <project_dir> <to_state> [--force]
     python3 kanban_state_machine.py pull_ticket <project_dir> <ticket_id> [--title "..."] [--backends '{...}']
     python3 kanban_state_machine.py complete_ticket <project_dir> <ticket_id>
-    python3 kanban_state_machine.py transition_story <project_dir> <story_id> <to_state> [--reason "..."]
+    python3 kanban_state_machine.py transition_story <project_dir> <story_id> <to_state> [--reason "..."] [--force-recovery]
     python3 kanban_state_machine.py evaluate_dod <project_dir> <ticket_id>
     python3 kanban_state_machine.py throughput <project_dir> [--window 7]
     python3 kanban_state_machine.py summary <project_dir>
@@ -28,8 +28,9 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-# Spec-aware state I/O (see docs/multi-spec-design.md, plugin-claude/hooks/lib/spec_state.py).
+# Spec-aware state I/O (see docs/multi-spec-design.md, core/lib/spec_state.py).
 import spec_state as _ss
+import host_env
 
 # Import shared story pipeline (same directory).
 from story_pipeline import (
@@ -46,9 +47,12 @@ from story_pipeline import (
     verification_loops_active,
     list_stories_by_state,
     next_action as _sp_next_action,
+    dep_context,
+    dependency_gate_mode,
     parallelism_config,
     resolve_dod_tier,
     _resolve_receipts_dir,
+    _cli_receipt_gated_refusal,
 )
 
 
@@ -101,7 +105,10 @@ def _default_state() -> dict[str, Any]:
         "tickets_completed": [],
         "current_stories": [],
         "cumulative_ticket_number": 0,
-        "agent_backends": {"default": "claude", "roles": {}},
+        "agent_backends": {
+            "default": host_env.default_agent_backend(),
+            "roles": {},
+        },
         "transitioned_from": None,
     }
 
@@ -330,15 +337,14 @@ def transition_story(
     # gates pass; redirect the `reviewing → done` promotion to `blocked`
     # (recoverable) rather than silently completing on green SE/QE/CR.
     if to_state == "done":
-        _story = get_story(state, story_id)
-        if _story and _story.get("state") == "reviewing":
-            _ticket_num = state.get("cumulative_ticket_number", 1)
-            _intensity = determine_dod_intensity(ticket_number=_ticket_num)
-            _pre_dod = _sp_evaluate_dod(project_dir, story_id, _intensity)
-            _block = dod_gate_block_reason(_pre_dod)
-            if _block:
-                to_state = "blocked"
-                reason = _block
+        # Delegated to the shared kernel (#277). resolve_done_edge reproduces
+        # this mode's ticket-number intensity and its deliberate absence of a
+        # PO acceptance redirect.
+        from advance_kernel import resolve_done_edge
+
+        to_state, reason, _pre_dod = resolve_done_edge(
+            project_dir, state, story_id, to_state, reason, mode="kanban"
+        )
 
     state = _sp_transition_story(state, story_id, to_state, reason, project_dir)
     _write_state(project_dir, state)
@@ -351,7 +357,9 @@ def transition_story(
         if story:
             story["dod"] = result
             _write_state(project_dir, state)
-            _sp_ship_evaluated_dod(story_id, result)   # #199
+            _sp_ship_evaluated_dod(
+                story_id, result, project_dir=project_dir
+            )   # #199
 
     return state
 
@@ -368,7 +376,9 @@ def evaluate_ticket_dod(project_dir: str, ticket_id: str) -> dict[str, Any]:
     if story:
         story["dod"] = result
         _write_state(project_dir, state)
-        _sp_ship_evaluated_dod(ticket_id, result)   # #199
+        _sp_ship_evaluated_dod(
+            ticket_id, result, project_dir=project_dir
+        )   # #199
 
     return result
 
@@ -411,6 +421,8 @@ def next_action(project_dir: str) -> dict[str, Any]:
         verification_loops=verification_loops_active(project_dir),
         dod_tier_info=resolve_dod_tier(project_dir, state),
         parallelism=parallelism_config(project_dir),
+        dep_context=dep_context(project_dir, state),
+        dependency_gate=dependency_gate_mode(project_dir),
     )
     result.update(base)
     return result
@@ -564,9 +576,21 @@ def main() -> None:
 
         elif action == "transition_story":
             if len(args) < 2:
-                _die("Usage: transition_story <project_dir> <story_id> <to_state> [--reason '...']")
+                _die(
+                    "Usage: transition_story <project_dir> <story_id> <to_state> "
+                    "[--reason '...'] [--force-recovery]"
+                )
             story_id, to_state = args[0], args[1]
             reason = _parse_flag(args, "--reason", None)
+            forced = "--force-recovery" in args
+            from_state = str(
+                (get_story(read_state(project_dir), story_id) or {}).get("state") or ""
+            )
+            refused = _cli_receipt_gated_refusal(
+                from_state, to_state, story_id, forced=forced, reason=reason
+            )
+            if refused:
+                _die(refused)
             result = transition_story(project_dir, story_id, to_state, reason)
             print(json.dumps(result, indent=2))
 

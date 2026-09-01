@@ -34,6 +34,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+
+def _host_env():
+    """Lazy import so a partial install cannot break module load."""
+    import host_env
+
+    return host_env
+
+
 CHAIN_ID_ENV = "SYNAPTORY_CHAIN_ID"
 AGENT_DEPTH_ENV = "SYNAPTORY_AGENT_DEPTH"
 MAX_AGENT_DEPTH = 3  # Hard cap enforced by SubagentStart hook (BEA4-F1 / H7-F1)
@@ -57,7 +65,7 @@ def chain_id(project_dir: str | os.PathLike[str] | None = None) -> str:
     if env:
         return env
     if project_dir is None:
-        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        project_dir = _host_env().project_dir()
     path = _chain_id_file(project_dir)
     try:
         if path.exists():
@@ -91,7 +99,7 @@ def agent_depth() -> int:
         except ValueError:
             pass
     # File-based fallback: read the live counter.
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project_dir = _host_env().project_dir()
     counter = _active_depth_file(project_dir)
     try:
         if counter.exists():
@@ -113,7 +121,7 @@ def increment_depth(project_dir: str | os.PathLike[str] | None = None) -> int:
     Claude Code is serial enough that a simple read-modify-write is fine.
     """
     if project_dir is None:
-        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        project_dir = _host_env().project_dir()
     counter = _active_depth_file(project_dir)
     try:
         counter.parent.mkdir(parents=True, exist_ok=True)
@@ -133,7 +141,7 @@ def increment_depth(project_dir: str | os.PathLike[str] | None = None) -> int:
 def decrement_depth(project_dir: str | os.PathLike[str] | None = None) -> int:
     """Atomically decrement the active-depth counter, clamped at 0."""
     if project_dir is None:
-        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        project_dir = _host_env().project_dir()
     counter = _active_depth_file(project_dir)
     try:
         if not counter.exists():
@@ -170,7 +178,7 @@ def emit(
     dropped so hooks remain non-blocking.
     """
     if project_dir is None:
-        project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        project_dir = _host_env().project_dir()
     sink_dir = _orchestrator_dir(project_dir)
     sink = sink_dir / "events.jsonl"
     try:

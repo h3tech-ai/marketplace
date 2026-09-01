@@ -45,6 +45,8 @@ ABSOLUTE_CONTINUATION_CAP = 50
 # reason strings / tests; membership is decided by CONTINUE_ELIGIBLE.
 STOP_ACTIONS = (
     "await_acceptance",
+    # #304: every queued Work Unit is held by an unmet `depends_on` edge.
+    "deps_blocked",
     "sprint_complete",
     "await_sync",  # SPQ cross-workstream barrier — a human gate (§8, §10.2)
     "all_blocked",
@@ -288,7 +290,8 @@ def should_continue(project_dir: str, session_id: str) -> dict[str, Any]:
         + f" — {na.get('reason', '')}. "
         f'Run `python3 "${{CLAUDE_PLUGIN_ROOT}}/hooks/lib/{sm_script}" next_action "$(pwd)"` '
         "and execute the returned action. Do NOT stop until next_action returns "
-        "sprint_complete, await_acceptance, await_sync, or all_blocked. "
+        "sprint_complete, await_acceptance, await_sync, deps_blocked, or "
+        "all_blocked. "
         f"(continuation {n})"
     )
     _log_emit(

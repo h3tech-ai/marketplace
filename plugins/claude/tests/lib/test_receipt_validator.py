@@ -279,6 +279,24 @@ def test_token_usage_present_no_warning(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_token_usage_sdk_aliases_do_not_warn(tmp_path: Path):
+    """Cursor receipts copy provider SDK names; Cost canonicalizes them."""
+    receipt = _good_receipt()
+    receipt["token_usage"] = {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "stage": "se-implementation",
+    }
+    p = _write(tmp_path, receipt)
+    r = validate_receipt(str(p), str(tmp_path))
+    assert r.valid
+    token_warnings = [w for w in r.warnings if "token_usage" in w]
+    assert not token_warnings, f"unexpected token_usage warnings: {token_warnings}"
+
+
+@pytest.mark.unit
 def test_token_usage_unknown_stage_warns_for_unknown_role(tmp_path: Path):
     """GAP-7 (#163): the stage warning survives ONLY when no canonical stage
     is derivable from the role — an unknown role can't be backfilled."""

@@ -2,11 +2,20 @@
 
 This is the installable native Codex host package for Synaptory.
 
-Invoke `$synaptory` in an existing Synaptory repository. The plugin can inspect
-readiness, install all nine managed project agent profiles, read the shared
-Scrum/Kanban/SPQ state, execute the deterministic SE→QE→CR story loop, validate
-Codex receipts, and advance state only through the shared Synaptory lifecycle
-engine.
+Invoke `$synaptory` in an existing Synaptory repository. **Codex is certified
+for SPQ only** (`build_mode: spq`). Scrum and Kanban share the lifecycle kernel
+but have not been proven end-to-end on this host. The skill, its limitations,
+the managed always-on `AGENTS.md` block, and the plugin description warn before
+delivery dispatch and recommend SPQ. An explicit user may continue an
+uncertified Scrum/Kanban run through the same fail-closed MCP gates.
+
+The plugin can inspect readiness, install all nine managed project agent
+profiles, read the shared lifecycle state, execute the deterministic
+SE→QE→CR story loop, validate Codex receipts, and advance state only through
+the shared Synaptory lifecycle engine. Validated receipts hand an allowlisted
+analytics projection to the authenticated Synaptory CLI/outbox so Activity,
+Cost, and Quality can populate without uploading prompts, transcripts,
+artifact content or paths, commands, summaries, or findings.
 
 The package composes these host-neutral sources from `plugin-claude/`:
 
@@ -17,20 +26,36 @@ The package composes these host-neutral sources from `plugin-claude/`:
 
 The Codex-authored layer owns the plugin manifest, `$synaptory` workflow, MCP
 boundary, hooks, project bootstrap, and pure-TOML agent profiles.
-Project bootstrap also enables `multi_agent_v2`, which Codex 0.147.0 requires
-for reliable fresh named-agent dispatch. It preserves unrelated config and
+Project bootstrap also explicitly enables the stable `multi_agent` feature for
+fresh named-agent dispatch. It preserves unrelated config and
 refuses to override an explicit user `false`.
 
-Current execution scope is standard, non-regulated projects whose lifecycle is
-already in Scrum `SPRINT_EXECUTION`, Kanban `EXECUTION`, or SPQ
-`SLICE_EXECUTION`. Broader ceremonies and focused modes remain part of the full
-port. `baa_enforced` projects fail closed until the regulated Codex path is
-certified.
+Current certified execution scope is standard, non-regulated SPQ, covering the
+complete guarded lifecycle from initialization and Discovery through Commit,
+repeated Cycle execution, Sync, Checkpoint, Acceptance, and Complete. Scrum and
+Kanban remain shared-kernel, uncertified paths. `baa_enforced` projects fail
+closed until the regulated Codex path is certified.
 
-Installed acceptance on Codex 0.147.0 has completed a synthetic Scrum story
-through fresh SE, QE, and CR profiles with valid receipts, a passing DoD, and
-terminal `sprint_complete`. Treat this as the standard-project canary tier;
-cost attribution and latency optimization remain required before broad staff
-rollout.
+Installed acceptance on Codex 0.147.0 has completed a two-Cycle SPQ release
+through Work Unit delivery, Sync, Checkpoint, Acceptance, and terminal
+`COMPLETE`. Fresh managed profiles produced dispatch-bound receipts; all
+receipts reached Activity and Cost, and pipeline-computed DoD reached Quality.
+Treat this as the SPQ standard-project canary tier. The companion read-only
+`scripts/standard_pilot.py` combines installed-plugin doctor evidence with
+HTTPS health, latency, and fail-closed authentication probes for a
+representative deployment. Regulated/HC0 remains refused.
 
 The runtime target is Codex CLI `0.147.0` or newer.
+
+## Local development beside production
+
+Production and local testing intentionally use different CLI identities:
+
+- `synaptory` → production stamp and `~/.synaptory/`
+- `synaptory-local` → loopback stamp and `~/.synaptory-local/`
+
+The installed Codex package selects the CLI from its immutable control-plane
+stamp. A local package chooses `synaptory-local`; a production package chooses
+`synaptory` and fails closed if that binary is loopback-stamped. Use
+`SYNAPTORY_CLI_BIN` only for an explicit CI/test override. Do not put
+`SYNAPTORY_CP_ENV=dev` or a loopback URL in a global shell profile.

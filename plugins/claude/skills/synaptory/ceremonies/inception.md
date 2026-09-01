@@ -174,10 +174,10 @@ engagement: {engagement}
 config: .synaptory.yaml
 -->"""
 
-    Bash(f'printf "%s" \'{claude_section}\' | python3 "${{CLAUDE_PLUGIN_ROOT}}/hooks/lib/update_claude_md.pyc" "${{CLAUDE_PROJECT_DIR}}"')
+    Bash(f'printf "%s" \'{claude_section}\' | python3 "${{CLAUDE_PLUGIN_ROOT}}/hooks/lib/update_claude_md.py" "${{CLAUDE_PROJECT_DIR}}"')
 ```
 
-**Note:** `update_claude_md.pyc` is idempotent — it inserts or updates the `synaptory` section without overwriting other content.
+**Note:** `update_claude_md.py` is idempotent — it inserts or updates the `synaptory` section without overwriting other content.
 
 ---
 
@@ -274,7 +274,7 @@ Design path (2.5a/2.5b) — it does **not** skip the baseline.
 **Skip the entire step only if:** CLI tool, library, backend-only API, or infrastructure
 project (no UI surface).
 
-Follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/design-grooming.md`.
+Follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`.
 
 ### Step 2.5a — Connect project repo to Claude Design (one-time, optional)
 
@@ -316,10 +316,14 @@ Claude Design can connect to the project's GitHub repo and extract the design sy
 
 This is the guaranteed artifact — it runs for every UI-surface project regardless of
 `engagement_mode` or `design.enabled`. Generate **self-contained HTML/CSS mockups** for the
-key screens/flows derived from the Mini-BRD/BRD, using the design system reference under
-`${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/` (component-patterns, color-palettes,
-typography, spacing-layout) as the token source so the baseline is consistent rather than
-ad-hoc.
+key screens/flows derived from the Mini-BRD/BRD, using the design system reference as the
+token source so the baseline is consistent rather than ad-hoc. These bodies are
+control-plane delivered, not packaged (ADR-016) -- fetch them first:
+
+Bash("synaptory skills get design-assets/component-patterns")
+Bash("synaptory skills get design-assets/color-palettes")
+Bash("synaptory skills get design-assets/typography")
+Bash("synaptory skills get design-assets/spacing-layout")
 
 **Requirements (see design-grooming.md → "In-repo mockup baseline"):**
 - Each page inlines its CSS — no external CDN/font/script fetches — so it opens directly in
@@ -332,7 +336,7 @@ ad-hoc.
 Because `SessionEnd` ships inline orchestrator receipts through
 `receipt_validator.py`, this receipt MUST carry every required field — `story_id`, `role`,
 `backend`, `model`, `artifacts`, non-empty `metrics`, `verification_commands`, and
-`completed_at` (see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/receipt-protocol.md`).
+`completed_at` (see `.synaptory/.protocols/receipt-protocol.md`).
 The orchestrator generates the baseline itself, so `role` is `orchestrator` and
 `token_usage.stage` is `orchestrator`. Use the inception-scoped `story_id` `INCEPTION-0`
 (matches the `[A-Z][A-Z0-9]*-\d+` pattern):

@@ -194,22 +194,22 @@ Agent(prompt="Generate security infrastructure following Phase 6. Write to infra
 Load each phase file before executing that phase. Phase files are the canonical implementation guides — do not proceed from memory alone.
 
 ### Phase 1 — Infrastructure Assessment
-`!cat ${CLAUDE_SKILL_DIR}/phases/01-assessment.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/01-assessment.md`
 
 ### Phase 2 — Infrastructure as Code
-`!cat ${CLAUDE_SKILL_DIR}/phases/02-infrastructure-as-code.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/02-infrastructure-as-code.md`
 
 ### Phase 3 — CI/CD Pipelines
-`!cat ${CLAUDE_SKILL_DIR}/phases/03-cicd-pipelines.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/03-cicd-pipelines.md`
 
 ### Phase 4 — Container Orchestration
-`!cat ${CLAUDE_SKILL_DIR}/phases/04-container-orchestration.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/04-container-orchestration.md`
 
 ### Phase 5 — Monitoring & Observability
-`!cat ${CLAUDE_SKILL_DIR}/phases/05-monitoring.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/05-monitoring.md`
 
 ### Phase 6 — Security
-`!cat ${CLAUDE_SKILL_DIR}/phases/06-security.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/06-security.md`
 
 ---
 

@@ -40,6 +40,7 @@ Check the task context for mode indicators:
 
 - **Healthcare:** If the task mentions HIPAA, PHI, ePHI, healthcare, BAA, HITRUST, clinical, patient data, or medical records → read `modes/healthcare.md` and apply its additional checks ON TOP of the standard pipeline. Continue reading this file — the mode file supplements (does not replace) the standard pipeline.
 - **Pentest:** If the task mentions "pentest", "penetration test", "red team", or "exploit" — OR if engagement mode is Controlled and this is a Release audit → read `modes/pentest.md` and run the PTES 7-phase methodology AFTER the standard pipeline completes. Continue reading this file — the mode file supplements (does not replace) the standard pipeline.
+- **Scoped audit:** If the task carries a `## Scope` block (Secure mode, or any caller that supplies an explicit file list) → read `modes/scoped-audit.md` FIRST. Its scope contract **replaces** the Pre-Flight Read Order and Input Classification below — the envelope's file list is the audit surface, not `services/`/`api/`. The rest of this file still applies.
 - **Standard:** No special mode indicators → follow the standard security + compliance pipeline below
 
 ## Finding Memory

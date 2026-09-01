@@ -16,20 +16,6 @@ source "${PLUGIN_ROOT}/hooks/_plugin-env.sh"
 # shellcheck source=./_cp-url.sh
 source "${PLUGIN_ROOT}/hooks/_cp-url.sh"
 
-# Cache the plugin root so skill stubs can find the decrypt hook without
-# needing ${CLAUDE_PLUGIN_ROOT} / ${CLAUDE_SKILL_DIR} expansion in skill
-# markdown (Claude Code does not reliably substitute those in !bash inline
-# commands). Derive the channel from plugin.json.name so the cache path
-# matches the CLI's own channel layout (~/.synaptory-next/ vs ~/.synaptory/).
-_plugin_name=$(python3 -c "import json,sys;print(json.load(open('${PLUGIN_ROOT}/.claude-plugin/plugin.json'))['name'])" 2>/dev/null || echo "synaptory")
-case "$_plugin_name" in
-  synaptory)      _root_cache_dir="$HOME/.synaptory" ;;
-  synaptory-*)    _root_cache_dir="$HOME/.${_plugin_name}" ;;
-  *)              _root_cache_dir="$HOME/.${_plugin_name}" ;;
-esac
-mkdir -p "$_root_cache_dir" 2>/dev/null || true
-printf '%s' "$PLUGIN_ROOT" > "$_root_cache_dir/.plugin-root" 2>/dev/null || true
-
 if [[ -z "$_cp_url" ]] || [[ "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
   SYNAPTORY_HOOK_LIB="${PLUGIN_ROOT}/hooks/lib" python3 -c "
 import sys, os
@@ -65,6 +51,18 @@ emit('SessionStart', additional_context=msg)
 " 2>/dev/null
   exit 1
 fi
+
+# Channel identity comes from the selected binary, not plugin.json.name: local
+# and production packages intentionally keep the same stable plugin name while
+# their CLIs use separate state roots and keychain services.
+_cli_command=$(basename "$cli")
+case "$_cli_command" in
+  synaptory-local) _root_cache_dir="$HOME/.synaptory-local" ;;
+  synaptory-*)     _root_cache_dir="$HOME/.${_cli_command}" ;;
+  *)               _root_cache_dir="$HOME/.synaptory" ;;
+esac
+mkdir -p "$_root_cache_dir" 2>/dev/null || true
+printf '%s' "$PLUGIN_ROOT" > "$_root_cache_dir/.plugin-root" 2>/dev/null || true
 
 # Enforce cli_min_version from plugin.json (ADR-018 §C.1). The plugin
 # was built against a specific CLI; older CLIs may miss subcommands or
@@ -138,7 +136,7 @@ if [[ -z "$_policy" ]]; then
 fi
 case "$_policy" in prompt|auto|off) ;; *) _policy="prompt" ;; esac   # sanitise unknowns
 _now=$(date +%s 2>/dev/null || echo 0)
-_stamp_dir="${HOME}/.synaptory"
+_stamp_dir="${_root_cache_dir}"
 _stamp="${_stamp_dir}/.version-check-stamp"
 _interval="${SYNAPTORY_VERSION_CHECK_INTERVAL:-21600}"   # 6h between checks
 _last=0; [[ -r "$_stamp" ]] && _last=$(cat "$_stamp" 2>/dev/null || echo 0)
@@ -254,12 +252,12 @@ fi
 # sign-in (detached so it can't stall session start), throttled so repeated
 # blocked starts don't storm browser tabs. The CLI's local OAuth callback
 # server survives the hook exit via nohup/setsid.
-_auth_stamp="${HOME}/.synaptory/.login-launch-stamp"
+_auth_stamp="${_root_cache_dir}/.login-launch-stamp"
 _now=$(date +%s 2>/dev/null || echo 0)
 _last=0; [[ -r "$_auth_stamp" ]] && _last=$(cat "$_auth_stamp" 2>/dev/null || echo 0)
 _launched=0
 if [[ "${SYNAPTORY_AUTH_NO_AUTOLAUNCH:-}" != "1" ]] && [[ "$_now" -gt 0 ]] && (( _now - _last >= 90 )); then
-  mkdir -p "${HOME}/.synaptory" 2>/dev/null || true
+  mkdir -p "${_root_cache_dir}" 2>/dev/null || true
   echo "$_now" > "$_auth_stamp" 2>/dev/null || true
   if command -v setsid >/dev/null 2>&1; then
     setsid "$cli" login >/dev/null 2>&1 < /dev/null &
@@ -271,11 +269,12 @@ if [[ "${SYNAPTORY_AUTH_NO_AUTOLAUNCH:-}" != "1" ]] && [[ "$_now" -gt 0 ]] && ((
   _launched=1
 fi
 
-CLI_BIN="$cli" PLUGIN_ROOT="$PLUGIN_ROOT" LAUNCHED="$_launched" SYNAPTORY_HOOK_LIB="${PLUGIN_ROOT}/hooks/lib" python3 <<'PY' 2>/dev/null
+CLI_BIN="$cli" CLI_COMMAND="$_cli_command" PLUGIN_ROOT="$PLUGIN_ROOT" LAUNCHED="$_launched" SYNAPTORY_HOOK_LIB="${PLUGIN_ROOT}/hooks/lib" python3 <<'PY' 2>/dev/null
 import json, os, sys
 sys.path.insert(0, os.environ["SYNAPTORY_HOOK_LIB"])
 from hook_io import emit
 plugin_root = os.environ["PLUGIN_ROOT"]
+cli_command = os.environ.get("CLI_COMMAND", "synaptory")
 launched = os.environ.get("LAUNCHED") == "1"
 opened = ("A browser window is opening for Entra sign-in — complete it, then start a **new Claude Code session**."
           if launched else
@@ -287,14 +286,14 @@ Synaptory is blocked until you re-authenticate (your session lapsed or was never
 {opened}
 
 ```bash
-synaptory login
+{cli_command} login
 ```
 
 **If the CLI isn't installed yet:**
 ```bash
 bash "{plugin_root}/hooks/install-cli.sh"
 ```
-Open a new terminal so `$PATH` picks up `~/.local/bin`, then run `synaptory login`.
+Open a new terminal so `$PATH` picks up `~/.local/bin`, then run `{cli_command} login`.
 
 After sign-in, **start a new Claude Code session**. (Set `SYNAPTORY_AUTH_NO_AUTOLAUNCH=1` to stop the browser from opening automatically.)"""
 emit("SessionStart", additional_context=msg)

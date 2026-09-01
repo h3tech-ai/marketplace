@@ -89,7 +89,7 @@ Read `.synaptory.yaml` for project config.
    }])
    ```
 
-5. **Write `.synaptory.yaml`** from template `${CLAUDE_SKILL_DIR}/../_shared/templates/synaptory.yaml.tmpl`, filling in detected values. Continue with analysis.
+5. **Write `.synaptory.yaml`** from template `Bash("synaptory skills get templates/synaptory.yaml.tmpl")`, filling in detected values. Continue with analysis.
 
 ### 1b. Detect Existing Context Packages
 
@@ -319,8 +319,8 @@ Write to `.synaptory/reverse-engineering/architecture/impact-templates/[module]-
 ### 2g. Write Context Packages
 
 Write summaries to `.synaptory/.orchestrator/context-packages/`:
-- `dependency-map.md` — from template `${CLAUDE_SKILL_DIR}/../_shared/templates/context-packages/dependency-map.tmpl.md`
-- `interface-contracts.md` — from template `${CLAUDE_SKILL_DIR}/../_shared/templates/context-packages/interface-contracts.tmpl.md`
+- `dependency-map.md` — from template `Bash("synaptory skills get templates/context-packages/dependency-map.tmpl")`
+- `interface-contracts.md` — from template `Bash("synaptory skills get templates/context-packages/interface-contracts.tmpl")`
 
 Context packages are **summaries** for session injection. Full detailed analysis stays in `reverse-engineering/architecture/`.
 
@@ -435,7 +435,7 @@ Write detailed findings to `.synaptory/reverse-engineering/live-exploration/`:
 - `api-contracts-live.md` — API calls observed during exploration
 - `navigation-map.md` — screen connectivity graph and primary flows
 
-Write context package summary to `.synaptory/.orchestrator/context-packages/ui-contracts.md` — from template `${CLAUDE_SKILL_DIR}/../_shared/templates/context-packages/ui-contracts.tmpl.md`
+Write context package summary to `.synaptory/.orchestrator/context-packages/ui-contracts.md` — from template `Bash("synaptory skills get templates/context-packages/ui-contracts.tmpl")`
 
 ```
   [+] Live App Exploration
@@ -700,7 +700,7 @@ Write detailed findings to `.synaptory/reverse-engineering/database/`:
 - `schema-drift.md` — code vs database mismatches with risk assessment
 - `db-business-rules.md` — constraints, triggers, computed columns as business rules
 
-Write context package summary to `.synaptory/.orchestrator/context-packages/data-schema.md` — from template `${CLAUDE_SKILL_DIR}/../_shared/templates/context-packages/data-schema.tmpl.md`
+Write context package summary to `.synaptory/.orchestrator/context-packages/data-schema.md` — from template `Bash("synaptory skills get templates/context-packages/data-schema.tmpl")`
 
 ```
   [+] Live Database Schema Analysis
@@ -948,7 +948,7 @@ Collect all conflicts as numbered Open Questions for the PRD.
 
 ### 6c. Write PRD
 
-Write to `.synaptory/reverse-engineering/PRD.md` using template `${CLAUDE_SKILL_DIR}/../_shared/templates/prd.tmpl.md`.
+Write to `.synaptory/reverse-engineering/PRD.md` using template `Bash("synaptory skills get templates/prd.tmpl")`.
 
 **PRD Sections** (include only sections with sufficient source material — omit sections with no data rather than writing empty sections):
 

@@ -1,11 +1,11 @@
 interface:
   display_name: "Synaptory"
   short_description: "Run governed Synaptory delivery with Codex agents."
-  default_prompt: "Use $synaptory to inspect readiness and continue the deterministic Synaptory story loop with native Codex agents."
+  default_prompt: "Use $synaptory to set up or continue governed SPQ delivery. Recommend `build_mode: spq`; warn that Scrum and Kanban are uncertified on Codex."
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true
 dependencies:
   tools:
     - type: "mcp"
       value: "synaptory"
-      description: "Synaptory readiness, state, dispatch, receipt, advancement, tracker, and project-bootstrap tools."
+      description: "Synaptory readiness, SPQ-certified lifecycle, dispatch, receipt, advancement, tracker, and project-bootstrap tools."

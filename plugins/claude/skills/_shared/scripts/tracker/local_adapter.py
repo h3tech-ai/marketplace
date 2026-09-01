@@ -140,13 +140,18 @@ class LocalAdapter(ArtifactAdapter):
 
     def update_story_status(self, story_id: str, status: str, *,
                             allow_skip: bool = False) -> Story:
-        self._validate_status_transition(story_id, status, allow_skip)
         data = self._load()
         for s in data["stories"]:
             if s["id"] == story_id:
+                self._validate_status_transition(story_id, status, allow_skip)
                 s["status"] = status
                 self._save()
                 return self._dict_to_story(s)
+        if allow_skip:
+            # Workstream clones often don't share the integration tracker
+            # file. `--allow-skip` makes a missing id a no-op instead of a
+            # red "Story not found" herring.
+            return Story(id=story_id, title="", status=status)
         raise AdapterError(f"Story not found: {story_id}")
 
     def update_story(self, story_id: str, **fields) -> Story:

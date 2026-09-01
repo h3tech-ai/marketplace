@@ -173,3 +173,58 @@ def test_pull_ticket_cli_passes_acceptance_criteria(project, monkeypatch):
     ticket = next(s for s in read_state(project)["current_stories"] if s["id"] == "TICK-9")
     assert ticket["ui_bearing"] is True
     assert ticket["acceptance_criteria"]
+
+
+# ── #304: the serial path now gates `depends_on` in this lifecycle too ─────
+
+
+def test_serial_dispatch_now_gates_depends_on():
+    """An intentional behaviour change, asserted here so nobody reverts it.
+
+    `create_story` populates `depends_on` for all three lifecycles (#134
+    GAP-6), and with story parallelism defaulting off the serial path was the
+    ONLY path -- and it was ungated, so a queued story could start against an
+    unfinished upstream. The gate is deliberately not conditioned on
+    build_mode: #304 objects to serial and parallel dispatch disagreeing about
+    one contract. A project holding aspirational or stale edges (the shipped
+    prompts described `depends_on` as a batch filter) can set
+    `resilience.dependency_gate: warn` for one release.
+    """
+    from story_pipeline import next_action
+
+    def _unit(sid, state, **kw):
+        return {"id": sid, "title": sid, "state": state, **kw}
+
+    board = {
+        "version": "2.0",
+        "build_mode": "kanban",
+        "lifecycle_state": "EXECUTION",
+        "cumulative_ticket_number": 2,
+        "current_stories": [
+            _unit("TK-02", "queued", depends_on=["TK-01"]),
+        ],
+    }
+    out = next_action(board)
+    assert out["action"] == "deps_blocked", out
+    assert out["dependencies_held"][0]["story_id"] == "TK-02"
+
+
+def test_serial_dispatch_skips_a_blocked_unit_instead_of_starving_the_queue():
+    from story_pipeline import next_action
+
+    def _unit(sid, state, **kw):
+        return {"id": sid, "title": sid, "state": state, **kw}
+
+    board = {
+        "version": "2.0",
+        "build_mode": "kanban",
+        "lifecycle_state": "EXECUTION",
+        "cumulative_ticket_number": 2,
+        "current_stories": [
+            _unit("TK-02", "queued", depends_on=["TK-01"]),
+            _unit("TK-01", "queued"),
+        ],
+    }
+    out = next_action(board)
+    assert out["action"] == "dispatch_se"
+    assert out["story_id"] == "TK-01", "blocked FIFO head starved the queue"

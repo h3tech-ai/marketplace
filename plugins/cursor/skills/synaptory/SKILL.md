@@ -1,10 +1,10 @@
 ---
 name: synaptory
 description: >-
-  Synaptory orchestrator for Cursor. Classify the request, run Scrum/Kanban/SPQ
-  ceremonies or standalone modes, and dispatch the SE→QE→CR pipeline with
-  receipts. Use at the start of delivery work, status, doctor, or when the
-  user says /synaptory.
+  Synaptory orchestrator for Cursor. Certified for SPQ (`build_mode: spq`).
+  Classify the request, run the Cycle loop with receipts, and stop at human
+  gates. Warn and recommend SPQ if the project is Scrum or Kanban. Use at the
+  start of delivery work, status, doctor, or when the user says /synaptory.
 disable-model-invocation: true
 metadata:
   host: cursor

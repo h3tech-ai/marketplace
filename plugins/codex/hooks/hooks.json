@@ -26,6 +26,31 @@
           }
         ]
       }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/run-hook.sh\" SubagentStop",
+            "timeout": 10,
+            "statusMessage": "Validating Synaptory receipt..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/run-hook.sh\" Stop",
+            "timeout": 2
+          }
+        ]
+      }
     ]
   }
 }

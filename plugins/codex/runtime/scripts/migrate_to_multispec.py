@@ -39,14 +39,16 @@ from pathlib import Path
 
 
 def _resolve_lib_dirs() -> tuple[Path, Path]:
-    """Locate the hooks/lib and skills/_shared/scripts/tracker directories.
+    """Locate the shared lib/ and tracker/ directories.
 
-    The script lives at plugin-claude/skills/_shared/scripts/migrate_to_multispec.py,
-    so the plugin root is three levels up.
+    The lib dir sits at a different depth per layout (core/lib in the source
+    tree, <pkg>/hooks/lib once composed), so probe rather than count parents.
     """
     here = Path(__file__).resolve().parent
-    plugin_root = here.parent.parent.parent  # → plugin-claude/
-    return plugin_root / "hooks" / "lib", here / "tracker"
+    sys.path.insert(0, str(here))
+    from _runtime_paths import find_lib_dir  # type: ignore
+
+    return find_lib_dir(here), here / "tracker"
 
 
 HOOKS_LIB, TRACKER_DIR = _resolve_lib_dirs()

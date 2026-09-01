@@ -1,14 +1,14 @@
 {
   "name": "synaptory",
-  "version": "1.1.5",
-  "cli_min_version": "1.1.5",
+  "version": "1.2.0",
+  "cli_min_version": "1.2.0",
   "description": "Synaptory — multi-agent adaptive delivery for Claude Code, backed by the H3Tech control plane. Project-scoped Entra sign-in, envelope-encrypted skill delivery, 9 delivery roles, Scrum + Kanban lifecycle. /synaptory — build, discover, preview, and more.",
   "author": {
     "name": "H3Tech Inc.",
     "url": "https://github.com/h3tech-ai"
   },
   "homepage": "https://synaptory.h3t.co",
-  "repository": "https://github.com/h3tech-ai/synaptory",
+  "repository": "https://github.com/h3tech-ai/synaptory-v1",
   "license": "PROPRIETARY",
   "keywords": ["synaptory", "saas", "orchestrator", "full-stack", "meta-skill", "pipeline", "devops", "architecture", "testing", "security", "sre", "ai", "ml", "llm", "multi-agent", "scrum", "kanban"],
   "skills": "./skills/",

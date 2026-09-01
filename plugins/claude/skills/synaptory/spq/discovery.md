@@ -5,7 +5,7 @@
 > **Participants:** RA (conditional), PO, SA, PE, QE, Orchestrator
 > **Output:** an **approved baseline**: problem framed, first Work Units drafted, foundation architecture, CI/CD, test framework, the three barrier proof scripts, and N provisioned workstreams
 
-Discovery is SPQ's Request + Analyze + first Plan. It is the nearest analogue to Scrum's Inception, and it carries one obligation Inception does not: **the cross-workstream barrier's inputs must exist before the first Slice opens.** A team that reaches `SYNC` and discovers `scripts/sync-regression.sh` was never written has already spent the integration slot.
+Discovery is SPQ's Request + Analyze + first Plan. It is the nearest analogue to Scrum's Inception, and it carries one obligation Inception does not: **the cross-workstream barrier's inputs must exist before the first Cycle opens.** A team that reaches `SYNC` and discovers `scripts/sync-regression.sh` was never written has already spent the integration slot.
 
 ## Discovery Depth
 
@@ -13,8 +13,8 @@ Read from `.synaptory.yaml` → `sprint.inception`. That is the existing key; SP
 
 | Depth | When to Use | Scope |
 |------|-------------|-------|
-| **foundation** (default) | Most projects. Direction is clear, details will emerge. | Mini-BRD, 3-5 epics, Slice 1 Work Units with ACs, foundation ADRs, lightweight SAD (1-2 pages), API skeleton, ERD, CI/CD + Docker, test framework, barrier proof scripts. |
-| **blueprint** | Complex domains, regulatory, fixed-scope contracts needing a comprehensive plan. | Full BRD with NFRs, all epics decomposed, Slice 1-2 Work Units, complete SAD + API contracts + ERD, full infra bootstrap, detailed test spec. |
+| **foundation** (default) | Most projects. Direction is clear, details will emerge. | Mini-BRD, 3-5 epics, Cycle 1 Work Units with ACs, foundation ADRs, lightweight SAD (1-2 pages), API skeleton, ERD, CI/CD + Docker, test framework, barrier proof scripts. |
+| **blueprint** | Complex domains, regulatory, fixed-scope contracts needing a comprehensive plan. | Full BRD with NFRs, all epics decomposed, Cycle 1-2 Work Units, complete SAD + API contracts + ERD, full infra bootstrap, detailed test spec. |
 
 ```
 CONFIG=$(cat .synaptory.yaml 2>/dev/null)
@@ -110,7 +110,7 @@ fi
 
 **Verify the state is SPQ, not scrum.** `init` writes `build_mode: spq` and `lifecycle_state: DISCOVERY`. If `read` reports anything else, stop. A scrum state file driven by SPQ prompts fails open rather than closed: the Stop-hook loop engine would drive the *scrum* state machine and the barrier would never be reached.
 
-**If bootstrap fails** (missing module, permission error): create `pipeline-state.json` manually with `{"version": "2.0", "build_mode": "spq", "lifecycle_state": "DISCOVERY", "discovery": {"completed_at": null, "baseline_approved": false}, "current_slice": 0, "current_stories": []}` and continue.
+**If bootstrap fails** (missing module, permission error): create `pipeline-state.json` manually with `{"version": "2.0", "build_mode": "spq", "lifecycle_state": "DISCOVERY", "discovery": {"completed_at": null, "baseline_approved": false}, "current_cycle": 0, "current_stories": []}` and continue.
 
 **Generate `CLAUDE.md` (idempotent).** It is the session-persistent anchor Claude Code reads at the start of every session, and under SPQ it carries one extra obligation: it must name the lifecycle as `spq` and it must carry the git safety rules, because those rules are what make `SYNC` a human gate.
 
@@ -121,7 +121,7 @@ if not Read("CLAUDE.md") or "synaptory-state" not in Read("CLAUDE.md"):
     #   - a Workstreams table (id, branch, shared_owner) from .synaptory.yaml
     #   - the six git safety rules VERBATIM, plus:
     #     7. NEVER hand-author a readiness record under .synaptory/sync/.
-    #   - a <!-- synaptory-state --> comment carrying phase: DISCOVERY and slice: 0
+    #   - a <!-- synaptory-state --> comment carrying phase: DISCOVERY and cycle: 0
     Bash('printf "%s" "$SECTION" | python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/update_claude_md.py" "${CLAUDE_PROJECT_DIR}"')
 ```
 
@@ -202,7 +202,7 @@ PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 **PO output:**
 - Mini-BRD (foundation) or full BRD with NFRs (blueprint): vision, problem, target users, key features
 - 3-5 epics with rough breakdowns
-- Slice 1 Work Units fully decomposed with acceptance criteria (Given/When/Then), each carrying `kind`, `labels`, `depends_on` and (optionally) `file_scope`
+- Cycle 1 Work Units fully decomposed with acceptance criteria (Given/When/Then), each carrying `kind`, `labels`, `depends_on` and (optionally) `file_scope`
 - **A proposed workstream assignment per epic**, naming which product area owns it
 
 The PO receipt looks like this (`stage` is the load-bearing field; `model` and `token_usage` come from the agent's own run):
@@ -255,7 +255,7 @@ SA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 
 1. **The shared paths.** Which directories hold cross-workstream contracts and the design system (typically `contracts/`, an OpenAPI directory, a shared types package, a design-token package). These become `spq.sync.shared_digest_paths`, which barrier criterion 4 compares.
 2. **A recommendation for which workstream should own them** (`shared_owner: true`). One workstream, not a committee, the owner publishes a pinned version at each Commit and the rest build against it.
-3. **The workstream seams.** Where the product decomposes with the fewest shared touchpoints. A decomposition that gives every workstream a stake in `contracts/` produces a barrier that blocks every Slice.
+3. **The workstream seams.** Where the product decomposes with the fewest shared touchpoints. A decomposition that gives every workstream a stake in `contracts/` produces a barrier that blocks every Cycle.
 
 Record all three in the SAD and reflect (1) and (2) into `.synaptory.yaml` at Step 5.
 
@@ -269,9 +269,17 @@ Record all three in the SAD and reflect (1) and (2) into `.synaptory.yaml` at St
 
 **Skip the entire step for:** CLI tools, libraries, backend-only APIs, infrastructure projects.
 
-Follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/design-grooming.md`. For UI-surface projects the in-repo mockup baseline is **MANDATORY** and the Baseline Gate blocks on it; `design.enabled: false` disables only the optional Claude Design path, not the baseline.
+Follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`. For UI-surface projects the in-repo mockup baseline is **MANDATORY** and the Baseline Gate blocks on it; `design.enabled: false` disables only the optional Claude Design path, not the baseline.
 
-Generate self-contained HTML/CSS mockups for the key screens using the design system reference under `${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/` as the token source. Each page inlines its CSS (no external CDN/font/script fetches). Cover the landing screen, the primary user flow, and the core action at minimum. Write to `${design.mockups_dir}` (default `.synaptory/design/mockups/`): one `{screen}.html` per screen plus an `index.html` gallery.
+Generate self-contained HTML/CSS mockups for the key screens using the design system
+reference as the token source. Those bodies are control-plane delivered, not packaged
+(ADR-016) -- fetch them first:
+
+Bash("synaptory skills get design-assets/component-patterns")
+Bash("synaptory skills get design-assets/color-palettes")
+Bash("synaptory skills get design-assets/typography")
+Bash("synaptory skills get design-assets/spacing-layout")
+ Each page inlines its CSS (no external CDN/font/script fetches). Cover the landing screen, the primary user flow, and the core action at minimum. Write to `${design.mockups_dir}` (default `.synaptory/design/mockups/`): one `{screen}.html` per screen plus an `index.html` gallery.
 
 **Under SPQ the mockup baseline has a second job:** it is the first draft of the design system the `shared_owner` workstream will publish and pin at each Commit. Note in `.synaptory/design/mockups/README.md` which tokens are shared (and therefore governed by the barrier) versus workstream-local.
 
@@ -310,7 +318,7 @@ PE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 - Dockerfile + docker-compose.dev.yml
 - Dev environment setup
 - Basic monitoring configuration
-- **A CI job that runs on `sync/slice-*` branches.** The integration branch is where the barrier is evaluated, so it must be a first-class CI target rather than an unmatched glob
+- **A CI job that runs on `sync/cycle-*` branches.** The integration branch is where the barrier is evaluated, so it must be a first-class CI target rather than an unmatched glob
 
 **Blueprint adds:** staging environment setup.
 
@@ -358,7 +366,7 @@ QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 
 **QE output:**
 - Test framework configuration (jest/pytest/go-test based on the confirmed stack)
-- Slice 1 test specification
+- Cycle 1 test specification
 - **The journey definition that `scripts/sync-journey.sh` executes.** QE owns *what* the journey asserts; PE owns the script plumbing that runs it. Say so in both prompts, or each will assume the other did it.
 - **A regression-scope statement**: which suites belong in `sync-regression.sh` (everything cross-workstream) versus a workstream's own pre-declare run. Getting this wrong in the expensive direction, the full suite per Work Unit, is the measured cause of slow cycles.
 
@@ -376,7 +384,7 @@ The barrier cannot form a quorum from an empty list, and these ids are **permane
 
 | Input | Why it blocks |
 |---|---|
-| **N and the workstream ids** | Every clone, branch and `SYNAPTORY_ACTIVE_SPEC` derives from them |
+| **N and the workstream ids** | Every clone, manifest branch and native `spq/workstream` pin derives from them |
 | **Which workstream is `shared_owner: true`** | Decides who publishes contracts and the design system at each Commit |
 | **The tracker discriminator**, a label or a Linear project | Commit filters each workstream's admitted set by it; Linear permits only these two |
 
@@ -390,7 +398,7 @@ build_mode: "spq"
 tracker:
   backend: "linear"
   linear:
-    manage_cycles: true          # REQUIRED, a Slice IS a Cycle; defaults to false
+    manage_cycles: true          # REQUIRED, a Cycle IS a Cycle; defaults to false
 
 spq:
   workstreams:
@@ -401,8 +409,8 @@ spq:
       integration: true          # the barrier seat; excluded from the readiness quorum
   sync:
     remote: "origin"
-    branch_pattern: "ws/{id}"
-    integration_branch_pattern: "sync/slice-{n}"
+    branch_pattern: "cycle/{cycle_id}/ws/{id}"
+    integration_branch_pattern: "cycle/{cycle_id}/integration"
     promote_to: "dev"
     mode: "all_or_nothing"
     readiness_dir: ".synaptory/sync"
@@ -413,22 +421,26 @@ spq:
     journey_script: "scripts/sync-journey.sh"
     digest_script: "scripts/shared-digest.sh"
     verdict_cache: true
-  slice:
+  cycle:
     scope_defined: true
     number_owner: "integration_state"
 ```
 
 Then, per workstream:
 
-1. **Create the branch** from `dev`, named per `branch_pattern` (or an explicit `branch:` override). The barrier resolves branches **from config alone**, because it needs the branch name before it can read the record on it, so a branch that does not match is invisible to `collect`.
-2. **Clone it** into that Crew's working copy.
-3. **Export `SYNAPTORY_ACTIVE_SPEC={workstream-id}`** in that clone's environment. This is what stamps `workstream_id` onto every receipt and span; unset, the work is unattributed forever.
-4. **Un-ignore the readiness directory** in the project `.gitignore`. `.synaptory/` is gitignored as a whole; `.synaptory/sync/` is the one narrow exception, because the readiness record crosses the clone boundary through git:
+1. **Create its working clone** from `dev`. Do not guess the Cycle branch yet: Commit allocates the collision-safe `cycle_id` and seals the exact branch into the Cycle manifest.
+2. **After Commit seals the manifest, check out the manifest-declared branch** in that clone. The default is `cycle/{cycle_id}/ws/{id}`; an explicit workstream `branch:` override is sealed the same way. `collect` treats the sealed manifest as authority and only falls back to config for a pre-manifest legacy Cycle.
+3. **Hydrate and pin the workstream** in that clone: `hydrate_cycle --workstream {workstream-id}` validates the manifest projection and writes `.synaptory/.orchestrator/spq/workstream`. The pin is a FILE, so it survives the shell — you do not have to re-export anything. (`SYNAPTORY_WORKSTREAM` overrides it for a one-off command; `SYNAPTORY_ACTIVE_SPEC` is the Scrum/Kanban Multi-Spec variable and SPQ ignores it entirely.)
+4. **Un-ignore the two committed subtrees** in the project `.gitignore`. `.synaptory/` is gitignored as a whole; these are the narrow exceptions, because git is SPQ's only channel between clones:
    ```
    .synaptory/*
    !.synaptory/sync/
+   !.synaptory/cycles/
+!.synaptory/coordination-cycles/
    ```
-   Per-workstream filenames mean no merge conflicts. Nothing else under `.synaptory/` gets committed.
+   `sync/` carries readiness records; `cycles/<cycle-id>/` carries the sealed Cycle manifest and the dependency events. Per-workstream filenames and per-workstream event directories mean no merge conflicts. Nothing else under `.synaptory/` gets committed.
+
+   Note the trailing `/*` on the first line. Git cannot re-include a path whose parent directory is excluded, so `.synaptory/` followed by a negation silently does nothing and the records stay uncommittable.
 5. **Create the tracker discriminator**: the label or Linear project each workstream's admitted set is filtered by.
 
 Verify the config resolves before the gate:
@@ -451,7 +463,7 @@ After all Discovery steps complete, present the Baseline Gate for human approval
   Problem        {✓ framed | ○ not framed}
   Vision         {✓ if BRD/Mini-BRD exists | ○ if not}
   Epics          {N} identified
-  Slice 1        {N} Work Units ready (with ACs)
+  Cycle 1        {N} Work Units ready (with ACs)
   Architecture   {N} ADRs · SAD {✓ lightweight | ✓ full} · ERD {N} entities
   Shared surface {paths} owned by {shared_owner}
   API            {✓ skeleton | ✓ full contracts}
@@ -464,7 +476,7 @@ After all Discovery steps complete, present the Baseline Gate for human approval
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Options:
-  1. Approve and open Slice 1 (Recommended)
+  1. Approve and open Cycle 1 (Recommended)
   2. Show details
   3. I have concerns
   4. Chat about this
@@ -493,7 +505,7 @@ After all Discovery steps complete, present the Baseline Gate for human approval
    `discovery.baseline_approved: true`. If either is wrong, do NOT proceed;
    surface the error to the user.
 3. Print one line: `✓ Baseline Gate approved. State transitioned to COMMIT at <timestamp>.`
-4. Load `${CLAUDE_PLUGIN_ROOT}/skills/synaptory/spq/commit.md` and open Slice 1.
+4. Load `${CLAUDE_PLUGIN_ROOT}/skills/synaptory/spq/commit.md` and open Cycle 1.
 
 If you do not have permission to run any of these tool calls, **stop** and tell the user. Do not pretend the gate passed.
 
@@ -505,9 +517,9 @@ If you do not have permission to run any of these tool calls, **stop** and tell 
 
 | Activity | Discovery |
 |---|---|
-| Decompose ALL Work Units | No. Slice 1 only (foundation), Slice 1-2 (blueprint) |
-| Fix the Slice roadmap | No, the PO admits units per Slice at Commit |
-| Complete architecture design | No, lightweight SAD + foundation ADRs; the rest emerges per Slice via SA triggers |
-| Lock architecture | No, architecture evolves per Slice |
-| Open a Slice | No. `open_slice` is Commit's act, and it owns the Slice number |
+| Decompose ALL Work Units | No. Cycle 1 only (foundation), Cycle 1-2 (blueprint) |
+| Fix the Cycle roadmap | No, the PO admits units per Cycle at Commit |
+| Complete architecture design | No, lightweight SAD + foundation ADRs; the rest emerges per Cycle via SA triggers |
+| Lock architecture | No, architecture evolves per Cycle |
+| Open a Cycle | No. `open_cycle` is Commit's act, and it owns the Cycle number |
 | Run a barrier | No, but it must leave behind everything the barrier needs |

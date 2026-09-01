@@ -91,9 +91,7 @@ Every deployment strategy MUST include a verified rollback procedure. Write `scr
 
 Each pull request must get an isolated, short-lived environment for integration testing and manual QA. Read the full specification from the shared protocol:
 
-```
-!cat .synaptory/.protocols/ephemeral-environments.md
-```
+!`cat .synaptory/.protocols/ephemeral-environments.md 2>/dev/null || true`
 
 Generate these files following the protocol:
 

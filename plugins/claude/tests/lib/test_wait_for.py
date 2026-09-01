@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[3]
-WAIT_FOR = REPO / "plugin-claude" / "skills" / "_shared" / "scripts" / "wait_for.py"
+WAIT_FOR = REPO / "core" / "scripts" / "wait_for.py"
 
 
 def _run(*args: str, env_extra: dict | None = None) -> tuple[int, dict, str]:

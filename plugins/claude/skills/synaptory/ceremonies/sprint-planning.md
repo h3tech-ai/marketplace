@@ -101,7 +101,7 @@ Read the PO backend wrapper at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${
   | `ui`, `frontend`, `design`, `ux`, `screen`, `page` | `ui` |
   | UI label **and** a backend/api label (or no label matches) | `mixed` |
 
-- **`depends_on`** — story ids that must be `done` before this story can join a parallel dispatch batch. Record real sequencing constraints only (schema before endpoints, endpoint before screen); an empty list means independently dispatchable.
+- **`depends_on`** — story ids that must be `done` before this story can be dispatched **at all**. This is a hard gate on both the serial and the parallel path (#304), not a parallel-batch filter: a story with an unmet edge is not dispatched, and an edge naming a story that is not on the board fails closed rather than being ignored. So record real sequencing constraints only (schema before endpoints, endpoint before screen) — an aspirational or stale edge now stalls the sprint. An empty list means independently dispatchable.
 
 - **`file_scope`** — the glob/dir list the story is expected to touch (e.g. `["services/auth/", "libs/shared/errors/"]`). Optional under worktree isolation; **required** for every batch member under `parallelism.isolation: shared`, where batches only form from pairwise-disjoint scopes.
 
@@ -110,7 +110,7 @@ Read the PO backend wrapper at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${
 
 **Design-PENDING resolution (signal-gated):** For each story in the proposed sprint backlog tagged `[DESIGN-PENDING]`:
 
-Follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/design-grooming.md`.
+Follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`.
 
 1. Check if `sprint-{N}-preview.md` exists in `.synaptory/design/` — if yes, generate a scoped handoff bundle from the relevant prototype section
 2. If no sprint preview exists, prompt the team to create a targeted prototype in Claude Design for this story (use the story's ACs as the design brief)
@@ -125,7 +125,7 @@ Follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/pro
 
 ## Step 3 — SA Architecture Review (Conditional)
 
-Follow the SA Auto-Detect Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/sa-triggers.md`.
+Follow the SA Auto-Detect Protocol at `.synaptory/.protocols/sa-triggers.md`.
 
 For each story in the proposed sprint backlog:
 1. Scan story text for architecture trigger signals
@@ -257,7 +257,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/scrum_state_machine.py" start_sprint "$
 
 **Always include each story's `acceptance_criteria`** (the same ACs the PO refined and the tracker holds) in the `--stories` JSON. They are snapshotted onto the story record and drive the `ui_acceptance` DoD gate (#44): a story whose ACs describe a user-facing screen is auto-routed to SE `frontend` + QE `browser-qa` and cannot reach `done` without UI verification. Omitting the ACs disables that protection for the story.
 
-**Also carry the Step 2 classification fields** (`kind`, `labels`, `depends_on`, `file_scope`) onto each entry. They are snapshotted at intake: `kind` suppresses the ui_bearing heuristic for `enabler`/`infra`/`backend` stories and selects the `quality.verification.by_kind` tier; `depends_on` + `file_scope` gate parallel-dispatch batch membership (#134 GAP-6/GAP-8). The Kanban `pull_ticket` and the `create_story`/`add_story` CLIs accept the same fields.
+**Also carry the Step 2 classification fields** (`kind`, `labels`, `depends_on`, `file_scope`) onto each entry. They are snapshotted at intake: `kind` suppresses the ui_bearing heuristic for `enabler`/`infra`/`backend` stories and selects the `quality.verification.by_kind` tier; `depends_on` gates dispatch outright on both the serial and the parallel path (#304) and, together with `file_scope`, parallel-batch membership (#134 GAP-6/GAP-8). The Kanban `pull_ticket` and the `create_story`/`add_story` CLIs accept the same fields.
 
 This creates story records in `queued` state and transitions the lifecycle to `SPRINT_EXECUTION`.
 

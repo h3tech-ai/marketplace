@@ -182,7 +182,7 @@ DAST is non-blocking in BUILD (no running app). It only runs in VERIFY when a st
 
 DAST uses two tracks with different speeds and scopes:
 
-**Track 1 — Per-PR (Nuclei, fast):** Lightweight scan runs against the ephemeral PR environment after it's live. Covers critical/high severity only. Blocks merge on Critical findings. Configured in the ephemeral environment protocol (`skills/_shared/protocols/ephemeral-environments.md` — DAST Integration section). Write to `.github/workflows/pr-environment.yml` as part of the ephemeral environment workflow.
+**Track 1 — Per-PR (Nuclei, fast):** Lightweight scan runs against the ephemeral PR environment after it's live. Covers critical/high severity only. Blocks merge on Critical findings. Configured in the ephemeral environment protocol (`.synaptory/.protocols/ephemeral-environments.md` — DAST Integration section). Write to `.github/workflows/pr-environment.yml` as part of the ephemeral environment workflow.
 
 **Track 2 — Weekly scheduled (ZAP, comprehensive):** Full OWASP ZAP scan runs weekly against staging. Covers all severities with OpenAPI-driven endpoint coverage. This is the scan that catches medium/low findings and verifies full endpoint coverage.
 

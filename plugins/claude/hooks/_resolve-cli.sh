@@ -2,49 +2,110 @@
 # Resolve the synaptory CLI that matches this plugin tree.
 #
 # Search order:
-#  1. $SYNAPTORY_CLI_BIN — explicit override (CI, e2e).
-#  2. synaptory-local on PATH when this plugin is stamped for loopback
-#     (./synaptory deploy local). Never fall through to `synaptory`.
-#  3. synaptory on PATH for production / marketplace plugins.
+#  1. $SYNAPTORY_CLI_BIN — explicit override (CI, dev loops).
+#  2. For a loopback-stamped/local plugin, `synaptory-local` beside the PATH
+#     `synaptory`, then on PATH / in the standard user bin directories.
+#  3. For every other plugin, `synaptory` on PATH / in the standard user bin
+#     directories.
+#
+# A discovered production-name binary is inspected before use. If it is
+# loopback-stamped, resolution fails closed with the issue-#108 remediation
+# instead of letting a production plugin ship telemetry to localhost.
 #
 # A localhost-stamped CLI must not live at the `synaptory` name — that is
 # what sent prod-plugin projects to the local stack.
 
 set -euo pipefail
 
-_HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-$(cd "${_HOOK_DIR}/.." && pwd)}}"
 # shellcheck source=./_cp-url.sh
 source "${_HOOK_DIR}/_cp-url.sh"
 
-if [[ -n "${SYNAPTORY_CLI_BIN:-}" ]] && [[ -x "${SYNAPTORY_CLI_BIN}" ]]; then
-  printf '%s' "$SYNAPTORY_CLI_BIN"
-  exit 0
+_local_plugin=0
+if _synaptory_cp_url_is_local "${_cp_url:-}" || [[ "$PLUGIN_ROOT" == */plugins/local/* ]]; then
+  _local_plugin=1
 fi
 
-if _synaptory_cp_url_is_local "${_cp_url:-}"; then
-  if command -v synaptory-local >/dev/null 2>&1; then
-    command -v synaptory-local
+_candidate_url() {
+  local candidate="$1" line
+  line=$("$candidate" status 2>&1 | sed -n 's/^control_plane_url:[[:space:]]*//p' | head -n1 || true)
+  printf '%s' "$line"
+}
+
+_validate_candidate() {
+  local candidate="$1" explicit="${2:-0}" candidate_url
+  candidate_url=$(_candidate_url "$candidate")
+  # Explicit overrides are the CI/dev escape hatch. Validate them when they
+  # expose an identity, while retaining compatibility with tiny test shims.
+  if [[ -z "$candidate_url" ]] && [[ "$explicit" == "1" ]]; then
+    return 0
+  fi
+  if [[ -z "$candidate_url" ]]; then
+    echo "synaptory: refusing CLI with unreadable build identity: ${candidate}" >&2
+    return 1
+  fi
+  if [[ "$_local_plugin" == "1" ]]; then
+    if ! _synaptory_cp_url_is_local "$candidate_url"; then
+      echo "synaptory: refusing production-stamped CLI for local plugin (${candidate_url}). Install the local channel as ~/.local/bin/synaptory-local." >&2
+      return 1
+    fi
+  elif _synaptory_cp_url_is_local "$candidate_url"; then
+    cat >&2 <<EOF
+synaptory: refusing loopback-stamped CLI for a production plugin (${candidate_url}).
+This is the issue #108 local/prod collision. Restore the production CLI:
+  curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+Keep local testing at ~/.local/bin/synaptory-local; do not overwrite synaptory.
+EOF
+    return 1
+  fi
+  return 0
+}
+
+if [[ -n "${SYNAPTORY_CLI_BIN:-}" ]] && [[ -x "$SYNAPTORY_CLI_BIN" ]]; then
+  if _validate_candidate "$SYNAPTORY_CLI_BIN" 1; then
+    printf '%s' "$SYNAPTORY_CLI_BIN"
     exit 0
   fi
-  cat >&2 <<'EOF'
-synaptory: local CLI not found (synaptory-local).
-
-This plugin is pointed at a local control plane (hooks/lib/cp-url.local).
-Install the local-channel CLI without overwriting prod:
-
-  ./synaptory deploy local
-
-That writes ~/.local/bin/synaptory-local and leaves ~/.local/bin/synaptory
-(the prod CLI) alone. Do not export SYNAPTORY_CP_ENV or
-SYNAPTORY_CONTROL_PLANE_URL — they are ignored and mix installs.
-EOF
   exit 1
 fi
 
-if command -v synaptory >/dev/null 2>&1; then
-  command -v synaptory
+_candidate=""
+if [[ "$_local_plugin" == "1" ]]; then
+  if command -v synaptory >/dev/null 2>&1; then
+    _prod=$(command -v synaptory)
+    [[ -x "$(dirname "$_prod")/synaptory-local" ]] && _candidate="$(dirname "$_prod")/synaptory-local"
+  fi
+  if [[ -z "$_candidate" ]] && command -v synaptory-local >/dev/null 2>&1; then
+    _candidate=$(command -v synaptory-local)
+  fi
+  for _path in "$HOME/.local/bin/synaptory-local" "$HOME/bin/synaptory-local"; do
+    if [[ -z "$_candidate" ]] && [[ -x "$_path" ]]; then _candidate="$_path"; fi
+  done
+else
+  if command -v synaptory >/dev/null 2>&1; then
+    _candidate=$(command -v synaptory)
+  fi
+  for _path in "$HOME/.local/bin/synaptory" "$HOME/bin/synaptory"; do
+    if [[ -z "$_candidate" ]] && [[ -x "$_path" ]]; then _candidate="$_path"; fi
+  done
+fi
+
+if [[ -n "$_candidate" ]] && _validate_candidate "$_candidate"; then
+  printf '%s' "$_candidate"
   exit 0
+fi
+
+if [[ "$_local_plugin" == "1" ]]; then
+  cat >&2 <<'EOF'
+synaptory: local CLI not found or its build stamp does not match this plugin.
+
+Build the local channel and install it without replacing production:
+  ./synaptory deploy local
+
+Expected binary: ~/.local/bin/synaptory-local
+EOF
+  exit 1
 fi
 
 cat >&2 <<'EOF'

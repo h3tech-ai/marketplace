@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Shared MCP stdio transport for the Synaptory host servers.
+
+After the advance kernel landed, the two MCP servers shared the *gate* but still
+carried ~120 duplicated lines of JSON-RPC plumbing: framing, `initialize`,
+`tools/list`, `tools/call`, the `-32601` unknown-method reply, and the tool
+registry shape. Every fix had to land twice, and in practice landed once.
+
+Framing is a real per-host protocol difference, not drift, so it is a declared
+parameter rather than a unified default:
+
+    Codex   NDJSON        one JSON-RPC message per line. Header bytes corrupt the
+                          Codex stdio handshake before `initialize` completes, so
+                          framed mode must never be its default.
+    Cursor  Content-Length classic MCP stdio framing.
+
+Both hosts may switch at runtime for compatibility testing, and both switches are
+honoured here rather than reimplemented per server.
+
+Python 3.9 compatible: this file is projected into every host package.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from typing import Any, Callable, Dict, Optional
+
+PROTOCOL_VERSION = "2024-11-05"
+# Client versions we can negotiate down from. Echoing a newer date claims
+# capabilities this transport does not implement.
+SUPPORTED_PROTOCOL_VERSIONS = frozenset(
+    {PROTOCOL_VERSION, "2025-03-26", "2025-06-18"}
+)
+
+NDJSON = "ndjson"
+FRAMED = "framed"
+
+
+# ── framing ──────────────────────────────────────────────────────────────────
+
+
+def read_framed(stream=None) -> Optional[Dict[str, Any]]:
+    """Read one Content-Length framed JSON-RPC message, or None at EOF."""
+    buffer = stream if stream is not None else sys.stdin.buffer
+    headers: Dict[str, str] = {}
+    while True:
+        line = buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        decoded = line.decode("utf-8", "replace")
+        if ":" in decoded:
+            key, value = decoded.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+    length = int(headers.get("content-length") or 0)
+    if length <= 0:
+        return None
+    return json.loads(buffer.read(length).decode("utf-8"))
+
+
+def write_framed(payload: Dict[str, Any], stream=None) -> None:
+    buffer = stream if stream is not None else sys.stdout.buffer
+    body = json.dumps(payload).encode("utf-8")
+    buffer.write(("Content-Length: %d\r\n\r\n" % len(body)).encode("ascii"))
+    buffer.write(body)
+    buffer.flush()
+
+
+# ── tool registry ────────────────────────────────────────────────────────────
+
+
+def tools_list(tools: Dict[str, Any]) -> Dict[str, Any]:
+    """The `tools/list` result for a host's tool registry.
+
+    Emits MCP tool ANNOTATIONS. They were absent, and a client that is told
+    nothing about a tool must assume the worst: every tool looks potentially
+    destructive, so a non-interactive client has to ask for approval on all of
+    them and, with no one to ask, cancels. That is the shape of the observed
+    failure -- `codex exec` returning `user cancelled MCP tool call` for EVERY
+    synaptory tool including pure reads like `next_action` and `get_status`,
+    while the same server answered correctly when driven directly over NDJSON
+    (#333, from #323 G5).
+
+    A tool declares `readOnlyHint` only if it cannot change repository or
+    Synaptory state. Everything else is a mutation and says so, because
+    understating a mutation to buy smoother approvals is how a gate stops being
+    a gate. `destructiveHint` is reserved for tools that can undo or discard
+    committed work; a guarded forward transition is a mutation, not a
+    destruction.
+    """
+    return {
+        "tools": [
+            {
+                "name": name,
+                "description": spec["description"],
+                "inputSchema": spec["schema"],
+                "annotations": _tool_annotations(name, spec),
+            }
+            for name, spec in tools.items()
+        ]
+    }
+
+
+# Tools that cannot change repository or Synaptory state. Named explicitly
+# rather than pattern-matched on the name: `get_*`/`*_status` is a convention,
+# and a convention silently mislabels the first tool that breaks it -- in the
+# direction of claiming read-only for something that writes.
+_READ_ONLY_TOOLS = frozenset({
+    "doctor",
+    "get_status",
+    "get_state",
+    "next_action",
+    "spq_status",
+    "spq_manifest_validate",
+    "spq_dependency_status",
+    "spq_coordination_status",
+    "spq_sync_status",
+})
+
+
+def _tool_annotations(name: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """MCP annotations for one tool.
+
+    An explicit `annotations` key on the spec wins, so a host can correct a
+    single tool without editing this list.
+    """
+    declared = spec.get("annotations")
+    if isinstance(declared, dict):
+        return dict(declared)
+
+    read_only = name in _READ_ONLY_TOOLS
+    return {
+        "title": name,
+        "readOnlyHint": read_only,
+        # A guarded lifecycle advance is a mutation, not a destruction: it adds
+        # state and evidence, and every backward move is a separate guarded verb.
+        "destructiveHint": False,
+        # Reads are idempotent. Mutations are NOT claimed to be: the advance
+        # boundary records receipt digests to prevent replay, so telling a client
+        # a mutation is safe to retry would invite exactly the double-advance
+        # that guard exists to stop.
+        "idempotentHint": read_only,
+        # Nothing here reaches outside the project and its control plane.
+        "openWorldHint": False,
+    }
+
+
+def _required_argument_error(schema: Dict[str, Any], arguments: Any) -> Optional[str]:
+    """Return a stable refusal for a malformed tool argument object.
+
+    MCP clients use ``inputSchema`` to shape calls, but the server remains the
+    authority.  Treating the schema as documentation only lets a raw
+    ``tools/call`` bypass every ``required`` identity the UI showed the user.
+    Keep this deliberately small and dependency-free: shared schemas currently
+    need object shape plus required-field enforcement; individual handlers own
+    semantic validation of their values.
+    """
+    if not isinstance(arguments, dict):
+        return "arguments must be an object"
+    missing = [
+        str(field)
+        for field in (schema.get("required") or [])
+        if field not in arguments or arguments.get(field) is None
+    ]
+    if missing:
+        return "missing required argument(s): %s" % ", ".join(missing)
+    return None
+
+
+def call_tool(tools: Dict[str, Any], name: str, arguments: Optional[dict]) -> Dict[str, Any]:
+    """Invoke a registered tool, turning any exception into an error payload.
+
+    A host server must never crash the transport on a tool bug: the caller gets a
+    refusal it can act on instead of a dead stdio pipe.
+    """
+    spec = tools.get(name)
+    if spec is None:
+        return {"error": "unknown tool: %s" % name}
+    validation_error = _required_argument_error(
+        spec.get("schema") or {}, arguments if arguments is not None else {}
+    )
+    if validation_error:
+        return {"error": "invalid arguments for %s: %s" % (name, validation_error)}
+    try:
+        fn: Callable[[dict], Dict[str, Any]] = spec["fn"]
+        return fn(arguments or {})
+    except Exception as exc:  # noqa: BLE001 - reported, never raised at the wire
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+# ── JSON-RPC ─────────────────────────────────────────────────────────────────
+
+
+def dispatch(
+    request: Dict[str, Any],
+    tools: Dict[str, Any],
+    *,
+    server_name: str = "synaptory",
+    server_version: str = "0.0.0",
+) -> Optional[Dict[str, Any]]:
+    """Handle one JSON-RPC request. None means "no response is due"."""
+    method = request.get("method")
+    request_id = request.get("id")
+
+    if method == "initialize":
+        # NEGOTIATE, never refuse. The spec's rule is that a server which does
+        # not speak the client's version answers with one it DOES speak, and the
+        # client decides whether to continue. Hard-erroring here made the server
+        # unreachable from any client newer than the newest date in the set --
+        # which is exactly what happened: Cursor's agent sends 2025-11-25 and
+        # got `-32602 Unsupported MCP protocol version`, so the whole Cursor tool
+        # surface was unusable from the CLI.
+        #
+        # The original concern is still honoured: the response echoes OUR
+        # version, not the client's, so nothing over-claims a capability this
+        # transport does not implement.
+        _ = (request.get("params") or {}).get("protocolVersion")
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": server_name, "version": server_version},
+            },
+        }
+
+    if method in ("notifications/initialized", "initialized"):
+        return None
+
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": request_id, "result": tools_list(tools)}
+
+    if method == "tools/call":
+        params = request.get("params") or {}
+        arguments = params.get("arguments")
+        result = call_tool(
+            tools,
+            str(params.get("name") or ""),
+            arguments if arguments is not None else {},
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(result, default=str)}],
+                "isError": bool(isinstance(result, dict) and result.get("error")),
+            },
+        }
+
+    # Notifications (no id) get no reply, even for unknown methods.
+    if request_id is None:
+        return None
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": -32601, "message": "Method not found: %s" % method},
+    }
+
+
+def resolve_framing(default: str) -> str:
+    """Apply the runtime framing overrides both hosts already honoured."""
+    if os.environ.get("SYNAPTORY_MCP_NDJSON") == "1":
+        return NDJSON
+    if os.environ.get("SYNAPTORY_MCP_FRAMED") == "1":
+        return FRAMED
+    return default
+
+
+def detect_framing(default: str, stream=None) -> str:
+    """Sniff the client's framing from the first byte it sends.
+
+    A host's declared default is a guess about a client it does not control, and
+    the guess was wrong: `plugin-cursor` declared FRAMED because Cursor's IDE
+    speaks it, while Cursor's agent CLI speaks NDJSON. The framed reader then
+    failed to parse the bare JSON line, `serve` returned 0, and the client
+    reported "connection failed" with nothing in stderr -- a silent exit that
+    looks exactly like a clean shutdown.
+
+    `{` can only begin NDJSON; `C` can only begin `Content-Length`. An explicit
+    env override still wins, and an unreadable stream falls back to the default
+    rather than guessing.
+    """
+    override = resolve_framing(default)
+    if os.environ.get("SYNAPTORY_MCP_NDJSON") == "1" or os.environ.get(
+        "SYNAPTORY_MCP_FRAMED"
+    ) == "1":
+        return override
+    buffer = stream if stream is not None else getattr(sys.stdin, "buffer", None)
+    peek = getattr(buffer, "peek", None)
+    if peek is None:
+        return default
+    try:
+        head = peek(16).lstrip()
+    except Exception:  # noqa: BLE001 - unpeekable stream, keep the default
+        return default
+    if head[:1] == b"{":
+        return NDJSON
+    if head[:1] in (b"C", b"c"):
+        return FRAMED
+    return default
+
+
+def serve(
+    tools: Dict[str, Any],
+    *,
+    server_name: str = "synaptory",
+    server_version: str = "0.0.0",
+    default_framing: str = NDJSON,
+) -> int:
+    """Run the stdio loop until EOF. Returns a process exit code.
+
+    `default_framing` is the host's protocol requirement; the environment
+    overrides above still apply.
+    """
+    framing = detect_framing(default_framing)
+
+    if framing == FRAMED:
+        while True:
+            try:
+                request = read_framed()
+            except Exception:  # noqa: BLE001 - a malformed frame ends the session
+                return 0
+            if request is None:
+                return 0
+            response = dispatch(
+                request, tools, server_name=server_name, server_version=server_version
+            )
+            if response is not None:
+                write_framed(response)
+
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            response = dispatch(
+                json.loads(line),
+                tools,
+                server_name=server_name,
+                server_version=server_version,
+            )
+        except Exception as exc:  # noqa: BLE001 - unparseable line, keep serving
+            response = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error: %s" % exc},
+            }
+        if response is not None:
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+    return 0
+
+
+# ── shared tool schemas ──────────────────────────────────────────────────────
+# Both servers expose the same four kernel-backed tools with byte-identical
+# JSON Schemas. Defining them once means a new argument cannot reach one host's
+# schema and not the other's.
+
+_PROJECT_DIR = {"project_dir": {"type": "string"}}
+
+
+def schema(*names: str, required=()) -> Dict[str, Any]:
+    """Build an object schema from the shared property vocabulary."""
+    properties = dict(_PROJECT_DIR)
+    for name in names:
+        properties[name] = {
+            "allow_skip": {"type": "boolean"},
+            "run_regression": {"type": "boolean"},
+            "accept_revision": {"type": "boolean"},
+            "force": {"type": "boolean"},
+            "use_cache": {"type": "boolean"},
+            "output": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "digest": {"type": "string"},
+                },
+                "additionalProperties": True,
+            },
+            "evaluation": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+            # #305 release inputs. Typed as arrays because the default fallback
+            # is `string`, and a caller handed a stringified list would have it
+            # accepted here and rejected deep inside `validate` -- with a message
+            # about the manifest rather than about the argument.
+            "children": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "dependency_edges": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+            },
+            "coordination_seq": {"type": "integer"},
+        }.get(name) or {"type": "string"}
+    built: Dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        built["required"] = list(required)
+    return built
+
+
+PROJECT_ONLY_SCHEMA = schema()
+VALIDATE_RECEIPT_SCHEMA = schema("receipt_path", required=("receipt_path",))
+ADVANCE_SCHEMA = schema("story_id", "to_state", "receipt_path", "reason",
+                        required=("story_id", "to_state"))
+BEGIN_DISPATCH_SCHEMA = schema("story_id", "role", required=("story_id",))
+TRACKER_UPDATE_SCHEMA = schema("story_id", "status", "allow_skip",
+                               required=("story_id", "status"))
+
+ACCEPT_STORY_SCHEMA = schema("story_id", "accepted_by",
+                             required=("story_id", "accepted_by"))
+APPROVE_BASELINE_SCHEMA = schema("approved_by")
+OPEN_CYCLE_SCHEMA = schema("cycle_number", "goal", "work_units", "tracker_cycle")
+HYDRATE_CYCLE_SCHEMA = schema(
+    "cycle_number", "goal", "work_units", "tracker_cycle", "workstream_id",
+    required=("cycle_number",),
+)
+DECLARE_SYNC_READY_SCHEMA = schema("cycle_number", "workstream", "declared_by")
+CLEAR_SYNC_SCHEMA = schema("cycle_number", "cleared_by")
+CLOSE_CYCLE_SCHEMA = schema("proceed_to", "force")
+INITIALIZE_SCHEMA = schema("workstream_id")
+TRANSITION_SCHEMA = schema("to_state", "force", required=("to_state",))
+REQUEST_ACCEPTANCE_SCHEMA = schema("story_id", required=("story_id",))
+EVALUATE_SYNC_SCHEMA = schema("cycle_number", "use_cache")
+
+# Coordination Cycle CEREMONY schemas (#305). Separate from the `SPQ_*` ones
+# above because these are host ceremony tools, not the shared `spq_mcp` surface.
+OPEN_COORDINATION_SCHEMA = schema(
+    "release_goal", "children", "dependency_edges", "coordination_seq",
+    "baseline_sha", "created_by",
+    required=("release_goal", "children"),
+)
+REVISE_COORDINATION_SCHEMA = schema(
+    "coordination_cycle_id", "drop_child", "reason", "revised_by",
+    required=("drop_child", "reason"),
+)
+CLEAR_RELEASE_SCHEMA = schema("coordination_cycle_id", "cleared_by")
+
+# ── SPQ Cycle schemas (#303/#304/#305) ───────────────────────────────────────
+# Identities only: no manifest_path, record_path or ledger_path. A caller
+# therefore has no path to substitute, so the containment check that guards the
+# receipt path has nothing to guard here -- the attack surface is removed by
+# schema design rather than validated away. Every SPQ path is derived
+# server-side from (cycle_id, workstream_id) under
+# `.synaptory/.orchestrator/spq/`.
+#
+# `workstream_id` is the NATIVE SPQ identity. It is never SYNAPTORY_ACTIVE_SPEC:
+# #303/#304/#305 forbid SPQ resolving anything through Multi-Spec identity.
+
+SPQ_CYCLE_SCHEMA = schema("cycle_id")
+SPQ_HYDRATE_SCHEMA = schema(
+    "cycle_id", "workstream_id", "manifest_hash", "accept_revision",
+    required=("cycle_id", "workstream_id", "manifest_hash"),
+)
+SPQ_DECLARE_READY_SCHEMA = schema(
+    "cycle_id", "workstream_id", "run_regression",
+    required=("cycle_id", "workstream_id"),
+)
+SPQ_SYNC_SCHEMA = schema("cycle_id", required=("cycle_id",))
+SPQ_LEDGER_APPEND_SCHEMA = schema(
+    "cycle_id", "work_unit_id", "condition", "manifest_hash", "commit_sha",
+    "output", "evaluation",
+    required=("cycle_id", "work_unit_id", "condition", "manifest_hash"),
+)
+# The whole-Cycle report is the default; `work_unit_id` narrows it. Borrowing
+# the cut schema here would have made the unit id REQUIRED, so an operator could
+# not ask "why is anything blocked" without already knowing the answer.
+SPQ_DEP_STATUS_SCHEMA = schema("cycle_id", "work_unit_id")
+SPQ_CUT_SCHEMA = schema(
+    "cycle_id", "manifest_hash", "work_unit_id", "reason",
+    required=("cycle_id", "manifest_hash", "work_unit_id"),
+)
+
+
+# ── Coordination Cycle schemas (#305) ────────────────────────────────────────
+# Identities only, same as the Cycle schemas above: no manifest_path, no
+# ledger_path, no report_path. Every coordination path is derived server-side
+# under `.synaptory/.orchestrator/spq/coordination-cycles/`, so a caller has
+# nothing to substitute and the containment check has nothing to guard.
+
+SPQ_COORDINATION_SCHEMA = schema("coordination_cycle_id")
+SPQ_RELEASE_READINESS_SCHEMA = schema("coordination_cycle_id", "use_cache")
+# The producer side. `coordination_manifest_hash` and `cycle_manifest_hash` are
+# BOTH required and both checked against what this clone resolves: an event
+# published against a superseded release, or about a child revision the release
+# did not pin, describes a state that is gone.
+SPQ_CROSS_EVENT_SCHEMA = schema(
+    "coordination_cycle_id", "coordination_manifest_hash", "cycle_id",
+    "cycle_manifest_hash", "work_unit_id", "condition", "commit_sha", "output",
+    required=(
+        "coordination_cycle_id", "coordination_manifest_hash", "cycle_id",
+        "condition",
+    ),
+)
+
+
+# ── shared advance/dispatch response shaping ─────────────────────────────────
+
+
+def advance_response(decision: Any, error_text: Callable[[Any], str]) -> Dict[str, Any]:
+    """Map a kernel Decision onto the MCP wire shape both servers use.
+
+    `error_text` is the host's own prose; the structure is shared so a refusal
+    cannot carry a `code` on one host and omit it on the other, which is exactly
+    the drift the conformance suite caught between these two servers.
+    """
+    if not decision.allowed:
+        payload: Dict[str, Any] = {
+            "advanced": False,
+            "error": error_text(decision),
+            "code": decision.code,
+        }
+        for key in ("receipt_path", "next_action", "dod"):
+            value = getattr(decision, key, None)
+            if value is not None:
+                payload[key] = value
+        for key, value in (decision.extra or {}).items():
+            payload.setdefault(key, value)
+        return payload
+    return {
+        "advanced": True,
+        "story": decision.story,
+        "receipt_path": decision.receipt_path,
+        "dod": decision.dod,
+        "next_action": decision.next_action,
+        "receipt_warnings": list(decision.warnings or []),
+    }

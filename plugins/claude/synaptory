@@ -26,6 +26,7 @@
 #                                                 Lifecycle ops on the running stack
 #                                                 (use ./synaptory deploy local to start it).
 #   ./synaptory e2e [--keep-stack] [--scenario ...]    Cross-module harness.
+#   ./synaptory conformance [--report [path]]         Cross-host contract + report.
 
 set -euo pipefail
 
@@ -112,15 +113,20 @@ extract_frontmatter() {
 
 generate_stub() {
   local skill_name="$1" original_file="$2"
-  local fm
+  local fm stub_cli stub_state
   fm=$(extract_frontmatter "$original_file")
+  case "${SYNAPTORY_CHANNEL:-}" in
+    local) stub_cli="synaptory-local"; stub_state=".synaptory-local" ;;
+    ""|stable) stub_cli="synaptory"; stub_state=".synaptory" ;;
+    *) stub_cli="synaptory-${SYNAPTORY_CHANNEL}"; stub_state=".synaptory-${SYNAPTORY_CHANNEL}" ;;
+  esac
   # Stub resolution order:
-  #   1. \`synaptory\` on PATH — installed standalone via the marketplace
-  #      install script (cli/install.sh on macOS/Linux, install.ps1 on
-  #      Windows). ADR-008: the CLI no longer ships bundled in the plugin.
-  #   2. A cached pointer at ~/.synaptory-next/.plugin-root or
-  #      ~/.synaptory/.plugin-root, written by SessionStart when the plugin
-  #      loads. Used when \`synaptory\` is on PATH but the skill stub needs
+  #   1. The build channel's CLI on PATH — \`synaptory\` for production or
+  #      \`synaptory-local\` for a local package. ADR-008: the CLI no longer
+  #      ships bundled in the plugin.
+  #   2. The same channel's cached .plugin-root pointer, written by
+  #      SessionStart when the plugin loads. Used when the CLI is not on PATH
+  #      but the skill stub needs
   #      to call into the plugin's decrypt hook directly (e.g. mid-session
   #      after the SessionStart handshake completed but before the user
   #      restarts their terminal).
@@ -134,7 +140,7 @@ allowed-tools: Bash(bash -c *synaptory*)
 
 # ${skill_name}
 
-!\`bash -c 'if command -v synaptory >/dev/null 2>&1; then synaptory skills get "${skill_name}" && exit 0; fi; for f in "\$HOME/.synaptory-next/.plugin-root" "\$HOME/.synaptory/.plugin-root"; do if [ -r "\$f" ]; then pr="\$(cat "\$f")"; if [ -x "\$pr/hooks/synaptory-decrypt-skill.sh" ]; then exec bash "\$pr/hooks/synaptory-decrypt-skill.sh" "${skill_name}"; fi; fi; done; echo "synaptory: CLI not on PATH and plugin root not cached. Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash" >&2; exit 1'\`
+!\`bash -c 'if command -v ${stub_cli} >/dev/null 2>&1; then ${stub_cli} skills get "${skill_name}" && exit 0; fi; f="\$HOME/${stub_state}/.plugin-root"; if [ -r "\$f" ]; then pr="\$(cat "\$f")"; if [ -x "\$pr/hooks/synaptory-decrypt-skill.sh" ]; then exec bash "\$pr/hooks/synaptory-decrypt-skill.sh" "${skill_name}"; fi; fi; echo "synaptory: ${stub_cli} is not on PATH and the ${stub_state} plugin root is not cached." >&2; exit 1'\`
 STUB
 }
 
@@ -205,6 +211,9 @@ _compose_cursor_plugin() {
     exit 1
   fi
   bash "$compose" || exit 1
+  # Never stamp SYNAPTORY_CP_URL into the source tree. compose.py writes the
+  # committed marketplace default; local testing uses gitignored cp-url.local.
+  # The build URL is applied to the published copy in _package_cursor_marketplace.
   _package_cursor_marketplace
 }
 
@@ -225,6 +234,10 @@ _package_cursor_marketplace() {
     --exclude '.pytest_cache' \
     "$src/" "$dest/"
   python3 "${src}/scripts/compose.py" --strip-ip --out "$dest" || exit 1
+  if [[ -n "${SYNAPTORY_CP_URL:-}" ]]; then
+    printf '%s\n' "${SYNAPTORY_CP_URL}" > "${dest}/hooks/lib/cp-url"
+    echo "  Stamped Cursor control-plane URL → ${dest#"$REPO_ROOT"/}/hooks/lib/cp-url"
+  fi
   mkdir -p "$(dirname "$catalog_dest")"
   cp -f "$catalog_src" "$catalog_dest"
   echo "  Cursor plugin → ${dest} (IP-stripped)"
@@ -245,7 +258,9 @@ _compose_codex_plugin() {
     echo "  skipped (plugin-codex not in this tree)"
     return 0
   fi
-  python3 "$compose" --out "$output" || exit 1
+  python3 "$compose" \
+    --out "$output" \
+    --control-plane-url "${SYNAPTORY_CP_URL}" || exit 1
   mkdir -p "$(dirname "$catalog_dest")"
   cp -f "$catalog_src" "$catalog_dest"
   echo "  Codex catalog → ${catalog_dest}"
@@ -391,11 +406,20 @@ INIT
   # first. macOS rsync tolerates the missing parent; rsync 3.2.7 on Linux
   # fails with "mkdir failed: No such file or directory (2)".
   mkdir -p "$OUTPUT_DIR"
-  # -L dereferences symlinks into plugin-core/ (agents, protocols) so the dist
+  # -L dereferences symlinks into core/ (hooks/lib, scripts, receipt-schema) so the dist
   # gets real files — the marketplace copy is standalone, no symlink leakage.
   rsync -aL --exclude='__pycache__' --exclude='*.pyc' --exclude='assets/' "$PLUGIN_ROOT/" "$OUTPUT_DIR/"
 
   echo "  Copied plugin-claude/ → marketplace/${PLUGIN_NAME}/"
+
+  # Authored bodies carry host-neutral {{include:}} / {{read:}} directives.
+  # Expand them into Claude's native inline form in the DIST tree only; the
+  # authored source stays host-neutral. Fails the build on a malformed directive
+  # or an include naming a file that does not exist.
+  if ! python3 "${REPO_ROOT}/core/scripts/expand_claude_directives.py" "$OUTPUT_DIR"; then
+    echo "ERROR: directive expansion failed for the Claude package" >&2
+    exit 1
+  fi
 
   # Rewrite dist plugin.json "name" to match PLUGIN_NAME. The source tree
   # keeps name="synaptory" so local dev (claude --plugin-dir ./plugin-claude) is
@@ -462,7 +486,7 @@ with open(p, 'w') as f:
   #   * Keep agent SKILL.md + phases/modes/tech-packs PLAINTEXT for now —
   #     these are loaded inside the agent prompt via Read or `!cat`, both
   #     of which need the file on local disk. Rewriting those references
-  #     to use Bash/CLI is a follow-up slice; stripping them here would
+  #     to use Bash/CLI is a follow-up cycle; stripping them here would
   #     break agent dispatch.
   #   * Keep _shared/scripts/ plaintext .py (runtime helpers). The .pyc
   #     bytecode obfuscation is dropped — separate hardening task.
@@ -924,17 +948,16 @@ cmd_test() {
   if [ "$mode" = "all" ] || [ "$mode" = "syntax" ]; then
   # Python syntax
   for py_file in \
-    plugin-claude/hooks/lib/state_machine.py \
-    plugin-claude/hooks/lib/scrum_state_machine.py \
-    plugin-claude/hooks/lib/kanban_state_machine.py \
-    plugin-claude/hooks/lib/story_pipeline.py \
-    plugin-claude/hooks/lib/receipt_validator.py \
-    plugin-claude/hooks/lib/verification_runner.py \
-    plugin-claude/hooks/lib/mode_reader.py \
-    plugin-claude/hooks/lib/update_claude_md.py \
-    plugin-claude/skills/_shared/scripts/backend/backend_config.py \
-    plugin-claude/skills/_shared/scripts/backend/prompt_translator.py \
-    plugin-claude/skills/_shared/scripts/tracker/tracker_cli.py \
+    core/lib/state_machine.py \
+    core/lib/scrum_state_machine.py \
+    core/lib/kanban_state_machine.py \
+    core/lib/story_pipeline.py \
+    core/lib/receipt_validator.py \
+    core/lib/verification_runner.py \
+    core/lib/mode_reader.py \
+    core/lib/update_claude_md.py \
+    core/scripts/backend/backend_config.py \
+    core/scripts/tracker/tracker_cli.py \
     plugin-claude/scripts/build_user_guide.py \
     plugin-cursor/hooks/lib/cursor_hook.py \
     plugin-cursor/mcp/server.py \
@@ -1003,6 +1026,22 @@ cmd_test() {
     else
       failed=$((failed + 1))
     fi
+
+    # Layer 2b: the cross-host conformance contract. Run as its OWN invocation
+    # with an explicit -c rather than appended to pytest_dirs above. There is no
+    # repo-root pytest config, so the combined run resolves rootdir to the repo
+    # root and every per-tree ini silently deactivates; appending would inherit
+    # that and lose --strict-markers, which this suite depends on.
+    if [[ -d conformance ]]; then
+      echo ""
+      echo "  Running cross-host conformance contract (conformance/)..."
+      echo ""
+      if python3 -m pytest -c conformance/pytest.ini conformance -q --no-header 2>&1; then
+        :
+      else
+        failed=$((failed + 1))
+      fi
+    fi
   fi
 
   echo ""
@@ -1067,13 +1106,25 @@ _build_cli_binaries() {
   elif [[ "${PLUGIN_NAME}" != "synaptory" ]]; then
     channel="${PLUGIN_NAME#synaptory-}"
   fi
+  # SYNAPTORY_BUILD_CLI_TARGETS narrows the cross-compile to a space-separated
+  # list of `os/arch` pairs. Empty (the default, and every release path) builds
+  # all five, so `deploy prod` is byte-for-byte unchanged. CI's e2e subset sets
+  # it to the one target it actually executes: the 5-platform compile measured
+  # 69s of a 269s stack bring-up, and four of those binaries are never run.
+  # Releases and `e2e_scope: full` keep all five, so the cross-platform compile
+  # check still gates the way to prod.
+  local -a target_args=()
+  if [[ -n "${SYNAPTORY_BUILD_CLI_TARGETS:-}" ]]; then
+    read -r -a target_args <<< "${SYNAPTORY_BUILD_CLI_TARGETS}"
+    echo "  targets narrowed to: ${target_args[*]}"
+  fi
   (cd "$cli_dir" && \
     VERSION="${ver}" \
     SYNAPTORY_CP_URL="${SYNAPTORY_CP_URL}" \
     SYNAPTORY_CHANNEL="${channel}" \
     SYNAPTORY_CP_ENTRA_TENANT_ID="${SYNAPTORY_CP_ENTRA_TENANT_ID}" \
     SYNAPTORY_CP_ENTRA_CLIENT_ID="${SYNAPTORY_CP_ENTRA_CLIENT_ID}" \
-    ./scripts/build-all.sh)
+    ./scripts/build-all.sh "${target_args[@]+"${target_args[@]}"}")
   echo "  ✓ CLI binaries in ${cli_dir}/dist/  (channel=${channel:-stable})"
   echo ""
 }
@@ -1125,7 +1176,7 @@ _stage_cli_to_dist() {
     "${REPO_ROOT}/plugin-claude/.claude-plugin/plugin.json" 2>/dev/null | head -n1)
   cli_min="${cli_min:-$ver}"
   released_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  notes_url="https://github.com/h3tech-ai/synaptory/releases/tag/v${ver}"
+  notes_url="https://github.com/h3tech-ai/synaptory-v1/releases/tag/v${ver}"
   case "$(printf '%s' "${SYNAPTORY_RELEASE_CRITICAL:-}" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes|on) critical=true ;;
     *)             critical=false ;;
@@ -1303,7 +1354,9 @@ _deploy_prod() {
     df -h / 2>/dev/null | awk 'NR==2{printf "  root fs: %s used, %s free (%s)\n",$3,$4,$5}' || true
   fi
 
-  cmd_build "$@"
+  # Release artifacts are always the canonical stable/prod identity even if
+  # the operator previously ran a local build in the same checkout.
+  SYNAPTORY_CHANNEL=stable cmd_build "$@"
 
   local ver
   ver=$(cat "$VERSION_FILE" | tr -d '[:space:]')
@@ -1453,13 +1506,26 @@ cmd_dev() {
       shift
       local url="${SYNAPTORY_CP_URL:-$(_local_stack_url)}"
       (cd "${REPO_ROOT}/cli" && go run -ldflags \
-        "-X github.com/h3tech-ai/synaptory/cli/internal/cli.ControlPlaneURL=${url} -X github.com/h3tech-ai/synaptory/cli/internal/cli.Channel=local" \
+        "-X github.com/h3tech-ai/synaptory-v1/cli/internal/cli.ControlPlaneURL=${url} -X github.com/h3tech-ai/synaptory-v1/cli/internal/cli.Channel=local" \
         ./cmd/synaptory "$@")
       ;;
     plugin)
       shift
-      echo "  Launching: claude --plugin-dir ${PLUGIN_ROOT} $*"
-      exec claude --plugin-dir "${PLUGIN_ROOT}" "$@"
+      # Authored source stays host-neutral ({{read:}} / {{include:}}). Dist
+      # expands those; a raw --plugin-dir would ship the literals into the
+      # live prompt. Expand into a staging copy the same way the marketplace
+      # package is produced.
+      local staging
+      staging=$(mktemp -d "${TMPDIR:-/tmp}/synaptory-dev-plugin.XXXXXX")
+      rsync -aL --exclude='__pycache__' --exclude='*.pyc' --exclude='tests/' \
+        "${PLUGIN_ROOT}/" "${staging}/"
+      if ! python3 "${REPO_ROOT}/core/scripts/expand_claude_directives.py" "$staging"; then
+        echo "ERROR: directive expansion failed for ./synaptory dev plugin" >&2
+        rm -rf "$staging"
+        exit 1
+      fi
+      echo "  Launching: claude --plugin-dir ${staging} $*  (directives expanded)"
+      exec claude --plugin-dir "${staging}" "$@"
       ;;
     *) echo "Usage: $0 dev {cli|plugin} [args…]" >&2; exit 1 ;;
   esac
@@ -1480,7 +1546,7 @@ cmd_cli() {
       shift
       local url="${SYNAPTORY_CP_URL:-$(_local_stack_url)}"
       (cd "$cli_dir" && go run -ldflags \
-        "-X github.com/h3tech-ai/synaptory/cli/internal/cli.ControlPlaneURL=${url} -X github.com/h3tech-ai/synaptory/cli/internal/cli.Channel=local" \
+        "-X github.com/h3tech-ai/synaptory-v1/cli/internal/cli.ControlPlaneURL=${url} -X github.com/h3tech-ai/synaptory-v1/cli/internal/cli.Channel=local" \
         ./cmd/synaptory "$@")
       ;;
     build)
@@ -1595,6 +1661,27 @@ cmd_release() {
   exit 1
 }
 
+cmd_conformance() {
+  # The cross-host conformance contract, plus its generated report.
+  # Always -c: there is no repo-root pytest config, so a bare invocation
+  # resolves rootdir upward and silently drops --strict-markers.
+  local report=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --report) report="${2:-docs/v1.0/conformance-report.md}"; [ -n "${2:-}" ] && shift ;;
+      *) ;;
+    esac
+    shift
+  done
+  cd "$REPO_ROOT" || exit 1
+  if [ -n "$report" ]; then
+    python3 -m pytest -c conformance/pytest.ini conformance -q --no-header \
+      "--conformance-report=$report"
+  else
+    python3 -m pytest -c conformance/pytest.ini conformance -q --no-header
+  fi
+}
+
 cmd_e2e() {
   # Cross-module end-to-end harness. See docs/BRD.md §11 + e2e/README.md.
   #
@@ -1603,13 +1690,16 @@ cmd_e2e() {
   # never leaves a stack running. Pass --keep-stack to skip teardown.
   local keep_stack=false
   local scenario=""
+  local marker=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --keep-stack) keep_stack=true; shift ;;
       --scenario) scenario="$2"; shift 2 ;;
+      --smoke) marker="smoke"; shift ;;
+      --marker) marker="$2"; shift 2 ;;
       --help|-h)
         cat <<'USAGE'
-Usage: ./synaptory e2e [--keep-stack] [--scenario test_NN_name.py]
+Usage: ./synaptory e2e [--keep-stack] [--scenario test_NN_name.py | --smoke | --marker EXPR]
 
 Drives the cross-module end-to-end harness against a fresh local stack.
 See docs/BRD.md §11 for the full scenario catalogue and FR coverage map.
@@ -1619,6 +1709,11 @@ USAGE
       *) echo "Unknown flag: $1" >&2; return 1 ;;
     esac
   done
+
+  if [[ -n "$scenario" && -n "$marker" ]]; then
+    echo "--scenario and --smoke/--marker are mutually exclusive" >&2
+    return 1
+  fi
 
   # E2E exercises the real exchange + refresh endpoints without contacting
   # Entra. The local compose file includes a fixture IdP, but normal local
@@ -1630,6 +1725,21 @@ USAGE
   export SYNAPTORY_CP_ENTRA_USERS_GROUP="synaptory-users"
   export SYNAPTORY_CP_ENTRA_ADMINS_GROUP="synaptory-admins"
   export FIXTURE_URL="http://localhost:9000"
+
+  # The web Playwright specs need a real signed-in session: the console pages
+  # redirect to /auth/login without one, so unauthenticated runs fail with
+  # "unexpected value .../auth/login" rather than testing anything. The
+  # fixture IdP mints API tokens but cannot produce the web app's iron-session
+  # COOKIE, so the local-credential path is what a browser can actually drive.
+  #
+  # Test-only, and local-stack-only by construction: both flags default to
+  # false everywhere else, and `deploy prod` never sets them.
+  export SYNAPTORY_CP_LOCAL_AUTH_ENABLED="true"
+  export SYNAPTORY_LOCAL_AUTH_ENABLED="true"
+  export SYNAPTORY_CP_LOCAL_ADMIN_UPN="${SYNAPTORY_CP_LOCAL_ADMIN_UPN:-admin@h3t.co}"
+  export SYNAPTORY_CP_LOCAL_ADMIN_PASSWORD="${SYNAPTORY_CP_LOCAL_ADMIN_PASSWORD:-e2e-local-admin}"
+  export SYNAPTORY_CP_LOCAL_USER_UPN="${SYNAPTORY_CP_LOCAL_USER_UPN:-user@h3t.co}"
+  export SYNAPTORY_CP_LOCAL_USER_PASSWORD="${SYNAPTORY_CP_LOCAL_USER_PASSWORD:-e2e-local-user}"
 
   local infra_dir="${REPO_ROOT}/infra"
   local compose_file="${infra_dir}/compose/docker-compose.local.yml"
@@ -1653,11 +1763,16 @@ USAGE
   # Keep this as a simple command. Wrapping a Bash function in `||` disables
   # errexit throughout that function, which previously let failed Docker
   # builds continue and report a false successful build.
-  cmd_deploy local
+  # E2E is verification, not a release. A normal local deploy intentionally
+  # patch-bumps VERSION, so pin this build to the current value to keep a test
+  # run from modifying tracked release manifests.
+  cmd_deploy local --version "$CURRENT_VERSION"
 
   echo "[e2e] running scenarios"
   if [[ -n "$scenario" ]]; then
     E2E_SCENARIO="$scenario" "${REPO_ROOT}/e2e/run-e2e.sh"
+  elif [[ -n "$marker" ]]; then
+    E2E_MARKER="$marker" "${REPO_ROOT}/e2e/run-e2e.sh"
   else
     "${REPO_ROOT}/e2e/run-e2e.sh"
   fi
@@ -1711,6 +1826,7 @@ cmd_help() {
                                  Lifecycle ops on the running compose stack
                                  (use `deploy local` to start it).
     e2e [--keep-stack] [--scenario test_NN_name.py]
+    conformance [--report [path]]
                                  Cross-module end-to-end harness against a
                                  fresh local stack.
     help                         Show this help message.
@@ -1741,6 +1857,7 @@ case "$COMMAND" in
   api)          cmd_api "$@" ;;
   release)      cmd_release "$@" ;;
   e2e)          cmd_e2e "$@" ;;
+  conformance)  cmd_conformance "$@" ;;
   help|--help|-h) cmd_help ;;
   *) echo "Unknown command: $COMMAND (run: ./synaptory help)" >&2; exit 1 ;;
 esac

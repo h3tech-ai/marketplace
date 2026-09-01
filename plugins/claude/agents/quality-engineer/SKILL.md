@@ -346,7 +346,7 @@ Wait for all 5 agents to complete, then run Phase 7 (Test Infrastructure) sequen
 
 ### Phase 1 — Test Planning
 
-`!cat ${CLAUDE_SKILL_DIR}/phases/01-test-planning.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/01-test-planning.md`
 
 ---
 
@@ -358,15 +358,15 @@ Load each phase on demand. **Execute in the order listed below — not by phase 
 
 | Phase | File | Parallel Group |
 |-------|------|---------------|
-| Phase 8: Test Data Management | `!cat ${CLAUDE_SKILL_DIR}/phases/08-test-data.md` | Sequential (before Group A) |
-| Phase 2: Unit Tests | `!cat ${CLAUDE_SKILL_DIR}/phases/02-unit-tests.md` | Group A (parallel) |
-| Phase 3: Integration Tests | `!cat ${CLAUDE_SKILL_DIR}/phases/03-integration-tests.md` | Group A (parallel) |
-| Phase 4: Contract Tests (MANDATORY) | `!cat ${CLAUDE_SKILL_DIR}/phases/04-contract-tests.md` | Group A (parallel) |
-| Phase 5: E2E Tests | `!cat ${CLAUDE_SKILL_DIR}/phases/05-e2e-tests.md` | Group A (parallel) |
-| Phase 6: Performance Tests (MANDATORY) | `!cat ${CLAUDE_SKILL_DIR}/phases/06-performance-tests.md` | Group A (parallel) |
-| Phase 9: Observability Tests (conditional) | `!cat ${CLAUDE_SKILL_DIR}/phases/09-observability-tests.md` | Group A (parallel, only if observability detected) |
-| Phase 7: Test Infrastructure | `!cat ${CLAUDE_SKILL_DIR}/phases/07-test-infrastructure.md` | Sequential (after Group A) |
-| Phase 10: Runtime Verification (conditional) | `!cat ${CLAUDE_SKILL_DIR}/phases/10-runtime-verification.md` | Sequential (LAST, when the story's DoD requires `runtime_verified`) |
+| Phase 8: Test Data Management | !`cat ${CLAUDE_SKILL_DIR}/phases/08-test-data.md` | Sequential (before Group A) |
+| Phase 2: Unit Tests | !`cat ${CLAUDE_SKILL_DIR}/phases/02-unit-tests.md` | Group A (parallel) |
+| Phase 3: Integration Tests | !`cat ${CLAUDE_SKILL_DIR}/phases/03-integration-tests.md` | Group A (parallel) |
+| Phase 4: Contract Tests (MANDATORY) | !`cat ${CLAUDE_SKILL_DIR}/phases/04-contract-tests.md` | Group A (parallel) |
+| Phase 5: E2E Tests | !`cat ${CLAUDE_SKILL_DIR}/phases/05-e2e-tests.md` | Group A (parallel) |
+| Phase 6: Performance Tests (MANDATORY) | !`cat ${CLAUDE_SKILL_DIR}/phases/06-performance-tests.md` | Group A (parallel) |
+| Phase 9: Observability Tests (conditional) | !`cat ${CLAUDE_SKILL_DIR}/phases/09-observability-tests.md` | Group A (parallel, only if observability detected) |
+| Phase 7: Test Infrastructure | !`cat ${CLAUDE_SKILL_DIR}/phases/07-test-infrastructure.md` | Sequential (after Group A) |
+| Phase 10: Runtime Verification (conditional) | !`cat ${CLAUDE_SKILL_DIR}/phases/10-runtime-verification.md` | Sequential (LAST, when the story's DoD requires `runtime_verified`) |
 
 ### Parallel Output Verification (REQUIRED before Phase 7)
 
@@ -475,10 +475,10 @@ Before marking the skill as complete, verify:
 
 ## Test Health Tracking, Time Gates & Accessibility
 
-`!cat ${CLAUDE_SKILL_DIR}/phases/test-health.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/test-health.md`
 
 ---
 
 ## Receipt & Verification Protocol
 
-`!cat ${CLAUDE_SKILL_DIR}/phases/receipt-protocol.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/receipt-protocol.md`

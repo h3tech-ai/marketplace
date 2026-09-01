@@ -20,10 +20,14 @@ import os
 import re
 import subprocess
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
+from protocol_materialize import (  # noqa: F401
+    PROTOCOL_NAMES,
+    REQUIRED_PROTOCOLS,
+    materialize_protocols,
+)
 
 ROSTER = frozenset(
     {
@@ -60,38 +64,6 @@ SESSION_END_SCRIPTS = (
     "synaptory-access-token-cleanup.sh",
     "synaptory-pipeline-snapshot.sh",
 )
-
-# Keep in sync with plugin-claude/hooks/synaptory-inject-protocols.sh and seed.py.
-REQUIRED_PROTOCOLS = (
-    "receipt-protocol",
-    "input-validation",
-    "tool-efficiency",
-    "freshness-protocol",
-    "iron-laws",
-    "verification-discipline",
-    "socratic-gate",
-    "anti-safe-harbor",
-    "script-output-handling",
-    "clean-code-self-check",
-    "scope-challenge",
-    "finding-memory",
-    "tdd-discipline",
-    "code-review-response",
-    "subagent-isolation",
-    "source-attribution",
-    "open-decision-registry",
-)
-PROTOCOL_NAMES = REQUIRED_PROTOCOLS + (
-    "ux-protocol",
-    "visual-identity",
-    "boundary-safety",
-    "conflict-resolution",
-    "coverage-ratchet",
-    "ephemeral-environments",
-)
-# Every name we materialize is required for fail-closed cloud delivery.
-REQUIRED_PROTOCOLS = PROTOCOL_NAMES
-
 
 def plugin_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -324,109 +296,19 @@ def _auth_blocked_message() -> str:
     )
 
 
-_PROTOCOL_FETCH_BUDGET_S = 6.0
-_PROTOCOL_FETCH_ONE_S = 4.0
-
-
-def _protocol_disk_dirs(root: Path) -> list[Path]:
-    return [
-        root / "skills" / "_shared" / "protocols",
-        root.parent / "plugin-claude" / "skills" / "_shared" / "protocols",
-    ]
-
-
-def _read_protocol_disk(name: str, disk_dirs: list[Path]) -> str:
-    for d in disk_dirs:
-        path = d / f"{name}.md"
-        if path.is_file():
-            try:
-                return path.read_text(encoding="utf-8")
-            except OSError:
-                return ""
-    return ""
-
-
-def _fetch_protocol_body(name: str, cli: str | None, disk_dirs: list[Path]) -> str:
-    body = ""
-    if cli:
-        try:
-            proc = subprocess.run(
-                [cli, "skills", "get", f"protocols/{name}", "--host", "cursor"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=_PROTOCOL_FETCH_ONE_S,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            proc = None
-        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
-            body = proc.stdout
-    if not body:
-        body = _read_protocol_disk(name, disk_dirs)
-    return body
-
-
 def _materialize_protocols(project: str, root: Path) -> list[str]:
-    """Write protocol bodies to `.synaptory/.protocols/<name>.md` in parallel.
+    """Write protocol bodies to `.synaptory/.protocols/<name>.md`.
 
     Returns names that are still missing (fail-closed for required set).
     Cloud agents do not run sessionStart; callers must invoke this from
-    subagentStart as well. Wall-clock budget is bounded so we deny before
-    the hook timeout instead of failing open.
+    subagentStart as well.
     """
-    dest = Path(project) / ".synaptory" / ".protocols"
-    try:
-        dest.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return list(REQUIRED_PROTOCOLS)
-    cli = _cli_bin()
-    disk_dirs = _protocol_disk_dirs(root)
-    missing: list[str] = []
-    need_fetch: list[str] = []
-    for name in PROTOCOL_NAMES:
-        cached = dest / f"{name}.md"
-        if cached.is_file() and cached.stat().st_size > 0:
-            continue
-        need_fetch.append(name)
-    deadline = time.monotonic() + _PROTOCOL_FETCH_BUDGET_S
-    if need_fetch:
-        workers = min(8, len(need_fetch))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {
-                pool.submit(_fetch_protocol_body, name, cli, disk_dirs): name
-                for name in need_fetch
-            }
-            try:
-                remaining = max(0.05, deadline - time.monotonic())
-                for fut in as_completed(futs, timeout=remaining):
-                    name = futs[fut]
-                    try:
-                        body = fut.result()
-                    except Exception:
-                        body = ""
-                    if body.strip():
-                        try:
-                            (dest / f"{name}.md").write_text(body, encoding="utf-8")
-                        except OSError:
-                            body = ""
-                    if name in REQUIRED_PROTOCOLS and not (body or "").strip():
-                        missing.append(name)
-            except TimeoutError:
-                for name in need_fetch:
-                    path = dest / f"{name}.md"
-                    if name in REQUIRED_PROTOCOLS and not (
-                        path.is_file() and path.stat().st_size > 0
-                    ):
-                        if name not in missing:
-                            missing.append(name)
-    for name in PROTOCOL_NAMES:
-        path = dest / f"{name}.md"
-        if name in REQUIRED_PROTOCOLS and not (
-            path.is_file() and path.stat().st_size > 0
-        ):
-            if name not in missing:
-                missing.append(name)
-    return missing
+    return materialize_protocols(
+        project,
+        plugin_root=root,
+        cli=_cli_bin(),
+        host="cursor",
+    )
 
 
 def shutil_which(name: str) -> bool:
@@ -803,13 +685,49 @@ def _deny(message: str) -> dict[str, Any]:
     return {"permission": "deny", "user_message": message}
 
 
+def _claude_activity_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Project Cursor postToolUse / shell stdin onto the Claude parser shape."""
+    tool = _tool_name(data)
+    inp = dict(_tool_input(data))
+    command = data.get("command")
+    if command and not inp.get("command"):
+        inp["command"] = command
+    path = (
+        inp.get("file_path")
+        or inp.get("path")
+        or data.get("file_path")
+        or data.get("file_path_after")
+        or ""
+    )
+    if path and not inp.get("file_path"):
+        inp["file_path"] = path
+    mapped = {
+        "Shell": "Bash",
+        "StrReplace": "Edit",
+        "ReadFile": "Read",
+    }.get(tool, tool)
+    out = {
+        "tool_name": mapped or tool,
+        "tool_input": inp,
+        "hook_event_name": str(data.get("hook_event_name") or "PostToolUse"),
+    }
+    # Claude PostToolUse carries the CLI session UUID as session_id.
+    # Cursor sends conversation_id, which is NOT that UUID — forwarding it
+    # as --session-id makes the CLI drop the ping (no per-session binding).
+    sid = str(data.get("session_id") or "").strip()
+    if sid:
+        out["session_id"] = sid
+    return out
+
+
 def activity(data: dict[str, Any], project: str, root: Path) -> None:
     if not (Path(project) / ".synaptory").is_dir():
         return
-    _run_script(root, "synaptory-activity-ping.sh", json.dumps(data).encode())
+    payload = _claude_activity_payload(data)
+    _run_script(root, "synaptory-activity-ping.sh", json.dumps(payload).encode())
     monitor = root / "hooks" / "synaptory-monitor-events.sh"
     if monitor.is_file():
-        _run_script(root, "synaptory-monitor-events.sh", json.dumps(data).encode())
+        _run_script(root, "synaptory-monitor-events.sh", json.dumps(payload).encode())
 
 
 def tool_failure(data: dict[str, Any], project: str, root: Path) -> None:

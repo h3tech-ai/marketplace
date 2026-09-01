@@ -39,9 +39,11 @@ def _state(*stories: dict, sprint: int = 2, **kw) -> dict:
     }
 
 
-def _receipt(receipts_dir: Path, sid: str, role: str) -> None:
+def _receipt(receipts_dir: Path, sid: str, role: str, *, completed_at: str = "2099-01-01T00:00:00Z") -> None:
     receipts_dir.mkdir(parents=True, exist_ok=True)
-    (receipts_dir / f"{sid}-{role}.json").write_text('{"task": "t"}')
+    (receipts_dir / f"{sid}-{role}.json").write_text(
+        json.dumps({"task": "t", "completed_at": completed_at})
+    )
 
 
 # ── one test per action ──────────────────────────────────────────────────────
@@ -284,13 +286,12 @@ def test_stale_receipt_redispatches_not_advances(tmp_path: Path):
     """P1b regression guard: a receipt OLDER than the story's entry into its
     current stage — e.g. left behind when reject_story needs-fix reset an
     accepted story back to in_progress — is stale. next_action must
-    re-dispatch (redo the work), not advance past it on the old receipt."""
-    import time
+    re-dispatch (redo the work), not advance past it on the old receipt.
 
-    _receipt(tmp_path, "US-1", "se")
-    old = time.time() - 100
-    os.utime(tmp_path / "US-1-se.json", (old, old))
-    # Story (re-)entered in_progress AFTER that stale receipt was written.
+    Freshness is `completed_at` vs stage `entered_at`, the same clock
+    evaluate_dispatch uses. mtime is not consulted.
+    """
+    _receipt(tmp_path, "US-1", "se", completed_at="2000-01-01T00:00:00Z")
     story = _story(
         "US-1", "in_progress",
         pipeline_log=[{"state": "in_progress", "entered_at": _iso()}],
@@ -302,13 +303,52 @@ def test_stale_receipt_redispatches_not_advances(tmp_path: Path):
 
 @pytest.mark.unit
 def test_fresh_receipt_after_stage_entry_advances(tmp_path: Path):
-    """Complement: a receipt written AFTER the current stage entry is a
+    """Complement: a receipt completed AFTER the current stage entry is a
     genuine crash-recovery signal → advance, don't re-dispatch."""
     story = _story(
         "US-1", "testing",
         pipeline_log=[{"state": "testing", "entered_at": _iso(-100)}],
     )
-    _receipt(tmp_path, "US-1", "qe")  # mtime = now, after the 100s-ago entry
+    _receipt(tmp_path, "US-1", "qe")
+    out = next_action(_state(story), receipts_dir=str(tmp_path))
+    assert out["receipt_present"] is True
+    assert out["transition_to"] == "reviewing"
+
+
+@pytest.mark.unit
+def test_fresh_receipt_same_utc_second_is_contemporaneous(tmp_path: Path):
+    """Cursor receipts often omit fractional seconds. Same UTC second as
+    stage entry is this attempt, not a leftover from a prior one."""
+    story = _story(
+        "US-1", "testing",
+        pipeline_log=[{
+            "state": "testing",
+            "entered_at": "2026-08-24T16:52:34.647295Z",
+        }],
+    )
+    _receipt(tmp_path, "US-1", "qe", completed_at="2026-08-24T16:52:34Z")
+    out = next_action(_state(story), receipts_dir=str(tmp_path))
+    assert out["receipt_present"] is True
+    assert out["transition_to"] == "reviewing"
+
+
+@pytest.mark.unit
+def test_freshness_uses_completed_at_not_mtime(tmp_path: Path):
+    """Wedge guard: an old mtime must not disagree with a fresh completed_at.
+
+    Before this, next_action used mtime while evaluate_dispatch used
+    completed_at, so dispatch refused with 'call advance' while next_action
+    still wanted a re-dispatch.
+    """
+    import time
+
+    story = _story(
+        "US-1", "testing",
+        pipeline_log=[{"state": "testing", "entered_at": _iso(-100)}],
+    )
+    _receipt(tmp_path, "US-1", "qe", completed_at=_iso())
+    old = time.time() - 10_000
+    os.utime(tmp_path / "US-1-qe.json", (old, old))
     out = next_action(_state(story), receipts_dir=str(tmp_path))
     assert out["receipt_present"] is True
     assert out["transition_to"] == "reviewing"
@@ -576,9 +616,17 @@ def _failed(receipts_dir: Path, sid: str, role: str) -> None:
     """A fresh receipt whose verification FAILED (non-zero exit / not complete)."""
     receipts_dir.mkdir(parents=True, exist_ok=True)
     if role == "cr":
-        body = {"task": "t", "status": "changes-requested"}
+        body = {
+            "task": "t",
+            "status": "changes-requested",
+            "completed_at": "2099-01-01T00:00:00Z",
+        }
     else:  # se/qe → build_succeeds / tests_pass
-        body = {"task": "t", "verification_commands": [{"command": "x", "exit_code": 1}]}
+        body = {
+            "task": "t",
+            "verification_commands": [{"command": "x", "exit_code": 1}],
+            "completed_at": "2099-01-01T00:00:00Z",
+        }
     (receipts_dir / f"{sid}-{role}.json").write_text(json.dumps(body))
 
 
@@ -630,7 +678,11 @@ def test_vloop_on_passing_receipt_still_advances(tmp_path: Path):
     receipts = tmp_path
     receipts.mkdir(parents=True, exist_ok=True)
     (receipts / "US-1-qe.json").write_text(
-        json.dumps({"task": "t", "verification_commands": [{"command": "x", "exit_code": 0}]})
+        json.dumps({
+            "task": "t",
+            "verification_commands": [{"command": "x", "exit_code": 0}],
+            "completed_at": "2099-01-01T00:00:00Z",
+        })
     )
     out = next_action(_state(_testing_story()), receipts_dir=str(receipts),
                       verification_loops=True)
@@ -713,7 +765,11 @@ def _unverifiable(receipts_dir: Path, sid: str, role: str) -> None:
     verification_commands → _evaluate_check returns None."""
     receipts_dir.mkdir(parents=True, exist_ok=True)
     (receipts_dir / f"{sid}-{role}.json").write_text(
-        json.dumps({"task": "t", "verification_commands": ["pytest -q"]})
+        json.dumps({
+            "task": "t",
+            "verification_commands": ["pytest -q"],
+            "completed_at": "2099-01-01T00:00:00Z",
+        })
     )
 
 
@@ -1007,3 +1063,15 @@ def test_wrapper_parallel_block_respects_depends_on(tmp_path: Path):
 
     assert out["parallel"]["eligible"] is False
     assert [b["story_id"] for b in out["parallel"]["batch"]] == ["US-1"]
+
+
+# ── #304 action contract ────────────────────────────────────────────────────
+
+
+def test_deps_blocked_is_in_the_action_contract():
+    """Every consumer keys off NEXT_ACTIONS; a wrapper action outside it fails
+    the contract test."""
+    from story_pipeline import CONTINUE_ELIGIBLE
+
+    assert "deps_blocked" in NEXT_ACTIONS
+    assert "deps_blocked" not in CONTINUE_ELIGIBLE

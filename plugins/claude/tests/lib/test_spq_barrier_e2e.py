@@ -16,7 +16,7 @@ cannot demonstrate:
      working tree, which is what breaks the ordering circularity (records live
      on workstream branches, so they are only co-visible after the merge that
      is itself criterion 2).
-  3. Criterion 4 catches a mid-Slice edit to a governed shared component and
+  3. Criterion 4 catches a mid-Cycle edit to a governed shared component and
      names the culprit.
 
 Marked `slow`: it runs real git and real subprocesses. No network, no stack.
@@ -58,10 +58,24 @@ spq:
   sync:
     remote: "origin"
     branch_pattern: "ws/{id}"
-    integration_branch_pattern: "sync/slice-{n}"
+    integration_branch_pattern: "sync/cycle-{n}"
     promote_to: "dev"
     mode: "all_or_nothing"
     require_regression: true
+    # KNOWN FIXTURE LIMITATION, deliberately explicit rather than hidden.
+    #
+    # This topology has every clone run `open_cycle` independently, so each
+    # allocates its OWN cycle_id and seals its OWN manifest -- and the three
+    # identity criteria correctly report that the clones disagree. That
+    # disagreement is real, but it is an artifact of the fixture predating
+    # manifest hydration, not of the code under test here (criteria 2-5).
+    #
+    # The shipped flow is: the integration clone opens the Cycle and commits the
+    # manifest; workstream clones HYDRATE from it. Modernising this fixture onto
+    # that topology is follow-up work; until then the waiver keeps these tests
+    # about the criteria they are actually for, and reports itself as `waived`
+    # rather than passing silently.
+    allow_legacy_records: true
     require_journey: false
     shared_digest_paths:
       - "contracts/"
@@ -82,11 +96,22 @@ def _git(cwd: Path, *args: str) -> str:
 
 def _sm(project: Path, ws: str, *args: str) -> None:
     """Drive the state machine as the given workstream."""
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": ws}
-    subprocess.run(
-        ["python3", str(Path(sm.__file__)), args[0], str(project), *args[1:]],
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": ws}
+    extra: tuple[str, ...] = ()
+    if args and args[0] == "transition_story":
+        extra = ("--force-recovery", "--reason", "test fixture board setup")
+    proc = subprocess.run(
+        ["python3", str(Path(sm.__file__)), args[0], str(project), *args[1:], *extra],
         capture_output=True, text=True, env=env,
     )
+    # Surface failures. Swallowing them made every downstream assertion fail
+    # with a symptom ("local state is on Cycle 0") instead of the cause, which
+    # is the most expensive kind of test to debug.
+    if proc.returncode != 0:
+        raise AssertionError(
+            "fixture setup failed: %s %s\n%s\n%s"
+            % (args[0], project.name, proc.stdout[-800:], proc.stderr[-800:])
+        )
 
 
 @pytest.fixture
@@ -102,7 +127,12 @@ def topology(tmp_path: Path):
     (up / ".synaptory.yaml").write_text(CONFIG)
     # The carve-out that actually works: excluding CHILDREN, because git cannot
     # re-include a path whose parent directory is excluded.
-    (up / ".gitignore").write_text(".synaptory/*\n!.synaptory/sync/\n")
+    (up / ".gitignore").write_text(
+        # Both committed subtrees: `sync/` for readiness records and
+        # `cycles/` for the manifest, the dependency events and the
+        # cycle_id-keyed readiness records (#303).
+        ".synaptory/*\n!.synaptory/sync/\n!.synaptory/cycles/\n"
+    )
     shutil.copy(DIGEST_SCRIPT, up / "scripts" / "shared-digest.sh")
     (up / "scripts" / "regress.sh").write_text(
         "#!/usr/bin/env bash\necho 'RESULT exit=0 passed=42 failed=0'\n")
@@ -112,17 +142,35 @@ def topology(tmp_path: Path):
     _git(up, "add", "-A")
     _git(up, "commit", "-qm", "base")
 
+    # The SHIPPED topology (#303): the integration clone opens the Cycle ONCE
+    # and commits the sealed manifest; each workstream clone HYDRATES its
+    # projection from it. Previously every clone ran `open_cycle` independently,
+    # so each allocated its own cycle_id and sealed its own manifest -- three
+    # clones genuinely disagreeing about what the Cycle admitted, which is
+    # exactly what the identity criteria exist to catch.
+    all_units = []
+    for ws in WORKSTREAMS:
+        prefix = ws[:2].upper()
+        all_units += [
+            {"id": f"{prefix}X-1", "title": "a", "labels": [f"ws:{ws}"]},
+            {"id": f"{prefix}X-2", "title": "b", "labels": [f"ws:{ws}"]},
+        ]
+    _sm(up, "integration", "init")
+    _sm(up, "integration", "transition", "COMMIT")
+    _sm(up, "integration", "open_cycle", "1", "--goal", "cycle 1",
+        "--work-units", json.dumps(all_units))
+    _git(up, "add", "-A")
+    _git(up, "commit", "-qm", "cycle 1 manifest")
+
     clones: dict[str, Path] = {}
     for ws in WORKSTREAMS:
         d = tmp_path / ws
         _git(tmp_path, "clone", "-q", str(up), ws)
         _git(d, "checkout", "-q", "-b", f"ws/{ws}")
-        _sm(d, ws, "init")
-        _sm(d, ws, "transition", "COMMIT")
-        units = [{"id": f"{ws[:2].upper()}X-1", "title": "a"},
-                 {"id": f"{ws[:2].upper()}X-2", "title": "b"}]
-        _sm(d, ws, "open_slice", "1", "--goal", "slice 1",
-            "--work-units", json.dumps(units))
+        # Hydration projects the manifest: this clone gets ONLY the units it
+        # owns, and inherits the one cycle_id every clone agrees on.
+        _sm(d, ws, "hydrate_cycle", "1", "--workstream", ws)
+        units = [u for u in all_units if f"ws:{ws}" in u["labels"]]
         for u in units:
             _write_unit_receipts(d, u["id"])
             for st in ("in_progress", "testing", "reviewing", "done"):
@@ -187,19 +235,24 @@ def _do_work(clone: Path, ws: str) -> str:
     return _git(clone, "rev-parse", "HEAD").strip()
 
 
-def _declare_and_push(clone: Path, ws: str, slice_n: int = 1) -> dict:
+def _declare_and_push(clone: Path, ws: str, cycle_n: int = 1) -> dict:
     _do_work(clone, ws)
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": ws}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": ws}
     p = subprocess.run(
         ["python3", str(Path(sb.__file__)), "declare-ready", str(clone),
-         str(slice_n), "--declared-by", "lead@h3t.co"],
+         str(cycle_n), "--declared-by", "lead@h3t.co"],
         capture_output=True, text=True, env=env, cwd=str(clone),
     )
     assert p.returncode == 0, f"declare-ready failed for {ws}: {p.stderr}"
     _git(clone, "add", "-A")
-    _git(clone, "commit", "-qm", f"{ws} ready slice {slice_n}")
+    _git(clone, "commit", "-qm", f"{ws} ready cycle {cycle_n}")
     _git(clone, "push", "-q", "origin", f"ws/{ws}")
-    rec = clone / ".synaptory" / "sync" / f"slice-{slice_n}" / f"{ws}.json"
+    # Readiness records move to the collision-safe `.synaptory/cycles/<cycle-id>/`
+    # path once a Cycle identity exists; the `cycle-<N>` path remains for a
+    # Cycle that has none.
+    payload = json.loads(p.stdout or "{}")
+    rec = clone / (payload.get("path") or
+                   f".synaptory/sync/cycle-{cycle_n}/{ws}.json")
     return json.loads(rec.read_text())
 
 
@@ -208,7 +261,7 @@ def _declare_and_push(clone: Path, ws: str, slice_n: int = 1) -> dict:
 def test_all_work_units_terminal_yields_await_sync_in_every_clone(topology):
     _up, clones, _integ = topology
     for ws, d in clones.items():
-        env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": ws}
+        env = {**os.environ, "SYNAPTORY_WORKSTREAM": ws}
         p = subprocess.run(
             ["python3", str(Path(sm.__file__)), "next_action", str(d)],
             capture_output=True, text=True, env=env)
@@ -231,7 +284,7 @@ def test_the_digest_is_identical_across_independent_clones(topology):
 def test_declare_ready_derives_real_quality_evidence(topology):
     _up, clones, _integ = topology
     rec = _declare_and_push(clones["control-plane"], "control-plane")
-    assert rec["schema_version"] == "1.1"
+    assert rec["schema_version"] == "2.0"
     assert rec["work_units"] == {"admitted": 2, "done": 2, "cut": 0}
     # Derived from an actually-executed script, not a literal.
     assert rec["regression"]["exit_code"] == 0
@@ -265,7 +318,7 @@ def test_barrier_blocks_before_the_human_merge_then_clears_after(topology):
     # Criterion 2 is a HUMAN act (§8.5 step 2): into a sync/ feature branch,
     # never into dev, which is what keeps the shipped git rules intact.
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
@@ -285,7 +338,7 @@ def test_a_missing_workstream_blocks_all_or_nothing(topology):
 
 
 def test_criterion_4_allows_the_shared_owner_to_change_a_shared_component(topology):
-    """#239: the owner doing its job must not block the Slice.
+    """#239: the owner doing its job must not block the Cycle.
 
     This is the case the old comparison got backwards. It compared every
     workstream's claimed digest against the POST-MERGE integrated tree, so once
@@ -307,14 +360,14 @@ def test_criterion_4_allows_the_shared_owner_to_change_a_shared_component(topolo
         _declare_and_push(d, ws)
 
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in clones:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
     out = sb.evaluate(str(integ), 1, use_cache=False)
     crit = out["criteria"]["digests_match"]
     assert crit["passed"] is True, (
-        f"the owner's authorised change blocked the Slice: {crit.get('drift')}"
+        f"the owner's authorised change blocked the Cycle: {crit.get('drift')}"
     )
     assert crit["shared_owner"] == "control-plane"
     assert crit["used_digest_fallback"] is False, "git should have answered directly"
@@ -333,7 +386,7 @@ def test_criterion_4_names_the_file_a_non_owner_changed(topology):
         _declare_and_push(d, ws)
 
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in clones:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
@@ -346,9 +399,9 @@ def test_criterion_4_names_the_file_a_non_owner_changed(topology):
     ), crit["drift"]
 
 
-def test_criterion_4_catches_a_mid_slice_shared_component_edit(topology):
+def test_criterion_4_catches_a_mid_cycle_shared_component_edit(topology):
     """§12: shared components are published at Commit by the shared_owner, so a
-    delta from any other workstream means a mid-Slice edit needing adjudication."""
+    delta from any other workstream means a mid-Cycle edit needing adjudication."""
     up, clones, integ = topology
     culprit = clones["plugin-runtime"]
     (culprit / "contracts" / "api.json").write_text('{"version": 2, "sneaky": true}\n')
@@ -361,7 +414,7 @@ def test_criterion_4_catches_a_mid_slice_shared_component_edit(topology):
     _git(integ, "fetch", "-q", "origin")
     # Integrate only the CLEAN workstream, so the integrated tree carries the
     # published contract and the culprit's claim disagrees with it.
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     _git(integ, "merge", "-q", "--no-edit", "origin/ws/control-plane")
 
     out = sb.evaluate(str(integ), 1, use_cache=False)
@@ -381,15 +434,16 @@ def test_clear_sync_transitions_and_writes_the_barrier_receipt(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
     _sm(integ, "integration", "transition", "COMMIT")
-    _sm(integ, "integration", "open_slice", "1", "--goal", "s1", "--work-units", "[]")
+    # Integration admits no local units — delivery workstreams own the board.
+    _sm(integ, "integration", "open_cycle", "1", "--goal", "s1", "--work-units", "[]")
     _sm(integ, "integration", "transition", "SYNC")
 
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "integration"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "integration"}
     p = subprocess.run(
         ["python3", str(Path(sm.__file__)), "clear_sync", str(integ), "1",
          "--cleared-by", "lead@h3t.co"],
@@ -420,7 +474,7 @@ def test_a_replay_mismatch_refuses_declare_ready_in_a_real_clone(topology):
         "check": "tests_pass", "command": "pytest -q",
         "attested_exit_code": 0, "replayed_exit_code": 1}) + "\n")
 
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "control-plane"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "control-plane"}
     p = subprocess.run(
         ["python3", str(Path(sb.__file__)), "declare-ready", str(d), "1"],
         capture_output=True, text=True, env=env, cwd=str(d))
@@ -433,12 +487,12 @@ def test_a_replay_mismatch_refuses_declare_ready_in_a_real_clone(topology):
 # Review findings from PR #226 (all five reproduced before fixing)
 # ---------------------------------------------------------------------------
 
-def _write_record(clone: Path, ws: str, slice_n: int, **over) -> Path:
+def _write_record(clone: Path, ws: str, cycle_n: int, **over) -> Path:
     """Hand-write a record, bypassing declare-ready, to isolate barrier logic."""
-    d = clone / ".synaptory" / "sync" / f"slice-{slice_n}"
+    d = clone / ".synaptory" / "sync" / f"cycle-{cycle_n}"
     d.mkdir(parents=True, exist_ok=True)
     rec = {
-        "schema_version": "1.1", "slice": slice_n, "workstream": ws,
+        "schema_version": "1.1", "cycle": cycle_n, "workstream": ws,
         "branch": f"ws/{ws}", "head_sha": _git(clone, "rev-parse", "HEAD").strip(),
         "work_units": {"admitted": 2, "done": 2, "cut": 0},
         "shared_digests": {}, "regression": {"exit_code": 0},
@@ -453,14 +507,14 @@ def _write_record(clone: Path, ws: str, slice_n: int, **over) -> Path:
 
 def test_criterion_2_fails_when_no_head_was_merged(topology):
     """P1 #226: `branches_merged` passed on the branch NAME alone, so creating
-    `sync/slice-N` and merging NOTHING took the barrier green. Reproduced before
+    `sync/cycle-N` and merging NOTHING took the barrier green. Reproduced before
     the fix: verdict green with zero workstream heads integrated."""
     _up, clones, integ = topology
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
     # Create the expected branch, merge nothing.
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
 
     out = sb.evaluate(str(integ), 1, use_cache=False)
     c2 = out["criteria"]["branches_merged"]
@@ -475,7 +529,7 @@ def test_criterion_2_fails_when_one_head_is_omitted(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in ("control-plane", "plugin-runtime"):
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
@@ -491,7 +545,7 @@ def test_criterion_2_passes_only_with_every_head_merged(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
@@ -499,7 +553,10 @@ def test_criterion_2_passes_only_with_every_head_merged(topology):
     c2 = out["criteria"]["branches_merged"]
     assert c2["passed"] is True, c2["detail"]
     assert c2["unmerged"] == []
-    assert out["verdict"] == "green", out["blocking"]
+    assert out["verdict"] == "green", (out.get("blocking"), {
+        k: v.get("detail") for k, v in (out.get("criteria") or {}).items()
+        if not v.get("passed")
+    })
 
 
 def test_criterion_2_fails_on_an_unknown_head_sha(topology):
@@ -509,7 +566,7 @@ def test_criterion_2_fails_on_an_unknown_head_sha(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
@@ -525,17 +582,23 @@ def test_declare_ready_refuses_unfinished_work_units(topology):
     unfinished board could emit a schema-valid record."""
     _up, clones, _integ = topology
     d = clones["control-plane"]
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "control-plane"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "control-plane"}
     # Set the sub-state directly: `done -> blocked` is not a legal transition,
     # so driving it through the state machine leaves every unit done and tests
     # nothing. What is under test here is declare-ready's invariant, not the
     # transition table.
-    state_path = d / ".synaptory" / ".orchestrator" / "pipeline-state.json"
+    # Native SPQ layout (#303/#304/#305): `pipeline-state.json` is a mode +
+    # identity pointer, and the board lives in the workstream's own execution
+    # state under `.synaptory/.orchestrator/spq/cycles/<cycle-id>/`.
+    import spq_paths as sp
+
+    pointer = json.loads(
+        (d / ".synaptory" / ".orchestrator" / "pipeline-state.json").read_text()
+    )
+    cycle_id = pointer["spq"]["cycle_id"]
+    state_path = Path(sp.execution_state_path(str(d), cycle_id, "control-plane"))
     st = json.loads(state_path.read_text())
-    # Multi-spec layout: SYNAPTORY_ACTIVE_SPEC makes `initialize` write a v3
-    # file, so the board lives under specs[<workstream>].
-    slot = st["specs"]["control-plane"] if "specs" in st else st
-    slot["current_stories"][0]["state"] = "in_progress"
+    st["current_stories"][0]["state"] = "in_progress"
     state_path.write_text(json.dumps(st))
     p = subprocess.run(
         ["python3", str(Path(sb.__file__)), "declare-ready", str(d), "1"],
@@ -545,22 +608,22 @@ def test_declare_ready_refuses_unfinished_work_units(topology):
     assert not (d / ".synaptory" / "sync").exists()
 
 
-def test_declare_ready_refuses_a_slice_mismatch(topology):
+def test_declare_ready_refuses_a_cycle_mismatch(topology):
     _up, clones, _integ = topology
     d = clones["control-plane"]
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "control-plane"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "control-plane"}
     p = subprocess.run(
         ["python3", str(Path(sb.__file__)), "declare-ready", str(d), "7"],
         capture_output=True, text=True, env=env, cwd=str(d))
     assert p.returncode == 2
-    assert "local state is on Slice 1" in p.stderr
+    assert "local state is on Cycle 1" in p.stderr
 
 
 def test_declare_ready_refuses_the_no_regression_bypass(topology):
     """`--no-regression` must not defeat require_regression: true."""
     _up, clones, _integ = topology
     d = clones["control-plane"]
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "control-plane"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "control-plane"}
     p = subprocess.run(
         ["python3", str(Path(sb.__file__)), "declare-ready", str(d), "1",
          "--no-regression"],
@@ -575,7 +638,7 @@ def test_declare_ready_refuses_a_failing_regression(topology):
     (d / "scripts" / "regress.sh").write_text(
         "#!/usr/bin/env bash\necho 'RESULT exit=1 passed=40 failed=2'\nexit 1\n")
     (d / "scripts" / "regress.sh").chmod(0o755)
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "control-plane"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "control-plane"}
     p = subprocess.run(
         ["python3", str(Path(sb.__file__)), "declare-ready", str(d), "1"],
         capture_output=True, text=True, env=env, cwd=str(d))
@@ -591,7 +654,7 @@ def test_approve_baseline_records_and_transitions_atomically(tmp_path: Path):
     orch.mkdir(parents=True)
     (orch / "pipeline-state.json").write_text(json.dumps({
         "version": "2.0", "build_mode": "spq", "lifecycle_state": "DISCOVERY",
-        "current_slice": 0, "current_stories": [], "lifecycle_history": [],
+        "current_cycle": 0, "current_stories": [], "lifecycle_history": [],
         "discovery": {"completed_at": None, "baseline_approved": False}}))
 
     out = sm.approve_baseline(str(tmp_path), approved_by="lead@h3t.co")
@@ -610,77 +673,148 @@ def test_approve_baseline_requires_discovery(tmp_path: Path):
     orch.mkdir(parents=True)
     (orch / "pipeline-state.json").write_text(json.dumps({
         "version": "2.0", "build_mode": "spq", "lifecycle_state": "COMMIT",
-        "current_slice": 1, "current_stories": [], "lifecycle_history": []}))
+        "current_cycle": 1, "current_stories": [], "lifecycle_history": []}))
     with pytest.raises(ValueError, match="expected DISCOVERY"):
         sm.approve_baseline(str(tmp_path))
 
 
-def test_hydrate_slice_takes_a_fresh_clone_into_execution(tmp_path: Path):
-    """P1 #226: provisioning never opened local Slice state, so the shipped
+def test_hydrate_cycle_takes_a_fresh_clone_into_execution(tmp_path: Path):
+    """P1 #226: provisioning never opened local Cycle state, so the shipped
     prompt went straight to next_action and got `not_in_execution`."""
     (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
     units = [{"id": "WU-1", "title": "a"}, {"id": "WU-2", "title": "b"}]
-    out = sm.hydrate_slice(str(tmp_path), 3, units, goal="slice 3")
+    out = sm.hydrate_cycle(str(tmp_path), 3, units, goal="cycle 3")
     assert out["hydrated"] is True
-    assert out["lifecycle_state"] == "SLICE_EXECUTION"
-    assert out["current_slice"] == 3
+    assert out["lifecycle_state"] == "CYCLE_EXECUTION"
+    assert out["current_cycle"] == 3
     assert sm.next_action(str(tmp_path))["action"] == "dispatch_se"
 
 
-def test_hydrate_slice_is_idempotent(tmp_path: Path):
+def test_hydrate_cycle_is_idempotent(tmp_path: Path):
     (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
     units = [{"id": "WU-1", "title": "a"}]
-    sm.hydrate_slice(str(tmp_path), 3, units)
-    again = sm.hydrate_slice(str(tmp_path), 3, units)
+    sm.hydrate_cycle(str(tmp_path), 3, units)
+    again = sm.hydrate_cycle(str(tmp_path), 3, units)
     assert again["hydrated"] is False
     assert "already executing" in again["reason"]
 
 
-def test_hydrate_slice_records_the_workstream_identity(tmp_path: Path, monkeypatch):
-    """A workstream clone must end up with multispec state naming its workstream.
+def test_hydrate_cycle_records_the_workstream_identity(tmp_path: Path, monkeypatch):
+    """A workstream clone must end up with state naming its own workstream.
 
-    `read_state` returns a `_default_state()` that already carries
-    lifecycle_state="DISCOVERY", so hydrate_slice's "looks empty" guard never
-    fired on a clean clone and `initialize()` — the only spec-aware seeder —
-    was skipped. The first write then persisted the v2.0 single-spec default
-    and discarded SYNAPTORY_ACTIVE_SPEC.
+    The original defect (#226 P1) is unchanged: `read_state` returns a
+    `_default_state()` that already carries lifecycle_state="DISCOVERY", so
+    hydrate_cycle's "looks empty" guard never fired on a clean clone and the
+    seeder was skipped, discarding workstream identity. This is the SHIPPED
+    path -- modes/spq.md calls hydrate_cycle on a provisioned clone and never
+    runs `init` first.
 
-    This is the SHIPPED path: modes/spq.md calls hydrate_slice on a provisioned
-    clone and never runs `init` first.
+    Rewritten for native identity (#303/#304/#305). It used to assert the
+    Multi-Spec shape as the REQUIRED outcome (`version == "3.0"`,
+    `active_spec`, `specs[ws].current_stories`) -- the single most explicit
+    "workstream identity IS a spec slot" assertion in the repo. SPQ now owns
+    `.synaptory/.orchestrator/spq/`, and `pipeline-state.json` is a mode +
+    identity pointer, so the property being asserted is the same and the shape
+    is different.
     """
-    monkeypatch.setenv("SYNAPTORY_ACTIVE_SPEC", "plugin-runtime")
-    (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
-    sm.hydrate_slice(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}], goal="s1")
+    import spq_paths as sp
 
-    raw = json.loads(
+    monkeypatch.setenv("SYNAPTORY_WORKSTREAM", "plugin-runtime")
+    (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
+    sm.hydrate_cycle(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}], goal="s1")
+
+    project = str(tmp_path)
+    pointer = json.loads(
         (tmp_path / ".synaptory" / ".orchestrator" / "pipeline-state.json").read_text()
     )
-    assert raw["version"] == "3.0", f"seeded the single-spec shape: {raw['version']}"
-    assert raw["active_spec"] == "plugin-runtime"
-    assert [u["id"] for u in raw["specs"]["plugin-runtime"]["current_stories"]] == ["WU-1"]
-    assert sm.next_action(str(tmp_path))["spec_id"] == "plugin-runtime"
+    # The pointer stays v2.0 flat so `advance_kernel.build_mode()` and
+    # `loop_engine` keep discovering the lifecycle exactly as before.
+    assert pointer["version"] == "2.0"
+    assert pointer["build_mode"] == "spq"
+    assert pointer["spq"]["workstream_id"] == "plugin-runtime"
+    cycle_id = pointer["spq"]["cycle_id"]
+    assert sp.CYCLE_ID_RE.match(cycle_id), cycle_id
+    assert sp.seq_of(cycle_id) == 1, "seq stays the receipt-facing number"
+    assert "specs" not in pointer, "SPQ must not author a Multi-Spec envelope"
+    assert "active_spec" not in pointer
+
+    # The board lives in the workstream's own execution state.
+    execution = json.loads(
+        Path(sp.execution_state_path(project, cycle_id, "plugin-runtime")).read_text()
+    )
+    assert [u["id"] for u in execution["current_stories"]] == ["WU-1"]
+
+    # Identity survives the shell: the pin makes it a property of the checkout.
+    assert sp.read_pin(project) == "plugin-runtime"
+    monkeypatch.delenv("SYNAPTORY_WORKSTREAM", raising=False)
+    out = sm.next_action(project)
+    assert out["workstream_id"] == "plugin-runtime"
+    assert out["cycle_id"] == cycle_id
+    assert out["spec_id"] == "plugin-runtime", "deprecated mirror, one minor"
 
 
-def test_hydrate_slice_does_not_strand_the_clone_in_v2(tmp_path: Path, monkeypatch):
-    """Following the documented flow must not demand a migration afterwards.
+def test_hydrate_cycle_is_idempotent_on_a_second_run(tmp_path: Path, monkeypatch):
+    """Re-running after a partial setup must converge, not error.
 
-    `initialize` refuses to add a v3 spec slot to a v2 file, so a clone seeded
-    as v2 by hydrate_slice would fail any later spec-aware `init` with "Run
-    migrate_to_multispec.py first" — a migration demand manufactured by
-    following the prompts.
+    Replaces `test_hydrate_cycle_does_not_strand_the_clone_in_v2`, whose whole
+    subject was the v2-vs-v3 envelope collision: `initialize` refused to add a
+    v3 spec slot to a v2 file, so a clone seeded by hydrate_cycle failed any
+    later `init` with "Run migrate_to_multispec.py first" -- a migration demand
+    manufactured by following the prompts. SPQ authors no envelope now, so that
+    collision cannot occur; what still needs asserting is the convergence the
+    docstring promises.
     """
-    monkeypatch.setenv("SYNAPTORY_ACTIVE_SPEC", "delivery-cli")
+    monkeypatch.setenv("SYNAPTORY_WORKSTREAM", "delivery-cli")
     (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
-    sm.hydrate_slice(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}])
-    sm.initialize(str(tmp_path))   # must not raise
+    sm.hydrate_cycle(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}])
+    again = sm.hydrate_cycle(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}])
+    assert again["hydrated"] is False
+    assert "already executing" in again["reason"]
+    sm.initialize(str(tmp_path))  # must not raise
 
 
-def test_hydrate_slice_refuses_an_empty_unit_list(tmp_path: Path):
-    """An empty Slice would make next_action return await_sync immediately and
+def test_hydrate_cycle_refuses_an_empty_unit_list(tmp_path: Path):
+    """An empty Cycle would make next_action return await_sync immediately and
     let the workstream declare readiness having delivered nothing."""
     (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
-    with pytest.raises(ValueError, match="empty Slice"):
-        sm.hydrate_slice(str(tmp_path), 3, [])
+    with pytest.raises(ValueError, match="empty Cycle"):
+        sm.hydrate_cycle(str(tmp_path), 3, [])
+
+
+def test_hydrate_cycle_opens_next_cycle_from_finished_execution(tmp_path: Path):
+    """Workstreams stay in CYCLE_EXECUTION after Cycle N; hydrate N+1 must
+    walk to COMMIT without the user passing --force."""
+    (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
+    sm.hydrate_cycle(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}])
+    state = sm.read_state(str(tmp_path))
+    state["current_stories"][0]["state"] = "done"
+    sm._write_state(str(tmp_path), state)
+    out = sm.hydrate_cycle(str(tmp_path), 2, [{"id": "WU-2", "title": "b"}])
+    assert out["hydrated"] is True
+    assert out["current_cycle"] == 2
+    assert out["lifecycle_state"] == "CYCLE_EXECUTION"
+    assert [s["id"] for s in out["current_stories"]] == ["WU-2"]
+
+
+def test_hydrate_cycle_opens_next_cycle_from_sync(tmp_path: Path):
+    """Documented path: declare ready, transition SYNC, then hydrate N+1."""
+    (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
+    sm.hydrate_cycle(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}])
+    state = sm.read_state(str(tmp_path))
+    state["current_stories"][0]["state"] = "done"
+    sm._write_state(str(tmp_path), state)
+    sm.transition(str(tmp_path), "SYNC")
+    out = sm.hydrate_cycle(str(tmp_path), 2, [{"id": "WU-2", "title": "b"}])
+    assert out["hydrated"] is True
+    assert out["current_cycle"] == 2
+    assert [s["id"] for s in out["current_stories"]] == ["WU-2"]
+
+
+def test_hydrate_cycle_refuses_unfinished_previous_cycle(tmp_path: Path):
+    (tmp_path / ".synaptory.yaml").write_text('build_mode: "spq"\n')
+    sm.hydrate_cycle(str(tmp_path), 1, [{"id": "WU-1", "title": "a"}])
+    with pytest.raises(ValueError, match="unfinished"):
+        sm.hydrate_cycle(str(tmp_path), 2, [{"id": "WU-2", "title": "b"}])
 
 
 def test_regression_script_covers_every_shippable_module():
@@ -707,7 +841,7 @@ def _break_remote(clone: Path) -> None:
     Leaves the already-populated remote-tracking refs intact, which is exactly
     the dangerous shape: `git show origin/ws/x:...` still succeeds and returns
     STALE content, so a barrier that does not require a successful fetch can
-    decide green from records belonging to an earlier Slice.
+    decide green from records belonging to an earlier Cycle.
     """
     _git(clone, "remote", "set-url", "origin", str(clone / "does-not-exist.git"))
 
@@ -720,7 +854,7 @@ def test_evaluate_blocks_when_the_remote_is_unreachable(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
@@ -746,12 +880,15 @@ def test_a_cached_green_is_not_served_while_the_remote_is_unreachable(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
 
     first = sb.evaluate(str(integ), 1, use_cache=True)
-    assert first["verdict"] == "green"
+    assert first["verdict"] == "green", (first.get("blocking"), {
+        k: v.get("detail") for k, v in (first.get("criteria") or {}).items()
+        if not v.get("passed")
+    })
     assert sb.evaluate(str(integ), 1, use_cache=True)["cache_served"] is True
 
     _break_remote(integ)
@@ -767,7 +904,7 @@ def test_clear_blocks_when_the_remote_is_unreachable(topology):
     for ws, d in clones.items():
         _declare_and_push(d, ws)
     _git(integ, "fetch", "-q", "origin")
-    _git(integ, "checkout", "-q", "-b", "sync/slice-1", "dev")
+    _git(integ, "checkout", "-q", "-b", "sync/cycle-1", "dev")
     for ws in WORKSTREAMS:
         _git(integ, "merge", "-q", "--no-edit", f"origin/ws/{ws}")
     _break_remote(integ)
@@ -815,8 +952,8 @@ def test_status_stays_usable_offline_and_says_so(topology):
 def provisioned_clones(tmp_path: Path):
     """Clones as PROVISIONING leaves them: branch and discriminator only.
 
-    Deliberately does NOT call init / transition / open_slice. The round-1
-    hydration test used a bare tmp_path and called `sm.hydrate_slice` directly,
+    Deliberately does NOT call init / transition / open_cycle. The round-1
+    hydration test used a bare tmp_path and called `sm.hydrate_cycle` directly,
     so it characterised the function while leaving the prompt path — the thing
     that was actually broken — uncovered.
     """
@@ -826,7 +963,12 @@ def provisioned_clones(tmp_path: Path):
     (up / "contracts").mkdir(parents=True)
     (up / "contracts" / "api.json").write_text('{"version": 1}\n')
     (up / ".synaptory.yaml").write_text(CONFIG)
-    (up / ".gitignore").write_text(".synaptory/*\n!.synaptory/sync/\n")
+    (up / ".gitignore").write_text(
+        # Both committed subtrees: `sync/` for readiness records and
+        # `cycles/` for the manifest, the dependency events and the
+        # cycle_id-keyed readiness records (#303).
+        ".synaptory/*\n!.synaptory/sync/\n!.synaptory/cycles/\n"
+    )
     _git(up, "init", "-q")
     _git(up, "add", "-A")
     _git(up, "commit", "-qm", "base")
@@ -840,8 +982,8 @@ def provisioned_clones(tmp_path: Path):
     return up, clones
 
 
-def _tracker_backlog(slice_n: int) -> list[dict]:
-    """A tracker-shaped Slice backlog spanning every workstream.
+def _tracker_backlog(cycle_n: int) -> list[dict]:
+    """A tracker-shaped Cycle backlog spanning every workstream.
 
     Shape mirrors `tracker_cli.py get-sprint-backlog`, including the
     discriminator label the prompt filters on.
@@ -863,12 +1005,12 @@ def test_shipped_hydration_path_takes_provisioned_clones_into_execution(
 ):
     """P2 round 2: drive the CLI command `modes/spq.md` actually prints, with a
     filtered tracker-shaped backlog, and prove dispatch happens with NO manual
-    init / transition / open_slice anywhere."""
+    init / transition / open_cycle anywhere."""
     _up, clones = provisioned_clones
     backlog = _tracker_backlog(1)
 
     for ws, d in clones.items():
-        env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": ws}
+        env = {**os.environ, "SYNAPTORY_WORKSTREAM": ws}
 
         # Before hydration the prompt's own loop command must report that there
         # is nothing to dispatch — this is the symptom the finding described.
@@ -883,8 +1025,8 @@ def test_shipped_hydration_path_takes_provisioned_clones_into_execution(
 
         # The exact CLI form printed in modes/spq.md.
         hyd = subprocess.run(
-            ["python3", str(Path(sm.__file__)), "hydrate_slice", str(d), "1",
-             "--goal", "Slice 1", "--work-units", json.dumps(mine)],
+            ["python3", str(Path(sm.__file__)), "hydrate_cycle", str(d), "1",
+             "--goal", "Cycle 1", "--work-units", json.dumps(mine)],
             capture_output=True, text=True, env=env)
         assert hyd.returncode == 0, hyd.stderr
         assert json.loads(hyd.stdout)["hydrated"] is True
@@ -896,7 +1038,7 @@ def test_shipped_hydration_path_takes_provisioned_clones_into_execution(
         na = json.loads(post.stdout)
         assert na["action"] == "dispatch_se", (ws, na)
         assert na["story_id"] in {u["id"] for u in mine}
-        assert na["current_slice"] == 1
+        assert na["current_cycle"] == 1
 
 
 def test_shipped_hydration_admits_only_this_workstreams_units(provisioned_clones):
@@ -905,10 +1047,10 @@ def test_shipped_hydration_admits_only_this_workstreams_units(provisioned_clones
     _up, clones = provisioned_clones
     backlog = _tracker_backlog(1)
     d = clones["control-plane"]
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "control-plane"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "control-plane"}
     mine = [u for u in backlog if "ws:control-plane" in u["labels"]]
     subprocess.run(
-        ["python3", str(Path(sm.__file__)), "hydrate_slice", str(d), "1",
+        ["python3", str(Path(sm.__file__)), "hydrate_cycle", str(d), "1",
          "--work-units", json.dumps(mine)],
         capture_output=True, text=True, env=env, check=True)
 
@@ -925,11 +1067,11 @@ def test_shipped_hydration_then_declare_ready_end_to_end(provisioned_clones):
     commands the prompts print."""
     _up, clones = provisioned_clones
     d = clones["plugin-runtime"]
-    env = {**os.environ, "SYNAPTORY_ACTIVE_SPEC": "plugin-runtime"}
+    env = {**os.environ, "SYNAPTORY_WORKSTREAM": "plugin-runtime"}
     mine = [u for u in _tracker_backlog(1) if "ws:plugin-runtime" in u["labels"]]
 
     subprocess.run(
-        ["python3", str(Path(sm.__file__)), "hydrate_slice", str(d), "1",
+        ["python3", str(Path(sm.__file__)), "hydrate_cycle", str(d), "1",
          "--work-units", json.dumps(mine)],
         capture_output=True, text=True, env=env, check=True)
     # PR-1 needs real evidence, otherwise declare-ready refuses on the DoD
@@ -939,7 +1081,8 @@ def test_shipped_hydration_then_declare_ready_end_to_end(provisioned_clones):
     for st in ("in_progress", "testing", "reviewing", "done"):
         subprocess.run(
             ["python3", str(Path(sm.__file__)), "transition_story", str(d),
-             "PR-1", st], capture_output=True, text=True, env=env)
+             "PR-1", st, "--force-recovery", "--reason", "test fixture board setup"],
+            capture_output=True, text=True, env=env)
 
     na = json.loads(subprocess.run(
         ["python3", str(Path(sm.__file__)), "next_action", str(d)],

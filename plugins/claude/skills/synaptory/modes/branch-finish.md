@@ -162,7 +162,7 @@ Bash("""gh pr create --title "{pr_title}" --body "$(cat <<'EOF'
 - [ ] All {test_count} tests passing
 - [ ] {specific_test_items_from_changes}
 
-Generated with [synaptory](https://github.com/h3tech-ai/synaptory)
+Generated with [synaptory](https://github.com/h3tech-ai/synaptory-v1)
 EOF
 )" """)
 ```

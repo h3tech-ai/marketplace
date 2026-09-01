@@ -41,11 +41,32 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _host_env():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _runtime_paths import find_lib_dir
+
+    sys.path.insert(0, str(find_lib_dir()))
+    import host_env
+
+    return host_env
+
+
+def _host_project_dir():
+    return _host_env().project_dir()
+
+
+def _host_plugin_root():
+    return _host_env().plugin_root()
+
 
 MAX_TIMEOUT_S = 1800.0
 _INTERVAL_HARD_FLOOR_S = 0.05  # even the test hook can't busy-spin below this
@@ -176,11 +197,13 @@ def _check_gh_run(run_id: str, budget_s: float) -> bool:
 
 
 def _emit_wait_timeout(label: str, waited_s: float, attempts: int) -> None:
-    project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project_dir = _host_project_dir()
     # events.jsonl breadcrumb (only lands inside a synaptory project).
     try:
-        hooks_lib = Path(__file__).resolve().parents[3] / "hooks" / "lib"
-        sys.path.insert(0, str(hooks_lib))
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _runtime_paths import find_lib_dir  # type: ignore
+
+        sys.path.insert(0, str(find_lib_dir()))
         from synaptory_logger import emit as _log_emit  # type: ignore
 
         _log_emit(
@@ -192,9 +215,17 @@ def _emit_wait_timeout(label: str, waited_s: float, attempts: int) -> None:
         )
     except Exception:
         pass
-    # Control-plane activity event via the CLI outbox.
+    # Control-plane activity event via the CLI outbox. The CLI is resolved
+    # through the canonical channel-aware resolver, not `which("synaptory")` --
+    # that named the PRODUCTION binary from a local or source-tree run, so the
+    # activity event was addressed to prod and stranded in the outbox (#320).
     try:
-        cli = shutil.which("synaptory")
+        from _runtime_paths import find_lib_dir  # type: ignore
+
+        sys.path.insert(0, str(find_lib_dir()))
+        from gate_emitter import _resolve_cli  # type: ignore
+
+        cli = _resolve_cli()
         if cli:
             subprocess.Popen(
                 [

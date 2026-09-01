@@ -22,7 +22,7 @@ of (url, project_id). When v2.5 ships, the Go CLI reads these same JSON blobs
 out of the OS keychain. Field names, types, ordering — all identical, so
 migration is a copy-from-disk → store-in-keychain step with no schema change.
 
-Default file location: ~/.synaptory/.session/<hash>.json  (0600)
+Default file location: ~/.synaptory[-local]/.session/<hash>.json  (0600)
 Override via env: SYNAPTORY_SESSION_STORE_DIR
 """
 
@@ -34,8 +34,10 @@ import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
+from host_env import state_dir
+
 _STORE_DIR_ENV = "SYNAPTORY_SESSION_STORE_DIR"
-_DEFAULT_STORE_DIR = os.path.expanduser("~/.synaptory/.session")
+_DEFAULT_STORE_DIR = os.path.join(state_dir(), ".session")
 
 
 def _store_dir() -> str:

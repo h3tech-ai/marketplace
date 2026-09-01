@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""The SPQ tool surface, defined once for every MCP host (#303 host parity).
+
+Cursor and Codex each expose SPQ through their own server, and "both servers
+implement the same contract" enforced only by code review is how `story_id`
+becomes `work_unit_id` on one host. The tool bodies therefore live here and each
+server registers them, passing its own gates in. A new argument, a changed
+refusal, or a new tool reaches both hosts or neither.
+
+## What is on the boundary, and what deliberately is not
+
+A verb belongs here iff it mutates durable Cycle state, produces evidence that
+crosses a clone boundary, or the ceremony cannot proceed without it. Everything
+else stays CLI-only so the model's reachable surface stays small.
+
+    reads       spq_get_cycle, spq_dependency_ledger, spq_manifest_validate
+    mutations   spq_publish_event, spq_refresh_ledger, spq_cut_work_unit
+
+The CEREMONY operations -- initialize, approve_baseline, open_cycle,
+hydrate_cycle, enter_sync, declare_ready, evaluate_sync, clear_sync,
+close_cycle, complete -- are NOT here. Each host already exposes them
+(`spq_lifecycle` on Codex, the lifecycle tools on Cursor), and a second path to
+the same operation is worse than either path alone: two gates to keep in step,
+and a model free to pick whichever one refuses less. This module adds only the
+#303 manifest and ledger surface, which neither host had.
+
+NOT exposed, on purpose: `init`, the raw `transition` edge, `approve_baseline`,
+`open_cycle`, `add_story`, `transition_story`, `unblock_story`,
+`record_method_signal`, the acceptance verbs, and `sync_barrier collect`.
+The first group is either already covered by `advance` / `begin_dispatch` or is
+an operator recovery hatch that must not be model-reachable. `collect` is an
+internal step of `evaluate`; exposing it separately would let the model observe
+PARTIAL quorum and act on it, which is the opposite of what a barrier is for.
+
+## Identities only
+
+Every schema carries identities -- `cycle_id`, `workstream_id`, `work_unit_id`
+-- and never a path. There is therefore no `manifest_path` or `record_path` for a
+caller to substitute, so the containment check that guards the receipt path has
+nothing to guard here: the attack surface is removed by schema design rather
+than validated away. Every path is derived server-side under
+`.synaptory/.orchestrator/spq/`.
+
+`workstream_id` is the NATIVE SPQ identity. It is never `SYNAPTORY_ACTIVE_SPEC`,
+which remains the Scrum/Kanban Multi-Spec variable that SPQ ignores.
+
+Python 3.9 compatible: this file is projected into every host package.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Callable, Dict, List, Optional
+
+import mcp_transport
+
+# Tools that change durable state or publish evidence. These run the host's
+# policy AND readiness gates; the reads run only the policy gate, because
+# refusing to let an operator LOOK at why their Cycle is blocked helps nobody.
+MUTATING = frozenset(
+    {
+        "spq_publish_event",
+        "spq_cut_work_unit",
+        "spq_publish_cross_cycle_event",
+    }
+)
+
+# The two `refresh_*` verbs are DELIBERATELY not in that set, though they do
+# write a file. What they write is a local cache both modules' own docstrings
+# describe as "never authoritative and can be deleted safely" -- rebuilt from
+# git, publishing nothing, relied on by nobody else.
+#
+# Gating them on execution readiness made the fail-closed dependency gate
+# self-defeating: the gate holds a Work Unit with `dep_ledger_stale` and tells
+# the operator to run refresh, and refresh then refuses because the clone has
+# not installed nine managed agent profiles. A clone could not find out whether
+# its own dependency was satisfied without provisioning to dispatch agents it
+# was never going to dispatch. Observed on Codex with a real agent, which
+# correctly reported the Work Unit blocked and could not get past it.
+#
+# The policy gate still applies to them, so a regulated project still refuses.
+
+
+def _project(args: Dict[str, Any]) -> str:
+    return str(args.get("project_dir") or os.getcwd())
+
+
+def _refused(code: str, message: str, **extra: Any) -> Dict[str, Any]:
+    payload = {"ok": False, "code": code, "error": message}
+    payload.update(extra)
+    return payload
+
+
+# ── tool bodies ─────────────────────────────────────────────────────────────
+
+
+def _get_cycle(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_manifest
+    import spq_state_machine as spq
+
+    project = _project(args)
+    ident = spq.identity(project, cycle_id=args.get("cycle_id"))
+    manifest = spq.read_manifest(project, ident.cycle_id) if ident.cycle_id else {}
+    state = {}
+    try:
+        state = spq.read_state(project)
+    except Exception as exc:  # noqa: BLE001 - report, do not raise, on a read
+        return _refused("state_unreadable", str(exc))
+    return {
+        "ok": True,
+        "cycle_id": ident.cycle_id,
+        "cycle_seq": ident.cycle_seq,
+        "workstream_id": ident.workstream_id,
+        "runner_id": ident.runner_id,
+        "identity_source": ident.source,
+        "lifecycle_state": state.get("lifecycle_state"),
+        "cycle_goal": state.get("cycle_goal"),
+        "manifest_hash": manifest.get("manifest_hash"),
+        "manifest_revision": manifest.get("manifest_revision"),
+        "integration_ref": manifest.get("integration_ref"),
+        "manifest_valid": bool(manifest) and spq_manifest.verify_hash(manifest),
+        "admitted": spq_manifest.admitted_ids(manifest) if manifest else [],
+        "owners": spq_manifest.owners(manifest) if manifest else {},
+        "work_units": [
+            {
+                "id": u.get("id"),
+                "state": u.get("state"),
+                "unit_status": spq.integration_label(u),
+            }
+            for u in state.get("current_stories") or []
+        ],
+        "sync": state.get("sync"),
+    }
+
+
+def _dependency_ledger(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Read-only. #304's "an unknown dependency is observable to the operator"."""
+    import spq_state_machine as spq
+
+    return {"ok": True, **spq.dep_status(_project(args), args.get("work_unit_id"))}
+
+
+def _manifest_validate(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_manifest
+    import spq_state_machine as spq
+
+    project = _project(args)
+    ident = spq.identity(project, cycle_id=args.get("cycle_id"))
+    if not ident.cycle_id:
+        return _refused("no_cycle", "no Cycle identity resolves for this project")
+    manifest = spq.read_manifest(project, ident.cycle_id)
+    if not manifest:
+        return _refused("no_manifest", "Cycle %s has no sealed manifest" % ident.cycle_id)
+    return {
+        "ok": True,
+        "cycle_id": ident.cycle_id,
+        "manifest_hash": manifest.get("manifest_hash"),
+        "manifest_revision": manifest.get("manifest_revision"),
+        "integration_ref": manifest.get("integration_ref"),
+        "hash_verified": spq_manifest.verify_hash(manifest),
+        "problems": spq_manifest.validate(manifest),
+    }
+
+
+def _hydrate_cycle(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_state_machine as spq
+
+    project = _project(args)
+    cycle_id = args.get("cycle_id")
+    declared_hash = args.get("manifest_hash")
+    try:
+        ident = spq.identity(project, cycle_id=cycle_id)
+        manifest = spq.read_manifest(project, ident.cycle_id) if ident.cycle_id else {}
+        # The caller states which manifest it believes it is joining. Refusing a
+        # mismatch here means a stale prompt cannot hydrate a clone onto a
+        # revision the Cycle has moved past without anyone noticing.
+        if declared_hash and manifest.get("manifest_hash") != declared_hash:
+            # Also fires when NO manifest is reachable. A caller cannot be on
+            # the manifest it names if there is none -- and letting that through
+            # was the stale-prompt case this check exists for, passing silently
+            # because the guard required a manifest to compare against.
+            return _refused(
+                "manifest_hash_mismatch",
+                "caller expected manifest %s but Cycle %s is on %s"
+                % (
+                    declared_hash,
+                    ident.cycle_id or "<unresolved>",
+                    manifest.get("manifest_hash") or "no sealed manifest",
+                ),
+            )
+        seq = ident.cycle_seq if ident.cycle_seq is not None else 1
+        result = spq.hydrate_cycle(
+            project, int(seq), [], workstream_id=args.get("workstream_id")
+        )
+    except spq.HydrationRefusal as exc:
+        return _refused(exc.code, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _refused("hydrate_failed", str(exc))
+    return {
+        "ok": True,
+        "hydrated": result.get("hydrated"),
+        "reprojected": result.get("reprojected", False),
+        "reason": result.get("reason"),
+        "work_units": [u.get("id") for u in result.get("current_stories") or []],
+    }
+
+
+def _require_declared_identity(args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Refuse a mutation whose declared identity is not the current one.
+
+    Review finding P1(3): both mutations took `cycle_id` and `manifest_hash` in
+    their SCHEMA and then ignored them, so a caller naming Cycle 3 mutated
+    whichever Cycle happened to be current. A required argument the body
+    discards is worse than no argument at all -- the caller believes it bound
+    the operation to an identity, and nothing did.
+    """
+    import spq_state_machine as spq
+
+    project = _project(args)
+    declared_cycle = args.get("cycle_id")
+    declared_hash = args.get("manifest_hash")
+    missing = [
+        name
+        for name, value in (
+            ("cycle_id", declared_cycle),
+            ("manifest_hash", declared_hash),
+        )
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        return _refused(
+            "identity_required",
+            "mutation requires non-empty %s" % " and ".join(missing),
+        )
+    try:
+        ident = spq.identity(project)
+    except Exception as exc:  # noqa: BLE001
+        return _refused("no_identity", str(exc))
+
+    if str(declared_cycle) != str(ident.cycle_id or ""):
+        return _refused(
+            "cycle_mismatch",
+            "caller declared Cycle %s but this clone is on %s. Mutating the "
+            "current Cycle instead would apply the change to a Cycle the caller "
+            "never named." % (declared_cycle, ident.cycle_id or "<none>"),
+        )
+    manifest = spq.read_manifest(project, ident.cycle_id) if ident.cycle_id else {}
+    actual = manifest.get("manifest_hash")
+    if actual != declared_hash:
+        return _refused(
+            "manifest_hash_mismatch",
+            "caller declared manifest %s but Cycle %s is on %s"
+            % (declared_hash, ident.cycle_id or "<none>",
+               actual or "no sealed manifest"),
+        )
+    return None
+
+
+def _publish_event(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_ledger
+    import spq_state_machine as spq
+
+    refusal = _require_declared_identity(args)
+    if refusal:
+        return refusal
+    output = args.get("output")
+    if output is not None and not isinstance(output, dict):
+        return _refused(
+            "invalid_output",
+            "output evidence must be an object containing id and digest",
+        )
+    evaluation = args.get("evaluation")
+    if evaluation is not None and not isinstance(evaluation, dict):
+        return _refused(
+            "invalid_evaluation",
+            "evaluation attestation must be the object returned by "
+            "evaluate-incremental",
+        )
+    try:
+        result = spq.publish_event(
+            _project(args),
+            unit_id=str(args.get("work_unit_id") or ""),
+            condition=str(args.get("condition") or ""),
+            cycle_id=args.get("cycle_id"),
+            commit_sha=str(args.get("commit_sha") or ""),
+            output=output,
+            evaluation=evaluation,
+        )
+    except spq_ledger.LedgerError as exc:
+        return _refused("event_refused", str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _refused("publish_failed", str(exc))
+    return {
+        "ok": True,
+        "event_id": result["event"]["event_id"],
+        "condition": result["event"]["condition"],
+        # Propagation is a human step: the shipped git rules forbid agents
+        # pushing. Returning the command is what stops the latency reading as a
+        # failure.
+        "push_command": result["push_command"],
+    }
+
+
+def _refresh_ledger(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_state_machine as spq
+
+    try:
+        return {"ok": True, **spq.refresh_ledger(
+            _project(args), cycle_id=args.get("cycle_id")
+        )}
+    except Exception as exc:  # noqa: BLE001
+        return _refused("refresh_failed", str(exc))
+
+
+def _cut_work_unit(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_state_machine as spq
+
+    refusal = _require_declared_identity(args)
+    if refusal:
+        return refusal
+    try:
+        spq.cut_work_unit(
+            _project(args),
+            str(args.get("work_unit_id") or ""),
+            str(args.get("reason") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _refused("cut_refused", str(exc))
+    return {"ok": True, "work_unit_id": args.get("work_unit_id")}
+
+
+def _declare_sync_ready(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Authorize a readiness declaration; the CLI derives the evidence.
+
+    The Cycle regression exceeds any MCP tool timeout BY DESIGN -- `spq/sync.md`
+    documents that it outruns both the 30s hook budget and the 60s replay cap,
+    and a test pins that the resulting warnings are expected. A tool cannot own
+    a multi-minute run.
+
+    So this is a DEFERRED CONTRACT: it checks everything checkable now, then
+    names the exact command and the record path the CLI will derive. Evidence
+    stays producible only by the CLI's own derivation -- `declare_ready`
+    deliberately has no way to be handed evidence -- and the boundary keeps the
+    authorization and the later verification.
+    """
+    import sync_barrier
+    import spq_state_machine as spq
+
+    project = _project(args)
+    workstream = args.get("workstream_id")
+    try:
+        ident = spq.identity(project, cycle_id=args.get("cycle_id"))
+    except Exception as exc:  # noqa: BLE001
+        return _refused("no_identity", str(exc))
+    seq = ident.cycle_seq if ident.cycle_seq is not None else 1
+
+    if args.get("run_regression") is False:
+        # Delegating with the regression skipped is a real declaration, so it
+        # runs inline and the barrier's own refusals apply.
+        try:
+            result = sync_barrier.declare_ready(
+                project, int(seq), workstream=workstream, run_regression=False
+            )
+        except sync_barrier.BarrierError as exc:
+            return _refused("declare_refused", str(exc))
+        return {"ok": True, "record": result["record"], "path": result["path"]}
+
+    cfg = sync_barrier.load_spq_config(project)
+    ws_id = workstream or ident.workstream_id or ""
+    return {
+        "ok": True,
+        "deferred": True,
+        "cycle_id": ident.cycle_id,
+        "cycle_seq": seq,
+        "workstream_id": ws_id,
+        "record_path": sync_barrier.record_relpath(cfg, int(seq), ws_id, ident.cycle_id),
+        "command": (
+            "python3 ${SYNAPTORY_PLUGIN_ROOT}/hooks/lib/sync_barrier.py "
+            "declare-ready . %d --workstream %s" % (int(seq), ws_id)
+        ),
+        "reason": (
+            "the Cycle regression outruns any tool timeout by design, so the "
+            "record is derived by the CLI. Run the command, then call "
+            "spq_sync_evaluate."
+        ),
+    }
+
+
+def _sync_evaluate(args: Dict[str, Any]) -> Dict[str, Any]:
+    import sync_barrier
+    import spq_state_machine as spq
+
+    project = _project(args)
+    try:
+        ident = spq.identity(project, cycle_id=args.get("cycle_id"))
+        seq = ident.cycle_seq if ident.cycle_seq is not None else 1
+        verdict = sync_barrier.evaluate(project, int(seq))
+    except Exception as exc:  # noqa: BLE001
+        return _refused("evaluate_failed", str(exc))
+    return {"ok": True, **verdict}
+
+
+def _sync_clear(args: Dict[str, Any]) -> Dict[str, Any]:
+    import sync_barrier
+    import spq_state_machine as spq
+
+    project = _project(args)
+    try:
+        ident = spq.identity(project, cycle_id=args.get("cycle_id"))
+        seq = ident.cycle_seq if ident.cycle_seq is not None else 1
+        result = spq.clear_sync(project, int(seq))
+    except Exception as exc:  # noqa: BLE001
+        return _refused("clear_refused", str(exc))
+    return {"ok": True, "lifecycle_state": result.get("lifecycle_state")}
+
+
+# ── Coordination Cycle bodies (#305) ────────────────────────────────────────
+
+
+def _require_declared_release(args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Bind a mutation to the release revision the caller believes it is on.
+
+    The same guard `_require_declared_identity` applies one level down, and for
+    the same reason: a prompt that has gone stale would otherwise publish against
+    a release whose children have changed under it. Both hashes are checked --
+    the parent's, because an event against a superseded revision may name a
+    since-dropped child; and the child's, because the release pinned an exact
+    increment and an event about another revision is about another admitted set.
+    """
+    import coordination_cycle
+    import spq_paths
+
+    project = _project(args)
+    declared = str(args.get("coordination_cycle_id") or "")
+    declared_hash = str(args.get("coordination_manifest_hash") or "")
+    if not declared or not declared_hash:
+        return _refused(
+            "identity_required",
+            "coordination_cycle_id and coordination_manifest_hash are both "
+            "required: a release mutation has to name the revision it believes "
+            "it is acting on.",
+        )
+    try:
+        resolved = spq_paths.resolve_coordination_id(
+            project, coordination_cycle_id=declared, require=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _refused("no_identity", str(exc))
+    if resolved != declared:
+        return _refused(
+            "coordination_mismatch",
+            "this clone is on Coordination Cycle %s, not %s" % (resolved, declared),
+        )
+    manifest = coordination_cycle.read_manifest(project, resolved)
+    if not manifest:
+        return _refused(
+            "no_manifest",
+            "no manifest for Coordination Cycle %s is readable here; pull the "
+            "release branch" % resolved,
+        )
+    actual = str(manifest.get("manifest_hash") or "")
+    if actual != declared_hash:
+        return _refused(
+            "coordination_manifest_hash_mismatch",
+            "the release is on manifest %s but this call declares %s. Re-read "
+            "the release before publishing against it." % (actual, declared_hash),
+            expected=actual,
+        )
+    return None
+
+
+def _coordination_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_state_machine as spq
+
+    project = _project(args)
+    out = spq.coordination_status(
+        project, coordination_cycle_id=args.get("coordination_cycle_id")
+    )
+    return dict(out, ok=True)
+
+
+def _release_readiness(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_state_machine as spq
+
+    project = _project(args)
+    try:
+        out = spq.release_readiness(
+            project,
+            coordination_cycle_id=args.get("coordination_cycle_id"),
+            use_cache=bool(args.get("use_cache", True)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _refused("release_readiness_failed", str(exc))
+    return dict(out, ok=True)
+
+
+def _publish_cross_cycle_event(args: Dict[str, Any]) -> Dict[str, Any]:
+    import coordination_cycle
+    import spq_state_machine as spq
+
+    refusal = _require_declared_release(args)
+    if refusal:
+        return refusal
+    project = _project(args)
+    output = args.get("output")
+    if output is not None and not isinstance(output, dict):
+        return _refused("invalid_output", "output must be an object")
+    try:
+        result = spq.publish_cross_cycle_event(
+            project,
+            cycle_id=args.get("cycle_id"),
+            condition=str(args.get("condition") or "cycle_integrated"),
+            coordination_cycle_id=args.get("coordination_cycle_id"),
+            unit_id=str(args.get("work_unit_id") or ""),
+            output=output,
+            commit_sha=str(args.get("commit_sha") or ""),
+        )
+    except coordination_cycle.CoordinationError as exc:
+        return _refused("event_refused", str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _refused("publish_failed", str(exc))
+    return dict(result, ok=True)
+
+
+def _refresh_coordination(args: Dict[str, Any]) -> Dict[str, Any]:
+    import spq_state_machine as spq
+
+    project = _project(args)
+    try:
+        return dict(
+            spq.refresh_coordination(
+                project,
+                coordination_cycle_id=args.get("coordination_cycle_id"),
+            ),
+            ok=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _refused("refresh_failed", str(exc))
+
+
+# ── registry ────────────────────────────────────────────────────────────────
+
+_BODIES: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
+    "spq_get_cycle": _get_cycle,
+    "spq_dependency_ledger": _dependency_ledger,
+    "spq_manifest_validate": _manifest_validate,
+    "spq_publish_event": _publish_event,
+    "spq_refresh_ledger": _refresh_ledger,
+    "spq_cut_work_unit": _cut_work_unit,
+    "spq_coordination_status": _coordination_status,
+    "spq_release_readiness": _release_readiness,
+    "spq_publish_cross_cycle_event": _publish_cross_cycle_event,
+    "spq_refresh_coordination": _refresh_coordination,
+}
+
+_DESCRIPTIONS = {
+    "spq_get_cycle": "Cycle identity, manifest state, and this workstream's board.",
+    "spq_dependency_ledger": "Per-Work-Unit dependency resolution with reasons.",
+    "spq_manifest_validate": "Verify the sealed Cycle manifest's hash and shape.",
+    "spq_publish_event": "Record that a Work Unit reached a condition others depend on.",
+    "spq_refresh_ledger": "Rebuild the local dependency-ledger cache from git.",
+    "spq_cut_work_unit": "Cut a Work Unit from the Cycle (the §8.6 release valve).",
+    "spq_coordination_status": "The Coordination Cycle this clone belongs to, and what gates each child.",
+    "spq_release_readiness": "Exact included child Cycles, hashes, SHAs, dependency closure and evidence.",
+    "spq_publish_cross_cycle_event": "Record that a child Cycle reached a condition another child depends on.",
+    "spq_refresh_coordination": "Rebuild the local cross-Cycle ledger cache from git.",
+}
+
+_SCHEMAS = {
+    "spq_get_cycle": mcp_transport.SPQ_CYCLE_SCHEMA,
+    "spq_dependency_ledger": mcp_transport.SPQ_DEP_STATUS_SCHEMA,
+    "spq_manifest_validate": mcp_transport.SPQ_CYCLE_SCHEMA,
+    "spq_publish_event": mcp_transport.SPQ_LEDGER_APPEND_SCHEMA,
+    "spq_refresh_ledger": mcp_transport.SPQ_CYCLE_SCHEMA,
+    "spq_cut_work_unit": mcp_transport.SPQ_CUT_SCHEMA,
+    "spq_coordination_status": mcp_transport.SPQ_COORDINATION_SCHEMA,
+    "spq_release_readiness": mcp_transport.SPQ_RELEASE_READINESS_SCHEMA,
+    "spq_publish_cross_cycle_event": mcp_transport.SPQ_CROSS_EVENT_SCHEMA,
+    "spq_refresh_coordination": mcp_transport.SPQ_COORDINATION_SCHEMA,
+}
+
+
+def tools(
+    *,
+    policy_gate: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+    readiness_gate: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """The registry a host merges into its own TOOLS map.
+
+    Gates are passed in rather than imported, because they are the one genuinely
+    host-specific part: Codex refuses regulated projects outright and re-checks
+    execution readiness server-side, Cursor refuses BAA projects. Everything
+    else is identical by construction.
+    """
+
+    def _wrap(name: str, body: Callable[[Dict[str, Any]], Dict[str, Any]]):
+        def _run(args: Dict[str, Any]) -> Dict[str, Any]:
+            project = _project(args)
+            if policy_gate is not None:
+                refusal = policy_gate(project)
+                if refusal:
+                    return dict(refusal, ok=False)
+            if name in MUTATING and readiness_gate is not None:
+                refusal = readiness_gate(project)
+                if refusal:
+                    return dict(refusal, ok=False)
+            try:
+                return body(args)
+            except Exception as exc:  # noqa: BLE001 - a tool refuses, never raises
+                return _refused("tool_error", "%s: %s" % (name, exc))
+
+        return _run
+
+    return {
+        name: {
+            "fn": _wrap(name, body),
+            "description": _DESCRIPTIONS[name],
+            "schema": _SCHEMAS[name],
+        }
+        for name, body in _BODIES.items()
+    }

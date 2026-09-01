@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+"""The release barrier for a Coordination Cycle (#305).
+
+## Why this iterates EDGES, not children
+
+The child-Cycle barrier (`sync_barrier`) is all-or-nothing across a quorum by
+design (§8.6): every workstream in a Cycle shares one goal and one integration
+ref, so a lane that cannot make it cuts scope rather than merging late.
+
+A release is not that. Platform, Contract Mastery and EHR share a codebase and a
+date, and nothing else. Gating Platform on EHR because they are in the same
+release would be inventing a dependency the product does not have -- and that is
+the failure the epic names: "unrelated child Cycles are not forced through a
+single global readiness barrier."
+
+So `evaluate_edges` walks `manifest["dependency_edges"]`, and per-child readiness
+is computed from that child's OWN facts. `gated_children` maps each child to the
+edges that gate it, which for a child with no inbound edge is `[]` by
+construction rather than by luck. Both functions are pure, so the property is a
+cheap unit test instead of a git fixture -- and it is in the verdict payload,
+where a regression is visible rather than inferred.
+
+## What it reads, and how
+
+Everything through `git show` / `ls-tree` / `merge-base`. No merge, no checkout,
+no working-tree mutation -- the same rule `sync_barrier.collect` states one level
+down, for the same reason: reading a release must not change one.
+
+A failed fetch is BLOCKING, not a warning, and it is checked before the verdict
+cache. A cached green served while the remote is unreachable would be exactly the
+staleness the fetch exists to rule out.
+
+## What it does NOT do
+
+It never merges the composition. `modes/init.md` forbids agents committing,
+merging or pushing, so composing the release is a human act; this verifies
+whether it happened, which is a fact rather than an assumption.
+
+Python 3.9 compatible: this file is projected into every host package.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from typing import Any, Dict, List, Optional, Tuple
+
+SCHEMA_VERSION = "1.0"
+VERDICT_KIND = "spq.coordination.verdict"
+READINESS_KIND = "spq.coordination.release_readiness"
+
+# Ordered, like `sync_barrier.CRITERIA`. `blocking` is derived by walking this.
+CRITERIA = (
+    "manifest_sealed",
+    "children_resolved",
+    "child_integration_green",
+    "edges_satisfied",
+    "composition_merged",
+    "composition_regression_green",
+)
+
+# Per-edge refusal codes. A closed set: an operator reads the code, not the
+# prose, and each one points at a different next move.
+EDGE_OK = "satisfied"
+EDGE_MISSING = "cross_event_missing"
+EDGE_TOO_WEAK = "cross_condition_too_weak"
+EDGE_UNVERIFIED = "cross_event_unverified"
+EDGE_STALE = "cross_ledger_stale"
+EDGE_CHILD_DROPPED = "cross_child_dropped"
+
+
+class CoordinationBarrierError(RuntimeError):
+    """The release cannot be evaluated or cleared."""
+
+
+def _git(project_dir: str, *args: str) -> Tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=str(project_dir), capture_output=True,
+            text=True, timeout=300,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return 1, "", str(exc)
+    return result.returncode, result.stdout, result.stderr
+
+
+def _ref_head(project_dir: str, ref: str) -> str:
+    if not ref:
+        return ""
+    code, out, _ = _git(project_dir, "rev-parse", "--verify", "%s^{commit}" % ref)
+    return out.strip() if code == 0 else ""
+
+
+def _is_ancestor(project_dir: str, sha: str, of: str) -> bool:
+    if not sha or not of:
+        return False
+    code, _, _ = _git(project_dir, "merge-base", "--is-ancestor", sha, of)
+    return code == 0
+
+
+def _now() -> str:
+    import state_store
+
+    return state_store.now_iso()
+
+
+# ── collect: every fact, read without merging ──────────────────────────────
+
+
+def collect(
+    project_dir: str,
+    coordination_cycle_id: str,
+    *,
+    fetch: bool = True,
+    remote: str = "origin",
+) -> Dict[str, Any]:
+    """Read each child's published state off its own integration ref."""
+    import coordination_cycle as cc
+    import spq_manifest
+    import spq_paths
+
+    out: Dict[str, Any] = {
+        "coordination_cycle_id": coordination_cycle_id,
+        "fetched": False,
+        "children": {},
+        "warnings": [],
+    }
+
+    manifest = cc.read_manifest(project_dir, coordination_cycle_id)
+    out["manifest"] = manifest
+    if not manifest:
+        out["fetch_failed"] = None
+        out["warnings"].append(
+            "no manifest for Coordination Cycle %s" % coordination_cycle_id
+        )
+        return out
+
+    if fetch:
+        code, _, err = _git(project_dir, "fetch", remote, "--prune")
+        out["fetched"] = code == 0
+        if code != 0:
+            # BLOCKING. Remote-tracking refs are stale, so every child fact read
+            # below could belong to an older increment.
+            out["fetch_failed"] = "git fetch %s failed: %s" % (
+                remote, err.strip()[:200]
+            )
+            out["warnings"].append(out["fetch_failed"])
+
+    parent_ref = str(manifest.get("integration_ref") or "")
+    out["composition_head"] = _ref_head(project_dir, "HEAD")
+    out["current_branch"] = _git(
+        project_dir, "rev-parse", "--abbrev-ref", "HEAD"
+    )[1].strip()
+    out["expected_branch"] = parent_ref
+
+    for child in manifest.get("children") or []:
+        cid = str(child.get("cycle_id") or "")
+        if not cid:
+            continue
+        state = str(child.get("state") or "included")
+        record: Dict[str, Any] = {
+            "cycle_id": cid,
+            "cycle_seq": child.get("cycle_seq"),
+            "goal": child.get("goal"),
+            "state": state,
+            "manifest_hash": child.get("manifest_hash"),
+            "selected_sha": child.get("selected_sha"),
+            "integration_ref": child.get("integration_ref"),
+            "manifest_hash_verified": None,
+            "selected_sha_present": None,
+            "selected_sha_on_child_integration": None,
+            "selected_sha_on_composition": None,
+            "child_advanced_beyond_pin": None,
+            "child_sync_verdict": None,
+            "child_sync_evidence": None,
+            "detail": "",
+        }
+        if state == "dropped":
+            record["detail"] = "dropped: %s" % (child.get("dropped_reason") or "")
+            out["children"][cid] = record
+            continue
+
+        ref = str(child.get("integration_ref") or "")
+        resolved = ""
+        for candidate in ("%s/%s" % (remote, ref), ref):
+            if ref and _ref_head(project_dir, candidate):
+                resolved = candidate
+                break
+        record["resolved_ref"] = resolved
+        if not resolved:
+            record["detail"] = (
+                "child integration ref %r is not readable here; fetch it before "
+                "composing the release" % ref
+            )
+            out["children"][cid] = record
+            continue
+
+        sha = str(child.get("selected_sha") or "")
+        record["selected_sha_present"] = bool(sha) and bool(
+            _ref_head(project_dir, sha)
+        )
+        record["selected_sha_on_child_integration"] = _is_ancestor(
+            project_dir, sha, resolved
+        )
+        record["selected_sha_on_composition"] = _is_ancestor(
+            project_dir, sha, "HEAD"
+        )
+        tip = _ref_head(project_dir, resolved)
+        # NOT a failure. The parent pins a SHA, not a branch tip, which is
+        # exactly what lets a child open its next Cycle without disturbing the
+        # release.
+        record["child_advanced_beyond_pin"] = bool(tip and sha and tip != sha)
+
+        # The child's sealed manifest, as the CHILD published it. Re-hashed here
+        # rather than trusted: the pin is the claim, this is the check.
+        rel = os.path.relpath(
+            spq_paths.committed_manifest_path(project_dir, cid), project_dir
+        )
+        code, blob, _ = _git(project_dir, "show", "%s:%s" % (resolved, rel))
+        if code == 0:
+            try:
+                child_manifest = json.loads(blob)
+            except ValueError:
+                child_manifest = None
+            if isinstance(child_manifest, dict):
+                recomputed = spq_manifest.compute_hash(child_manifest)
+                record["manifest_hash_verified"] = (
+                    recomputed == str(child.get("manifest_hash") or "")
+                    and spq_manifest.verify_hash(child_manifest)
+                )
+                record["child_manifest_revision"] = child_manifest.get(
+                    "manifest_revision"
+                )
+        if record["manifest_hash_verified"] is None:
+            record["detail"] = (
+                "the child's sealed manifest is not readable at %s, so the "
+                "pinned hash cannot be checked" % resolved
+            )
+
+        record["child_sync_verdict"], record["child_sync_evidence"] = _child_sync(
+            project_dir, resolved, child
+        )
+        out["children"][cid] = record
+
+    return out
+
+
+def _child_sync(
+    project_dir: str, ref: str, child: Dict[str, Any]
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """The child's own barrier verdict, read from its committed readiness records.
+
+    The parent RE-READS the child's evidence; it never re-runs the child's
+    barrier. Whether a Cycle is green is that Cycle's own question, already
+    answered by a quorum the parent has no standing to second-guess.
+
+    Returns `("green"|"blocked", evidence)`, or `(None, None)` when the records
+    could not be READ at all -- which the caller must treat as blocking, not as
+    absent. This previously returned the literal string "declared" for any
+    readable JSON, which meant a child that had merely written records -- with
+    Work Units still outstanding, or a failed regression on the record -- was
+    indistinguishable from one that had actually passed its barrier.
+    """
+    import coordination_cycle as cc
+
+    cid = str(child.get("cycle_id") or "")
+    records = cc.read_child_sync_records(project_dir, ref, cid)
+    if records is None:
+        return None, None
+
+    verdict = cc.sync_evidence_verdict(
+        records,
+        child_manifest=cc.read_child_manifest(project_dir, ref, cid),
+        pinned_manifest_hash=str(child.get("manifest_hash") or ""),
+    )
+    rel_dir = os.path.relpath(
+        os.path.join(_committed_sync_dir(project_dir, cid)), project_dir
+    )
+    return verdict["verdict"], {
+        "workstreams": verdict["workstreams"],
+        "manifest_hashes": verdict["manifest_hashes"],
+        "blocking": verdict["blocking"],
+        "expected_workstreams": verdict["expected_workstreams"],
+        "detail": verdict["detail"],
+        "criteria_read": verdict["criteria_read"],
+        "readiness_dir": rel_dir,
+    }
+
+
+def _committed_sync_dir(project_dir: str, cycle_id: str) -> str:
+    import spq_paths
+
+    return os.path.join(spq_paths.committed_cycle_dir(project_dir, cycle_id), "sync")
+
+
+# ── the pure half: edges gate, children do not ─────────────────────────────
+
+
+def evaluate_edges(
+    collected: Dict[str, Any],
+    manifest: Dict[str, Any],
+    satisfied: Dict[str, Any],
+    *,
+    ledger_fresh: bool = True,
+    accept_unverified: bool = False,
+) -> List[Dict[str, Any]]:
+    """One record per declared edge. PURE: a function of its arguments.
+
+    This is the whole structural claim of #305 in one function. It walks
+    `dependency_edges`, so a child that appears in no edge contributes nothing
+    here and can never be reported as blocked by one.
+    """
+    import coordination_cycle as cc
+
+    by_id = cc.children_index(manifest)
+    out: List[Dict[str, Any]] = []
+    for edge in cc.edges(manifest):
+        key = cc.edge_key(edge)
+        condition = str(edge.get("condition") or "")
+        record = {
+            "id": edge.get("id"),
+            "waiter_cycle_id": edge.get("waiter_cycle_id"),
+            "waiter_unit_id": edge.get("waiter_unit_id"),
+            "producer_cycle_id": edge.get("producer_cycle_id"),
+            "producer_unit_id": edge.get("producer_unit_id"),
+            "output": edge.get("output"),
+            "condition": condition,
+            "key": key,
+            "satisfied": False,
+            "observed_condition": None,
+            "event_id": None,
+            "commit_sha": None,
+            "published_at": None,
+            "verified": None,
+            "reason_code": EDGE_MISSING,
+            "detail": "",
+        }
+
+        producer = by_id.get(str(edge.get("producer_cycle_id"))) or {}
+        if str(producer.get("state") or "included") == "dropped":
+            record["reason_code"] = EDGE_CHILD_DROPPED
+            record["detail"] = (
+                "producer Cycle %s is dropped from this release"
+                % edge.get("producer_cycle_id")
+            )
+            out.append(record)
+            continue
+
+        event = satisfied.get(key)
+        if event is None:
+            record["reason_code"] = EDGE_MISSING if ledger_fresh else EDGE_STALE
+            record["detail"] = (
+                "no %s event recorded for %s%s"
+                % (
+                    condition,
+                    key,
+                    "" if ledger_fresh
+                    else " (the coordination ledger cache is behind; run "
+                         "refresh_coordination to be sure)",
+                )
+            )
+            out.append(record)
+            continue
+
+        record["observed_condition"] = event.get("condition")
+        record["event_id"] = event.get("event_id")
+        record["commit_sha"] = event.get("sha")
+        record["published_at"] = event.get("published_at")
+        record["verified"] = event.get("verified")
+
+        if condition not in (event.get("satisfies") or []):
+            record["reason_code"] = EDGE_TOO_WEAK
+            record["detail"] = (
+                "%s has a %r event, which does not meet the declared condition "
+                "%r" % (key, event.get("condition"), condition)
+            )
+            out.append(record)
+            continue
+        if not event.get("verified") and not accept_unverified:
+            record["reason_code"] = EDGE_UNVERIFIED
+            record["detail"] = (
+                "the %s event for %s is a claim, not proof, and this release "
+                "does not accept unverified cross-Cycle events"
+                % (event.get("condition"), key)
+            )
+            out.append(record)
+            continue
+
+        record["satisfied"] = True
+        record["reason_code"] = EDGE_OK
+        record["detail"] = "%s satisfied by %s" % (condition, event.get("event_id"))
+        out.append(record)
+    return out
+
+
+def child_readiness(
+    collected: Dict[str, Any],
+    manifest: Dict[str, Any],
+    cycle_id: str,
+    edge_records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """One child's readiness, from that child's OWN facts. PURE.
+
+    `blocking` contains only reasons derived from this child. An unrelated
+    sibling's failure can never appear here, which is the property AC 7 asks for
+    stated as code rather than as a comment.
+    """
+    import coordination_cycle as cc
+
+    child = cc.children_index(manifest).get(str(cycle_id)) or {}
+    facts = (collected.get("children") or {}).get(str(cycle_id)) or {}
+    gating = [e for e in edge_records if str(e.get("waiter_cycle_id")) == str(cycle_id)]
+
+    blocking: List[str] = []
+    if str(child.get("state") or "included") == "dropped":
+        return {
+            "cycle_id": cycle_id,
+            "state": "dropped",
+            "dropped_reason": child.get("dropped_reason"),
+            "blocking": [],
+            "gating_edges": [],
+            "passed": True,
+            "detail": "dropped from this release",
+        }
+
+    if not facts.get("selected_sha_present"):
+        blocking.append("selected_sha_present")
+    if not facts.get("selected_sha_on_child_integration"):
+        blocking.append("selected_sha_on_child_integration")
+    if facts.get("manifest_hash_verified") is not True:
+        blocking.append("manifest_hash_verified")
+    if not facts.get("selected_sha_on_composition"):
+        blocking.append("selected_sha_on_composition")
+    # The child's OWN barrier verdict. Reported here since the first cut of this
+    # function but never enforced, so a child with four green SHA flags and no
+    # readable Sync evidence at all returned `passed: True` -- release readiness
+    # resting on ancestry, which says a commit is on a branch and nothing about
+    # whether the Cycle that produced it ever passed its own barrier.
+    if facts.get("child_sync_verdict") != "green":
+        blocking.append("child_sync_verdict")
+    for edge in gating:
+        if not edge.get("satisfied"):
+            blocking.append("edge:%s" % edge.get("id"))
+
+    return {
+        "cycle_id": cycle_id,
+        "cycle_seq": child.get("cycle_seq"),
+        "goal": child.get("goal"),
+        "state": "included",
+        "manifest_hash": child.get("manifest_hash"),
+        "manifest_hash_verified": facts.get("manifest_hash_verified"),
+        "selected_sha": child.get("selected_sha"),
+        "selected_sha_present": facts.get("selected_sha_present"),
+        "selected_sha_on_child_integration": facts.get(
+            "selected_sha_on_child_integration"
+        ),
+        "selected_sha_on_composition": facts.get("selected_sha_on_composition"),
+        "child_advanced_beyond_pin": facts.get("child_advanced_beyond_pin"),
+        "child_sync_verdict": facts.get("child_sync_verdict"),
+        "child_sync_evidence": facts.get("child_sync_evidence"),
+        "integration_ref": child.get("integration_ref"),
+        "gating_edges": [e.get("id") for e in gating],
+        "blocking": blocking,
+        "passed": not blocking,
+        "detail": facts.get("detail") or "",
+    }
+
+
+# ── the verdict ─────────────────────────────────────────────────────────────
+
+
+def _run_proof_script(project_dir: str, script: str, *, label: str) -> Dict[str, Any]:
+    """Run a release-level proof script. A SKIPPED script is unproven, not passed.
+
+    Same rule `sync_barrier` applies to a skipped journey, and for the same
+    reason: treating absence of evidence as evidence is how a barrier quietly
+    stops being a barrier.
+    """
+    if not script:
+        return {"skipped": True, "reason": "no script configured", "command": None}
+    path = os.path.join(project_dir, script)
+    if not os.path.exists(path):
+        return {"skipped": True, "reason": "script %s not found" % script,
+                "command": None}
+    try:
+        result = subprocess.run(
+            ["bash", script], cwd=str(project_dir), capture_output=True,
+            text=True, timeout=3600,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"skipped": False, "exit_code": None, "command": "bash %s" % script,
+                "reason": "%s failed to run: %s" % (label, exc)}
+    return {
+        "skipped": False,
+        "exit_code": result.returncode,
+        "command": "bash %s" % script,
+        "summary": (result.stdout or result.stderr).strip()[-500:],
+    }
+
+
+def _verdict_cache_key(
+    coordination_cycle_id: str, manifest: Dict[str, Any], collected: Dict[str, Any]
+) -> str:
+    """Keyed on the RELEASE identity, not on a sequence number.
+
+    Deliberately not an extension of `sync_barrier._verdict_cache_key`, which
+    keys on `cycle_n`: a parent clone evaluating Platform Cycle 12 and a second
+    child also on 12 in one working tree would share a key prefix there.
+    """
+    import hashlib
+
+    parts = [
+        coordination_cycle_id,
+        str(manifest.get("manifest_hash") or ""),
+        str(collected.get("composition_head") or ""),
+    ]
+    for cid in sorted((collected.get("children") or {})):
+        facts = collected["children"][cid]
+        parts.append("%s@%s" % (cid, facts.get("selected_sha") or ""))
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return "coordination_barrier:evaluate:%s:%s" % (coordination_cycle_id, digest)
+
+
+def evaluate(
+    project_dir: str,
+    coordination_cycle_id: str,
+    *,
+    use_cache: bool = True,
+    remote: str = "origin",
+) -> Dict[str, Any]:
+    """The release verdict. Fail-closed on anything it cannot prove."""
+    import coordination_cycle as cc
+
+    collected = collect(project_dir, coordination_cycle_id, fetch=True, remote=remote)
+    manifest = collected.get("manifest") or {}
+
+    if not manifest:
+        return _blocked(
+            coordination_cycle_id, manifest, ["manifest_sealed"],
+            "no manifest for Coordination Cycle %s is readable here. The "
+            "committed copy is the only one that travels: pull the release "
+            "branch." % coordination_cycle_id,
+        )
+
+    # Checked BEFORE the cache probe on purpose: a cached green must not be
+    # served while the remote is unreachable, or the cache becomes the very
+    # staleness the fetch is meant to rule out.
+    if collected.get("fetch_failed"):
+        return _blocked(
+            coordination_cycle_id, manifest, ["fetch"],
+            "cannot evaluate the release: %s. Remote-tracking refs may be "
+            "stale, so every child fact read could belong to an older "
+            "increment." % collected["fetch_failed"],
+        )
+
+    cache_key = _verdict_cache_key(coordination_cycle_id, manifest, collected)
+    if use_cache:
+        try:
+            import verification_cache
+
+            hit = verification_cache.lookup(project_dir, cache_key)
+            if hit:
+                hit = dict(hit)
+                hit["cache_served"] = True
+                return hit
+        except Exception:  # noqa: BLE001
+            pass
+
+    snap = cc.snapshot(project_dir, coordination_cycle_id)
+    satisfied = cc.satisfied_map(snap, manifest)
+    policy = manifest.get("release_policy") or {}
+    edge_records = evaluate_edges(
+        collected, manifest, satisfied,
+        ledger_fresh=bool(snap.get("fresh")),
+        accept_unverified=bool(policy.get("accept_unverified_events")),
+    )
+    included = cc.included_children(manifest)
+    readiness = [
+        child_readiness(collected, manifest, str(c["cycle_id"]), edge_records)
+        for c in included
+    ]
+
+    criteria: Dict[str, Any] = {}
+
+    criteria["manifest_sealed"] = {
+        "passed": cc.verify_hash(manifest) and not cc.validate(
+            manifest, require_baseline=False
+        ),
+        "detail": "manifest verifies against its own hash and validates clean",
+    }
+    if not criteria["manifest_sealed"]["passed"]:
+        criteria["manifest_sealed"]["detail"] = "; ".join(
+            cc.validate(manifest, require_baseline=False)
+        ) or "the manifest does not match its own hash"
+
+    unresolved = [
+        r["cycle_id"] for r in readiness if r.get("manifest_hash_verified") is not True
+    ]
+    criteria["children_resolved"] = {
+        "passed": not unresolved,
+        "detail": (
+            "%d of %d included children resolved at their pinned hash"
+            % (len(readiness) - len(unresolved), len(readiness))
+        ),
+        "unresolved": unresolved,
+    }
+
+    # Ancestry ALONE is not greenness. `selected_sha_on_child_integration` says
+    # the pinned commit is reachable from the child's integration ref; it says
+    # nothing about whether that Cycle passed its own Sync barrier. Release
+    # evidence has to carry both, or a release can ship an increment from a
+    # Cycle that never went green (#305 review, P1).
+    not_green = [r["cycle_id"] for r in readiness if not (
+        r.get("selected_sha_present")
+        and r.get("selected_sha_on_child_integration")
+        and r.get("child_sync_verdict") == "green"
+    )]
+    criteria["child_integration_green"] = {
+        "passed": not not_green,
+        "detail": (
+            "%d of %d children have their pinned increment on their own "
+            "integration ref AND green Sync evidence for it"
+            % (len(readiness) - len(not_green), len(readiness))
+        ),
+        # PER CHILD, independently. A sibling's failure never lands here.
+        "children": {r["cycle_id"]: r for r in readiness},
+    }
+
+    unsatisfied = [e for e in edge_records if not e.get("satisfied")]
+    criteria["edges_satisfied"] = {
+        "passed": not unsatisfied,
+        "detail": (
+            "%d of %d declared edges satisfied"
+            % (len(edge_records) - len(unsatisfied), len(edge_records))
+        ),
+        "edges": edge_records,
+    }
+
+    unmerged = [
+        {"cycle_id": r["cycle_id"], "selected_sha": r.get("selected_sha"),
+         "reason": "not an ancestor of the composition HEAD"}
+        for r in readiness if not r.get("selected_sha_on_composition")
+    ]
+    on_branch = collected.get("current_branch") == collected.get("expected_branch")
+    criteria["composition_merged"] = {
+        "passed": bool(on_branch) and not unmerged,
+        "head_sha": collected.get("composition_head"),
+        "unmerged": unmerged,
+        "detail": (
+            "every pinned increment is an ancestor of the composition HEAD"
+            if on_branch and not unmerged
+            else (
+                "not on the release integration ref (%s, expected %s)"
+                % (collected.get("current_branch"), collected.get("expected_branch"))
+                if not on_branch
+                else "%d pinned increment(s) not in the composition" % len(unmerged)
+            )
+        ),
+    }
+
+    verification = manifest.get("verification") or {}
+    if verification.get("require_composition_regression", True):
+        proof = _run_proof_script(
+            project_dir,
+            str(verification.get("composition_regression_script") or ""),
+            label="composition regression",
+        )
+        criteria["composition_regression_green"] = {
+            "passed": proof.get("exit_code") == 0,
+            "detail": (
+                "composition regression green" if proof.get("exit_code") == 0
+                else "composition regression %s"
+                % (proof.get("reason") or "exited %s" % proof.get("exit_code"))
+            ),
+            "proof": proof,
+            "waived": False,
+        }
+    else:
+        criteria["composition_regression_green"] = {
+            "passed": True, "waived": True,
+            "detail": "release does not require a composition regression",
+            "proof": None,
+        }
+
+    blocking = [c for c in CRITERIA if not criteria.get(c, {}).get("passed")]
+    verdict = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": VERDICT_KIND,
+        "coordination_cycle_id": coordination_cycle_id,
+        "coordination_seq": manifest.get("coordination_seq"),
+        "release_id": manifest.get("release_id"),
+        "manifest_hash": manifest.get("manifest_hash"),
+        "manifest_revision": manifest.get("manifest_revision"),
+        "verdict": "green" if not blocking else "blocked",
+        "branch": collected.get("current_branch"),
+        "expected_branch": collected.get("expected_branch"),
+        "criteria": criteria,
+        "blocking": blocking,
+        "children": readiness,
+        # The property, in the payload: a child with no gating edge maps to [].
+        "gated_children": {
+            str(c["cycle_id"]): [
+                e["id"] for e in edge_records
+                if str(e.get("waiter_cycle_id")) == str(c["cycle_id"])
+            ]
+            for c in manifest.get("children") or []
+        },
+        "ledger": {
+            "fresh": snap.get("fresh"),
+            "detail": snap.get("detail"),
+            "refreshed_at": snap.get("refreshed_at"),
+            "unreadable_refs": snap.get("unreadable_refs") or [],
+        },
+        "warnings": collected.get("warnings") or [],
+        "fetch_failed": collected.get("fetch_failed"),
+        "evaluated_at": _now(),
+        "as_of": _now(),
+        "cache_served": False,
+    }
+
+    if use_cache:
+        try:
+            import verification_cache
+
+            verification_cache.store(project_dir, cache_key, verdict)
+        except Exception:  # noqa: BLE001
+            pass
+    return verdict
+
+
+def _blocked(
+    ccid: str, manifest: Dict[str, Any], blocking: List[str], detail: str
+) -> Dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": VERDICT_KIND,
+        "coordination_cycle_id": ccid,
+        "release_id": manifest.get("release_id"),
+        "manifest_hash": manifest.get("manifest_hash"),
+        "verdict": "blocked",
+        "criteria": {},
+        "blocking": blocking,
+        "children": [],
+        "gated_children": {},
+        "detail": detail,
+        "evaluated_at": _now(),
+        "as_of": _now(),
+        "cache_served": False,
+    }
+
+
+# ── the report ──────────────────────────────────────────────────────────────
+
+
+def release_readiness(
+    project_dir: str, coordination_cycle_id: str, *, use_cache: bool = True
+) -> Dict[str, Any]:
+    """Exact included children, hashes, SHAs, dependency closure and evidence.
+
+    Rendered from GIT, which is what closes the AC. The control-plane view is a
+    convenience over the same data and never a second source of truth.
+    """
+    import coordination_cycle as cc
+
+    verdict = evaluate(project_dir, coordination_cycle_id, use_cache=use_cache)
+    manifest = cc.read_manifest(project_dir, coordination_cycle_id)
+    edge_records = (verdict.get("criteria", {}).get("edges_satisfied") or {}).get(
+        "edges"
+    ) or []
+    satisfied = [e for e in edge_records if e.get("satisfied")]
+
+    children_rows = list(verdict.get("children") or [])
+    for child in manifest.get("children") or []:
+        if str(child.get("state")) == "dropped":
+            children_rows.append(
+                {
+                    "cycle_id": child.get("cycle_id"),
+                    "cycle_seq": child.get("cycle_seq"),
+                    "goal": child.get("goal"),
+                    "state": "dropped",
+                    "manifest_hash": child.get("manifest_hash"),
+                    "selected_sha": "",
+                    "dropped_reason": child.get("dropped_reason"),
+                    "dropped_at": child.get("dropped_at"),
+                    "gating_edges": [],
+                    "blocking": [],
+                }
+            )
+
+    proof = (verdict.get("criteria", {}).get("composition_regression_green") or {}).get(
+        "proof"
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": READINESS_KIND,
+        "coordination_cycle_id": coordination_cycle_id,
+        "coordination_seq": manifest.get("coordination_seq"),
+        "release_id": manifest.get("release_id"),
+        "release_goal": manifest.get("release_goal"),
+        "manifest_hash": manifest.get("manifest_hash"),
+        "manifest_revision": manifest.get("manifest_revision"),
+        "supersedes": manifest.get("supersedes"),
+        "verdict": verdict.get("verdict"),
+        "blocking": verdict.get("blocking"),
+        "children": children_rows,
+        "dependency_closure": {
+            "declared": len(edge_records),
+            "satisfied": len(satisfied),
+            "unsatisfied": len(edge_records) - len(satisfied),
+            "edges": edge_records,
+        },
+        "verification_evidence": {
+            "composition_head_sha": (
+                verdict.get("criteria", {}).get("composition_merged") or {}
+            ).get("head_sha"),
+            "composition_regression": proof,
+            "cross_cycle_events": [
+                {
+                    "event_id": e.get("event_id"),
+                    "condition": e.get("observed_condition"),
+                    "verified": e.get("verified"),
+                    "commit_sha": e.get("commit_sha"),
+                    "key": e.get("key"),
+                }
+                for e in satisfied
+            ],
+            "child_barrier_evidence": {
+                str(r.get("cycle_id")): r.get("child_sync_evidence")
+                for r in (verdict.get("children") or [])
+                if r.get("child_sync_evidence")
+            },
+        },
+        "gated_children": verdict.get("gated_children"),
+        "ledger": verdict.get("ledger"),
+        "evaluated_at": verdict.get("evaluated_at"),
+        "as_of": verdict.get("as_of"),
+        "note": (
+            "Rendered from git, which is authoritative. A control-plane view of "
+            "the same release is a report, never a second source of truth."
+        ),
+    }
+
+
+def clear(
+    project_dir: str, coordination_cycle_id: str, *, cleared_by: Optional[str] = None
+) -> Dict[str, Any]:
+    """Record a green release and emit the gate. Re-evaluates fail-closed."""
+    import spq_paths
+
+    verdict = evaluate(project_dir, coordination_cycle_id, use_cache=False)
+    if verdict.get("verdict") != "green":
+        raise CoordinationBarrierError(
+            "cannot clear Coordination Cycle %s: %s still blocking. %s"
+            % (
+                coordination_cycle_id,
+                verdict.get("blocking"),
+                verdict.get("detail") or
+                "A child that cannot make the release is dropped from the "
+                "parent manifest rather than held for.",
+            )
+        )
+
+    who = cleared_by or os.environ.get("SYNAPTORY_UPN") or ""
+    rid = spq_paths.release_id(coordination_cycle_id)
+    try:
+        # SPQ adds no new gate types (design §13.2). A Coordination Cycle maps
+        # onto the existing `release` gate; `GateEvent.target_id` is a plain
+        # String with no foreign key, so `RELEASE-{seq}` is accepted as-is and
+        # is distinguishable from a child Cycle's `ACCEPTANCE-{n}`.
+        from gate_emitter import emit_release_approved
+
+        emit_release_approved(rid, who, project_dir=project_dir)
+    except Exception:  # noqa: BLE001 - never block a ceremony on the CP
+        pass
+
+    _write_release_receipt(project_dir, coordination_cycle_id, verdict, who)
+    return verdict
+
+
+def _write_release_receipt(
+    project_dir: str, ccid: str, verdict: Dict[str, Any], who: str
+) -> Optional[str]:
+    """`RELEASE-{seq}-readiness.json`.
+
+    Descriptive suffix rather than a role abbreviation, matching
+    `SYNC-{n}-barrier.json`: the orchestrator writes it and `orchestrator` has no
+    entry in the contract's role-abbreviation map.
+    """
+    import spq_paths
+    import state_store
+
+    try:
+        rid = spq_paths.release_id(ccid)
+        receipts = spq_paths.coordination_receipts_dir(project_dir, ccid)
+        os.makedirs(receipts, exist_ok=True)
+        passed = sum(
+            1 for c in CRITERIA
+            if (verdict.get("criteria", {}).get(c) or {}).get("passed")
+        )
+        proof = (
+            verdict.get("criteria", {}).get("composition_regression_green") or {}
+        ).get("proof") or {}
+        commands = [c for c in [proof.get("command")] if c]
+        if not commands:
+            # At least one command, or SubagentStop errors on an empty list.
+            commands = ["git merge-base --is-ancestor <selected_sha> HEAD"]
+        path = os.path.join(receipts, "%s-readiness.json" % rid)
+        state_store.write_json_atomic(path, {
+            "task": "Coordination Cycle %s release readiness" % ccid,
+            "story_id": rid,
+            "agent": "orchestrator",
+            "role": "orchestrator",
+            "backend": "orchestrator",
+            "model": "orchestrator",
+            "artifacts": [],
+            "verification_commands": commands,
+            "completed_at": _now(),
+            "token_usage": {"stage": "orchestrator"},
+            "metrics": {
+                "children_included": len(verdict.get("children") or []),
+                "criteria_passed": passed,
+                "criteria_total": len(CRITERIA),
+            },
+            "cleared_by": who,
+            "verdict": verdict.get("verdict"),
+            "manifest_hash": verdict.get("manifest_hash"),
+        })
+        return path
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def status(project_dir: str, coordination_cycle_id: str) -> Dict[str, Any]:
+    """A cheap, offline view: no fetch, no proof scripts."""
+    import coordination_cycle as cc
+
+    manifest = cc.read_manifest(project_dir, coordination_cycle_id)
+    if not manifest:
+        return {"coordination_cycle_id": coordination_cycle_id,
+                "manifest_present": False}
+    collected = collect(project_dir, coordination_cycle_id, fetch=False)
+    snap = cc.snapshot(project_dir, coordination_cycle_id)
+    satisfied = cc.satisfied_map(snap, manifest)
+    edge_records = evaluate_edges(
+        collected, manifest, satisfied, ledger_fresh=bool(snap.get("fresh"))
+    )
+    return {
+        "coordination_cycle_id": coordination_cycle_id,
+        "manifest_present": True,
+        "release_id": manifest.get("release_id"),
+        "manifest_hash": manifest.get("manifest_hash"),
+        "children": [
+            child_readiness(collected, manifest, str(c["cycle_id"]), edge_records)
+            for c in cc.included_children(manifest)
+        ],
+        "edges": edge_records,
+        "ledger": {"fresh": snap.get("fresh"), "detail": snap.get("detail")},
+        "as_of": _now(),
+    }
+
+
+def main(argv: List[str]) -> int:
+    import spq_paths
+
+    if len(argv) < 3:
+        print(__doc__, file=__import__("sys").stderr)
+        return 1
+    action, project_dir = argv[1], argv[2]
+    args = argv[3:]
+
+    def _flag(name: str) -> Optional[str]:
+        for i, a in enumerate(args):
+            if a == name and i + 1 < len(args):
+                return args[i + 1]
+        return None
+
+    ccid = spq_paths.resolve_coordination_id(
+        project_dir, coordination_cycle_id=_flag("--coordination-cycle-id"),
+        require=True,
+    )
+    try:
+        if action == "evaluate":
+            out = evaluate(project_dir, ccid, use_cache="--no-cache" not in args)
+            print(json.dumps(out, indent=2, default=str))
+            return 0 if out.get("verdict") == "green" else 3
+        if action == "release-readiness":
+            out = release_readiness(
+                project_dir, ccid, use_cache="--no-cache" not in args
+            )
+            print(json.dumps(out, indent=2, default=str))
+            return 0 if out.get("verdict") == "green" else 3
+        if action == "status":
+            print(json.dumps(status(project_dir, ccid), indent=2, default=str))
+            return 0
+        if action == "clear":
+            out = clear(project_dir, ccid, cleared_by=_flag("--cleared-by"))
+            print(json.dumps(out, indent=2, default=str))
+            return 0
+    except CoordinationBarrierError as exc:
+        print("[coordination_barrier] %s" % exc, file=__import__("sys").stderr)
+        return 2
+    print("[coordination_barrier] unknown action: %s" % action,
+          file=__import__("sys").stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main(sys.argv))

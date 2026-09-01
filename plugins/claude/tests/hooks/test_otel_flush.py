@@ -1,20 +1,17 @@
-"""Layer 2 — `synaptory-pipeline-snapshot.sh` Stop hook tests.
+"""Layer 2 — the OTel flush hook, and the Stop-hook snapshot beside it.
 
-NOTE: The `synaptory-otel-flush.sh` hook described in the test spec does NOT exist
-in this codebase. There is no standalone OTel flush hook — the CLI's OTel export
-is invoked inline by the hooks that call `synaptory telemetry *` (the stub CLI
-handles those silently).
+This file used to open by asserting the opposite of the truth:
 
-These tests instead cover `synaptory-pipeline-snapshot.sh` (the Stop hook), which is
-the closest high-risk analogue: it writes a pipeline state snapshot to disk and
-is conditionally skipped when the workspace doesn't exist, mirroring the
-"noop when disabled" contract the spec described.
+    NOTE: The `synaptory-otel-flush.sh` hook described in the test spec does NOT
+    exist in this codebase.
 
-Two tests pin the contract:
-  - `test_otel_flush_invokes_cli_when_workspace_exists` — run the hook with a
-    populated .synaptory/ workspace; assert the snapshot file is written.
-  - `test_otel_flush_noop_when_workspace_absent` — no .synaptory/ directory;
-    assert hook exits 0 without creating output files.
+It does exist, at `plugin-claude/hooks/synaptory-otel-flush.sh`, registered on
+SessionStart and Stop in hooks.json. So the one hook responsible for getting
+spans to the control plane had NO coverage, which is how a complete three-host
+Cycle reported `otel_events: 0` with nothing going red (#331 G11).
+
+The pipeline-snapshot tests below are kept -- they are real tests of a real
+hook, just not of this one.
 """
 
 from __future__ import annotations
@@ -120,3 +117,93 @@ def test_otel_flush_noop_when_workspace_absent(
     assert not (project_dir / ".synaptory").exists(), (
         "hook must not create .synaptory/ when workspace was absent"
     )
+
+
+# ─── the actual OTel flush hook (#331 G11) ──────────────────────────────────
+
+
+@pytest.mark.hook
+def test_otel_flush_ships_every_pending_span_batch(
+    plugin_root: Path,
+    hook_env: dict[str, str],
+    run_hook,
+    tmp_path: Path,
+):
+    """Each `spans-*.jsonl` must be handed to `telemetry traces`.
+
+    Asserted against the stub CLI's telemetry log, so "the hook ran" cannot be
+    mistaken for "the spans shipped" -- the distinction that made `otel_events:
+    0` survive a whole Cycle unnoticed.
+    """
+    project_dir = Path(hook_env["CLAUDE_PROJECT_DIR"])
+    otel = project_dir / ".synaptory" / ".orchestrator" / "otel"
+    otel.mkdir(parents=True)
+    batches = ["spans-sess-a.jsonl", "spans-sess-b.jsonl"]
+    for name in batches:
+        (otel / name).write_text('{"name":"span"}\n', encoding="utf-8")
+
+    log = tmp_path / "telemetry.log"
+    env = {**hook_env, "SYNAPTORY_STUB_TELEMETRY_LOG": str(log)}
+    hook = plugin_root / "hooks" / "synaptory-otel-flush.sh"
+
+    result = run_hook(hook, env=env, stdin="")
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+
+    assert log.exists(), "the flush hook never invoked `telemetry traces`"
+    shipped = log.read_text(encoding="utf-8")
+    for name in batches:
+        assert name in shipped, f"{name} was not shipped:\n{shipped}"
+    assert shipped.count("traces") == len(batches)
+
+
+@pytest.mark.hook
+def test_otel_flush_skips_empty_batches(
+    plugin_root: Path,
+    hook_env: dict[str, str],
+    run_hook,
+    tmp_path: Path,
+):
+    """An empty file is not a batch. Shipping it wastes a call and can look
+    like a successful export of nothing."""
+    project_dir = Path(hook_env["CLAUDE_PROJECT_DIR"])
+    otel = project_dir / ".synaptory" / ".orchestrator" / "otel"
+    otel.mkdir(parents=True)
+    (otel / "spans-empty.jsonl").write_text("", encoding="utf-8")
+
+    log = tmp_path / "telemetry.log"
+    env = {**hook_env, "SYNAPTORY_STUB_TELEMETRY_LOG": str(log)}
+    hook = plugin_root / "hooks" / "synaptory-otel-flush.sh"
+
+    assert run_hook(hook, env=env, stdin="").returncode == 0
+    assert not log.exists() or "spans-empty" not in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.hook
+def test_otel_flush_is_silent_outside_a_synaptory_project(
+    plugin_root: Path,
+    hook_env: dict[str, str],
+    run_hook,
+):
+    """No otel dir, no work, no noise. Stop hooks fire in every project."""
+    hook = plugin_root / "hooks" / "synaptory-otel-flush.sh"
+    result = run_hook(hook, env=hook_env, stdin="")
+    assert result.returncode == 0
+    assert result.stderr.strip() == ""
+
+
+@pytest.mark.hook
+def test_the_writer_and_the_flusher_agree_on_the_path(plugin_root: Path):
+    """A drift guard on the two halves of the export.
+
+    `otel_writer` writes `.orchestrator/otel/spans-<sid>.jsonl` and the hook
+    globs `$OTEL_DIR/spans-*.jsonl`. If either moves, spans accumulate on disk
+    and the control plane silently reports zero -- with no error anywhere,
+    because each half works perfectly on its own.
+    """
+    writer = (plugin_root / "hooks" / "lib" / "otel_writer.py").read_text("utf-8")
+    flusher = (plugin_root / "hooks" / "synaptory-otel-flush.sh").read_text("utf-8")
+
+    assert 'f"spans-{sid}.jsonl"' in writer
+    assert '".orchestrator" / "otel"' in writer
+    assert 'OTEL_DIR="$SUITE_DIR/.orchestrator/otel"' in flusher
+    assert '"$OTEL_DIR"/spans-*.jsonl' in flusher

@@ -14,6 +14,8 @@ _HOOK_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 # shellcheck source=lib/resolve-python.sh
 source "${_HOOK_ROOT}/hooks/lib/resolve-python.sh"
 _py="${SYNAPTORY_PYTHON:-python3}"
+# shellcheck source=lib/receipt-paths.sh
+source "${_HOOK_ROOT}/hooks/lib/receipt-paths.sh"
 
 SUITE_DIR="${CLAUDE_PROJECT_DIR}/.synaptory"
 
@@ -24,7 +26,7 @@ fi
 
 # Count artifacts for context
 ADR_COUNT=$(find "$SUITE_DIR" -name "ADR-*.md" 2>/dev/null | wc -l | tr -d ' ')
-RECEIPT_COUNT=$(find "$SUITE_DIR/.orchestrator/receipts" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+RECEIPT_COUNT=$(synaptory_receipt_count "$SUITE_DIR/.orchestrator")
 PROTOCOL_COUNT=$(find "$SUITE_DIR/.protocols" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
 
 CONTEXT="# Production-Grade Native Project Detected

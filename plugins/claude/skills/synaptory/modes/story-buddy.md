@@ -8,7 +8,7 @@ Works for both **brownfield** (context packages from Discover mode) and **greenf
 
 ```python
 config = Read(".synaptory.yaml") or {}
-TRACKER_CLI = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/skills/_shared/scripts/tracker/tracker_cli.py" --project-dir .'
+TRACKER_CLI = 'python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py" --project-dir .'
 
 # Context source: context packages (brownfield/Discover) OR Inception state (any post-Inception project)
 context_pkgs = Glob(".synaptory/.orchestrator/context-packages/*.md")

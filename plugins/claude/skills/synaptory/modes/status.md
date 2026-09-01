@@ -106,7 +106,7 @@ If `build_mode == "scrum"` and `sprints_completed` exists:
 If `lifecycle_state` is `"SPRINT_EXECUTION"`:
 
 ```python
-TRACKER_CLI = f'python3 "${{CLAUDE_PLUGIN_ROOT}}/skills/_shared/scripts/tracker/tracker_cli.py" --project-dir .'
+TRACKER_CLI = 'python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py" --project-dir .'
 
 # Fetch sprint stories — capture stderr to surface tracker errors
 tracker_result = Bash(f'{TRACKER_CLI} get-sprint-backlog {sprint_state.current_sprint} 2>&1')

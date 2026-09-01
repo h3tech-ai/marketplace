@@ -42,7 +42,7 @@ def test_under_cap_passes_through_untouched():
 @pytest.mark.unit
 def test_oversized_additional_context_capped_including_marker():
     """Regression (PR #83 re-review): the final string — marker included —
-    must not exceed the 10 KB cap. The old code sliced to the cap and THEN
+    must not exceed the 10 KB cap. The old code cycled to the cap and THEN
     appended the marker, overshooting to 10,294 bytes."""
     out = _emit(event_name="SessionStart", additional_context="x" * (11 * 1024))
     encoded = out["additionalContext"].encode("utf-8")

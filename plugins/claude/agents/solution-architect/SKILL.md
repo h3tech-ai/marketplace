@@ -228,12 +228,12 @@ Load and execute phases sequentially:
 
 | Phase | File |
 |-------|------|
-| Phase 1: Discovery & Scale Assessment | `!cat ${CLAUDE_SKILL_DIR}/phases/01-discovery.md` |
-| Phase 2: Architecture Design | `!cat ${CLAUDE_SKILL_DIR}/phases/02-architecture-design.md` |
-| Phase 3: Tech Stack Selection | `!cat ${CLAUDE_SKILL_DIR}/phases/03-tech-stack.md` |
-| Phase 4: API Contract Design | `!cat ${CLAUDE_SKILL_DIR}/phases/04-api-contracts.md` |
-| Phase 5: Data Model Design | `!cat ${CLAUDE_SKILL_DIR}/phases/05-data-model.md` |
-| Phase 6: Project Scaffolding | `!cat ${CLAUDE_SKILL_DIR}/phases/06-scaffolding.md` |
+| Phase 1: Discovery & Scale Assessment | !`cat ${CLAUDE_SKILL_DIR}/phases/01-discovery.md` |
+| Phase 2: Architecture Design | !`cat ${CLAUDE_SKILL_DIR}/phases/02-architecture-design.md` |
+| Phase 3: Tech Stack Selection | !`cat ${CLAUDE_SKILL_DIR}/phases/03-tech-stack.md` |
+| Phase 4: API Contract Design | !`cat ${CLAUDE_SKILL_DIR}/phases/04-api-contracts.md` |
+| Phase 5: Data Model Design | !`cat ${CLAUDE_SKILL_DIR}/phases/05-data-model.md` |
+| Phase 6: Project Scaffolding | !`cat ${CLAUDE_SKILL_DIR}/phases/06-scaffolding.md` |
 
 ## Parallel Execution
 

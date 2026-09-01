@@ -166,3 +166,85 @@ def test_empty_file_is_drift(tmp_path: Path):
     out = check_drift(tmp_path)
     assert out["ok"] is False
     assert any("empty" in p for p in out["problems"])
+
+
+# ── #303/#304/#305: SPQ on the retired layout is itself drift ──────────────
+
+
+def test_an_spq_project_on_the_v3_layout_is_reported_as_drift():
+    """This is what turns a hard block on the first advance into a warning on
+    the first message: SessionStart already watches pipeline-state.json, so the
+    FileChanged hook runs this validator before anything is dispatched."""
+    problems = validate_pipeline_state(
+        {
+            "version": "3.0",
+            "build_mode": "spq",
+            "active_spec": "spine",
+            "specs": {"spine": {}},
+        }
+    )
+    assert problems
+    assert any("migrate_spq_native.py" in p for p in problems)
+
+
+def test_a_scrum_project_on_the_v3_layout_is_still_clean():
+    """Multi-Spec is RETAINED for scrum and kanban; flagging it would be a
+    false positive on a supported configuration."""
+    problems = validate_pipeline_state(
+        {
+            "version": "3.0",
+            "build_mode": "scrum",
+            "active_spec": "spine",
+            "specs": {
+                "spine": {
+                    "lifecycle_state": "SPRINT_EXECUTION",
+                    "current_stories": [],
+                }
+            },
+        }
+    )
+    assert not [p for p in problems if "migrate_spq_native" in p]
+
+
+def test_a_cycle_seq_that_disagrees_with_the_cycle_id_is_drift():
+    """The seq is the receipt-facing projection of the id, so a mismatch means
+    CYCLE-{seq} receipts name a different Cycle than the storage does."""
+    import spq_paths as sp
+
+    problems = validate_pipeline_state(
+        {
+            "version": "2.0",
+            "build_mode": "spq",
+            "lifecycle_state": "CYCLE_EXECUTION",
+            "current_stories": [],
+            "spq": {"cycle_id": sp.new_cycle_id(7), "cycle_seq": 3},
+        }
+    )
+    assert any("disagrees" in p for p in problems)
+
+
+def test_a_malformed_cycle_id_is_drift():
+    problems = validate_pipeline_state(
+        {
+            "version": "2.0",
+            "build_mode": "spq",
+            "lifecycle_state": "CYCLE_EXECUTION",
+            "current_stories": [],
+            "spq": {"cycle_id": "../escape", "cycle_seq": 1},
+        }
+    )
+    assert any("cycle_id" in p for p in problems)
+
+
+def test_a_well_formed_spq_pointer_is_clean():
+    import spq_paths as sp
+
+    cycle_id = sp.new_cycle_id(7)
+    problems = validate_pipeline_state(
+        {
+            "version": "2.0",
+            "build_mode": "spq",
+            "spq": {"cycle_id": cycle_id, "cycle_seq": 7, "workstream_id": "spine"},
+        }
+    )
+    assert problems == [], problems

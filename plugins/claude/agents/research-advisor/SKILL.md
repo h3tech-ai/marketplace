@@ -146,13 +146,13 @@ Follow `.synaptory/.protocols/visual-identity.md`. Print structured progress thr
 
 ## Activation Intelligence
 
-`!cat ${CLAUDE_SKILL_DIR}/reference/activation-intelligence.md 2>/dev/null || true`
+!`cat ${CLAUDE_SKILL_DIR}/reference/activation-intelligence.md`
 
 ---
 
 ## Dialogue Protocol
 
-`!cat ${CLAUDE_SKILL_DIR}/reference/dialogue-protocol.md 2>/dev/null || true`
+!`cat ${CLAUDE_SKILL_DIR}/reference/dialogue-protocol.md`
 
 ---
 
@@ -160,7 +160,7 @@ Follow `.synaptory/.protocols/visual-identity.md`. Print structured progress thr
 
 ## Research Discipline
 
-`!cat ${CLAUDE_SKILL_DIR}/reference/research-discipline.md 2>/dev/null || true`
+!`cat ${CLAUDE_SKILL_DIR}/reference/research-discipline.md`
 
 ---
 
@@ -307,7 +307,7 @@ AskUserQuestion(questions=[{
 
 ## Context Persistence
 
-`!cat ${CLAUDE_SKILL_DIR}/reference/context-persistence.md 2>/dev/null || true`
+!`cat ${CLAUDE_SKILL_DIR}/reference/context-persistence.md`
 
 ---
 

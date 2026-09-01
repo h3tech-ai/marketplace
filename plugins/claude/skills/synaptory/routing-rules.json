@@ -90,14 +90,14 @@
       "mode": "SPQ",
       "trigger_signals": [
         "spq",
-        "open slice",
-        "next slice",
-        "run a slice",
-        "slice execution",
+        "open cycle",
+        "next cycle",
+        "run a cycle",
+        "cycle execution",
         "spq lifecycle"
       ],
       "trigger_patterns": [
-        "(?:open|start|run|next)\\s+slice(?:\\s+\\d+)?",
+        "(?:open|start|run|next)\\s+cycle(?:\\s+\\d+)?",
         "spq\\s+(?:lifecycle|delivery|mode)"
       ],
       "skills_involved": [
@@ -114,20 +114,20 @@
       "lifecycle": "spq",
       "pipeline": [],
       "skip_conditions": [],
-      "notes": "Routes to the SPQ lifecycle: DISCOVERY -> COMMIT -> SLICE_EXECUTION -> SYNC -> CHECKPOINT -> (loop or ACCEPTANCE). Requires build_mode: spq. The distinguishing feature vs scrum is SYNC, the cross-workstream integration barrier."
+      "notes": "Routes to the SPQ lifecycle: DISCOVERY -> COMMIT -> CYCLE_EXECUTION -> SYNC -> CHECKPOINT -> (loop or ACCEPTANCE). Requires build_mode: spq. The distinguishing feature vs scrum is SYNC, the cross-workstream integration barrier."
     },
     {
       "mode": "Sync",
       "trigger_signals": [
         "sync",
-        "sync workstreams",
+        "sync workstreams", "coordination cycle", "cycle of cycles", "release readiness", "pin the release", "drop from the release",
         "sync crews",
         "integrate workstreams",
         "run the barrier",
         "declare ready"
       ],
       "trigger_patterns": [
-        "sync\\s+(?:workstreams?|crews?|slice)",
+        "sync\\s+(?:workstreams?|crews?|cycle)",
         "(?:run|clear|evaluate)\\s+the\\s+barrier",
         "declare\\s+(?:sync\\s+)?ready"
       ],
@@ -146,13 +146,13 @@
       "mode": "Checkpoint",
       "trigger_signals": [
         "checkpoint",
-        "close slice",
-        "demo the slice",
-        "slice review"
+        "close cycle",
+        "demo the cycle",
+        "cycle review"
       ],
       "trigger_patterns": [
         "checkpoint(?:\\s+\\d+)?",
-        "(?:close|demo)\\s+(?:the\\s+)?slice"
+        "(?:close|demo)\\s+(?:the\\s+)?cycle"
       ],
       "skills_involved": [
         "technical-writer",
@@ -161,7 +161,7 @@
       "lifecycle": "spq",
       "pipeline": [],
       "skip_conditions": [],
-      "notes": "Closes the Slice with a customer demonstration from an integrated dev, then harvests MethodSignals. Always runs AFTER SYNC \u2014 integration precedes demonstration."
+      "notes": "Closes the Cycle with a customer demonstration from an integrated dev, then harvests MethodSignals. Always runs AFTER SYNC \u2014 integration precedes demonstration."
     },
     {
       "mode": "Test",
@@ -185,6 +185,43 @@
       "lifecycle": "standalone"
     },
     {
+      "mode": "Secure",
+      "trigger_signals": [
+        "secure",
+        "security review",
+        "security audit",
+        "audit my code",
+        "harden",
+        "is this secure",
+        "vulnerability scan",
+        "check for vulnerabilities",
+        "owasp",
+        "stride",
+        "threat model",
+        "pentest",
+        "penetration test"
+      ],
+      "trigger_patterns": [
+        "(?:security|secure)\\s+(?:review|audit|check|scan|pass|assessment)",
+        "audit\\s+(?:my|this|the)?\\s*(?:code|repo|repository|codebase|branch|changes|diff)",
+        "harden(?:ing)?",
+        "(?:vulnerabilit(?:y|ies)|vulns?)\\s*(?:scan|check|assessment)?",
+        "owasp|stride",
+        "threat\\s+model",
+        "pen(?:etration)?\\s*test",
+        "is\\s+(?:this|my|the)\\b.*\\bsecure\\b"
+      ],
+      "skills_involved": [
+        "compliance-engineer",
+        "software-engineer"
+      ],
+      "pipeline": [],
+      "skip_conditions": [],
+      "notes": "Standalone Compliance Engineer audit (STRIDE + OWASP), diff-scoped by default. SE runs only when the user accepts remediation at the triage gate. Read modes/secure.md.",
+      "tiebreaker": "Use Secure (not Review) when audit, harden, vulnerability, OWASP, STRIDE, or threat-model intent is present",
+      "lifecycle": "standalone"
+    },
+    {
       "mode": "Review",
       "trigger_signals": [
         "review my code",
@@ -202,7 +239,7 @@
       ],
       "pipeline": [],
       "skip_conditions": [],
-      "tiebreaker": "Use Review (not Verify) when 'my code' or 'this code' is present without audit/harden intent",
+      "tiebreaker": "Use Review (not Secure) when 'my code' or 'this code' is present without audit/harden intent",
       "lifecycle": "standalone"
     },
     {
@@ -578,7 +615,7 @@
       "skills_involved": [],
       "pipeline": [],
       "skip_conditions": [],
-      "notes": "Gather context + file GitHub issue on h3tech-ai/synaptory"
+      "notes": "Gather context + file GitHub issue on h3tech-ai/synaptory-v1"
     },
     {
       "mode": "Context Refresh",
@@ -644,7 +681,7 @@
         "PLAN"
       ],
       "notes": "Executes modes/story-buddy.md with role=implement. Requires story ID in request. Skips PLAN \u2014 story already exists in tracker. SE implements with context package injection.",
-      "tiebreaker": "Use Story Buddy \u2014 Implement (not Feature) when a story ID pattern [A-Z]+-\\d+ or US-\\d+ is present",
+      "tiebreaker": "Use Story Buddy \u2014 Implement (not Build) when a story ID pattern [A-Z]+-\\d+ or US-\\d+ is present",
       "lifecycle": "standalone"
     },
     {
@@ -705,9 +742,9 @@
   ],
   "tiebreakers": [
     {
-      "conflict": "review vs verify",
-      "rule": "Review if 'my code / this code'. Verify if 'before launch / audit / harden / production ready'",
-      "reason": "Verify implies multi-agent parallel audit; Review is single-agent read-only"
+      "conflict": "review vs secure",
+      "rule": "Review if 'my code / this code' with no audit intent. Secure if 'security review / audit / harden / vulnerability / OWASP / STRIDE / threat model'. Release if 'before launch / ship it / production ready' AND the project is already in a delivery lifecycle",
+      "reason": "Secure is a scoped Compliance Engineer audit that needs no lifecycle state; Release is the full multi-agent pre-launch pass; Review is single-agent read-only quality"
     },
     {
       "conflict": "test vs debug",
@@ -725,9 +762,9 @@
       "reason": "Specificity beats generality"
     },
     {
-      "conflict": "reliability vs optimize",
-      "rule": "Reliability if SLO, error budget, chaos, runbook, incident, or on-call is mentioned. Optimize if performance or scale is the goal without operational framing",
-      "reason": "Reliability = operational engineering; Optimize = code/infra performance tuning"
+      "conflict": "operational reliability vs performance optimization",
+      "rule": "Both route to Optimize. Lead with platform-engineer when SLO, error budget, chaos, runbook, incident, or on-call is mentioned; lead with code-reviewer when performance or scale is the goal without operational framing",
+      "reason": "There is no separate Reliability mode \u2014 Optimize carries both skills and the signal decides which one leads"
     },
     {
       "conflict": "implement + story ID vs Build",

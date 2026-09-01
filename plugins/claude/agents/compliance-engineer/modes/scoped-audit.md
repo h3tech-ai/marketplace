@@ -1,0 +1,79 @@
+# Scoped Audit Mode
+
+**Activates when the task envelope carries a `## Scope` block** — the Synaptory orchestrator's Secure mode sends one on every dispatch.
+
+This mode replaces the directory-oriented **Pre-Flight Read Order** and **Input Classification** rules in SKILL.md. It does not replace the audit itself: STRIDE, OWASP, auth, data, and supply chain all still run, on a smaller surface.
+
+The standard pipeline assumes a `services/` + `api/` layout and stops when it is absent. That assumption is correct inside a Synaptory-scaffolded project and wrong everywhere else — most repos asking for a security review are neither. Here the **envelope's file list is the scope**, whatever the directory names are.
+
+---
+
+## Scope Contract
+
+The envelope carries:
+
+| Field | Meaning |
+|---|---|
+| `scope` | `diff` (changed files only), `full` (whole codebase), or `path` (named files/directories) |
+| `base` | The merge-base commit the diff was taken against, or `n/a` |
+| `files` | The resolved file list — one path per line. **This is the audit surface.** |
+
+Rules:
+
+1. **The file list is authoritative.** Do not go looking for `services/` or `api/` and stop when they are missing. Audit what you were given.
+2. **Audit the listed files plus their direct (1-hop) callers.** A changed function is only as safe as the input it receives — find the callers with `Grep`, read them, stop there. Go 2-hop only for auth, session, crypto, deserialization, and database access paths.
+3. **Empty file list is the only STOP condition.** If `files` is empty and `scope` is not `full`, stop and report that the scope resolved to nothing — do not silently audit the whole repo.
+4. **`scope: full` runs the standard pipeline** with one change: derive the read order from the actual repository layout (read the root listing and `.synaptory.yaml` first) instead of the fixed `services/`, `frontend/`, `api/` order.
+
+## Pre-Flight Read Order (replaces SKILL.md's)
+
+1. `.synaptory.yaml` — project config, stack, compliance flags
+2. The envelope's `files` list — read every entry
+3. The diff itself, when `base` is present: `git diff {base}...HEAD -- {files}`. **Read the diff, not just the file.** What changed is what you are auditing; the rest of the file is baseline.
+4. Direct callers of the changed symbols (`Grep` for the exported names)
+5. Adjacent security config the changed code depends on — auth middleware, input validation layers, CSP/CORS setup, secret loading. Read it before flagging its absence; it usually lives one layer up.
+
+## Severity Under Diff Scope
+
+The policy in SKILL.md's Brownfield Awareness section is the rule here, applied per finding:
+
+| Finding lives in | Severity |
+|---|---|
+| A line the diff added or modified | **Full severity.** Newly introduced, actionable, blocks. |
+| A file in scope, but a line the diff did not touch | **Informational baseline.** Report under "Pre-existing", do not block. |
+| Outside the scope entirely, found while tracing callers | **Informational baseline**, with a one-line note. Never expand the audit to chase it. |
+
+Report the two groups separately. A user auditing a 12-file branch does not want 200 pre-existing findings from a codebase they inherited — and cannot tell which of them their change introduced.
+
+**`metrics.findings_critical` on the receipt counts newly introduced, unremediated criticals only.** Pre-existing criticals go in `metrics.findings_critical_baseline`. That gate blocks a pipeline; loading it with inherited debt makes it unsatisfiable, which is exactly how it fell out of use.
+
+## Phase Selection
+
+Load only the phases the changed surface warrants. Skipping a phase is a decision you must state in the report ("no dependency manifest changed — supply chain audit skipped").
+
+| Changed surface | Phases to load |
+|---|---|
+| Always | 01 (threat model — scoped to the changed data flows), 02 (code audit) |
+| Auth, session, token, RBAC, middleware | + 03 |
+| Models, migrations, PII fields, logging, storage, serialization | + 04 |
+| `package.json`, `requirements.txt`, `go.mod`, `Cargo.toml`, lockfiles, Dockerfiles | + 05 |
+| Any finding at High or above | + 06 (remediation plan) |
+| App is already running and the change touches a route | + 07 (DAST) |
+| Prompt templates, agent/tool definitions, LLM calls | + 08 |
+
+Under `scope: full`, load all phases as the standard pipeline does.
+
+## Scanner Leads
+
+The envelope may carry `## Scanner Leads` — JSON from `security_scan.py`. These are regex hits, not findings. Confirm each one against the real code before it becomes a finding; a lead you cannot confirm is a false positive and should be reported as such, not dropped silently.
+
+## Suppressed Findings
+
+The envelope may carry `## Suppressed Findings` from `finding-memory.json`. Apply it exactly as the Finding Memory section of SKILL.md specifies. Do not re-raise what a human already triaged.
+
+## Output
+
+Same Output Contract as the standard pipeline, plus:
+
+- `.synaptory/compliance-engineer/audit-report.md` MUST open with the scope block it was given (scope, base, file count) so the report is reproducible.
+- The findings file separates **Newly Introduced** from **Pre-existing Baseline**.

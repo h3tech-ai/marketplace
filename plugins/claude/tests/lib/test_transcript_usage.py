@@ -162,3 +162,25 @@ def test_patch_receipt_silent_on_unparseable_transcript(tmp_path, mod):
     transcript.write_text("garbage\n{still garbage\n", encoding="utf-8")
     assert mod.patch_receipt(receipt, transcript) is False
     assert "token_usage" not in json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_patch_receipt_canonicalizes_sdk_token_names_without_transcript(tmp_path, mod):
+    """Cursor-shaped token_usage must rewrite onto Cost keys even with no JSONL."""
+    receipt = tmp_path / "r.json"
+    receipt.write_text(json.dumps({
+        "role": "software-engineer",
+        "token_usage": {
+            "input_tokens": 42,
+            "output_tokens": 7,
+            "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 1,
+            "stage": "se-implementation",
+        },
+    }), encoding="utf-8")
+    assert mod.patch_receipt(str(receipt)) is True
+    tu = json.loads(receipt.read_text(encoding="utf-8"))["token_usage"]
+    assert tu["input"] == 42
+    assert tu["output"] == 7
+    assert tu["cache_read"] == 3
+    assert tu["cache_write"] == 1
+    assert tu["stage"] == "se-implementation"

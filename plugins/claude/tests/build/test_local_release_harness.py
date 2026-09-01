@@ -62,7 +62,16 @@ def test_e2e_deploy_keeps_bash_errexit_enabled(repo_root: Path) -> None:
     e2e_command = launcher[launcher.index("cmd_e2e() {"):launcher.index("cmd_help() {")]
 
     assert "cmd_deploy local ||" not in e2e_command
-    assert "\n  cmd_deploy local\n" in e2e_command
+    assert 'cmd_deploy local --version "$CURRENT_VERSION"' in e2e_command
+
+
+@pytest.mark.build
+def test_e2e_runner_collects_all_failures_by_default(repo_root: Path) -> None:
+    runner = (repo_root / "e2e" / "run-e2e.sh").read_text(encoding="utf-8")
+
+    assert 'E2E_FAIL_FAST:-0' in runner
+    assert 'PYTEST_FAIL_FAST=(-x)' in runner
+    assert 'pytest scenarios -x' not in runner
 
 
 @pytest.mark.build

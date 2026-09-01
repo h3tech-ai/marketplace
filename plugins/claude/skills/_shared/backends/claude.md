@@ -62,6 +62,12 @@ This story's DoD tier is {DOD.TIER}. Your work is gated on these checks:
 Your receipt file is:
 .synaptory/.orchestrator/receipts/{STORY_ID}-{role-abbrev}.json
 
+If the dispatch contract carries a `receipt_path`, THAT path wins over the line
+above. The kernel resolves it through `advance_kernel.intended_receipts_dir`, so
+it already accounts for multi-spec and SPQ layouts, where the flat path above is
+not where any gate looks. Ceremony dispatches that are not kernel-driven resolve
+it in their own ceremony file instead.
+
 The SubagentStart hook injects the full Execution Envelope — treat it as
 binding: it defines exactly which evidence fields your receipt must carry
 for each active check.
@@ -86,6 +92,7 @@ ${CLAUDE_PLUGIN_ROOT}/agents/{role-name}/SKILL.md
 
 Write your receipt to:
 .synaptory/.orchestrator/receipts/{STORY_ID}-{role-abbrev}.json
+(or the dispatch contract's `receipt_path`, which takes precedence: see above)
 
 The receipt MUST include:
 - role: "{ROLE_NAME}" — the FULL role name ("software-engineer" / "quality-engineer" /
@@ -237,7 +244,7 @@ When a dispatch fails — missing receipt, invalid receipt, or verification comm
 
    Read the failure carefully and correct the issue. Do not repeat the same receipt.
    ```
-3. **Third failure (retry_cap reached) → transition to blocked**: call `transition_story(state, story_id, "blocked", reason=f"{role} repeated failure after {retry_cap} retries: {last_reason}")`. The `blocked` state requires human unblock.
+3. **Third failure (retry_cap reached) → transition to blocked**: run `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/advance_kernel.py" advance "$(pwd)" {story_id} blocked --reason "{role} repeated failure after {retry_cap} retries: {last_reason}"`. The `blocked` state requires human unblock.
 
 Cap is `.synaptory.yaml → resilience.story_retry_cap` (default 2). Set to 0 to disable retries.
 

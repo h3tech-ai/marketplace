@@ -69,7 +69,7 @@ Apply user's choice per story.
 
 ## Step 1.5 — Full Cross-Sprint Regression (sprint-level `no-regression` DoD)
 
-**This is where the FULL regression suite runs — once per sprint, not per story.** Per the verification trust chain (`skills/_shared/protocols/verification-discipline.md`): SE runs story-scoped fast gates, QE runs story-scoped AC tests, and the whole-suite cross-sprint sweep happens exactly here, at close.
+**This is where the FULL regression suite runs — once per sprint, not per story.** Per the verification trust chain (`.synaptory/.protocols/verification-discipline.md`): SE runs story-scoped fast gates, QE runs story-scoped AC tests, and the whole-suite cross-sprint sweep happens exactly here, at close.
 
 1. Run the project's full test suite (the canonical command from `.synaptory/.orchestrator/sprint-context.md` § Commands — e.g. `npm test`, `pytest`, `go test ./...`).
 2. **All prior sprints' tests must still pass.** Any failure is a regression finding: record the failing test, trace it to its story (via the test file's `// @story(US-XXX)` marker or describe block), and route a fix (SE dispatch or a carry-over story) before closing.

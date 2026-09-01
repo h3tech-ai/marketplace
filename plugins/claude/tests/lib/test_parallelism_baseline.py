@@ -6,7 +6,7 @@ whose SE windows are merely ADJACENT.
 
 That distinction is the entire measurement. §19.4 makes this baseline a
 precondition for the SPQ cutover, and the number it produces will be used to
-decide whether a slow first Slice is the barrier or the inherited per-Work-Unit
+decide whether a slow first Cycle is the barrier or the inherited per-Work-Unit
 serialization. A harness that reported adjacency as concurrency would certify a
 serial run as parallel and make the whole exercise worse than useless.
 
@@ -269,3 +269,98 @@ def test_every_backlog_unit_has_acceptance_criteria():
         (REPO_ROOT / "benchmarks" / "parallelism" / "backlog.json").read_text())
     for u in backlog["work_units"]:
         assert u.get("acceptance_criteria"), f"{u['id']} has no acceptance criteria"
+
+
+# ---------------------------------------------------------------------------
+# Fixture defects found by running the harness for real (#237)
+# ---------------------------------------------------------------------------
+
+BENCH = REPO_ROOT / "benchmarks" / "parallelism"
+
+
+def test_setup_ignores_bytecode_before_the_baseline_commit():
+    """A scaffolded arm must ignore `__pycache__` BEFORE `git add -A`.
+
+    Without it the copied demo-app's .pyc files land in the baseline commit,
+    and under `isolation: worktree` each concurrent unit recompiles them
+    differently. The integration merge then fails on binary add/add conflicts
+    before any source conflict is visible, and no single unit can fix it: a
+    shared .gitignore is outside every unit's file_scope.
+    """
+    text = (BENCH / "setup.sh").read_text()
+    assert '.gitignore' in text, "setup.sh writes no .gitignore into the arm"
+    ignore_at = text.index('"$TARGET/.gitignore"')
+    add_at = text.index('add -A')
+    assert ignore_at < add_at, ".gitignore must be written before `git add -A`"
+    for pattern in ("__pycache__/", "*.pyc"):
+        assert pattern in text, f"the arm's .gitignore omits {pattern}"
+
+
+def test_every_declared_file_scope_can_satisfy_its_acceptance_criteria():
+    """`file_scope` is the INPUT to the eligibility rules, so a scope narrower
+    than the ACs need feeds the batch decision data that cannot be built.
+
+    Both entries below are AC text naming a member of a PRE-EXISTING module:
+    `TaskStore.list` lives in todo/store.py, the `Task` record in
+    todo/models.py. A unit cannot deliver either from a fresh module alone.
+    """
+    units = {u["id"]: u for u in
+             json.loads((BENCH / "backlog.json").read_text())["work_units"]}
+    required = {"BM-1": "todo/store.py", "BM-3": "todo/models.py"}
+    for uid, path in required.items():
+        assert path in (units[uid].get("file_scope") or []), (
+            f"{uid} needs {path} to satisfy its acceptance criteria"
+        )
+
+
+def test_the_batchable_units_stay_pairwise_disjoint():
+    """BM-1..BM-4 are the disjoint-batch case. Widening a scope is fine as long
+    as they remain pairwise disjoint WITH EACH OTHER: BM-8 is meant to be the
+    only overlap a batch decision has to resolve."""
+    import itertools
+    units = {u["id"]: set(u.get("file_scope") or []) for u in
+             json.loads((BENCH / "backlog.json").read_text())["work_units"]}
+    for a, b in itertools.combinations(["BM-1", "BM-2", "BM-3", "BM-4"], 2):
+        assert not (units[a] & units[b]), (
+            f"{a} and {b} overlap on {sorted(units[a] & units[b])}; the batch "
+            "case needs them pairwise disjoint"
+        )
+    # The two intended overlaps, and no others.
+    overlaps = {frozenset((a, b)) for a, b in itertools.combinations(units, 2)
+                if units[a] & units[b]}
+    assert overlaps == {frozenset(("BM-2", "BM-8")), frozenset(("BM-1", "BM-6"))}
+
+
+def test_the_readme_dispatch_count_matches_the_pinned_dod_tier():
+    """Both arms pin `dod_tier: early`, whose required checks exclude
+    `code_reviewed`, so no CR is ever dispatched: 2 dispatches per unit, 18 per
+    arm. If a future change adds `code_reviewed` to the early tier, the README's
+    number silently becomes wrong, and this is where it surfaces."""
+    spec = importlib.util.spec_from_file_location(
+        "story_pipeline",
+        REPO_ROOT / "plugin-claude" / "hooks" / "lib" / "story_pipeline.py")
+    sp = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(sp)
+
+    setup = (BENCH / "setup.sh").read_text()
+    assert 'dod_tier: "early"' in setup, "the arms no longer pin the early tier"
+    roles_per_unit = 3 if "code_reviewed" in sp.DOD_TIER_CHECKS["early"] else 2
+    units = len(json.loads((BENCH / "backlog.json").read_text())["work_units"])
+
+    readme = (BENCH / "README.md").read_text()
+    expected = f"{roles_per_unit * units} subagent dispatches"
+    assert expected in readme, f"README should quote '{expected}'"
+
+
+def test_the_demo_app_does_not_suppress_its_own_test_summary():
+    """QE receipts quote this command's output as tests_pass evidence, and the
+    DoD gate keys only on exit_code. An `-q` in addopts silently became `-qq`
+    for anyone typing the habitual `pytest -q`, which drops the summary line and
+    leaves a human unable to see how many tests ran."""
+    ini = (BENCH / "demo-app" / "pytest.ini").read_text()
+    addopts = [ln for ln in ini.splitlines()
+               if ln.strip().startswith("addopts")]
+    assert not any("-q" in ln for ln in addopts), (
+        "addopts must not carry -q: it compounds with an operator's own -q"
+    )

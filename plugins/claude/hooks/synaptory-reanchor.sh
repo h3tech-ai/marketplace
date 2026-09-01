@@ -14,6 +14,8 @@ _HOOK_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 # shellcheck source=lib/resolve-python.sh
 source "${_HOOK_ROOT}/hooks/lib/resolve-python.sh"
 _py="${SYNAPTORY_PYTHON:-python3}"
+# shellcheck source=lib/receipt-paths.sh
+source "${_HOOK_ROOT}/hooks/lib/receipt-paths.sh"
 
 SUITE_DIR="${CLAUDE_PROJECT_DIR}/.synaptory"
 
@@ -49,24 +51,25 @@ ${SETTINGS}
 "
 fi
 
-# Part 2: Most recent 3 receipts (first 20 lines each)
-RECEIPTS_DIR="$SUITE_DIR/.orchestrator/receipts"
-if [ -d "$RECEIPTS_DIR" ]; then
-  RECENT_RECEIPTS=$(ls -t "$RECEIPTS_DIR"/*.json 2>/dev/null | head -3)
-  if [ -n "$RECENT_RECEIPTS" ]; then
-    CONTEXT="${CONTEXT}## Recent Agent Completions
+# Part 2: Most recent 3 receipts (first 20 lines each), from every layout.
+# PreCompact re-anchoring is exactly when losing this hurts most: pointing
+# at the flat dir meant an SPQ session re-anchored with no evidence at all
+# (#336). No `-d` guard on a single dir any more; the sweep returns nothing
+# when there is nothing, which is the same test one level up.
+RECENT_RECEIPTS=$(synaptory_recent_receipts "$SUITE_DIR/.orchestrator" 3)
+if [ -n "$RECENT_RECEIPTS" ]; then
+  CONTEXT="${CONTEXT}## Recent Agent Completions
 "
-    while IFS= read -r receipt; do
-      RECEIPT_NAME=$(basename "$receipt")
-      RECEIPT_CONTENT=$(head -20 "$receipt" 2>/dev/null)
-      CONTEXT="${CONTEXT}### ${RECEIPT_NAME}
+  while IFS= read -r receipt; do
+    RECEIPT_NAME=$(basename "$receipt")
+    RECEIPT_CONTENT=$(head -20 "$receipt" 2>/dev/null)
+    CONTEXT="${CONTEXT}### ${RECEIPT_NAME}
 ${RECEIPT_CONTENT}
 
 "
-    done <<< "$RECENT_RECEIPTS"
-    CONTEXT="${CONTEXT}---
+  done <<< "$RECENT_RECEIPTS"
+  CONTEXT="${CONTEXT}---
 "
-  fi
 fi
 
 # Part 3: BRD summary (first 30 lines)

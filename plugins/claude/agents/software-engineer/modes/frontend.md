@@ -25,7 +25,7 @@
 
 ```python
 # UX Psychology — cognitive principles that inform all design decisions
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/ux-psychology.md")
+Bash("synaptory skills get design-assets/ux-psychology")
 ```
 
 ## Design Knowledge Assets
@@ -36,15 +36,15 @@ Use the Python-powered design search engine for domain-specific recommendations.
 
 ```python
 # Generate a full design system recommendation based on domain + product type
-Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/scripts/search.py '[domain] [product-type]' --design-system")
+Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/design_assets/scripts/search.py '[domain] [product-type]' --design-system")
 
 # Search specific design domains
-Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/scripts/search.py '[query]' --domain style")
-Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/scripts/search.py '[query]' --domain color")
-Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/scripts/search.py '[query]' --domain typography")
+Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/design_assets/scripts/search.py '[query]' --domain style")
+Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/design_assets/scripts/search.py '[query]' --domain color")
+Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/design_assets/scripts/search.py '[query]' --domain typography")
 
 # Persist design system to project
-Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/scripts/search.py '[domain] [product-type]' --design-system --persist")
+Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/design_assets/scripts/search.py '[domain] [product-type]' --design-system --persist")
 ```
 
 **MANDATORY at Phase 2 start:** Run `--design-system` to generate domain-appropriate design recommendations before selecting tokens, colors, or typography. The output provides researched recommendations instead of generic defaults.
@@ -55,10 +55,10 @@ If Python is unavailable or the search engine is not needed, load curated design
 
 ```python
 # Load design assets (parallel reads) — fallback when search.py unavailable
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/color-palettes.md")
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/typography.md")
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/spacing-layout.md")
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/component-patterns.md")
+Bash("synaptory skills get design-assets/color-palettes")
+Bash("synaptory skills get design-assets/typography")
+Bash("synaptory skills get design-assets/spacing-layout")
+Bash("synaptory skills get design-assets/component-patterns")
 ```
 
 ### Optional Design References
@@ -67,9 +67,9 @@ Load these during Phase 5 (Design & Polish) when applying visual treatments:
 
 ```python
 # Animation and micro-interactions
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/animation-guide.md")
+Bash("synaptory skills get design-assets/animation-guide")
 # Visual effects — glassmorphism, shadows, gradients
-Read("${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/visual-effects.md")
+Bash("synaptory skills get design-assets/visual-effects")
 ```
 
 Use these assets as reference when:
@@ -308,7 +308,7 @@ After Phase 6 (Testing & A11y), run the automated UX audit scripts. Follow the `
 
 ```python
 # Run UX audit
-Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/design-assets/scripts/ux_audit.py frontend/app/")
+Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/design_assets/scripts/ux_audit.py frontend/app/")
 
 # Run accessibility checker
 Bash("python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/accessibility_checker.py frontend/app/")

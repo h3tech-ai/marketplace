@@ -32,7 +32,13 @@ REPO_ROOT = PLUGIN_ROOT.parent
 # Two paths are added because modules under hooks/lib/ use sibling-import
 # style (e.g. `from story_pipeline import …`) — they're typically loaded
 # as scripts. Tests mirror that import style.
-for _p in (PLUGIN_ROOT, PLUGIN_ROOT / "hooks" / "lib"):
+for _p in (
+    PLUGIN_ROOT,
+    PLUGIN_ROOT / "hooks" / "lib",
+    # core/scripts (via the plugin-claude symlink): tracker, backend config, and
+    # the compose directive expander.
+    PLUGIN_ROOT / "skills" / "_shared" / "scripts",
+):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -96,8 +102,9 @@ def stub_cli(tmp_path: Path, stub_cli_path: Path) -> StubCli:
     bodies_dir = tmp_path / "bodies"
     bin_dir.mkdir()
     bodies_dir.mkdir()
-    # Symlink keeps the shebang intact and means `command -v synaptory`
-    # resolves to a real executable.
+    # Both channel names point at the same fixture. The resolver chooses one
+    # from the plugin stamp, and the fixture reports the matching immutable
+    # identity from argv[0].
     (bin_dir / "synaptory").symlink_to(stub_cli_path)
     (bin_dir / "synaptory-local").symlink_to(stub_cli_path)
 
@@ -238,3 +245,46 @@ def _isolate_synaptory_state(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_runtime_stamp(monkeypatch, tmp_path):
+    """No test may depend on whether this laptop ran `./synaptory deploy local`.
+
+    `host_env.RUNTIME_STAMP_DIR` is `core/lib/`, and that is where
+    `./synaptory deploy local` writes a gitignored `cp-url.local` (#320). Left
+    pointing there, channel resolution — and so every CLI-resolution test —
+    would answer differently on a laptop that has deployed locally than in CI.
+    Tests that care about a stamp set one inside this empty directory.
+    """
+    stamp_dir = tmp_path / "runtime-stamp"
+    stamp_dir.mkdir(exist_ok=True)
+    try:
+        import host_env
+    except ImportError:  # pragma: no cover - shared runtime not on sys.path
+        return
+    monkeypatch.setattr(host_env, "RUNTIME_STAMP_DIR", stamp_dir)
+
+
+@pytest.fixture
+def stamp_runtime(monkeypatch, tmp_path):
+    """Give the shared runtime a cp-url stamp beside itself, as a host does.
+
+    Counterpart to `_neutralise_runtime_stamp`: any test whose subject resolves
+    a CLI or a control plane has to say which channel it is standing in, because
+    "no stamp" now resolves nothing rather than falling through to production
+    (#320). `local=True` writes the gitignored `cp-url.local` name that
+    `./synaptory deploy local` uses; otherwise the immutable build stamp.
+    """
+
+    def _stamp(url: str, *, local: bool = False) -> Path:
+        import host_env
+
+        directory = tmp_path / "runtime-stamp"
+        directory.mkdir(parents=True, exist_ok=True)
+        name = "cp-url.local" if local else "cp-url"
+        (directory / name).write_text(url + "\n", encoding="utf-8")
+        monkeypatch.setattr(host_env, "RUNTIME_STAMP_DIR", directory)
+        return directory
+
+    return _stamp

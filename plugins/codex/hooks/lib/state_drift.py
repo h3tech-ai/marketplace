@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover - defensive; keep the validator importable
     ]
 
 _KNOWN_BUILD_MODES = {"scrum", "kanban", "spq"}
+_KNOWN_DOD_TIERS = {"early", "growing", "mature", "release"}
 
 
 def _validate_substate(sub: dict[str, Any], label: str) -> list[str]:
@@ -69,6 +70,48 @@ def validate_pipeline_state(state: dict[str, Any]) -> list[str]:
         problems.append(f"unknown build_mode {build_mode!r}")
 
     specs = state.get("specs")
+
+    # An SPQ project on the v3 Multi-Spec layout is itself drift. SPQ owns its
+    # own store now (#303/#304/#305), and the state machine refuses such a
+    # project outright -- so surfacing it HERE is what turns a hard block on the
+    # first advance into a warning on the first message: SessionStart already
+    # registers pipeline-state.json in watchPaths, and the FileChanged hook runs
+    # this validator.
+    if build_mode == "spq" and (state.get("version") == "3.0" or isinstance(specs, dict)):
+        problems.append(
+            "pipeline-state.json is on the retired v3.0 Multi-Spec layout but "
+            "build_mode is spq. Run migrate_spq_native.py: SPQ state moved to "
+            ".synaptory/.orchestrator/spq/ with native cycle/workstream identity"
+        )
+        return problems
+
+    # An SPQ pointer carries its identity under `spq`; validate what it names.
+    if build_mode == "spq" and isinstance(state.get("spq"), dict):
+        spq = state["spq"]
+        cycle_id = spq.get("cycle_id")
+        seq = spq.get("cycle_seq")
+        if cycle_id is not None:
+            try:
+                import spq_paths
+
+                spq_paths.valid_cycle_id(str(cycle_id))
+                if isinstance(seq, int) and spq_paths.seq_of(str(cycle_id)) != seq:
+                    problems.append(
+                        "spq.cycle_seq (%s) disagrees with spq.cycle_id (%s); the "
+                        "seq is the receipt-facing projection of the id, so a "
+                        "mismatch means CYCLE-{seq} receipts name a different "
+                        "Cycle than the storage does" % (seq, cycle_id)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                problems.append("spq.cycle_id %r is invalid: %s" % (cycle_id, exc))
+
+            # Once a Cycle exists, `pipeline-state.json` is intentionally only
+            # a mode + native identity pointer. Lifecycle fields and stories
+            # live in the selected execution-state.json and are validated by
+            # the SPQ state machine. Applying the legacy flat-state validator
+            # here makes every correctly hydrated Cycle look corrupt.
+            return problems
+
     if isinstance(specs, dict):
         # v3 multi-spec: active_spec must resolve to an existing slot.
         active = state.get("active_spec")
@@ -95,16 +138,33 @@ def validate_config_text(text: str) -> list[str]:
     more config-drift classes matter. An absent key is fine (defaults apply).
     """
     problems: list[str] = []
+    section = ""
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].rstrip()
-        if not line or line[0] in " \t":  # top-level keys only
+        if not line:
             continue
-        if line.startswith("build_mode:"):
-            val = line.split(":", 1)[1].strip().strip('"').strip("'").lower()
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent == 0:
+            section = stripped.split(":", 1)[0]
+        if indent == 0 and stripped.startswith("build_mode:"):
+            val = stripped.split(":", 1)[1].strip().strip('"').strip("'").lower()
             if val and val not in _KNOWN_BUILD_MODES:
                 problems.append(
                     f".synaptory.yaml: unknown build_mode {val!r} "
                     f"(valid: {', '.join(sorted(_KNOWN_BUILD_MODES))})"
+                )
+        if indent == 2 and section == "dod" and stripped.startswith("tier:"):
+            problems.append(
+                ".synaptory.yaml: 'dod.tier' is not a supported setting; use "
+                "'quality.dod_tier' so the state machine actually applies it"
+            )
+        if indent == 2 and section == "quality" and stripped.startswith("dod_tier:"):
+            val = stripped.split(":", 1)[1].strip().strip('"').strip("'").lower()
+            if val not in _KNOWN_DOD_TIERS:
+                problems.append(
+                    f".synaptory.yaml: unknown quality.dod_tier {val!r} "
+                    f"(valid: {', '.join(sorted(_KNOWN_DOD_TIERS))})"
                 )
     return problems
 

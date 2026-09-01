@@ -1,32 +1,32 @@
 # Commit State (SPQ)
 
 > **Lifecycle state:** `COMMIT`
-> **Clone:** integration clone (the delivery lead's), which owns the Slice number
+> **Clone:** integration clone (the delivery lead's), which owns the Cycle number
 > **Participants:** PO, QE, SA (if triggered), Orchestrator
-> **Output:** an open Slice: admitted Work Units in `queued`, distributed across workstreams, shared components published and pinned, QE Slice test spec, DoD tier announced
+> **Output:** an open Cycle: admitted Work Units in `queued`, distributed across workstreams, shared components published and pinned, QE Cycle test spec, DoD tier announced
 
-Commit opens a Slice by **admitting** Work Units. Each admitted unit must clear readiness (Definition of Ready) before any workstream starts Build.
+Commit opens a Cycle by **admitting** Work Units. Each admitted unit must clear readiness (Definition of Ready) before any workstream starts Build.
 
-**Sizing at Commit carries more weight than Sprint Planning does.** A sprint ends when the clock runs out; a Slice ends when its admitted Work Units are done, and a workstream that cannot make the barrier **cuts scope** rather than merging late. Over-admitting here does not produce a late Slice; it produces a Slice that reaches `SYNC` with units cut, or N-1 workstreams waiting on one. Mis-sizing surfaces at the barrier, where it is expensive; it is cheap to fix here.
+**Sizing at Commit carries more weight than Sprint Planning does.** A sprint ends when the clock runs out; a Cycle ends when its admitted Work Units are done, and a workstream that cannot make the barrier **cuts scope** rather than merging late. Over-admitting here does not produce a late Cycle; it produces a Cycle that reaches `SYNC` with units cut, or N-1 workstreams waiting on one. Mis-sizing surfaces at the barrier, where it is expensive; it is cheap to fix here.
 
 ---
 
 ## Step 0: Allocate N, and Read What the Last Checkpoint Learned
 
-**The Slice number has exactly one owner: this clone's state.** It is monotonic. The tracker's cycle is a mirror bound to it, never the source: a cycle renamed or renumbered in Linear cannot silently repoint a Slice.
+**The Cycle number has exactly one owner: this clone's state.** It is monotonic. The tracker's cycle is a mirror bound to it, never the source: a cycle renamed or renumbered in Linear cannot silently repoint a Cycle.
 
 ```bash
 STATE=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" read "$(pwd)")
-# SLICE_N = current_slice + 1
-# SLICES_COMPLETED = len(slices_completed)
+# CYCLE_N = current_cycle + 1
+# CYCLES_COMPLETED = len(cycles_completed)
 ```
 
-Fix `SLICE_N` **now**, before any dispatch: every receipt written during this state is keyed `SLICE-{N}`, and Step 8 passes the same number to `open_slice` explicitly rather than letting it default. Pass it explicitly so the receipts written earlier in this state cannot disagree with the number that was ultimately allocated.
+Fix `CYCLE_N` **now**, before any dispatch: every receipt written during this state is keyed `CYCLE-{N}`, and Step 8 passes the same number to `open_cycle` explicitly rather than letting it default. Pass it explicitly so the receipts written earlier in this state cannot disagree with the number that was ultimately allocated.
 
 **Read the MethodSignals harvested at the previous Checkpoint.** SPQ has no retro event, so process learning is recorded as signals at Checkpoint and read *here*. This is the loop that makes the exercise worth running:
 
 ```bash
-# MethodSignals: where the SPQ mapping chafed last Slice. A state that had to be
+# MethodSignals: where the SPQ mapping chafed last Cycle. A state that had to be
 # skipped, a barrier criterion routinely waived, vocabulary that confused agents,
 # an agent straddling two execution profiles.
 python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list method_signal
@@ -36,15 +36,15 @@ python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list method_signal
 python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list
 ```
 
-**Feed the hits into this Slice's plan, do not just log them.** A signal that is read and ignored every Slice is worse than no signal, because it makes the store look maintained. Concretely:
+**Feed the hits into this Cycle's plan, do not just log them.** A signal that is read and ignored every Cycle is worse than no signal, because it makes the store look maintained. Concretely:
 
-| Signal | What it should change in THIS Slice |
+| Signal | What it should change in THIS Cycle |
 |---|---|
 | A barrier criterion waived twice | Admit a Work Unit that fixes the proof script, or change the config deliberately and say why |
 | A shared path edited by a non-owner workstream | Either move it out of `shared_digest_paths` or admit a unit in the `shared_owner`'s set that makes the change properly |
 | A recurring gate failure (e.g. `ui_acceptance`) | An AC-clarity or test-infrastructure unit, not another retry |
-| One workstream cutting scope every Slice | Admit fewer units to it. This is the mis-sizing a scope-defined Slice predicts |
-| A profile straddle (`po` as Analyst *and* Planner in the same state) | Nothing this Slice; it is v2 feedback. Leave it recorded. |
+| One workstream cutting scope every Cycle | Admit fewer units to it. This is the mis-sizing a scope-defined Cycle predicts |
+| A profile straddle (`po` as Analyst *and* Planner in the same state) | Nothing this Cycle; it is v2 feedback. Leave it recorded. |
 
 ---
 
@@ -53,18 +53,18 @@ python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list
 **Lightweight** (stable backlog, no new feedback from the prior Checkpoint):
 - PO confirms pre-refined Work Units
 - Skip SA (unless triggers found)
-- Orchestrator presents the Slice for approval
+- Orchestrator presents the Cycle for approval
 - QE generates the test spec
 
 **Full** (new customer feedback, scope changes, MethodSignals demanding action, units cut at the last barrier):
 - PO performs deep refinement
 - SA architecture review if triggers found
 - New units created from Checkpoint feedback and from cut units returning to the backlog
-- Full Slice scope negotiation
+- Full Cycle scope negotiation
 
 **How to decide:**
-- Slice 1: always **Full**
-- Slice 2+: **Full** if the prior Slice had customer feedback captured, MethodSignals requiring action, units cut at `SYNC`, or a blocked barrier. Otherwise **Lightweight**.
+- Cycle 1: always **Full**
+- Cycle 2+: **Full** if the prior Cycle had customer feedback captured, MethodSignals requiring action, units cut at `SYNC`, or a blocked barrier. Otherwise **Lightweight**.
 
 ---
 
@@ -73,16 +73,16 @@ python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list
 ```bash
 TRACKER_CLI="python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir $(pwd)"
 
-# Current backlog, including units cut from the previous Slice (they returned here)
+# Current backlog, including units cut from the previous Cycle (they returned here)
 ${TRACKER_CLI} get-backlog
 ${TRACKER_CLI} query --status TO_DO
 ```
 
 Also read:
-- Prior Checkpoint's customer feedback (`.synaptory/.orchestrator/slice-feedback.md`, if it exists)
-- The previous Slice's barrier verdict: which criterion blocked, and how long it took
+- Prior Checkpoint's customer feedback (`.synaptory/.orchestrator/cycle-feedback.md`, if it exists)
+- The previous Cycle's barrier verdict: which criterion blocked, and how long it took
   ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" status "$(pwd)" {SLICE_N minus 1}
+  python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" status "$(pwd)" {CYCLE_N minus 1}
   ```
 - The workstream list and the shared surface:
   ```bash
@@ -99,23 +99,23 @@ Dispatch the Project Owner agent.
 PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the refinement inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO slice admission", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md` for the full prompt template. The PO writes its receipt to `.synaptory/.orchestrator/receipts/SLICE-{N}-po.json` as its last action, and **the prompt MUST instruct it to set `token_usage.stage` to `pro-brd`**, because this stage is not derivable from the role.
+> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the refinement inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO cycle admission", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md` for the full prompt template. The PO writes its receipt to `.synaptory/.orchestrator/receipts/CYCLE-{N}-po.json` as its last action, and **the prompt MUST instruct it to set `token_usage.stage` to `pro-brd`**, because this stage is not derivable from the role.
 
-**Why the stage must be stated.** `project-owner` is deliberately absent from the receipt validator's role→stage fallback map, because it spans three stages (`pro-discovery`, `pro-brd`, `pro-ux-spec`) and the validator cannot pick one. The prefix fallback omits `pro-` for the same reason. Omit the stage and the receipt still validates, the work still runs, and the PO's cost attribution for this Slice is lost silently. Discovery uses `pro-discovery`; Commit uses **`pro-brd`**.
+**Why the stage must be stated.** `project-owner` is deliberately absent from the receipt validator's role→stage fallback map, because it spans three stages (`pro-discovery`, `pro-brd`, `pro-ux-spec`) and the validator cannot pick one. The prefix fallback omits `pro-` for the same reason. Omit the stage and the receipt still validates, the work still runs, and the PO's cost attribution for this Cycle is lost silently. Discovery uses `pro-discovery`; Commit uses **`pro-brd`**.
 
 **PO prompt context:**
-- Slice number `{SLICE_N}` and the goal under consideration
+- Cycle number `{CYCLE_N}` and the goal under consideration
 - Prior Checkpoint feedback, and which units were cut at the last barrier (they are backlog again, not automatically re-admitted)
 - MethodSignals and cross-loop signals from Step 0
 - Current backlog
 - **The workstream list, and which workstream owns the shared paths**
-- Throughput from closed Slices (`slices_completed[].work_units_done`) for capacity
+- Throughput from closed Cycles (`cycles_completed[].work_units_done`) for capacity
 
 **PO output:**
 - Refined Work Units with detailed acceptance criteria (Given/When/Then)
-- Priority ordering and a proposed **Slice Goal**
+- Priority ordering and a proposed **Cycle Goal**
 - **A workstream assignment per unit.** Every admitted unit belongs to exactly one workstream
-- Capacity recommendation **per workstream**, not for the Slice as a whole. A Slice of 12 units means nothing if 9 land on one workstream; that workstream sets the barrier date for everybody.
+- Capacity recommendation **per workstream**, not for the Cycle as a whole. A Cycle of 12 units means nothing if 9 land on one workstream; that workstream sets the barrier date for everybody.
 - Per-unit `kind`, `labels`, `depends_on`, `file_scope`
 
 **Work Unit classification.** Every admitted unit carries three fields that feed the pipeline:
@@ -131,7 +131,7 @@ PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
   | `ui`, `frontend`, `design`, `ux`, `screen`, `page` | `ui` |
   | UI label **and** a backend/api label (or no label matches) | `mixed` |
 
-- **`depends_on`**: unit ids that must be `done` before this one can join a parallel dispatch batch. Record real sequencing constraints only. **A `depends_on` that crosses workstreams is a design smell worth flagging**: the dependency cannot be satisfied inside one clone, so it either serialises two workstreams for the whole Slice or resolves only at the barrier. Prefer a contract published by the `shared_owner` at this Commit over a cross-workstream unit dependency.
+- **`depends_on`**: unit ids that must satisfy their declared condition before this one can be dispatched **at all** — a hard gate on both the serial and the parallel path (#304), not a parallel-batch filter. An edge naming a unit that is not on this workstream's board fails closed until the Cycle manifest and dependency ledger resolve it (#303). Record real sequencing constraints only. A cross-workstream edge MUST name a verifiable condition (`contract_published`, `artifact_published`, or `integrated`) and the producer's declared output; a bare `done` claim is local-board state and does not safely unblock another clone unless the project explicitly opts into unverified events. For `integrated`, configure `spq.sync.integration_mode: incremental`; for contract/artifact publication, configure the shared digest script. The producer publishes an event and the consumer refreshes its ledger during Cycle Execution — the dependency does not wait silently until the final barrier.
 - **`file_scope`**: the glob/dir list the unit is expected to touch. Optional under worktree isolation; **required** for every batch member under `parallelism.isolation: shared`.
 
 **Definition of Ready (admission criteria).** A unit is **admitted** only when all of these hold. Present anything failing as "not ready" and leave it in the backlog rather than admitting it and hoping:
@@ -143,14 +143,14 @@ PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 | 3 | Exactly one workstream owns it |
 | 4 | **Shared-path impact is declared**: either the unit does not touch `shared_digest_paths`, or it belongs to the `shared_owner` workstream |
 | 5 | No `[DESIGN-PENDING]` tag outstanding (see below) |
-| 6 | It fits inside this Slice for its workstream. A unit that plainly cannot finish is not admitted, a scope-defined Slice has no "carry-over" concept to absorb it |
+| 6 | It fits inside this Cycle for its workstream. A unit that plainly cannot finish is not admitted, a scope-defined Cycle has no "carry-over" concept to absorb it |
 
-**Design-PENDING resolution (signal-gated).** For each proposed unit tagged `[DESIGN-PENDING]`, follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/design-grooming.md`:
+**Design-PENDING resolution (signal-gated).** For each proposed unit tagged `[DESIGN-PENDING]`, follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`:
 
-1. If a Slice design preview exists in `.synaptory/design/`, generate a scoped handoff bundle from the relevant prototype section
+1. If a Cycle design preview exists in `.synaptory/design/`, generate a scoped handoff bundle from the relevant prototype section
 2. Otherwise prompt the team to create a targeted prototype using the unit's ACs as the brief
 3. Store the bundle at `.synaptory/design/{unit-id}-design.md`
-4. Record `design_ref: .synaptory/design/{unit-id}-design.md` against the unit. `tracker_cli.py` has **no field-update verb**, so set it in the tracker UI, and carry it into the Slice orientation pack (Step 9) so every dispatch sees it
+4. Record `design_ref: .synaptory/design/{unit-id}-design.md` against the unit. `tracker_cli.py` has **no field-update verb**, so set it in the tracker UI, and carry it into the Cycle orientation pack (Step 9) so every dispatch sees it
 5. Remove the `[DESIGN-PENDING]` tag
 6. **Guard:** a unit still tagged `[DESIGN-PENDING]` must NOT be admitted (criterion 5 above).
 
@@ -160,13 +160,13 @@ The PO receipt looks like this (`model` and `token_usage` come from the agent's 
 
 ```json
 {
-  "story_id": "SLICE-3",
+  "story_id": "CYCLE-3",
   "role": "project-owner",
   "backend": "claude",
   "model": "claude-opus-4-8",
-  "artifacts": [".synaptory/.orchestrator/slice-3-admission.md"],
+  "artifacts": [".synaptory/.orchestrator/cycle-3-admission.md"],
   "metrics": {"work_units_admitted": 11, "work_units_deferred": 4, "workstreams": 3},
-  "verification_commands": ["test -s .synaptory/.orchestrator/slice-3-admission.md"],
+  "verification_commands": ["test -s .synaptory/.orchestrator/cycle-3-admission.md"],
   "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "pro-brd"},
   "completed_at": "2026-08-10T00:00:00Z"
 }
@@ -176,7 +176,7 @@ The PO receipt looks like this (`model` and `token_usage` come from the agent's 
 
 ## Step 3: SA Architecture Review (Conditional)
 
-Follow the SA Auto-Detect Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/sa-triggers.md`.
+Follow the SA Auto-Detect Protocol at `.synaptory/.protocols/sa-triggers.md`.
 
 For each proposed Work Unit:
 1. Scan the unit text for architecture trigger signals
@@ -186,20 +186,20 @@ For each proposed Work Unit:
 Also run the periodic health check:
 ```
 Read .synaptory.yaml → architecture.health_check_interval (default: 3)
-If SLICE_N % health_check_interval == 0:
+If CYCLE_N % health_check_interval == 0:
   Dispatch the SA for an architecture health check regardless of triggers
 ```
 
 **Two SPQ-specific triggers, in addition to the protocol's list.** Both are about the shared surface, which is where parallel workstreams collide:
 
-- **Any change to `shared_digest_paths` this Slice.** A contract or design-system change is by definition N-workstream-visible, so it gets architectural review before it is published, not after the barrier reports a digest delta.
-- **The previous Slice's barrier blocked on criterion 4** (digests did not match). Something outside the intended ownership model moved a shared path; the SA decides whether the shared surface is drawn in the wrong place, which is a design question rather than a discipline problem.
+- **Any change to `shared_digest_paths` this Cycle.** A contract or design-system change is by definition N-workstream-visible, so it gets architectural review before it is published, not after the barrier reports a digest delta.
+- **The previous Cycle's barrier blocked on criterion 4** (digests did not match). Something outside the intended ownership model moved a shared path; the SA decides whether the shared surface is drawn in the wrong place, which is a design question rather than a discipline problem.
 
 ```
 SA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "solution-architect")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="SA slice architecture review", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/SLICE-{N}-sa.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="SA cycle architecture review", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/CYCLE-{N}-sa.json` as its last action.
 
 ---
 
@@ -207,14 +207,14 @@ SA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 
 Two needs pull in opposite directions: branch integration is inherently *after* the workstreams build, but shared components have to be settled *before* they build, or drift surfaces at merge time, the expensive moment. Commit resolves it:
 
-1. **Here at Commit**, the workstream flagged `shared_owner: true` publishes the contract and design-system version for this Slice.
+1. **Here at Commit**, the workstream flagged `shared_owner: true` publishes the contract and design-system version for this Cycle.
 2. **At `SYNC`**, barrier criterion 4 catches drift by digest comparison.
-3. Anything a workstream *needed* to change in a shared component becomes an input to the shared owner's **next** Commit, never a mid-Slice edit.
+3. Anything a workstream *needed* to change in a shared component becomes an input to the shared owner's **next** Commit, never a mid-Cycle edit.
 
 **Publish, then pin:**
 
 ```bash
-# The shared owner lands the Slice's contract + design-system version on its branch
+# The shared owner lands the Cycle's contract + design-system version on its branch
 # FIRST (a normal Work Unit with a normal SE/QE cycle, admitted in Step 2: the
 # publish is work, not an announcement).
 #
@@ -223,33 +223,33 @@ Two needs pull in opposite directions: branch integration is inherently *after* 
 bash scripts/shared-digest.sh contracts/
 ```
 
-Record the emitted digests in the Slice orientation pack (Step 9) as the pinned baseline for this Slice, one line per shared path. A digest reading `error:no-tracked-files` means a `shared_digest_paths` entry is typo'd or its content was deleted, fix it now. It is a silent barrier bypass: both sides then agree on "nothing", and criterion 4 passes vacuously on a shared component that dropped out of governance.
+Record the emitted digests in the Cycle orientation pack (Step 9) as the pinned baseline for this Cycle, one line per shared path. A digest reading `error:no-tracked-files` means a `shared_digest_paths` entry is typo'd or its content was deleted, fix it now. It is a silent barrier bypass: both sides then agree on "nothing", and criterion 4 passes vacuously on a shared component that dropped out of governance.
 
 ### The protection here is prompt-level, and you must not overstate it
 
-**State `shared_digest_paths` as ask-first in every `se` dispatch prompt** for this Slice. Exact wording to include:
+**State `shared_digest_paths` as ask-first in every `se` dispatch prompt** for this Cycle. Exact wording to include:
 
-> The paths `{shared_digest_paths}` are owned by the `{shared_owner}` workstream for Slice `{N}` and are pinned at digest `{digest}`. Do **not** edit them. If this Work Unit needs a change there, stop and report it. It becomes an input to the next Commit, not a change you make now.
+> The paths `{shared_digest_paths}` are owned by the `{shared_owner}` workstream for Cycle `{N}` and are pinned at digest `{digest}`. Do **not** edit them. If this Work Unit needs a change there, stop and report it. It becomes an input to the next Commit, not a change you make now.
 
 **No code enforces this.** The `sprint.protected_modules` config key is read in exactly one place (`modes/story-buddy.md`) and is not on the execution path, it does not gate any SE dispatch. The deterministic boundary guard covers `.synaptory/tracker/`, `pipeline-state.json` and `.synaptory/sync/` only. So:
 
 - Do **not** tell the user that `protected_modules` protects the shared surface. It does not.
 - The real detection is after the fact, at `SYNC` criterion 4.
-- If the first Slice shows drift, that is the signal to escalate to a deterministic guard rather than a stronger prompt. Record it as a MethodSignal at Checkpoint.
+- If the first Cycle shows drift, that is the signal to escalate to a deterministic guard rather than a stronger prompt. Record it as a MethodSignal at Checkpoint.
 
 ---
 
-## Step 5: Team Approves the Slice Scope
+## Step 5: Team Approves the Cycle Scope
 
-Present the admitted set for confirmation. **Show it per workstream**, because a Slice-level total hides the imbalance that decides the barrier date:
+Present the admitted set for confirmation. **Show it per workstream**, because a Cycle-level total hides the imbalance that decides the barrier date:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  SLICE {N}, COMMIT
+  CYCLE {N}, COMMIT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Slice Goal:  {PO_PROPOSED_GOAL}
-  Throughput:  {AVG} units/slice over {M} closed Slices
+  Cycle Goal:  {PO_PROPOSED_GOAL}
+  Throughput:  {AVG} units/cycle over {M} closed Cycles
   Shared:      contracts/ @ {digest[:12]}, owned by {shared_owner}
 
   Admitted Work Units:
@@ -271,17 +271,17 @@ Present the admitted set for confirmation. **Show it per workstream**, because a
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Options:
-  1. Approve the Slice (Recommended)
+  1. Approve the Cycle (Recommended)
   2. Add Work Units
   3. Remove Work Units
   4. Rebalance across workstreams
-  5. Adjust the Slice Goal
+  5. Adjust the Cycle Goal
   6. Chat about this
 ```
 
-**Call out an imbalance explicitly** when the busiest workstream carries more than roughly twice the lightest one's load: under `all_or_nothing`, the Slice clears when the *last* workstream is ready, so the others will idle at the barrier. Offer option 4 rather than waiting for `SYNC` to reveal it.
+**Call out an imbalance explicitly** when the busiest workstream carries more than roughly twice the lightest one's load: under `all_or_nothing`, the Cycle clears when the *last* workstream is ready, so the others will idle at the barrier. Offer option 4 rather than waiting for `SYNC` to reveal it.
 
-**The user has final authority over Slice scope.** They may admit something you flagged as not ready, record the override in the admission notes so the next Commit's signals show where it came from.
+**The user has final authority over Cycle scope.** They may admit something you flagged as not ready, record the override in the admission notes so the next Commit's signals show where it came from.
 
 ---
 
@@ -297,8 +297,8 @@ The DoD tier must be an **announced decision**, not a silent promotion the team 
 
 2. **Present it:**
    ```
-   ━━━ Slice {N} DoD Tier ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-     This Slice's DoD tier is {TIER}, requiring:
+   ━━━ Cycle {N} DoD Tier ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     This Cycle's DoD tier is {TIER}, requiring:
        {active_base_checks, one per line}
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    ```
@@ -315,15 +315,15 @@ The DoD tier must be an **announced decision**, not a silent promotion the team 
 
 ---
 
-## Step 6: QE Slice Test Specification
+## Step 6: QE Cycle Test Specification
 
-Dispatch the Quality Engineer agent for this Slice's units only.
+Dispatch the Quality Engineer agent for this Cycle's units only.
 
 ```
 QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the test-spec work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE slice test specification", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/SLICE-{N}-qe.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the test-spec work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE cycle test specification", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/CYCLE-{N}-qe.json` as its last action.
 
 **QE prompt context:**
 - The admitted units (ids, titles, ACs) **grouped by workstream**
@@ -331,36 +331,36 @@ QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backe
 - The pinned shared digest, contract tests assert against the pinned version, not against whatever is on a workstream branch
 
 **QE output:**
-- A test specification per unit AC, written to `.synaptory/.orchestrator/test-specification-slice-{N}.md`
+- A test specification per unit AC, written to `.synaptory/.orchestrator/test-specification-cycle-{N}.md`
 - **The layer split, stated per workstream:** which assertions run in the workstream's own pre-declare regression versus which belong in `scripts/sync-regression.sh` at the barrier. Cross-workstream assertions are only *runnable* on the integrated tree, so putting them in a workstream suite means they either fail there permanently or get skipped, and a skipped cross-workstream assertion is exactly the class of defect the barrier exists to catch.
-- **This Slice's journey**, if the increment changes the primary user path. `scripts/sync-journey.sh` executes it at criterion 5, and a journey that still asserts the previous Slice's flow passes while proving nothing.
+- **This Cycle's journey**, if the increment changes the primary user path. `scripts/sync-journey.sh` executes it at criterion 5, and a journey that still asserts the previous Cycle's flow passes while proving nothing.
 
 ---
 
 ## Step 7: Bind the Tracker Cycle
 
-A Slice **is** a tracker cycle (a Linear Cycle / Jira sprint / GitHub milestone). Requires `tracker.linear.manage_cycles: true`: it defaults to `false`, and without it the cycle is never created and each workstream's `get-sprint-backlog` returns nothing.
+A Cycle **is** a tracker cycle (a Linear Cycle / Jira sprint / GitHub milestone). Requires `tracker.linear.manage_cycles: true`: it defaults to `false`, and without it the cycle is never created and each workstream's `get-sprint-backlog` returns nothing.
 
 ```bash
 ${TRACKER_CLI} health-check
 
-# The tracker's cycle/sprint verbs are the SAME ones scrum uses. A Slice maps onto
+# The tracker's cycle/sprint verbs are the SAME ones scrum uses. A Cycle maps onto
 # the existing sprint interface, and SPQ adds no adapter surface.
 ${TRACKER_CLI} list-sprints
-echo '{"number":{SLICE_N},"goal":"{SLICE_GOAL}"}' | ${TRACKER_CLI} create-sprint
+echo '{"number":{CYCLE_N},"goal":"{CYCLE_GOAL}"}' | ${TRACKER_CLI} create-sprint
 ```
 
 Then write the admitted units into that cycle, each tagged with its workstream's discriminator (label or Linear project) so every clone can filter its own subset out of the shared cycle.
 
-The binding is recorded in this clone's state by `open_slice --tracker-cycle` in Step 8. Record it even when the cycle number happens to equal `N`: the point is that a cycle renamed or renumbered later cannot silently repoint the Slice, and the tracker stays a **mirror, never the source of truth**.
+The binding is recorded in this clone's state by `open_cycle --tracker-cycle` in Step 8. Record it even when the cycle number happens to equal `N`: the point is that a cycle renamed or renumbered later cannot silently repoint the Cycle, and the tracker stays a **mirror, never the source of truth**.
 
 ---
 
-## Step 8: Open the Slice
+## Step 8: Open the Cycle
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" open_slice "$(pwd)" {SLICE_N} \
-  --goal "{SLICE_GOAL}" \
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" open_cycle "$(pwd)" {CYCLE_N} \
+  --goal "{CYCLE_GOAL}" \
   --tracker-cycle {CYCLE_NUMBER} \
   --work-units '[
     {"id":"US-042","title":"User login with MFA",
@@ -376,31 +376,31 @@ python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" open_slice "$(pwd
 
 Notes that cost quality if skipped:
 
-- **Pass `{SLICE_N}` explicitly.** `open_slice` defaults to `current_slice + 1`, which is normally the same number, but the receipts written in Steps 2, 3 and 6 already committed to `SLICE-{N}`. An explicit argument makes a mismatch an error instead of a silent split across two ids. `open_slice` refuses a non-monotonic number outright.
+- **Pass `{CYCLE_N}` explicitly.** `open_cycle` defaults to `current_cycle + 1`, which is normally the same number, but the receipts written in Steps 2, 3 and 6 already committed to `CYCLE-{N}`. An explicit argument makes a mismatch an error instead of a silent split across two ids. `open_cycle` refuses a non-monotonic number outright.
 - **Always include `acceptance_criteria`.** They are snapshotted onto the unit record and drive the `ui_acceptance` DoD gate: a unit whose ACs describe a user-facing screen is auto-routed to SE `frontend` + QE `browser-qa` and cannot reach `done` without UI verification. Omitting the ACs disables that protection for the unit.
-- **Carry `kind`, `labels`, `depends_on`, `file_scope`.** Snapshotted at intake: `kind` suppresses the ui_bearing heuristic for `enabler`/`infra`/`backend` and selects the verification tier; `depends_on` + `file_scope` gate parallel-dispatch batch membership.
+- **Carry `kind`, `labels`, `depends_on`, `file_scope`.** Snapshotted at intake: `kind` suppresses the ui_bearing heuristic for `enabler`/`infra`/`backend` and selects the verification tier; `depends_on` gates dispatch outright on both paths (#304) and, with `file_scope`, parallel-batch membership.
 - **Put the workstream discriminator in `labels`** (e.g. `ws:frame`). It is how each clone filters its own admitted subset out of the shared cycle, and how per-workstream reporting reconciles against the tracker.
 
-`open_slice` creates the unit records in `queued`, records the tracker binding, clears any previous barrier verdict, and transitions the lifecycle to **`SLICE_EXECUTION`**.
+`open_cycle` creates the unit records in `queued`, records the tracker binding, clears any previous barrier verdict, and transitions the lifecycle to **`CYCLE_EXECUTION`**.
 
 ---
 
-## Step 9: Generate the Slice Orientation Pack
+## Step 9: Generate the Cycle Orientation Pack
 
-Write `.synaptory/.orchestrator/slice-context.md`: the **single onboarding digest every dispatched agent reads FIRST, instead of re-reading the BRD/ADRs/mockups from scratch**. The Orchestrator writes it inline (no agent dispatch), regenerated at **every** Commit so it never goes stale. Target ~2-4k tokens.
+Write `.synaptory/.orchestrator/cycle-context.md`: the **single onboarding digest every dispatched agent reads FIRST, instead of re-reading the BRD/ADRs/mockups from scratch**. The Orchestrator writes it inline (no agent dispatch), regenerated at **every** Commit so it never goes stale. Target ~2-4k tokens.
 
 ```markdown
-<!-- generated_at: {ISO-8601} | slice: {N} | git: {HEAD short SHA} -->
-# Slice {N} Orientation
+<!-- generated_at: {ISO-8601} | cycle: {N} | git: {HEAD short SHA} -->
+# Cycle {N} Orientation
 
-## Slice Goal & Work Units
+## Cycle Goal & Work Units
 {goal, then a table: id | title | workstream | kind | depends_on | verification tier}
 
 ## Workstreams & Ownership
-{table: workstream id | branch | SYNAPTORY_ACTIVE_SPEC value | shared_owner? |
+{table: workstream id | manifest branch | native workstream pin | shared_owner? |
  tracker discriminator}
 
-## Shared Components (PINNED for this Slice)
+## Shared Components (PINNED for this Cycle)
 {one line per shared_digest_paths entry: path | pinned digest | owning workstream}
 {followed VERBATIM by: "Do not edit these paths. A needed change is an input to
  the next Commit, reported, not made."}
@@ -411,7 +411,7 @@ Write `.synaptory/.orchestrator/slice-context.md`: the **single onboarding diges
  blocks, an agent cannot assert readiness by writing a file}
 
 ## Product & Architecture Digest
-{the decisions and constraints that bind THIS Slice's units; cite the source doc
+{the decisions and constraints that bind THIS Cycle's units; cite the source doc
  path next to each item so an agent can open it when the digest flags a gap}
 
 ## Commands
@@ -425,20 +425,20 @@ Write `.synaptory/.orchestrator/slice-context.md`: the **single onboarding diges
 {naming, error handling, test framework/patterns, styling}
 
 ## What Already Exists
-{features/endpoints/screens delivered in prior Slices, so agents extend instead
+{features/endpoints/screens delivered in prior Cycles, so agents extend instead
  of re-implementing}
 ```
 
-Dispatch prompts list this file right after `.synaptory.yaml` (see `skills/_shared/backends/claude.md`); agents open a full source doc only when the digest flags a gap or their unit cites it. Keep it honest, a wrong command, a stale file map, or a stale pinned digest costs every dispatch in the Slice.
+Dispatch prompts list this file right after `.synaptory.yaml` (see `skills/_shared/backends/claude.md`); agents open a full source doc only when the digest flags a gap or their unit cites it. Keep it honest, a wrong command, a stale file map, or a stale pinned digest costs every dispatch in the Cycle.
 
 Print:
 ```
-✓ Slice {N} opened, {M} Work Units admitted across {K} workstreams
-  Goal: {SLICE_GOAL}
+✓ Cycle {N} opened, {M} Work Units admitted across {K} workstreams
+  Goal: {CYCLE_GOAL}
   DoD tier: {TIER} ({active checks})
   Shared: {path} @ {digest[:12]} (owner: {shared_owner})
-  Orientation pack: .synaptory/.orchestrator/slice-context.md
-  Proceeding to Slice Execution, each workstream drives its own clone.
+  Orientation pack: .synaptory/.orchestrator/cycle-context.md
+  Proceeding to Cycle Execution, each workstream drives its own clone.
 ```
 
-Then hand off: each workstream clone loads `modes/spq.md` → `SLICE_EXECUTION` and drives its own `next_action` loop until it returns `await_sync`. The integration clone waits at the barrier; it does not dispatch Work Units.
+Then hand off: each workstream clone loads `modes/spq.md` → `CYCLE_EXECUTION` and drives its own `next_action` loop until it returns `await_sync`. The integration clone waits at the barrier; it does not dispatch Work Units.

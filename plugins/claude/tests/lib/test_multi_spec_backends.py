@@ -64,20 +64,20 @@ def test_github_multi_spec_yaml_parses(tmp_path: Path) -> None:
             tracker:
               backend: github
               github:
-                repo: h3tech-ai/synaptory
+                repo: h3tech-ai/synaptory-v1
 
             specs:
               - id: platform
                 name: Platform
                 github:
-                  repo: h3tech-ai/synaptory
+                  repo: h3tech-ai/synaptory-v1
                   filter:
                     type: label
                     value: platform
               - id: contract-mastery
                 name: CM
                 github:
-                  repo: h3tech-ai/synaptory
+                  repo: h3tech-ai/synaptory-v1
                   filter:
                     type: milestone
                     value: CM-2026Q1
@@ -88,7 +88,7 @@ def test_github_multi_spec_yaml_parses(tmp_path: Path) -> None:
     cfg = TrackerConfig.load(tmp_path)
     assert cfg.is_multispec()
     assert cfg.specs[0].backend() == "github"
-    assert cfg.specs[0].github.repo == "h3tech-ai/synaptory"
+    assert cfg.specs[0].github.repo == "h3tech-ai/synaptory-v1"
     assert cfg.specs[0].filter.type == "label"
     assert cfg.specs[1].filter.type == "milestone"
     assert cfg.specs[1].filter.value == "CM-2026Q1"
@@ -97,10 +97,10 @@ def test_github_multi_spec_yaml_parses(tmp_path: Path) -> None:
 def _gh_adapter(spec_type: str, value: str, tmp_path: Path = Path("/tmp")) -> GitHubAdapter:
     sp = SpecConfig(
         id="platform", name="P",
-        github=GitHubSpecBinding(repo="h3tech-ai/synaptory"),
+        github=GitHubSpecBinding(repo="h3tech-ai/synaptory-v1"),
         filter=SpecFilter(type=spec_type, value=value),
     )
-    cfg = TrackerConfig(backend="github", github=GitHubConfig(repo="h3tech-ai/synaptory"))
+    cfg = TrackerConfig(backend="github", github=GitHubConfig(repo="h3tech-ai/synaptory-v1"))
     return GitHubAdapter(tmp_path, cfg, spec=sp)
 
 
@@ -134,12 +134,12 @@ def test_github_milestone_filter_search_fragment_and_writes(tmp_path: Path) -> N
 
 
 def test_github_per_spec_cache_paths(tmp_path: Path) -> None:
-    cfg = TrackerConfig(backend="github", github=GitHubConfig(repo="h3tech-ai/synaptory"))
+    cfg = TrackerConfig(backend="github", github=GitHubConfig(repo="h3tech-ai/synaptory-v1"))
     sp_a = SpecConfig(id="platform", name="P",
-                      github=GitHubSpecBinding(repo="h3tech-ai/synaptory"),
+                      github=GitHubSpecBinding(repo="h3tech-ai/synaptory-v1"),
                       filter=SpecFilter(type="label", value="platform"))
     sp_b = SpecConfig(id="cm", name="CM",
-                      github=GitHubSpecBinding(repo="h3tech-ai/synaptory"),
+                      github=GitHubSpecBinding(repo="h3tech-ai/synaptory-v1"),
                       filter=SpecFilter(type="label", value="cm"))
     ad_a = GitHubAdapter(tmp_path, cfg, spec=sp_a)
     ad_b = GitHubAdapter(tmp_path, cfg, spec=sp_b)
@@ -152,7 +152,7 @@ def test_github_per_spec_cache_paths(tmp_path: Path) -> None:
 
 
 def test_github_legacy_adapter_no_spec_filter(tmp_path: Path) -> None:
-    cfg = TrackerConfig(backend="github", github=GitHubConfig(repo="h3tech-ai/synaptory"))
+    cfg = TrackerConfig(backend="github", github=GitHubConfig(repo="h3tech-ai/synaptory-v1"))
     ad = GitHubAdapter(tmp_path, cfg)
     assert ad.spec is None
     assert ad._spec_search_fragment() == ""
@@ -582,7 +582,7 @@ def test_github_mixed_mode_rejected(tmp_path: Path) -> None:
               - id: platform
                 name: P
                 github:
-                  repo: h3tech-ai/synaptory
+                  repo: h3tech-ai/synaptory-v1
                   filter:
                     type: label
                     value: platform
@@ -631,7 +631,7 @@ def test_github_config_parses_issue_type_and_status_map(tmp_path: Path) -> None:
             tracker:
               backend: github
               github:
-                repo: h3tech-ai/synaptory
+                repo: h3tech-ai/synaptory-v1
                 issue_type:
                   story: Deliverable
                   epic: Initiative
@@ -659,12 +659,12 @@ def test_github_spec_binding_parses_overrides(tmp_path: Path) -> None:
             tracker:
               backend: github
               github:
-                repo: h3tech-ai/synaptory
+                repo: h3tech-ai/synaptory-v1
             specs:
               - id: platform
                 name: P
                 github:
-                  repo: h3tech-ai/synaptory
+                  repo: h3tech-ai/synaptory-v1
                   issue_type: Deliverable
                   status_map:
                     blocked: "stuck"
@@ -744,7 +744,7 @@ def _gh_override_adapter(issue_types: dict | None = None,
                          status_map: dict | None = None,
                          tmp_path: Path = Path("/tmp")) -> GitHubAdapter:
     cfg = TrackerConfig(backend="github", github=GitHubConfig(
-        repo="h3tech-ai/synaptory",
+        repo="h3tech-ai/synaptory-v1",
         issue_type_overrides=issue_types or {},
         status_map=status_map or {},
     ))

@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""The only place SPQ storage paths and identities are spelled.
+
+SPQ used to borrow Multi-Spec: `SYNAPTORY_ACTIVE_SPEC` *was* the workstream id,
+and Cycle state *was* a `specs.<workstream>` slot. #303/#304/#305 require that
+to stop, and it can stop cleanly because SPQ never actually read across spec
+slots -- per `docs/spq-lifecycle-design.md` §5 each workstream owns its own
+clone with its own gitignored `pipeline-state.json`, and the barrier reads
+readiness from git. The integration clone's N slots were decorative.
+
+Three identities, each with distinct semantics, none encoded through a
+specification identifier:
+
+    cycle_id        the committed increment, collision-safe across clones
+    workstream_id   the durable ownership lane inside that Cycle
+    runner_id       ephemeral attribution for a human/box, advisory only
+
+`source_spec_refs[]` is product traceability and lives on the manifest. It must
+never select state, a cache, a receipt directory or a command -- enforced by
+`test_source_spec_refs_never_reach_a_path`, because "documentation says so" is
+not an invariant.
+
+Layout, all under the gitignored orchestrator dir:
+
+    .synaptory/.orchestrator/spq/
+      index.json                        cycle_seq_high, current_cycle_id, cycles[]
+      workstream                        pin file: this checkout's workstream_id
+      cycles/<cycle-id>/
+        manifest.json                   sealed 0o444 (#303)
+        dependency-ledger.json          local cache, rebuildable from git (#304)
+        workstreams/<ws>/
+          projection.json               the validated hydration input
+          execution-state.json          lifecycle, current_stories, logs
+          receipts/
+          tracker-data.json
+        receipts/                       cycle-level pseudo-unit receipts
+
+Python 3.9 compatible: this file is projected into every host package. Kept
+import-light on purpose -- `story_pipeline._resolve_receipts_dir` is on a hot
+path and calls in here.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
+SPQ_RELDIR = os.path.join(".synaptory", ".orchestrator", "spq")
+COMMITTED_RELDIR = os.path.join(".synaptory", "cycles")
+# The Coordination Cycle transport (#305). A SIBLING of `cycles/` for the same
+# reason `cycles/` is a sibling of `sync/`: different scope, different lifetime.
+# A parent pins child increments by (cycle_id, manifest_hash, selected_sha) and
+# its events cross Cycle boundaries, so it cannot live under any one child.
+COMMITTED_COORDINATION_RELDIR = os.path.join(".synaptory", "coordination-cycles")
+
+# `<seq>-<8 hex>`: the seq stays human- and receipt-facing, the hash makes two
+# clones that independently open "Cycle 7" produce different identities. Charset
+# is safe both as a path segment and as a git ref component.
+CYCLE_ID_RE = re.compile(r"^[0-9]+-[0-9a-f]{8}$")
+# `cc-<seq>-<8 hex>`: the SAME shape as a Cycle id with a namespace prefix, so a
+# human reading a git ref can tell parent from child -- and so the two
+# namespaces are PROVABLY disjoint. That disjointness is load-bearing, not
+# cosmetic: `valid_cycle_id` is called on the way into `resolve_identity`,
+# `seq_of`, `cycle_root`, `committed_cycle_dir`, `workstream_branch` and
+# `integration_branch`, so a coordination id that leaked into `index.json` or
+# the state pointer would make every subsequent `read_state`, `next_action` and
+# hook in that clone raise. Reciprocal negative tests assert each rejects the
+# other's format.
+COORDINATION_ID_RE = re.compile(r"^cc-[0-9]+-[0-9a-f]{8}$")
+
+WORKSTREAM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+RUNNER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+ENV_WORKSTREAM = "SYNAPTORY_WORKSTREAM"
+ENV_CYCLE_ID = "SYNAPTORY_CYCLE_ID"
+ENV_RUNNER = "SYNAPTORY_RUNNER_ID"
+ENV_COORDINATION = "SYNAPTORY_COORDINATION_CYCLE_ID"
+
+# Deliberately named so a grep for it finds this comment: SPQ IGNORES it, even
+# when set. It remains the Scrum/Kanban Multi-Spec identity, and an SPQ clone
+# with a stale export must not silently pick it up as a workstream.
+_MULTISPEC_ENV_IGNORED = "SYNAPTORY_ACTIVE_SPEC"
+
+
+class IdentityError(ValueError):
+    """An SPQ identity is missing, malformed, or unresolvable."""
+
+
+# ── validation ──────────────────────────────────────────────────────────────
+
+
+def _validate(kind: str, value: str, pattern: "re.Pattern[str]") -> str:
+    """Validate an id BEFORE it becomes a path segment.
+
+    Same posture as `worktree_manager._validate_story_id`: traversal,
+    absolute paths and empties are rejected at the identity layer so no
+    downstream join has to defend itself.
+    """
+    if not isinstance(value, str) or not value:
+        raise IdentityError("%s is required" % kind)
+    if not pattern.match(value):
+        raise IdentityError(
+            "invalid %s %r: expected %s" % (kind, value, pattern.pattern)
+        )
+    return value
+
+
+def valid_cycle_id(value: str) -> str:
+    return _validate("cycle_id", value, CYCLE_ID_RE)
+
+
+def valid_workstream_id(value: str) -> str:
+    return _validate("workstream_id", value, WORKSTREAM_ID_RE)
+
+
+def valid_coordination_cycle_id(value: str) -> str:
+    return _validate("coordination_cycle_id", value, COORDINATION_ID_RE)
+
+
+def new_cycle_id(
+    seq: int,
+    *,
+    baseline_sha: str = "",
+    goal: str = "",
+    created_at: str = "",
+    project_slug: str = "",
+) -> str:
+    """Allocate a collision-safe Cycle identity for sequence `seq`.
+
+    `seq` is allocated by the OPENING clone, which is always the integration
+    clone, so design §8.3's "cycle numbering has one owner" is preserved
+    unchanged. The hash suffix is what lets #305 reference exact child
+    identities across clones running at different cadences.
+    """
+    if not isinstance(seq, int) or seq < 0:
+        raise IdentityError("cycle sequence must be a non-negative int")
+    material = "|".join(
+        [project_slug, str(seq), baseline_sha, goal, created_at, uuid.uuid4().hex]
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
+    return "%d-%s" % (seq, digest)
+
+
+def seq_of(cycle_id: str) -> int:
+    """The receipt-facing projection of a Cycle identity.
+
+    `receipt_validator` enforces `^[A-Z][A-Z0-9]*-\\d+$`, so `CYCLE-7-9f2c1ab3`
+    is not a legal receipt id. Receipt ids therefore stay `CYCLE-{seq}` /
+    `SYNC-{seq}` / `CHECKPOINT-{seq}` / `ACCEPTANCE-{seq}` and the manifest
+    records both halves so the mapping is auditable.
+
+    Accepted, documented cost: receipt ids are not globally unique if two clones
+    both open a Cycle 7. They never were, `GateEvent.target_id` carries no
+    foreign key, and the manifest hash is the disambiguator in the audit trail.
+    """
+    valid_cycle_id(cycle_id)
+    return int(cycle_id.split("-", 1)[0])
+
+
+def default_runner_id() -> str:
+    """Best-effort `host-user`, reduced to the safe charset. Advisory only."""
+    import getpass
+    import socket
+
+    try:
+        host = socket.gethostname().split(".")[0]
+    except OSError:
+        host = "host"
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no passwd entry in some containers
+        user = "user"
+    raw = ("%s-%s" % (host, user)).lower()
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", raw).strip("-._")[:64]
+    return cleaned or "runner"
+
+
+# ── paths ───────────────────────────────────────────────────────────────────
+
+
+def spq_root(project_dir: str) -> str:
+    return os.path.join(str(project_dir), SPQ_RELDIR)
+
+
+def index_path(project_dir: str) -> str:
+    return os.path.join(spq_root(project_dir), "index.json")
+
+
+def pin_path(project_dir: str) -> str:
+    """One-line file naming this checkout's workstream. Written by hydration.
+
+    A file rather than an env var because a clone's workstream is a property of
+    the checkout, and an env var has to be re-exported in every shell -- which
+    is precisely how `SYNAPTORY_ACTIVE_SPEC` came to be forgotten and receipts
+    shipped unattributed.
+    """
+    return os.path.join(spq_root(project_dir), "workstream")
+
+
+def cycle_root(project_dir: str, cycle_id: str) -> str:
+    return os.path.join(spq_root(project_dir), "cycles", valid_cycle_id(cycle_id))
+
+
+def manifest_path(project_dir: str, cycle_id: str) -> str:
+    return os.path.join(cycle_root(project_dir, cycle_id), "manifest.json")
+
+
+def ledger_path(project_dir: str, cycle_id: str) -> str:
+    return os.path.join(cycle_root(project_dir, cycle_id), "dependency-ledger.json")
+
+
+def workstream_root(project_dir: str, cycle_id: str, workstream_id: str) -> str:
+    return os.path.join(
+        cycle_root(project_dir, cycle_id),
+        "workstreams",
+        valid_workstream_id(workstream_id),
+    )
+
+
+def projection_path(project_dir: str, cycle_id: str, workstream_id: str) -> str:
+    return os.path.join(
+        workstream_root(project_dir, cycle_id, workstream_id), "projection.json"
+    )
+
+
+def execution_state_path(project_dir: str, cycle_id: str, workstream_id: str) -> str:
+    return os.path.join(
+        workstream_root(project_dir, cycle_id, workstream_id), "execution-state.json"
+    )
+
+
+def lock_for(path: str) -> str:
+    return path + ".lock"
+
+
+def receipts_dir(
+    project_dir: str,
+    *,
+    cycle_id: Optional[str] = None,
+    workstream_id: Optional[str] = None,
+) -> str:
+    """Where SPQ receipts live.
+
+    Work-Unit receipts are per workstream; the cycle-level pseudo-unit receipts
+    (`CYCLE-{seq}`, `SYNC-{seq}-barrier`, `CHECKPOINT-{seq}-tw`) belong to the
+    Cycle, not to any one workstream, so they sit one level up.
+    """
+    if not cycle_id:
+        raise IdentityError("cycle_id is required to resolve an SPQ receipts dir")
+    if workstream_id:
+        return os.path.join(
+            workstream_root(project_dir, cycle_id, workstream_id), "receipts"
+        )
+    return os.path.join(cycle_root(project_dir, cycle_id), "receipts")
+
+
+def tracker_data_path(project_dir: str, cycle_id: str, workstream_id: str) -> str:
+    return os.path.join(
+        workstream_root(project_dir, cycle_id, workstream_id), "tracker-data.json"
+    )
+
+
+# ── the committed cross-clone transport (#303) ──────────────────────────────
+
+
+def committed_cycle_dir(project_dir: str, cycle_id: str) -> str:
+    """`.synaptory/cycles/<cycle-id>/` — git-tracked, unlike the store above.
+
+    A sibling of `.synaptory/sync/` rather than a tenant of it. `sync/` is
+    barrier OUTPUT: per-workstream claims written once at the end, keyed on the
+    colliding `seq`, and denied to agent write-tools by boundary guard G3. The
+    manifest is Cycle INPUT, authored before any workstream branch exists, and
+    the ledger fans in mid-Cycle at high frequency. Same tree, incompatible
+    lifetimes and churn.
+    """
+    return os.path.join(
+        str(project_dir), COMMITTED_RELDIR, valid_cycle_id(cycle_id)
+    )
+
+
+def committed_manifest_path(project_dir: str, cycle_id: str) -> str:
+    return os.path.join(committed_cycle_dir(project_dir, cycle_id), "manifest.json")
+
+
+def committed_events_dir(
+    project_dir: str, cycle_id: str, workstream_id: Optional[str] = None
+) -> str:
+    """Per-workstream event directories, so concurrent publishers never conflict.
+
+    One shared events file would make every mid-Cycle publish a merge conflict
+    between workstreams -- the opposite of what an event ledger is for.
+    """
+    base = os.path.join(committed_cycle_dir(project_dir, cycle_id), "events")
+    if workstream_id:
+        return os.path.join(base, valid_workstream_id(workstream_id))
+    return base
+
+
+def committed_sync_path(project_dir: str, cycle_id: str, workstream_id: str) -> str:
+    return os.path.join(
+        committed_cycle_dir(project_dir, cycle_id),
+        "sync",
+        "%s.json" % valid_workstream_id(workstream_id),
+    )
+
+
+# ── branch and worktree naming ──────────────────────────────────────────────
+
+
+def workstream_branch(cycle_id: str, workstream_id: str) -> str:
+    return "cycle/%s/ws/%s" % (
+        valid_cycle_id(cycle_id),
+        valid_workstream_id(workstream_id),
+    )
+
+
+def integration_branch(cycle_id: str) -> str:
+    return "cycle/%s/integration" % valid_cycle_id(cycle_id)
+
+
+# ── identity resolution ─────────────────────────────────────────────────────
+
+
+class Identity:
+    """Resolved SPQ identity plus where each half came from.
+
+    `source` is surfaced by the `identity` CLI verb so an operator can tell a
+    pinned workstream from an env override without guessing -- the diagnostic
+    that `SYNAPTORY_ACTIVE_SPEC` never offered.
+    """
+
+    __slots__ = ("cycle_id", "cycle_seq", "workstream_id", "runner_id", "source")
+
+    def __init__(
+        self,
+        cycle_id: Optional[str],
+        cycle_seq: Optional[int],
+        workstream_id: Optional[str],
+        runner_id: str,
+        source: Dict[str, str],
+    ) -> None:
+        self.cycle_id = cycle_id
+        self.cycle_seq = cycle_seq
+        self.workstream_id = workstream_id
+        self.runner_id = runner_id
+        self.source = source
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "cycle_id": self.cycle_id,
+            "cycle_seq": self.cycle_seq,
+            "workstream_id": self.workstream_id,
+            "runner_id": self.runner_id,
+            "source": dict(self.source),
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics
+        return "Identity(cycle_id=%r, workstream_id=%r, runner_id=%r)" % (
+            self.cycle_id,
+            self.workstream_id,
+            self.runner_id,
+        )
+
+
+def read_pin(project_dir: str) -> Optional[str]:
+    try:
+        with open(pin_path(project_dir), "r") as handle:
+            value = handle.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def write_pin(project_dir: str, workstream_id: str) -> None:
+    valid_workstream_id(workstream_id)
+    path = pin_path(project_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        handle.write(workstream_id + "\n")
+
+
+def resolve_identity(
+    project_dir: str,
+    *,
+    cycle_id: Optional[str] = None,
+    workstream_id: Optional[str] = None,
+    state: Optional[Dict[str, Any]] = None,
+    require_workstream: bool = False,
+    require_cycle: bool = False,
+) -> Identity:
+    """Resolve the SPQ identity for this checkout.
+
+    Order, most explicit first, and NEVER a default:
+
+        workstream_id  --workstream flag -> pin file -> SYNAPTORY_WORKSTREAM
+                       -> state pointer -> unresolved
+        cycle_id       --cycle-id flag   -> SYNAPTORY_CYCLE_ID   -> state pointer
+                       -> index.json current_cycle_id -> unresolved
+
+    `SYNAPTORY_ACTIVE_SPEC` is not consulted at any point. Defaulting a
+    workstream would silently attribute one lane's work to another, so an
+    unresolvable identity raises when the caller says it is required rather
+    than guessing.
+    """
+    spq = {}
+    if isinstance(state, dict) and isinstance(state.get("spq"), dict):
+        spq = state["spq"]
+
+    source: Dict[str, str] = {}
+
+    ws = workstream_id
+    if ws:
+        source["workstream_id"] = "flag"
+    # PIN BEFORE ENV, deliberately. This used to rank the environment higher,
+    # which defeated the whole reason the pin exists -- see `pin_path`: "a
+    # clone's workstream is a property of the checkout, and an env var has to be
+    # re-exported in every shell". With env winning, a hydrated clone was
+    # re-identified by any stray `SYNAPTORY_WORKSTREAM` in the shell, on EVERY
+    # read: `read_state` re-derives `_workstream_id` here each time, so the pin
+    # could be correct on disk and still never be believed.
+    #
+    # Measured consequence (#328 G1): `hydrate_cycle --workstream web` under
+    # `SYNAPTORY_WORKSTREAM=api` admitted web's units and then reported itself
+    # as `api`, so `declare-ready` declared as the wrong lane and the quorum
+    # never saw the real one.
+    #
+    # The env var keeps its job -- naming a lane BEFORE a pin exists, which is
+    # the pre-hydration case -- and loses only the ability to silently re-point
+    # a checkout that has already been hydrated. `--workstream` still overrides
+    # both, so nothing becomes unreachable.
+    if not ws:
+        ws = read_pin(project_dir)
+        if ws:
+            source["workstream_id"] = "pin"
+    if not ws:
+        ws = os.environ.get(ENV_WORKSTREAM) or None
+        if ws:
+            source["workstream_id"] = "env"
+    if not ws:
+        ws = spq.get("workstream_id") or None
+        if ws:
+            source["workstream_id"] = "state"
+    if ws:
+        valid_workstream_id(ws)
+    elif require_workstream:
+        raise IdentityError(
+            "no SPQ workstream identity for %s. Pass --workstream, export %s, "
+            "or run hydrate_cycle to write the pin file. SPQ does not read "
+            "%s and never defaults a workstream: defaulting would attribute "
+            "one lane's work to another."
+            % (project_dir, ENV_WORKSTREAM, _MULTISPEC_ENV_IGNORED)
+        )
+
+    cid = cycle_id
+    if cid:
+        source["cycle_id"] = "flag"
+    if not cid:
+        cid = os.environ.get(ENV_CYCLE_ID) or None
+        if cid:
+            source["cycle_id"] = "env"
+    if not cid:
+        cid = spq.get("cycle_id") or None
+        if cid:
+            source["cycle_id"] = "state"
+    if not cid:
+        cid = _index_current(project_dir)
+        if cid:
+            source["cycle_id"] = "index"
+    if cid:
+        valid_cycle_id(cid)
+    elif require_cycle:
+        raise IdentityError(
+            "no SPQ cycle identity for %s. Pass --cycle-id, export %s, or open "
+            "a Cycle first." % (project_dir, ENV_CYCLE_ID)
+        )
+
+    runner = os.environ.get(ENV_RUNNER) or default_runner_id()
+    _validate("runner_id", runner, RUNNER_ID_RE)
+    source["runner_id"] = "env" if os.environ.get(ENV_RUNNER) else "derived"
+
+    seq = None
+    if cid:
+        seq = seq_of(cid)
+    elif isinstance(spq.get("cycle_seq"), int):
+        seq = spq["cycle_seq"]
+
+    return Identity(cid, seq, ws, runner, source)
+
+
+def _index_current(project_dir: str) -> Optional[str]:
+    import state_store
+
+    index = state_store.read_json(index_path(project_dir))
+    value = index.get("current_cycle_id")
+    return value if isinstance(value, str) and value else None
+
+
+# ── index ───────────────────────────────────────────────────────────────────
+
+
+def read_index(project_dir: str) -> Dict[str, Any]:
+    import state_store
+
+    index = state_store.read_json(index_path(project_dir))
+    index.setdefault("cycle_seq_high", 0)
+    index.setdefault("current_cycle_id", None)
+    index.setdefault("cycles", [])
+    return index
+
+
+def record_cycle(
+    project_dir: str,
+    cycle_id: str,
+    *,
+    seq: int,
+    goal: str = "",
+    opened_at: str = "",
+    make_current: bool = True,
+) -> Dict[str, Any]:
+    """Append a Cycle to the local index, refusing a duplicate sequence.
+
+    The refusal is local: a clone cannot see another clone's index, so this
+    catches "opened Cycle 7 twice here", not "two clones both opened a 7". The
+    latter is exactly why `cycle_id` carries a hash.
+    """
+    import state_store
+
+    path = index_path(project_dir)
+    with state_store.transaction(lock_for(path)):
+        index = read_index(project_dir)
+        for entry in index["cycles"]:
+            if entry.get("cycle_id") == cycle_id:
+                if make_current:
+                    index["current_cycle_id"] = cycle_id
+                    state_store.write_json_atomic(path, index)
+                return index
+            if int(entry.get("seq") or -1) == int(seq):
+                raise IdentityError(
+                    "Cycle sequence %d is already recorded in this checkout as "
+                    "%s; sequences are monotonic and owned by the opening clone "
+                    "(design §8.3)" % (seq, entry.get("cycle_id"))
+                )
+        index["cycles"].append(
+            {
+                "cycle_id": cycle_id,
+                "seq": int(seq),
+                "goal": goal,
+                "opened_at": opened_at,
+            }
+        )
+        index["cycle_seq_high"] = max(int(index["cycle_seq_high"] or 0), int(seq))
+        if make_current:
+            index["current_cycle_id"] = cycle_id
+        state_store.write_json_atomic(path, index)
+        return index
+
+
+def list_cycles(project_dir: str) -> List[Dict[str, Any]]:
+    return list(read_index(project_dir).get("cycles") or [])
+
+
+def next_seq(project_dir: str) -> int:
+    return int(read_index(project_dir).get("cycle_seq_high") or 0) + 1
+
+
+# ── Coordination Cycle identity and storage (#305) ──────────────────────────
+#
+# Deliberately a PARALLEL namespace, not an extension of the Cycle one. The two
+# id formats reject each other, the indexes are separate files, and nothing here
+# ever writes `index.json` or the state pointer -- see `COORDINATION_ID_RE` for
+# why that separation is load-bearing rather than tidy.
+
+
+def new_coordination_cycle_id(
+    seq: int,
+    *,
+    baseline_sha: str = "",
+    goal: str = "",
+    created_at: str = "",
+    project_slug: str = "",
+) -> str:
+    """Allocate a collision-safe Coordination Cycle identity.
+
+    Same material recipe as `new_cycle_id`, so there is ONE collision argument
+    to review rather than two that drift.
+    """
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        raise IdentityError("coordination sequence must be a non-negative int")
+    material = "|".join(
+        ["cc", project_slug, str(seq), baseline_sha, goal, created_at, uuid.uuid4().hex]
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
+    return "cc-%d-%s" % (seq, digest)
+
+
+def coordination_seq_of(coordination_cycle_id: str) -> int:
+    valid_coordination_cycle_id(coordination_cycle_id)
+    return int(coordination_cycle_id.split("-")[1])
+
+
+def release_id(coordination_cycle_id: str) -> str:
+    """The receipt-facing projection of a Coordination Cycle identity.
+
+    `receipt_validator.STORY_ID_PATTERN` is `^[A-Z][A-Z0-9]*-\\d+$`, so
+    `RELEASE-cc-1-9f2c1ab3` is not a legal receipt id -- the same constraint that
+    keeps Cycle receipts on `CYCLE-{seq}`. Accepted, documented cost: two clones
+    that both open coordination sequence 1 produce the same receipt id. They
+    never could not; `GateEvent.target_id` carries no foreign key, and the
+    manifest hash is the disambiguator in the audit trail. It is also why a
+    parent pins child HASHES rather than child numbers.
+    """
+    return "RELEASE-%d" % coordination_seq_of(coordination_cycle_id)
+
+
+# ── local, gitignored ───────────────────────────────────────────────────────
+
+
+def coordination_root(project_dir: str) -> str:
+    return os.path.join(spq_root(project_dir), "coordination-cycles")
+
+
+def coordination_index_path(project_dir: str) -> str:
+    """A SEPARATE index from `index.json`.
+
+    Sharing one would put a `cc-` id one careless read away from
+    `resolve_identity`'s `valid_cycle_id`, which raises -- and that read happens
+    on every `read_state`, `next_action` and hook in the clone.
+    """
+    return os.path.join(coordination_root(project_dir), "index.json")
+
+
+def coordination_pin_path(project_dir: str) -> str:
+    """One-line file naming this checkout's Coordination Cycle.
+
+    A file rather than an env var for the same reason as the workstream pin: the
+    role of a clone is a property of the checkout, and an env var has to be
+    re-exported in every shell.
+    """
+    return os.path.join(coordination_root(project_dir), "coordination")
+
+
+def coordination_cycle_root(project_dir: str, coordination_cycle_id: str) -> str:
+    return os.path.join(
+        coordination_root(project_dir),
+        valid_coordination_cycle_id(coordination_cycle_id),
+    )
+
+
+def coordination_manifest_path(project_dir: str, coordination_cycle_id: str) -> str:
+    return os.path.join(
+        coordination_cycle_root(project_dir, coordination_cycle_id), "manifest.json"
+    )
+
+
+def coordination_ledger_path(project_dir: str, coordination_cycle_id: str) -> str:
+    return os.path.join(
+        coordination_cycle_root(project_dir, coordination_cycle_id),
+        "cross-cycle-ledger.json",
+    )
+
+
+def coordination_receipts_dir(project_dir: str, coordination_cycle_id: str) -> str:
+    """Where `RELEASE-{seq}` receipts live.
+
+    Without this a coordination clone has NO home for a receipt: `receipts_dir`
+    raises without a `cycle_id`, and `story_pipeline.receipts_dir_for` would fall
+    through its SPQ branch onto the Multi-Spec one and resolve a directory from
+    `SYNAPTORY_ACTIVE_SPEC` -- which #305 forbids in as many words.
+    """
+    return os.path.join(
+        coordination_cycle_root(project_dir, coordination_cycle_id), "receipts"
+    )
+
+
+# ── the committed cross-clone transport ─────────────────────────────────────
+
+
+def committed_coordination_dir(project_dir: str, coordination_cycle_id: str) -> str:
+    return os.path.join(
+        str(project_dir),
+        COMMITTED_COORDINATION_RELDIR,
+        valid_coordination_cycle_id(coordination_cycle_id),
+    )
+
+
+def committed_coordination_manifest_path(
+    project_dir: str, coordination_cycle_id: str
+) -> str:
+    return os.path.join(
+        committed_coordination_dir(project_dir, coordination_cycle_id), "manifest.json"
+    )
+
+
+def committed_coordination_events_dir(
+    project_dir: str,
+    coordination_cycle_id: str,
+    child_cycle_id: Optional[str] = None,
+) -> str:
+    """Per-CHILD event directories.
+
+    Same argument as the per-workstream split one level down: one shared events
+    file would make every mid-release publish a merge conflict between children,
+    which is the opposite of what an event ledger is for.
+    """
+    base = os.path.join(
+        committed_coordination_dir(project_dir, coordination_cycle_id), "events"
+    )
+    if child_cycle_id:
+        return os.path.join(base, valid_cycle_id(child_cycle_id))
+    return base
+
+
+def coordination_integration_branch(coordination_cycle_id: str) -> str:
+    return "coordination/%s/integration" % valid_coordination_cycle_id(
+        coordination_cycle_id
+    )
+
+
+# ── the coordination index ──────────────────────────────────────────────────
+
+
+def read_coordination_index(project_dir: str) -> Dict[str, Any]:
+    import state_store
+
+    index = state_store.read_json(coordination_index_path(project_dir))
+    index.setdefault("coordination_seq_high", 0)
+    index.setdefault("current_coordination_cycle_id", None)
+    index.setdefault("coordination_cycles", [])
+    return index
+
+
+def record_coordination_cycle(
+    project_dir: str,
+    coordination_cycle_id: str,
+    *,
+    seq: int,
+    release_goal: str = "",
+    opened_at: str = "",
+    make_current: bool = True,
+) -> Dict[str, Any]:
+    """Append to the local coordination index, refusing a duplicate sequence."""
+    import state_store
+
+    valid_coordination_cycle_id(coordination_cycle_id)
+    path = coordination_index_path(project_dir)
+    with state_store.transaction(lock_for(path)):
+        index = read_coordination_index(project_dir)
+        for entry in index["coordination_cycles"]:
+            if entry.get("coordination_cycle_id") == coordination_cycle_id:
+                if make_current:
+                    index["current_coordination_cycle_id"] = coordination_cycle_id
+                    state_store.write_json_atomic(path, index)
+                return index
+            if int(entry.get("seq") or -1) == int(seq):
+                raise IdentityError(
+                    "Coordination Cycle sequence %d is already recorded in this "
+                    "checkout as %s" % (seq, entry.get("coordination_cycle_id"))
+                )
+        index["coordination_cycles"].append(
+            {
+                "coordination_cycle_id": coordination_cycle_id,
+                "seq": int(seq),
+                "release_goal": release_goal,
+                "opened_at": opened_at,
+            }
+        )
+        index["coordination_seq_high"] = max(
+            int(index["coordination_seq_high"] or 0), int(seq)
+        )
+        if make_current:
+            index["current_coordination_cycle_id"] = coordination_cycle_id
+        state_store.write_json_atomic(path, index)
+        return index
+
+
+def list_coordination_cycles(project_dir: str) -> List[Dict[str, Any]]:
+    return list(read_coordination_index(project_dir).get("coordination_cycles") or [])
+
+
+def next_coordination_seq(project_dir: str) -> int:
+    return int(
+        read_coordination_index(project_dir).get("coordination_seq_high") or 0
+    ) + 1
+
+
+def read_coordination_pin(project_dir: str) -> Optional[str]:
+    try:
+        with open(coordination_pin_path(project_dir), "r", encoding="utf-8") as fh:
+            value = fh.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def write_coordination_pin(project_dir: str, coordination_cycle_id: str) -> None:
+    import state_store
+
+    valid_coordination_cycle_id(coordination_cycle_id)
+    path = coordination_pin_path(project_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(coordination_cycle_id + "\n")
+    os.replace(tmp, path)
+    _ = state_store
+
+
+def _discover_release(
+    project_dir: str, *, cycle_id: Optional[str] = None
+) -> Optional[str]:
+    """Scan the committed transport for a release that names this Cycle.
+
+    Returns None when nothing matches, and refuses when SEVERAL releases include
+    the same child: two live releases both claiming one Cycle is not a state the
+    barrier can reconcile, and guessing would resolve a dependency against the
+    wrong one. Same posture as the duplicate-sequence refusal in
+    `_cycle_id_for_seq`.
+    """
+    import state_store
+
+    root = os.path.join(str(project_dir), COMMITTED_COORDINATION_RELDIR)
+    if not os.path.isdir(root):
+        return None
+    matches: List[str] = []
+    for name in sorted(os.listdir(root)):
+        if not COORDINATION_ID_RE.match(name):
+            continue
+        manifest = state_store.read_json(
+            os.path.join(root, name, "manifest.json")
+        )
+        if manifest.get("coordination_cycle_id") != name:
+            continue
+        if cycle_id is None:
+            matches.append(name)
+            continue
+        for child in manifest.get("children") or []:
+            if str(child.get("cycle_id") or "") != str(cycle_id):
+                continue
+            # A DROPPED child is no longer in the release, so it must not
+            # resolve cross-Cycle edges through it.
+            if str(child.get("state") or "included") == "included":
+                matches.append(name)
+            break
+    if len(matches) > 1:
+        raise IdentityError(
+            "%d Coordination Cycles in this repository include Cycle %s (%s). "
+            "Pass --coordination-cycle-id to say which release this clone is "
+            "acting in." % (len(matches), cycle_id, ", ".join(sorted(matches)))
+        )
+    return matches[0] if matches else None
+
+
+def resolve_coordination_id(
+    project_dir: str,
+    *,
+    coordination_cycle_id: Optional[str] = None,
+    manifest: Optional[Dict[str, Any]] = None,
+    require: bool = False,
+) -> Optional[str]:
+    """Most explicit first: flag, env, the child manifest's own parent ref, pin,
+    index. `SYNAPTORY_ACTIVE_SPEC` is never consulted.
+
+    The manifest sits third deliberately: a workstream clone has no coordination
+    pin and no coordination index -- both live under the gitignored orchestrator
+    tree -- so the sealed child manifest it hydrated from is the only place the
+    parent binding travels.
+    """
+    candidate = coordination_cycle_id or os.environ.get(ENV_COORDINATION) or None
+    cycle_id_hint = str((manifest or {}).get("cycle_id") or "") or None
+    if not candidate and manifest:
+        candidate = manifest.get("coordination_cycle_id") or None
+    if not candidate:
+        candidate = read_coordination_pin(project_dir)
+    if not candidate:
+        candidate = read_coordination_index(project_dir).get(
+            "current_coordination_cycle_id"
+        )
+    if not candidate:
+        # The COMMITTED transport, last. This is the point of the transport and
+        # the only path that works for a CHILD clone: a child opens its Cycle
+        # before the release exists, so its sealed manifest carries no parent
+        # ref, and it has no pin and no index entry for a release it did not
+        # open. The release manifest that travelled with the repository is the
+        # only place the binding reaches it.
+        #
+        # Exactly the argument `spq_state_machine._cycle_id_for_seq` already
+        # makes one level down for a freshly cloned workstream.
+        candidate = _discover_release(project_dir, cycle_id=cycle_id_hint)
+    if not candidate:
+        if require:
+            raise IdentityError(
+                "no Coordination Cycle resolved: pass --coordination-cycle-id, "
+                "export %s, or open one with open_coordination_cycle"
+                % ENV_COORDINATION
+            )
+        return None
+    return valid_coordination_cycle_id(str(candidate))

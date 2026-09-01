@@ -192,22 +192,37 @@ def test_replay_unreplayable_command_keeps_attested(tmp_path: Path):
 # ─── #181 — the mismatch must also leave the machine ─────────────────────────
 
 
+_PROD_URL = "https://synaptory.h3t.co"
+
+
 @pytest.fixture
-def stub_cli(tmp_path: Path, monkeypatch):
+def stub_cli(tmp_path: Path, monkeypatch, stamp_runtime):
     """Fake `synaptory` on PATH that records argv, so the gate emission
-    can be asserted without a live CP or a real binary."""
+    can be asserted without a live CP or a real binary.
+
+    Stamps a production cp-url beside the shared runtime and has the shim answer
+    `status` with the same URL: an unstamped tree now resolves no CLI at all
+    rather than falling through to whatever is named `synaptory` (#320), so a
+    test that expects an emission has to say which channel it stands in.
+    `status` is the emitter's own identity probe and is not logged.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir()
     log = tmp_path / "calls.log"
     shim = bindir / "synaptory"
     shim.write_text(
         "#!/usr/bin/env bash\n"
+        'if [ "$1" = status ]; then\n'
+        f'  printf "control_plane_url:  {_PROD_URL}\\n"\n'
+        "  exit 0\n"
+        "fi\n"
         f'printf "%s\\n" "$*" >> {log}\n'
         "exit 0\n"
     )
     shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime(_PROD_URL)
     return log
 
 

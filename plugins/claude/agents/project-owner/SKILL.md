@@ -262,14 +262,14 @@ Load and execute phases based on Mode Dispatch:
 
 | Phase | File | Modes |
 |-------|------|-------|
-| Step 1: Understand the Input | `!cat ${CLAUDE_SKILL_DIR}/phases/01-understand-input.md` | full |
-| Step 2: Technical Enabler Discovery | `!cat ${CLAUDE_SKILL_DIR}/phases/02-technical-enabler-discovery.md` | full |
-| Step 3: Generate BRD | `!cat ${CLAUDE_SKILL_DIR}/phases/03-generate-brd.md` | full |
-| Step 4: Decompose into Epics | `!cat ${CLAUDE_SKILL_DIR}/phases/04-decompose-epics.md` | full, feature |
-| Step 5: Decompose into Features | `!cat ${CLAUDE_SKILL_DIR}/phases/05-decompose-features.md` | full, feature |
-| Step 6: Decompose into User Stories | `!cat ${CLAUDE_SKILL_DIR}/phases/06-decompose-stories.md` | full, feature |
-| Step 7: Backlog, Roadmap & Sprints | `!cat ${CLAUDE_SKILL_DIR}/phases/07-backlog-roadmap-sprints.md` | full, feature, refinement |
-| Step 8: Cross-Reference Validation | `!cat ${CLAUDE_SKILL_DIR}/phases/08-cross-reference-validation.md` | full, feature, refinement |
+| Step 1: Understand the Input | !`cat ${CLAUDE_SKILL_DIR}/phases/01-understand-input.md` | full |
+| Step 2: Technical Enabler Discovery | !`cat ${CLAUDE_SKILL_DIR}/phases/02-technical-enabler-discovery.md` | full |
+| Step 3: Generate BRD | !`cat ${CLAUDE_SKILL_DIR}/phases/03-generate-brd.md` | full |
+| Step 4: Decompose into Epics | !`cat ${CLAUDE_SKILL_DIR}/phases/04-decompose-epics.md` | full, feature |
+| Step 5: Decompose into Features | !`cat ${CLAUDE_SKILL_DIR}/phases/05-decompose-features.md` | full, feature |
+| Step 6: Decompose into User Stories | !`cat ${CLAUDE_SKILL_DIR}/phases/06-decompose-stories.md` | full, feature |
+| Step 7: Backlog, Roadmap & Sprints | !`cat ${CLAUDE_SKILL_DIR}/phases/07-backlog-roadmap-sprints.md` | full, feature, refinement |
+| Step 8: Cross-Reference Validation | !`cat ${CLAUDE_SKILL_DIR}/phases/08-cross-reference-validation.md` | full, feature, refinement |
 
 ---
 
@@ -505,4 +505,4 @@ Maintain gate status table per feature. Update as gates pass or are rejected.
 
 ## Receipt Protocol
 
-`!cat ${CLAUDE_SKILL_DIR}/phases/receipt-protocol.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/receipt-protocol.md`

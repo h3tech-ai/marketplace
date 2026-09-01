@@ -4,7 +4,7 @@
 Routes CLI actions to the correct v2 state machine:
   - scrum_state_machine.py  (Scrum lifecycle)
   - kanban_state_machine.py (Kanban lifecycle)
-  - spq_state_machine.py    (SPQ lifecycle — Slice/Sync/Checkpoint)
+  - spq_state_machine.py    (SPQ lifecycle — Cycle/Sync/Checkpoint)
   - story_pipeline.py       (per-story sub-state management)
 
 CLI: python3 state_machine.py <action> <project_dir> [args]

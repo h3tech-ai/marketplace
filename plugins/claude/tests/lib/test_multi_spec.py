@@ -116,7 +116,7 @@ def _seed_v2_project(pd: Path) -> None:
 
 
 def _run_migrate(pd: Path, primary: str, new: list[str]) -> subprocess.CompletedProcess:
-    script = _PLUGIN / "skills" / "_shared" / "scripts" / "migrate_to_multispec.py"
+    script = _PLUGIN.parent / "core" / "scripts" / "migrate_to_multispec.py"
     args = [
         sys.executable, str(script),
         "--project-dir", str(pd),

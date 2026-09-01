@@ -13,11 +13,14 @@ _synaptory_read_cp_url() {
   local root="${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
   _cp_url=""
   [[ -n "$root" ]] || return 0
-  local f
+  local f candidate
   for f in "${root}/hooks/lib/cp-url.local" "${root}/hooks/lib/cp-url"; do
     if [[ -f "$f" ]]; then
-      _cp_url=$(tr -d '[:space:]' < "$f")
-      break
+      candidate=$(tr -d '[:space:]' < "$f")
+      if [[ -n "$candidate" && "$candidate" != "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
+        _cp_url="$candidate"
+        break
+      fi
     fi
   done
   if [[ -z "$_cp_url" || "$_cp_url" == "SYNAPTORY_CP_URL_PLACEHOLDER" ]]; then
@@ -28,8 +31,15 @@ _synaptory_read_cp_url() {
 }
 
 _synaptory_cp_url_is_local() {
-  local u="${1:-}"
-  [[ "$u" == *localhost* || "$u" == *127.* || "$u" == *::1* ]]
+  local u
+  u=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$u" in
+    http://localhost|http://localhost:*|http://localhost/*|\
+    https://localhost|https://localhost:*|https://localhost/*|\
+    http://127.*|https://127.*|http://\[::1\]|http://\[::1\]:*|\
+    http://\[::1\]/*|https://\[::1\]|https://\[::1\]:*|https://\[::1\]/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 _synaptory_read_cp_url

@@ -7,14 +7,14 @@
 > **Adapted from:** `modes/release.md`
 
 Acceptance is SPQ's Release. It runs when the delivery owner decides to ship, not
-automatically after the last Slice. Every agent runs at **maximum depth**
+automatically after the last Cycle. Every agent runs at **maximum depth**
 (release-tier DoD intensity).
 
 What SPQ adds over `modes/release.md` is that the thing being released was built
-by N workstreams and integrated Slice by Slice at Sync. So Acceptance has two
-extra obligations before any activity starts: **every Slice's barrier must have
+by N workstreams and integrated Cycle by Cycle at Sync. So Acceptance has two
+extra obligations before any activity starts: **every Cycle's barrier must have
 cleared green**, and **nothing may be in flight on a workstream branch**. A
-release cut from a `dev` that is missing one workstream's last Slice is exactly
+release cut from a `dev` that is missing one workstream's last Cycle is exactly
 the failure Sync exists to prevent, arriving one state later.
 
 ---
@@ -24,11 +24,11 @@ the failure Sync exists to prevent, arriving one state later.
 `ACCEPTANCE` is reached from `CHECKPOINT` only:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" close_slice "$(pwd)" --proceed-to ACCEPTANCE
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" close_cycle "$(pwd)" --proceed-to ACCEPTANCE
 ```
 
-`SLICE_EXECUTION → ACCEPTANCE` and `SYNC → ACCEPTANCE` are illegal. There is one
-path to a release and it runs through a demonstrated, integrated Slice.
+`CYCLE_EXECUTION → ACCEPTANCE` and `SYNC → ACCEPTANCE` are illegal. There is one
+path to a release and it runs through a demonstrated, integrated Cycle.
 
 **Trigger signals:** "release", "ship it", "prepare for production", "deploy to
 production", "go live", "production ready". Suggest it at Checkpoint when the
@@ -40,28 +40,28 @@ backlog for the current increment is empty, but never auto-enter it.
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" read "$(pwd)"
-# require: lifecycle_state == "ACCEPTANCE";  N = current_slice (the last closed Slice)
+# require: lifecycle_state == "ACCEPTANCE";  N = current_cycle (the last closed Cycle)
 python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" summary "$(pwd)"
 ```
 
 ### Release integrity check, before any agent is dispatched
 
-Walk `slices_completed` from `summary` and assert three things. Each failure is
+Walk `cycles_completed` from `summary` and assert three things. Each failure is
 blocking, and each is cheap to check now and expensive to discover after a cut.
 
 | Check | Where to look | Failure means |
 |---|---|---|
-| Every closed Slice recorded a **green** barrier verdict | `slices_completed[].sync.verdict` | a Slice was force-transitioned past Sync; its increment was never proved integrated |
-| Every closed Slice's cleared sha is an ancestor of `dev` | `slices_completed[].sync.head_sha` | a Slice cleared but its promotion PR never landed, so `dev` is missing it |
-| No workstream has undeclared work for a Slice after the last closed one | `sync_barrier.py status "$(pwd)" {N}` per Slice; workstream branches ahead of `dev` | work exists that no barrier has seen. It ships unverified or it does not ship |
+| Every closed Cycle recorded a **green** barrier verdict | `cycles_completed[].sync.verdict` | a Cycle was force-transitioned past Sync; its increment was never proved integrated |
+| Every closed Cycle's cleared sha is an ancestor of `dev` | `cycles_completed[].sync.head_sha` | a Cycle cleared but its promotion PR never landed, so `dev` is missing it |
+| No workstream has undeclared work for a Cycle after the last closed one | `sync_barrier.py status "$(pwd)" {N}` per Cycle; workstream branches ahead of `dev` | work exists that no barrier has seen. It ships unverified or it does not ship |
 
 Work that is in flight has exactly two honest outcomes: it goes through one more
-`COMMIT → SLICE_EXECUTION → SYNC → CHECKPOINT` cycle, or it is cut and stays out
+`COMMIT → CYCLE_EXECUTION → SYNC → CHECKPOINT` loop, or it is cut and stays out
 of the release. There is no third option where it is included on the strength of
 its own workstream's tests.
 
 ```bash
-# per-Slice barrier status, read-only, runs no proof scripts
+# per-Cycle barrier status, read-only, runs no proof scripts
 python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" status "$(pwd)" {N}
 ```
 
@@ -97,15 +97,19 @@ dispatched in parallel. Activity 6 reads their output, so it runs last.
 
 ```bash
 QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the release regression inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE release regression", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/ACCEPTANCE-{N}-qe.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the release regression inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE release regression", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-qe.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
 
 **QE prompt context:**
-- Every Work Unit across every Slice and every workstream, not one workstream's set
+- Every Work Unit across every Cycle and every workstream, not one workstream's set
 - Full suite: unit, integration, contract, e2e, performance
-- The Sync journey script is the per-Slice increment journey. Release depth means
-  the **cross-Slice** journeys as well: a user path that spans two Slices was
+- The Sync journey script is the per-Cycle increment journey. Release depth means
+  the **cross-Cycle** journeys as well: a user path that spans two Cycles was
   never exercised by any single barrier
 - DoD intensity: `release`, all checks at maximum depth
 - Coverage baseline to compare against
@@ -129,15 +133,15 @@ workstream's `se` chain.
     "tests_passed": 4188,
     "tests_failed": 0,
     "coverage_pct": 84,
-    "slices_covered": 7,
+    "cycles_covered": 7,
     "workstreams": 3
   },
   "verification_commands": [
     {"command": "bash scripts/sync-regression.sh", "exit_code": 0, "summary": "4188 passed, 0 failed"},
-    {"command": "bash scripts/release-journeys.sh", "exit_code": 0, "summary": "11 cross-Slice journeys green"},
+    {"command": "bash scripts/release-journeys.sh", "exit_code": 0, "summary": "11 cross-Cycle journeys green"},
     "test -s reports/release-coverage.md"
   ],
-  "verification_summary": "Release regression green across 7 Slices and 3 workstreams",
+  "verification_summary": "Release regression green across 7 Cycles and 3 workstreams",
   "story_dod": {
     "tests_pass": true,
     "build_succeeds": true,
@@ -171,15 +175,19 @@ quiet a hook.
 
 ```bash
 CE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "compliance-engineer")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the security audit inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="CE release security audit", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${CE_BACKEND}.md`. The CE writes its receipt to `.synaptory/.orchestrator/receipts/ACCEPTANCE-{N}-ce.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the security audit inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="CE release security audit", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${CE_BACKEND}.md`. The CE writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-ce.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
 
 **CE prompt context:**
 - Complete STRIDE threat model over the integrated system
 - OWASP Top 10 assessment, full scope
 - Dependency audit against known vulnerabilities
-- Every `SYNC-{N}-ce.json` from the Slices that had one: the composed auth and
+- Every `SYNC-{N}-ce.json` from the Cycles that had one: the composed auth and
   data surface was reviewed incrementally, and this pass owns the whole
 - `healthcare.baa_enforced` and the PHI-bearing paths, when the project is
   subject to HIPAA or equivalent
@@ -224,9 +232,13 @@ audit results.
 
 ```bash
 PE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "platform-engineer")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not do the infrastructure work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PE production infrastructure", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `.synaptory/.orchestrator/receipts/ACCEPTANCE-{N}-pe.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not do the infrastructure work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PE production infrastructure", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-pe.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
 
 **PE prompt context:**
 - IaC modules for the production environment
@@ -248,15 +260,19 @@ configuration, rollback scripts, operational runbooks.
 
 ```bash
 TW_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "technical-writer")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not write the release documentation inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="TW release documentation", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${TW_BACKEND}.md`. The TW writes its receipt to `.synaptory/.orchestrator/receipts/ACCEPTANCE-{N}-tw.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not write the release documentation inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="TW release documentation", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${TW_BACKEND}.md`. The TW writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-tw.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
 
 **TW prompt context:**
-- Every completed Work Unit across every Slice, for documentation scope
+- Every completed Work Unit across every Cycle, for documentation scope
 - Existing architecture docs (ADRs, API contracts) and the shared contracts the
-  `shared_owner` published per Slice
-- Every `reports/slice-{N}-*.md` from the Checkpoints, which is the narrative
+  `shared_owner` published per Cycle
+- Every `reports/cycle-{N}-*.md` from the Checkpoints, which is the narrative
   spine of the release notes
 - The harvested MethodSignals, for the internal delivery retrospective section.
   These are the pilot's method evidence and belong in a durable document rather
@@ -270,9 +286,13 @@ guide, updated README, release notes.
 
 ```bash
 CR_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "code-reviewer")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the final review inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="CR release review", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${CR_BACKEND}.md`. The CR writes its receipt to `.synaptory/.orchestrator/receipts/ACCEPTANCE-{N}-cr.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the final review inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="CR release review", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${CR_BACKEND}.md`. The CR writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-cr.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
 
 **CR prompt context:**
 - The full codebase, not a per-Work-Unit scope
@@ -305,15 +325,15 @@ reports.
   RELEASE READINESS                        v{version}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Slices          {closed} closed, {green}/{closed} barrier green
+  Cycles          {closed} closed, {green}/{closed} barrier green
   Workstreams     {n} integrated, 0 branches ahead of dev
-  Work Units      {done} done, {cut} cut across all Slices
+  Work Units      {done} done, {cut} cut across all Cycles
   Tests           {passed}/{total} passing ({coverage}% coverage)
   Security        {critical} Critical, {high} High remaining
   Infrastructure  ✓ IaC validates, production CI/CD configured
   Documentation   ✓ API docs, guides, runbooks, release notes
   Rollback        ✓ Scripts exist and tested
-  Method evidence {signals} MethodSignals harvested over {closed} Slices
+  Method evidence {signals} MethodSignals harvested over {closed} Cycles
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -325,8 +345,8 @@ reports.
 ```
 
 **Blocking conditions** (must be resolved before shipping):
-- Any Slice without a green barrier verdict
-- Any Slice whose cleared sha is not an ancestor of `dev`
+- Any Cycle without a green barrier verdict
+- Any Cycle whose cleared sha is not an ancestor of `dev`
 - Any workstream branch carrying work no barrier has seen
 - Critical security findings > 0
 - Tests failing
@@ -351,21 +371,17 @@ python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" transition "$(pwd
 `COMPLETE` is terminal: `spq_state_machine.transition` refuses every transition
 out of it. Do not enter it to tidy the board.
 
-> **Known gap: the `release` gate event is not emitted by `spq`.** In `scrum`,
-> `→ COMPLETE` calls `gate_emitter.emit_release_approved`, so the cut appears in
-> the control plane's gate ledger and on `/overview`. `spq_state_machine` emits
-> `spec_ready` at `COMMIT` and `evidence_dod` at Sync clearance, but nothing on
-> `ACCEPTANCE → COMPLETE`. Until that is wired, the release decision reaches the
-> control plane only through the Activity receipts, so make sure the release
-> notes and `ACCEPTANCE-{N}-tw.json` record who approved the cut and when. Flag
-> it to the maintainers rather than working around it in a prompt.
+`ACCEPTANCE → COMPLETE` now validates all five release receipts and every
+closed Cycle's green Sync verdict before persisting the release approver and
+emitting `release_approved`. Missing or failed evidence is a state-machine
+refusal, not a prompt-level warning.
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ✓ RELEASED                               v{version}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  {closed} Slices, {n} workstreams, all barriers green.
+  {closed} Cycles, {n} workstreams, all barriers green.
   Documentation, infrastructure, and security artifacts are
   ready for production deployment.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -375,7 +391,7 @@ out of it. Do not enter it to tidy the board.
 
 Present the specific blocking and warning items. Route each to the owning
 workstream, not to whoever is nearest. A fix that touches code must go through a
-Slice and its barrier; a fix confined to docs, IaC or runbooks is re-dispatched
+Cycle and its barrier; a fix confined to docs, IaC or runbooks is re-dispatched
 here as the relevant Activity.
 
 ### On "Show full report"
@@ -427,7 +443,7 @@ something a single working copy already proved.
 | `ACCEPTANCE-{N}-tw.json` | TW subagent | `ACCEPTANCE-{N}` | `tw-docs` |
 | `ACCEPTANCE-{N}-cr.json` | CR subagent | `ACCEPTANCE-{N}` | `cr-review` |
 
-`{N}` is `current_slice`, which `close_slice` leaves at the last closed Slice
+`{N}` is `current_cycle`, which `close_cycle` leaves at the last closed Cycle
 number, so the release receipts are attributable to the increment they cut.
 `ACCEPTANCE-{N}` satisfies the required `^[A-Z][A-Z0-9]*-\d+$` story-id pattern.
 All five roles resolve their stage through `ROLE_STAGE_FALLBACK`, so the stage

@@ -8,13 +8,14 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 CP_URL_PLACEHOLDER = "SYNAPTORY_CP_URL_PLACEHOLDER"
 STAMPED_CP_URL_FILE = Path(__file__).resolve().parent.parent / "hooks" / "lib" / "cp-url"
 
 
 def _control_plane_url(cp_url_file: Path | None = None) -> tuple[str | None, str]:
-    """Resolve the operator-stamped URL. Runtime env overrides are ignored."""
+    """Resolve cp-url.local then the operator stamp; ignore runtime redirects."""
 
     stamped_file = cp_url_file or STAMPED_CP_URL_FILE
     candidates = (
@@ -33,21 +34,126 @@ def _control_plane_url(cp_url_file: Path | None = None) -> tuple[str | None, str
     return None, last_source
 
 
-def _is_local_url(url: str) -> bool:
-    lowered = url.lower()
-    return "localhost" in lowered or "127." in lowered or "::1" in lowered
+def _is_loopback_url(raw: str | None) -> bool:
+    if not raw:
+        return False
+    try:
+        host = (urlsplit(raw).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "localhost" or host == "::1" or host.startswith("127.")
 
 
-def _cli_path(control_plane: str | None = None) -> str | None:
+def _path_is_local_plugin(cp_url_file: Path) -> bool:
+    parts = cp_url_file.resolve().parts
+    return any(
+        parts[index : index + 2] == ("plugins", "local")
+        for index in range(max(0, len(parts) - 1))
+    )
+
+
+def _candidate_paths(name: str) -> list[Path]:
+    candidates: list[Path] = []
+    discovered = shutil.which(name)
+    if discovered:
+        candidates.append(Path(discovered))
+    # A local channel is intentionally installed beside the production PATH
+    # binary. Probe the sibling before the fixed GUI locations so a custom
+    # SYNAPTORY_CLI_PREFIX layout remains usable.
+    if name == "synaptory-local":
+        prod = shutil.which("synaptory")
+        if prod:
+            candidates.append(Path(prod).parent / name)
+    candidates.extend((Path.home() / ".local" / "bin" / name, Path.home() / "bin" / name))
+    out: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate.expanduser())
+        if value not in seen:
+            out.append(Path(value))
+            seen.add(value)
+    return out
+
+
+def _cli_identity_url(candidate: Path, *, timeout: float = 2.0) -> str | None:
+    """Read a CLI's immutable URL identity without exposing auth state."""
+
+    try:
+        result = subprocess.run(
+            [str(candidate), "status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("control_plane_url:"):
+            value = line.split(":", 1)[1].strip()
+            return value or None
+    return None
+
+
+def _cli_resolution(
+    cp_url_file: Path | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (path, failure_kind, reason) for this plugin's CLI channel."""
+
+    stamped_file = cp_url_file or STAMPED_CP_URL_FILE
+    control_plane, _source = _control_plane_url(stamped_file)
+    local_plugin = _is_loopback_url(control_plane) or _path_is_local_plugin(stamped_file)
     override = os.environ.get("SYNAPTORY_CLI_BIN", "").strip()
     if override:
         path = Path(override).expanduser()
         if path.is_file() and os.access(path, os.X_OK):
-            return str(path)
-        return None
-    if control_plane and _is_local_url(control_plane):
-        return shutil.which("synaptory-local")
-    return shutil.which("synaptory")
+            identity = _cli_identity_url(path)
+            # Tiny explicit CI shims do not implement `status`; explicit means
+            # the caller accepts that test boundary. Real CLIs expose an
+            # identity and must still match the plugin channel.
+            if identity is not None and _is_loopback_url(identity) != local_plugin:
+                return (
+                    None,
+                    "cli_control_plane_mismatch",
+                    f"explicit CLI build identity {identity} does not match this plugin",
+                )
+            return str(path), None, None
+        return None, "cli_unavailable", "SYNAPTORY_CLI_BIN is not executable"
+
+    name = "synaptory-local" if local_plugin else "synaptory"
+    for candidate in _candidate_paths(name):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            identity = _cli_identity_url(candidate)
+            if identity is None:
+                return (
+                    None,
+                    "cli_identity_unreadable",
+                    f"{name} does not expose a readable build identity",
+                )
+            if local_plugin and not _is_loopback_url(identity):
+                return (
+                    None,
+                    "cli_control_plane_mismatch",
+                    f"local plugin refuses production-stamped CLI {identity}",
+                )
+            if not local_plugin and _is_loopback_url(identity):
+                return (
+                    None,
+                    "cli_control_plane_mismatch",
+                    "production plugin refuses a loopback-stamped `synaptory` CLI "
+                    f"({identity}); restore production and keep local as synaptory-local (#108)",
+                )
+            return str(candidate), None, None
+    return (
+        None,
+        "cli_unavailable",
+        f"{name} CLI is unavailable",
+    )
+
+
+def _cli_path(cp_url_file: Path | None = None) -> str | None:
+    return _cli_resolution(cp_url_file)[0]
 
 
 def authentication_status(
@@ -65,13 +171,14 @@ def authentication_status(
     """
 
     control_plane, control_plane_source = _control_plane_url(cp_url_file)
+    cli, cli_failure_kind, cli_reason = _cli_resolution(cp_url_file)
     if os.environ.get("SYNAPTORY_AUTH_NO_GATE") == "1":
         return {
             "ready": True,
             "bypassed": True,
             "control_plane_configured": control_plane is not None,
             "control_plane_source": control_plane_source,
-            "cli_available": _cli_path() is not None,
+            "cli_available": cli is not None,
         }
 
     if not control_plane:
@@ -80,12 +187,11 @@ def authentication_status(
             "bypassed": False,
             "control_plane_configured": False,
             "control_plane_source": control_plane_source,
-            "cli_available": _cli_path() is not None,
+            "cli_available": cli is not None,
             "failure_kind": "control_plane_unconfigured",
             "reason": "build-stamped hooks/lib/cp-url is blank or still a placeholder",
         }
 
-    cli = _cli_path(control_plane)
     if not cli:
         return {
             "ready": False,
@@ -93,8 +199,8 @@ def authentication_status(
             "control_plane_configured": True,
             "control_plane_source": control_plane_source,
             "cli_available": False,
-            "failure_kind": "cli_unavailable",
-            "reason": "synaptory CLI is unavailable",
+            "failure_kind": cli_failure_kind or "cli_unavailable",
+            "reason": cli_reason or "synaptory CLI is unavailable",
         }
 
     command_env = os.environ.copy()
@@ -115,6 +221,7 @@ def authentication_status(
             "control_plane_configured": True,
             "control_plane_source": control_plane_source,
             "cli_available": True,
+            "cli_command": Path(cli).name,
             "failure_kind": "whoami_check_failed",
             "reason": f"synaptory whoami --check failed: {type(exc).__name__}",
         }
@@ -125,6 +232,7 @@ def authentication_status(
             "control_plane_configured": True,
             "control_plane_source": control_plane_source,
             "cli_available": True,
+            "cli_command": Path(cli).name,
             "failure_kind": "session_missing_or_expired",
             "reason": "synaptory session is missing or expired",
         }
@@ -134,6 +242,7 @@ def authentication_status(
         "control_plane_configured": True,
         "control_plane_source": control_plane_source,
         "cli_available": True,
+        "cli_command": Path(cli).name,
     }
 
 
@@ -147,9 +256,16 @@ def authentication_block_message(status: dict[str, Any]) -> str:
         )
     elif failure_kind == "cli_unavailable":
         remediation = "Install or repair the Synaptory CLI, then retry"
-    elif failure_kind == "session_missing_or_expired":
+    elif failure_kind in {"cli_control_plane_mismatch", "cli_identity_unreadable"}:
         remediation = (
-            "Run `synaptory login`, verify `synaptory whoami --check`, and retry"
+            "Restore production as `synaptory`, install local as "
+            "`synaptory-local`, and retry"
+        )
+    elif failure_kind == "session_missing_or_expired":
+        cli_command = str(status.get("cli_command") or "synaptory")
+        remediation = (
+            f"Run `{cli_command} login`, verify `{cli_command} whoami --check`, "
+            "and retry"
         )
     else:
         remediation = (

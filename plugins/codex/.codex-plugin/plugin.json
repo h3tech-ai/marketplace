@@ -1,13 +1,13 @@
 {
   "name": "synaptory",
-  "version": "1.1.5",
-  "description": "Native Synaptory delivery orchestration for Codex with deterministic lifecycle and receipt gates.",
+  "version": "1.2.0",
+  "description": "Native Synaptory delivery orchestration for Codex. Certified for SPQ (`build_mode: spq`); Scrum and Kanban are uncertified on this host, so warn and recommend SPQ.",
   "author": {
     "name": "H3Tech Inc.",
     "url": "https://github.com/h3tech-ai"
   },
   "homepage": "https://synaptory.h3t.co",
-  "repository": "https://github.com/h3tech-ai/synaptory",
+  "repository": "https://github.com/h3tech-ai/synaptory-v1",
   "license": "PROPRIETARY",
   "keywords": [
     "synaptory",
@@ -20,8 +20,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Synaptory",
-    "shortDescription": "Run governed Synaptory delivery in Codex.",
-    "longDescription": "A native Codex host package for Synaptory projects. It composes the shared lifecycle and receipt runtime, installs nine project-scoped role profiles, and runs fail-closed story execution selected by deterministic state-machine actions.",
+    "shortDescription": "SPQ-certified Synaptory delivery for Codex.",
+    "longDescription": "A native Codex host package for Synaptory projects. Codex is certified for SPQ (`build_mode: spq`). Scrum and Kanban share the lifecycle kernel but are uncertified on this host, so the plugin warns before delivery dispatch and recommends SPQ.",
     "developerName": "H3Tech Inc.",
     "category": "Developer Tools",
     "capabilities": [
@@ -30,10 +30,11 @@
       "Project agent bootstrap",
       "Deterministic story execution",
       "Receipt-gated advancement",
+      "Full SPQ lifecycle",
       "Lifecycle hooks"
     ],
     "websiteURL": "https://synaptory.h3t.co",
-    "defaultPrompt": "Use $synaptory to inspect readiness and continue governed Synaptory delivery with Codex agents."
+    "defaultPrompt": "Use $synaptory to inspect readiness and continue governed SPQ delivery with Codex agents. Recommend `build_mode: spq`; warn that Scrum and Kanban are uncertified on Codex."
   },
   "mcpServers": "./.mcp.json"
 }

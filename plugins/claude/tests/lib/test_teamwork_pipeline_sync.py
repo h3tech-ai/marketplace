@@ -281,17 +281,18 @@ def test_sync_tracker_status_visits_in_review(tmp_path: Path):
 
 
 @pytest.mark.unit
-def test_sync_tracker_status_warns_on_failure(tmp_path: Path, capsys):
-    """When the tracker CLI rejects the call (e.g. #111 audit-gate guard),
-    sync_tracker_status must surface a stderr warning so the agent
-    transcript shows the drift instead of board state silently lagging.
+def test_sync_tracker_status_allow_skip_does_not_warn_on_audit_jump(
+    tmp_path: Path, capsys
+):
+    """Pipeline sync passes --allow-skip so SPQ/Cursor can close a story
+    without walking every tracker column. The #111 TO_DO → DONE jump must
+    succeed silently; the pipeline is canonical.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks" / "lib"))
     import story_pipeline  # noqa: E402
 
     project = tmp_path / "proj"
     (project / ".synaptory" / ".orchestrator").mkdir(parents=True)
-    # Story is in TO_DO — direct `done` triggers the #111 guard rejection.
     (project / ".synaptory" / ".orchestrator" / "tracker-data.json").write_text(
         json.dumps({
             "epics": [], "sprints": [],
@@ -307,8 +308,58 @@ def test_sync_tracker_status_warns_on_failure(tmp_path: Path, capsys):
     story_pipeline.sync_tracker_status(str(project), "US-8", "done")
 
     err = capsys.readouterr().err
+    assert "tracker sync drift" not in err, (
+        "allow-skip audit jumps must not look like tracker drift; "
+        f"got: {err!r}"
+    )
+    data = json.loads(
+        (project / ".synaptory" / ".orchestrator" / "tracker-data.json")
+        .read_text()
+    )
+    final = next(s for s in data["stories"] if s["id"] == "US-8")
+    assert final["status"] == "DONE"
+
+
+@pytest.mark.unit
+def test_sync_tracker_status_warns_on_failure(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """When the tracker CLI exits non-zero (offline remote, adapter crash),
+    sync_tracker_status must surface a stderr warning so the agent
+    transcript shows the drift instead of board state silently lagging.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks" / "lib"))
+    import story_pipeline  # noqa: E402
+
+    project = tmp_path / "proj"
+    (project / ".synaptory" / ".orchestrator").mkdir(parents=True)
+    (project / ".synaptory" / ".orchestrator" / "tracker-data.json").write_text(
+        json.dumps({
+            "epics": [], "sprints": [],
+            "stories": [{
+                "id": "US-8", "title": "T", "feature": "", "epic": "",
+                "priority": "", "status": "TO_DO", "size": "", "sprint": "1",
+                "ac_count": 0, "acceptance_criteria": [], "raw_text": "",
+            }],
+        })
+    )
+    (project / ".synaptory.yaml").write_text("tracker:\n  backend: local\n")
+
+    class _Fail:
+        returncode = 1
+        stderr = "connection refused"
+        stdout = ""
+
+    monkeypatch.setattr(
+        story_pipeline.subprocess, "run", lambda *a, **k: _Fail()
+    )
+
+    story_pipeline.sync_tracker_status(str(project), "US-8", "done")
+
+    err = capsys.readouterr().err
     assert "tracker sync drift" in err, (
         "sync drift must produce a visible stderr warning; "
         f"got: {err!r}"
     )
     assert "US-8" in err
+    assert "connection refused" in err

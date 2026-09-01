@@ -215,3 +215,23 @@ def test_kanban_execution_continues(tmp_path: Path):
     out = _cont(p)
     assert out["continue"] is True
     assert "kanban_state_machine.py" in out["reason"]
+
+
+# ── #304: deps_blocked must stop the loop ──────────────────────────────────
+
+
+def test_deps_blocked_is_a_declared_stop_action():
+    import loop_engine as le
+
+    assert "deps_blocked" in le.STOP_ACTIONS
+    assert "deps_blocked" not in le.CONTINUE_ELIGIBLE
+
+
+def test_continuation_reason_names_deps_blocked():
+    """The reason string is what an operator reads to know why the session is
+    still running; omitting the new terminal action makes it misleading."""
+    import inspect
+
+    import loop_engine as le
+
+    assert "deps_blocked" in inspect.getsource(le)

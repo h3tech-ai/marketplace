@@ -636,4 +636,4 @@ Your receipt MUST include `verification_commands` with at least one command prov
 
 ## Receipt Protocol
 
-`!cat ${CLAUDE_SKILL_DIR}/phases/receipt-protocol.md`
+!`cat ${CLAUDE_SKILL_DIR}/phases/receipt-protocol.md`

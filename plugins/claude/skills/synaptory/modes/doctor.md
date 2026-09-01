@@ -55,7 +55,7 @@ tracker_plugin_on  = "tracker@h3tech-ai" in enabled_plugins
 
 # --- 1c. Plugin version ---
 plugin_json_path = os.path.expanduser(
-    "~/.claude/plugins/marketplaces/h3tech-ai/synaptory/.claude-plugin/plugin.json"
+    "~/.claude/plugins/marketplaces/h3tech-ai/synaptory-v1/.claude-plugin/plugin.json"
 )
 plugin_json_raw  = Bash(f'cat "{plugin_json_path}" 2>/dev/null || echo "__MISSING__"')
 plugin_installed = plugin_json_raw != "__MISSING__"

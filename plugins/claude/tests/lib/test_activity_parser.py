@@ -118,6 +118,33 @@ def test_empty_payload_yields_blanks():
 
 
 @pytest.mark.unit
+def test_cursor_shell_and_edit_aliases():
+    tool, summary = summarize(
+        {"tool": "Shell", "command": "pytest -q tests/test_notes_api.py"}
+    )
+    assert tool == "Shell"
+    assert summary == "Shell: pytest -q tests/test_notes_api.py"
+
+    tool, summary = summarize(
+        {"name": "StrReplace", "args": {"path": "api/notes_api.py"}}
+    )
+    assert tool == "StrReplace"
+    assert summary == "StrReplace: api/notes_api.py"
+
+
+@pytest.mark.unit
+def test_main_ignores_cursor_conversation_id():
+    """conversation_id is not the CLI session UUID; emitting it as line 3
+    would make `telemetry activity --session-id` drop the ping."""
+    lines = _run_parser(
+        '{"tool":"Shell","command":"ls","conversation_id":"conv-cursor-1"}'
+    )
+    assert lines[0] == "Shell"
+    assert lines[1] == "Shell: ls"
+    assert lines[2] == ""
+
+
+@pytest.mark.unit
 def test_non_dict_tool_input_is_tolerated():
     """Buggy stdin (tool_input as a string) must not crash the parser."""
     tool, summary = summarize({"tool_name": "Edit", "tool_input": "not-a-dict"})

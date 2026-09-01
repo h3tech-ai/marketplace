@@ -255,7 +255,7 @@ If the user provides feedback:
 
 **Skip if:** No UI signals in feedback and next-sprint stories are backend-only. Proceed directly to Step 6.
 
-Follow the Design Grooming Protocol at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/design-grooming.md`.
+Follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`.
 
 **Capture the canonical context inputs before prompting Claude Design:**
 ```

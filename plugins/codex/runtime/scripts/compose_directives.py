@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""Host-neutral content directives for authored agent and skill bodies.
+
+Authored markdown used to embed Claude-only syntax, and each host composer
+translated it with regexes over prose. That failed silently and in production:
+
+  * `_BANG_CAT` matched only the `` !`cat ...` `` spelling. The equally common
+    table-cell spelling `` `!cat ...` `` (backtick before the bang) was missed
+    entirely, so 38 instructions shipped to Cursor verbatim -- telling a host
+    that cannot expand `!cat` to expand `!cat`.
+  * `${CLAUDE_SKILL_DIR}` was rewritten to `${PLUGIN_ROOT}/roles`, dropping the
+    role segment. `${CLAUDE_SKILL_DIR}` is the *specific agent's* directory, so
+    the correct target is `${PLUGIN_ROOT}/roles/<role>`. Every rewritten path
+    pointed at a directory that does not exist.
+
+Neither failed a build. Both are the reason this module exists.
+
+Four directives, deliberately distinct because they mean different things:
+
+  {{include: phases/01-discovery.md}}
+      Plugin-owned CONTENT, resolved relative to the agent's own directory and
+      inlined by the host. The file must exist at compose time; a missing one
+      fails the build.
+
+  {{read: .synaptory/.protocols/iron-laws.md}}
+  {{read: .synaptory.yaml | fallback: No config -- defaults apply}}
+      A file in the USER's project, read at runtime. It cannot exist at compose
+      time, so it is never validated against disk -- only translated to each
+      host's native runtime-read form.
+
+  {{path: skills/_shared/scripts/tracker/tracker_cli.py}}
+      A PATH inside the installed plugin, named but not inlined -- the spelling
+      an agent needs to run a script or Read a sibling body. Expanded to the
+      host's plugin-root token AND its installed layout, which is not the
+      authored layout: `agents/<role>/...` is `roles/<role>/...` on Cursor. The
+      blind `${CLAUDE_PLUGIN_ROOT}` -> `${PLUGIN_ROOT}` token swap this replaces
+      got the token right and the layout wrong, so 15 composed Cursor paths
+      named a directory that does not exist.
+
+  {{self: modes/modernize.md}}
+      A path inside THIS agent's own directory -- what `${CLAUDE_SKILL_DIR}`
+      meant. Same host mapping as `{{include:}}`, without the inlining.
+
+  {{cp: design-assets/typography}}
+      A body ADR-016 withholds from every package and the control plane serves
+      instead. Expands to each host's native fetch call. Validated at compose
+      time against the authored tree, because a typo here is a 404 for a user.
+      Do NOT use `{{path:}}` for these: 25 authored references named files that
+      ship in no package AND were seeded nowhere, so they resolved to nothing on
+      every host, Claude included.
+
+Conflating content with a path is how a compose-time include ends up pointing at
+a path that only exists on a user's machine, so they stay separate. `{{path:}}`
+and `{{self:}}` are NOT validated against disk: they name a runtime location in
+a tree whose contents differ per host and are further stripped by ADR-016, so an
+existence check there fails on correct input. `{{include:}}` is validated
+because it inlines the bytes, and those must exist where the composer runs.
+
+Host TOOL names (`Agent(`, `AskUserQuestion`) are a closed vocabulary, not
+content, and live in `TOOL_VOCABULARY` / each host's `tools` map below rather
+than becoming a directive -- see that table's comment for why.
+
+Python 3.9 compatible: this file is projected into every host package.
+"""
+
+from __future__ import annotations
+
+import posixpath
+import re
+from typing import Any, Callable, Dict, List, Optional
+
+# A directive path may embed a braced group: a host/shell token such as
+# ${SE_BACKEND}, or an authored placeholder such as {mode} in
+# `agents/software-engineer/modes/{mode}.md`. Its closing brace would otherwise
+# terminate the capture early -- the directive then never matches, and the strict
+# guard below fails the build. Allow braced groups explicitly.
+_PATH = r"(?:\$?\{[^{}]*\}|[^{}|])+?"
+
+INCLUDE_RE = re.compile(r"\{\{\s*include:\s*(?P<path>" + _PATH + r")\s*\}\}")
+READ_RE = re.compile(
+    r"\{\{\s*read:\s*(?P<path>"
+    + _PATH
+    + r")\s*(?:\|\s*fallback:\s*(?P<fallback>[^}]*?)\s*)?\}\}"
+)
+PATH_RE = re.compile(r"\{\{\s*path:\s*(?P<path>" + _PATH + r")\s*\}\}")
+SELF_RE = re.compile(r"\{\{\s*self:\s*(?P<path>" + _PATH + r")\s*\}\}")
+CP_RE = re.compile(r"\{\{\s*cp:\s*(?P<name>" + _PATH + r")\s*\}\}")
+
+# A MALFORMED known directive, checked after substitution. Deliberately narrow:
+# authored bodies contain code samples with JSX/Handlebars braces such as
+# `{{ __html: content }}`, so a general `{{ word: }}` guard produces false
+# positives and would fail the build on a tailwind snippet.
+KNOWN_DIRECTIVES = ("include", "read", "path", "self", "cp")
+MALFORMED_RE = re.compile(
+    r"\{\{\s*(?P<name>" + "|".join(KNOWN_DIRECTIVES) + r")\s*:(?P<rest>[^\n]{0,80})"
+)
+
+def own_dir_for(relative: str) -> str:
+    """The authoring directory of a plugin-relative markdown path.
+
+    Every caller -- the Claude dist expander, the Cursor composer, the
+    control-plane seeder -- has to answer this identically, so it is answered
+    once here. Getting it wrong on one caller means that host ships a
+    `{{include:}}` pointing somewhere the file is not.
+
+    An agent's whole subtree resolves against `agents/<role>`, because a phase
+    or mode body includes its siblings as `phases/...`, not `../phases/...`.
+    Everything else resolves against its own parent directory.
+    """
+    normalized = relative.replace("\\", "/").lstrip("/")
+    parts = normalized.split("/")
+    if parts[0] == "agents" and len(parts) > 2:
+        return "agents/%s" % parts[1]
+    return posixpath.dirname(normalized)
+
+
+def has_directives(text: str) -> bool:
+    """True when `text` carries any directive this module expands.
+
+    Callers gate on this to skip the expander entirely (the control-plane
+    seeder does), so a false negative here means the directive reaches a user
+    verbatim. That is why this reuses MALFORMED_RE -- the same pattern the
+    strict guard uses -- instead of a hand-written marker list that would
+    disagree with the real regexes over whitespace, or go stale when a
+    directive is added.
+    """
+    return MALFORMED_RE.search(text) is not None
+
+#: `skills/_shared/` subdirectories ADR-016 withholds from every host package,
+#: which the control plane serves instead. THE source of truth: the seeder's
+#: copy is asserted equal to this one, because a directory listed in one and not
+#: the other is a body that is either referenced-and-unserved or served-and-
+#: unreachable. Both happened.
+#:
+#: `design-assets/scripts` and `design-assets/data` are deliberately NOT here --
+#: they live in `core/scripts/design_assets/` and ship on every host. A
+#: watermarked markdown body cannot be executed: the zero-width characters
+#: would corrupt the source, and `python3` needs a file on disk.
+CP_DELIVERED_SHARED = ("protocols", "design-assets", "templates")
+
+#: A `{{cp:}}` name has had its extension stripped by the seeder's namer, so a
+#: compose-time existence check has to try each one back.
+_CP_SUFFIX_CANDIDATES = (".md", ".tmpl", "")
+
+# Protocols are NOT shipped inside any host package (ADR-016). They are
+# control-plane delivered into the project at `.synaptory/.protocols/`, so a
+# plugin-relative protocol path names a file that does not exist once installed.
+# Every host needs the same remapping, so it lives here rather than in one
+# composer.
+_PROTOCOL_INFIX = "/skills/_shared/protocols/"
+
+
+def normalize_protocol_path(path: str) -> str:
+    """Rewrite a plugin-relative protocol path to its runtime location."""
+    normalized = path.replace("\\", "/")
+    if _PROTOCOL_INFIX in normalized:
+        name = normalized.split(_PROTOCOL_INFIX, 1)[1].split("/")[-1]
+        return ".synaptory/.protocols/%s" % name
+    if normalized.startswith("skills/_shared/protocols/"):
+        return ".synaptory/.protocols/%s" % normalized.split("/")[-1]
+    return path
+
+
+# Legacy Claude spellings. BOTH forms, which is the bug that shipped.
+LEGACY_BANG_CAT_RE = re.compile(r"!`cat\s+(?P<body>[^`]+)`|`!cat\s+(?P<body2>[^`]+)`")
+
+
+class DirectiveError(ValueError):
+    """A directive is malformed, unknown, or names a file that does not exist."""
+
+
+class Directives:
+    """Per-host expansion rules.
+
+    `include_form` and `read_form` receive a resolved path (and, for reads, an
+    optional fallback string) and return that host's native markdown.
+    `plugin_root` is the host's runtime plugin-root token; `layout` maps an
+    authored plugin-relative path onto that host's INSTALLED layout, which is
+    where the token-swap approach went wrong.
+    """
+
+    __slots__ = (
+        "host",
+        "include_form",
+        "read_form",
+        "_own_relative",
+        "plugin_root",
+        "layout",
+        "tools",
+        "cp_form",
+    )
+
+    def __init__(
+        self,
+        host: str,
+        include_form: Callable[[str], str],
+        read_form: Callable[[str, Optional[str]], str],
+        own_relative: Callable[["Directives", str, str], str],
+        plugin_root: str,
+        layout: Callable[[str], str],
+        tools: Dict[str, str],
+        cp_form: Callable[[str], str],
+    ) -> None:
+        self.host = host
+        self.include_form = include_form
+        self.read_form = read_form
+        self._own_relative = own_relative
+        self.plugin_root = plugin_root
+        self.layout = layout
+        self.tools = tools
+        self.cp_form = cp_form
+
+    def plugin_path(self, relative: str) -> str:
+        """`{{path:}}`: the host's spelling for a path inside the installed plugin."""
+        return "%s/%s" % (self.plugin_root, self.layout(relative))
+
+    def own_relative(self, own_dir: str, relative: str) -> str:
+        """`{{include:}}` / `{{self:}}`: a path inside the authoring directory."""
+        return self._own_relative(self, own_dir, relative)
+
+
+# ── host rule sets ───────────────────────────────────────────────────────────
+
+
+# `own_dir` is the plugin-relative directory the body was authored in --
+# `agents/<role>` for an agent, `skills/<skill>` for a skill. `{{include:}}` and
+# `{{self:}}` resolve against it.
+
+
+def _claude_own_relative(rules: "Directives", own_dir: str, relative: str) -> str:
+    # CLAUDE_SKILL_DIR already IS the loading unit's own directory at runtime,
+    # so Claude needs no own_dir and this stays what it has always emitted.
+    return "${CLAUDE_SKILL_DIR}/%s" % relative
+
+
+def _plugin_root_own_relative(rules: "Directives", own_dir: str, relative: str) -> str:
+    """Every non-Claude host spells it as plugin-root + own_dir + relative.
+
+    The role segment is required. Dropping it -- `${PLUGIN_ROOT}/roles` for
+    every agent -- was the shipped bug this module was written to kill, and an
+    empty `own_dir` reproduces it as `${PLUGIN_ROOT}/roles//<relative>`. So an
+    absent one raises rather than composing a path with a hole in it.
+    """
+    if not own_dir:
+        raise DirectiveError(
+            "{{include:}} / {{self:}} needs the authoring directory to resolve "
+            "for host %r; the composer must pass role= or own_dir= "
+            "(relative: %s)" % (rules.host, relative)
+        )
+    return "%s/%s/%s" % (rules.plugin_root, rules.layout(own_dir), relative)
+
+
+def _identity_layout(relative: str) -> str:
+    return relative
+
+
+def _cursor_layout(relative: str) -> str:
+    """Authored `agents/<role>/...` is installed as `roles/<role>/...` on Cursor.
+
+    Cursor's `agents/` holds the generated flat `<role>.md` dispatch stubs, so a
+    path carried over verbatim resolves to a file that is not there. The old
+    token swap changed `${CLAUDE_PLUGIN_ROOT}` to `${PLUGIN_ROOT}` and stopped,
+    which is why 15 composed paths named `agents/<role>/SKILL.md` -- a directory
+    the Cursor package does not have.
+    """
+    normalized = relative.lstrip("/")
+    if normalized == "agents" or normalized.startswith("agents/"):
+        return "roles" + normalized[len("agents"):]
+    return normalized
+
+
+# Host TOOL names. A closed vocabulary of identifiers, which is why this is a
+# declared table and not a directive: there is no spelling variant for a tool
+# name to hide in, and `{{tool: Agent}}(...)` at 200-odd prompt sites would cost
+# readability in text whose only reader is a model. Claude's names are the
+# authored lingua franca; every host declares its own dialect, and
+# `test_every_host_declares_every_tool` fails the build if one does not.
+TOOL_VOCABULARY = ("Agent(", "AskUserQuestion")
+
+_CLAUDE_TOOLS = {"Agent(": "Agent(", "AskUserQuestion": "AskUserQuestion"}
+# Cursor: the dispatch primitive is a named plugin subagent, `Task`.
+_CURSOR_TOOLS = {"Agent(": "Task(", "AskUserQuestion": "AskQuestion"}
+_CODEX_TOOLS = {"Agent(": "Agent(", "AskUserQuestion": "AskUserQuestion"}
+
+# A tool name is a word: `SubAgent(` and `MyAgent(` must not be rewritten. The
+# lookbehind is what keeps a substring replace from reaching inside an
+# identifier.
+_TOOL_RES = {
+    name: re.compile(r"(?<![0-9A-Za-z_])" + re.escape(name)) for name in TOOL_VOCABULARY
+}
+
+
+def apply_tool_names(text: str, host: str) -> str:
+    """Translate authored tool names into `host`'s dialect."""
+    rules = HOSTS.get(host)
+    if rules is None:
+        raise DirectiveError("unknown host: %s" % host)
+    for name in TOOL_VOCABULARY:
+        target = rules.tools[name]
+        if target != name:
+            text = _TOOL_RES[name].sub(lambda _match, _t=target: _t, text)
+    return text
+
+
+CLAUDE = Directives(
+    host="claude",
+    # Inline expansion: the content lands in the prompt with no round-trip, and
+    # is not optional. Preserving this is why includes are not an MCP tool call.
+    include_form=lambda path: "!`cat %s`" % path,
+    read_form=lambda path, fallback: (
+        "!`cat %s 2>/dev/null || echo \"%s\"`" % (path, fallback)
+        if fallback
+        else "!`cat %s 2>/dev/null || true`" % path
+    ),
+    own_relative=_claude_own_relative,
+    plugin_root="${CLAUDE_PLUGIN_ROOT}",
+    layout=_identity_layout,
+    tools=_CLAUDE_TOOLS,
+    cp_form=lambda name: 'Bash("synaptory skills get %s")' % name,
+)
+
+CURSOR = Directives(
+    host="cursor",
+    include_form=lambda path: "Read(`%s`)" % path,
+    read_form=lambda path, fallback: (
+        "Read(`%s`) if the file exists (%s)" % (path, fallback)
+        if fallback
+        else "Read(`%s`) if the file exists" % path
+    ),
+    own_relative=_plugin_root_own_relative,
+    plugin_root="${PLUGIN_ROOT}",
+    layout=_cursor_layout,
+    tools=_CURSOR_TOOLS,
+    # Cursor's shell tool is `Shell`; `Bash` does not exist on this host.
+    cp_form=lambda name: 'Shell("synaptory skills get %s")' % name,
+)
+
+CODEX = Directives(
+    host="codex",
+    include_form=lambda path: "Read `%s`" % path,
+    read_form=lambda path, fallback: (
+        "Read `%s` if present (%s)" % (path, fallback)
+        if fallback
+        else "Read `%s` if present" % path
+    ),
+    own_relative=_plugin_root_own_relative,
+    # ceremony_compose.py emits `${PLUGIN_ROOT}` into Codex prompt markdown;
+    # SYNAPTORY_PLUGIN_ROOT is the env var the shared Python runtime reads, not
+    # a prompt token.
+    plugin_root="${PLUGIN_ROOT}",
+    layout=_identity_layout,
+    tools=_CODEX_TOOLS,
+    cp_form=lambda name: "Run `synaptory skills get %s`" % name,
+)
+
+HOSTS: Dict[str, Directives] = {"claude": CLAUDE, "cursor": CURSOR, "codex": CODEX}
+
+
+# ── expansion ────────────────────────────────────────────────────────────────
+
+
+def expand(
+    text: str,
+    *,
+    host: str,
+    role: str = "",
+    own_dir: str = "",
+    source_dir: Optional[Any] = None,
+    strict: bool = True,
+    only: Optional[Any] = None,
+) -> str:
+    """Expand directives in `text` for `host`.
+
+    `{{include:}}` and `{{self:}}` resolve against the body's own authoring
+    directory. Name it with `own_dir` (plugin-relative, e.g. `skills/synaptory`)
+    or, for an agent, with `role` -- which is shorthand for
+    `own_dir="agents/<role>"`. `source_dir` is the same directory as a real
+    filesystem path; when given, every `{{include:}}` target must exist on disk.
+    `{{path:}}` is not checked against disk -- see the module docstring for why.
+
+    Tool names are NOT translated here. `apply_tool_names` is a separate step so
+    a composer can run it over files that carry no directives (shell, JSON)
+    without tripping the strict guard on unrelated brace syntax.
+
+    `only` restricts substitution to the named directives, for a composer that
+    needs different hosts for different directives in one file. Codex's ceremony
+    composer is the case: its invocation scanner matches the CLAUDE spelling of a
+    path, but a `{{cp:}}` expanded as Claude would emit `Bash(...)`, a tool that
+    host does not have. Pass `strict=False` on such a pass and let the final one
+    run the guard, or a leftover directive goes unnoticed.
+    """
+    rules = HOSTS.get(host)
+    if rules is None:
+        raise DirectiveError("unknown host: %s" % host)
+    if not own_dir and role:
+        own_dir = "agents/%s" % role
+
+    # `{{cp:}}` resolves against the PLUGIN root, which is `source_dir` with
+    # `own_dir` peeled back off. Derived rather than taken as a parameter so
+    # every existing caller validates cp names without being changed -- a
+    # caller that opted out would be a caller whose typos ship.
+    plugin_dir = None
+    if source_dir is not None and own_dir:
+        from pathlib import Path as _Path
+
+        candidate = _Path(str(source_dir))
+        depth = len([p for p in own_dir.split("/") if p])
+        if len(candidate.parts) > depth:
+            plugin_dir = candidate.parents[depth - 1] if depth else candidate
+
+    def _include(match: "re.Match") -> str:
+        relative = match.group("path").strip()
+        if not relative:
+            raise DirectiveError("empty {{include:}} path")
+        if relative.startswith("/") or ".." in relative.split("/"):
+            raise DirectiveError(
+                "{{include:}} path must stay inside the agent directory: %s" % relative
+            )
+        if source_dir is not None:
+            from pathlib import Path
+
+            target = Path(str(source_dir)) / relative
+            if not target.is_file():
+                raise DirectiveError(
+                    "{{include: %s}} names a file that does not exist: %s"
+                    % (relative, target)
+                )
+        return rules.include_form(rules.own_relative(own_dir, relative))
+
+    def _read(match: "re.Match") -> str:
+        path = normalize_protocol_path(match.group("path").strip())
+        if not path:
+            raise DirectiveError("empty {{read:}} path")
+        fallback = (match.group("fallback") or "").strip() or None
+        return rules.read_form(path, fallback)
+
+    def _contained(kind: str, relative: str) -> str:
+        """Reject a directive path that escapes the plugin tree."""
+        if not relative:
+            raise DirectiveError("empty {{%s:}} path" % kind)
+        if relative.startswith("/") or ".." in relative.split("/"):
+            raise DirectiveError(
+                "{{%s:}} path must stay inside the plugin tree: %s" % (kind, relative)
+            )
+        if "\\" in relative:
+            # Authored plugin paths are posix. A backslash here means the
+            # directive swallowed a shell-escaped quote from the surrounding
+            # line -- `\"{{path: x.py\}}"` instead of `\"{{path: x.py}}\"`.
+            # Normalising it to `/` (which this layout used to do) turned that
+            # into `x.py/` and shipped it. Three sites hit exactly this.
+            raise DirectiveError(
+                "{{%s:}} path contains a backslash, which is never a path "
+                "separator here -- it usually means the directive captured a "
+                "shell escape from the surrounding line: %s" % (kind, relative)
+            )
+        return relative
+
+    def _path(match: "re.Match") -> str:
+        relative = _contained("path", match.group("path").strip())
+        # A plugin-relative protocol path names a file ADR-016 does not ship;
+        # the runtime location is the same on every host.
+        normalized = normalize_protocol_path(relative)
+        if normalized != relative:
+            return normalized
+        return rules.plugin_path(relative)
+
+    def _self(match: "re.Match") -> str:
+        relative = _contained("self", match.group("path").strip())
+        return rules.own_relative(own_dir, relative)
+
+    def _cp(match: "re.Match") -> str:
+        name = _contained("cp", match.group("name").strip()).rstrip("/")
+        head = name.split("/")[0]
+        if head not in CP_DELIVERED_SHARED:
+            raise DirectiveError(
+                "{{cp: %s}} does not name a control-plane delivered directory; "
+                "expected one of %s. A body that ships inside the package is a "
+                "{{path:}}, not a {{cp:}}." % (name, ", ".join(CP_DELIVERED_SHARED))
+            )
+        if plugin_dir is not None:
+            from pathlib import Path
+
+            base = Path(str(plugin_dir)) / "skills" / "_shared" / name
+            if not any(
+                base.with_name(base.name + suffix).is_file()
+                for suffix in _CP_SUFFIX_CANDIDATES
+            ):
+                raise DirectiveError(
+                    "{{cp: %s}} names no authored body; the control plane would "
+                    "serve a 404. Looked for %s%s"
+                    % (name, base, "{" + ",".join(_CP_SUFFIX_CANDIDATES) + "}")
+                )
+        return rules.cp_form(name)
+
+    wanted = None if only is None else set(only)
+
+    def _enabled(name: str) -> bool:
+        return wanted is None or name in wanted
+
+    if _enabled("include"):
+        text = INCLUDE_RE.sub(_include, text)
+    if _enabled("read"):
+        text = READ_RE.sub(_read, text)
+    if _enabled("path"):
+        text = PATH_RE.sub(_path, text)
+    if _enabled("self"):
+        text = SELF_RE.sub(_self, text)
+    if _enabled("cp"):
+        text = CP_RE.sub(_cp, text)
+
+    if strict:
+        leftover = MALFORMED_RE.search(text)
+        if leftover:
+            raise DirectiveError(
+                "malformed {{%s: ...}} directive survived expansion: {{%s:%s"
+                % (leftover.group("name"), leftover.group("name"), leftover.group("rest"))
+            )
+    return text
+
+
+def find_legacy(text: str) -> List[str]:
+    """Return any surviving legacy `!cat` spellings, both forms.
+
+    Used as a build guard: an authored body that still carries one has not been
+    migrated, and would ship untranslated to any host that cannot expand it.
+    """
+    found = []
+    for match in LEGACY_BANG_CAT_RE.finditer(text):
+        found.append((match.group("body") or match.group("body2") or "").strip())
+    return found
+
+
+# Host-specific PATH tokens that authored markdown must no longer spell for
+# itself.
+#
+# EVERY SPELLING, which the first version of this guard got wrong. It matched
+# `\$\{?TOKEN\}?` and therefore missed `${{CLAUDE_PLUGIN_ROOT}}` -- the
+# doubled-brace f-string escape -- so seven authored sites in five files passed
+# a guard whose whole purpose was to find them. Same failure as `_BANG_CAT`
+# matching one of two `!cat` spellings, in the code written to replace it.
+#
+# The token is flagged only in PATH position (followed by `/`). A bare
+# `${CLAUDE_PLUGIN_ROOT}` with no path after it is a reference to the host's
+# environment VARIABLE -- an environ lookup in a doctor snippet, or prose
+# telling a Claude user to check that it is set. A directive cannot express
+# that and should not try to; the composers rename the variable.
+#
+# `CLAUDE_PROJECT_DIR` is deliberately absent, and this is a finding rather than
+# an omission: all three hosts consume that variable under the SAME name by
+# design (`host_env.PROJECT_DIR_VARS`, and every Cursor hook reads it directly),
+# and the Codex ceremony composer already treats `$(pwd)` and
+# `${CLAUDE_PROJECT_DIR}` as interchangeable before dropping the argument
+# entirely. A `{{project}}` directive would expand to the same token on every
+# host. Renaming the variable itself is a separate, larger change.
+_PATH_TOKENS = "CLAUDE_PLUGIN_ROOT|CLAUDE_SKILL_DIR"
+LEGACY_TOKEN_RE = re.compile(
+    r"\$\{\{?(?P<braced>" + _PATH_TOKENS + r")\}\}?/"
+    r"|\$(?P<plain>" + _PATH_TOKENS + r")/"
+)
+
+# `${{TOKEN}}` inside an f-string literal is an ESCAPED LITERAL, not a token the
+# author chose to spell -- the doubling is what makes `${TOKEN}` survive f-string
+# rendering. Four authored sites need it because their command genuinely
+# interpolates a Python value. A directive expands at compose time, before any
+# f-string exists, so it cannot emit the escape; forcing those four onto
+# `{{path:}}` would change what the rendered command says.
+#
+# Detected structurally rather than by a file allowlist: a doubled-brace token on
+# a line that opens no f-string is an ordinary token and still fails the guard.
+_FSTRING_OPENER = re.compile(r"""(?<![0-9A-Za-z_])f(?:'|")""")
+
+
+def find_legacy_tokens(text: str) -> List[str]:
+    """Return any surviving host path tokens that a directive should now carry.
+
+    An authored body spelling `${CLAUDE_PLUGIN_ROOT}/...` gets whatever the host
+    composer's string replacement happens to do with it -- the right token and
+    the wrong layout, in Cursor's case. `{{path:}}` / `{{self:}}` is the
+    spelling that survives a host it was not written for.
+    """
+    found = []
+    for line in text.splitlines():
+        is_fstring = _FSTRING_OPENER.search(line) is not None
+        for match in LEGACY_TOKEN_RE.finditer(line):
+            token = match.group("braced") or match.group("plain")
+            if match.group("braced") and is_fstring and "{{" in match.group(0):
+                continue  # escaped literal, see _FSTRING_OPENER
+            found.append(token)
+    return found

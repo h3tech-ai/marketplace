@@ -1,6 +1,6 @@
 # Synaptory for Cursor (staff install)
 
-This is the **Cursor host overlay**. Shared state machines, tracker, and role bodies live in `plugin-claude/` and are **composed** here by `scripts/compose.sh` (also run by `./synaptory build`). Do not hand-edit files marked `GENERATED`.
+This is the **Cursor host overlay**. Shared state machines, tracker and receipt logic live in `core/`; role bodies and the orchestrator content are Claude-authored and live in `plugin-claude/`. Both are **composed** here by `scripts/compose.sh` (also run by `./synaptory build`). Do not hand-edit files marked `GENERATED`.
 
 Install this tree — not `plugin-claude/` (that is Claude Code) and not a personal `~/.cursor/skills` wrapper.
 
@@ -28,6 +28,7 @@ Agent `roles/*/SKILL.md` + phases still ship plaintext — same leftover as Clau
 - HC0 (HIPAA) is **Enterprise-gated**: BAA + Privacy Mode lock + Eligible Model. Teams / Pro / Start: refuse. Plugin MCP is not BAA-covered.
 - One nesting level (main → child). Roles must not spawn roles.
 - No `PostCompact`, `StopFailure`, or `FileChanged` events.
+- **Certified delivery path is SPQ** (`build_mode: spq`). Scrum and Kanban have not been proven end-to-end on Cursor; the orchestrator must warn and recommend SPQ.
 
 ## Staff install (public marketplace repo)
 
@@ -50,6 +51,8 @@ Bring up the local stack first so this tree gets a gitignored
 `hooks/lib/cp-url.local` and `~/.local/bin/synaptory-local` is installed
 without overwriting prod `synaptory`:
 
+### Cursor IDE
+
 ```bash
 ./synaptory deploy local
 mkdir -p ~/.cursor/plugins/local
@@ -57,6 +60,35 @@ ln -sfn /absolute/path/to/synaptory/plugin-cursor ~/.cursor/plugins/local/synapt
 ```
 
 Reload Window. After editing `plugin-claude/`, run `plugin-cursor/scripts/compose.sh` (or `./synaptory build`) and Reload.
+
+### Cursor CLI (`cursor-agent`) — the symlink above does nothing
+
+`~/.cursor/plugins/local` is an **IDE** convention. `cursor-agent` has no
+local-plugin mechanism (`cursor-agent plugin` exposes only `marketplace`), so
+with the symlink correct it still loads no Synaptory server — and **it says
+nothing about it**.
+
+That silence is the actual danger. With no Synaptory surface the agent
+improvises, and the run looks successful: correct code, hand-authored QE-only
+receipts into the legacy path, the kernel never advanced, and both Work Units
+reported `done` while `spq_state_machine.py read` said `queued` (#332, from
+#323 G4).
+
+```bash
+python3 plugin-cursor/scripts/preflight.py --project <clone> --write
+cd <clone> && cursor-agent mcp enable synaptory
+python3 plugin-cursor/scripts/preflight.py --project <clone>   # must print `ready:`
+```
+
+**Run the check before every headless agent run.** It cannot be a hook: a
+plugin that is not loaded has no hook to fire, which is precisely why the
+failure was silent. `--write` merges into an existing `.cursor/mcp.json` rather
+than replacing it, so other MCP servers survive.
+
+Exit codes: `0` ready, `1` not wired (the message carries the fix), `2` wired
+but `cursor-agent` could not be asked. `2` is deliberately not `0`: "I could not
+tell" must never read as "ready", or the check becomes the same silent pass it
+exists to prevent.
 
 Do **not** export `SYNAPTORY_CONTROL_PLANE_URL` or `SYNAPTORY_CP_ENV`. Cursor
 hooks read `hooks/lib/cp-url.local` then the stamped `hooks/lib/cp-url`, and
@@ -77,5 +109,5 @@ Layer-2 drift tests fail CI if `plugin-claude/` changed and generated files here
 ## Manual check
 
 1. Local symlink as above.
-2. `/synaptory status`
-3. One SE→QE→CR story on a scratch `.synaptory` project.
+2. `/synaptory status` on a project with `build_mode: spq`.
+3. One SPQ Cycle (hydrate → SE→QE→CR → `declare_sync_ready` → Sync) on a scratch project. Scrum/Kanban is uncertified on Cursor — expect a warning recommending SPQ.

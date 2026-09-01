@@ -89,9 +89,21 @@ case "$cmd" in
     fi
     exit 0
     ;;
-  whoami|status)
+  whoami)
     # Used by some hooks for liveness checks; return a minimal sane body.
     echo "stub@synaptory.test"
+    ;;
+  status)
+    # Resolver identity probe. A single fixture backs both channel names, so
+    # report the immutable URL that the invoked name represents.
+    case "$(basename "$0")" in
+      synaptory-local)
+        echo "control_plane_url:  ${SYNAPTORY_STUB_CP_URL:-http://localhost:8080}"
+        ;;
+      *)
+        echo "control_plane_url:  ${SYNAPTORY_STUB_CP_URL:-https://synaptory.h3t.co}"
+        ;;
+    esac
     ;;
   --version|-v)
     # cli_min_version gate calls `synaptory --version`; emit a high version

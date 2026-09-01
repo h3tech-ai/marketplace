@@ -8,7 +8,7 @@ verification_runner.py (VERIFICATION_ALLOWLIST, shell-control token refusals,
 timeouts) and receipt_validator.py (required fields, VALID_V3_STAGES,
 role/backend enums). See issue #163 (WP1 of the #134 remediation program).
 
-The canonical JSON artifact ships at plugin-claude/receipt-schema/evidence-contract.json;
+The canonical JSON artifact ships at core/receipt-schema/evidence-contract.json;
 EMBEDDED_DEFAULTS below is content-equivalent (a drift test enforces equality)
 so consumers keep working when the file is absent (e.g. partial installs).
 The signed policy cache (~/.synaptory/.cache/policy.json → payload.receipt_schema)
@@ -33,6 +33,14 @@ import json
 import os
 import sys
 from typing import Any
+
+
+def _host_env():
+    """Lazy import so a partial install cannot break module load."""
+    import host_env
+
+    return host_env
+
 
 # ---------------------------------------------------------------------------
 # Embedded defaults — content-equivalent to receipt-schema/evidence-contract.json
@@ -397,16 +405,25 @@ EMBEDDED_DEFAULTS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 _CONTRACT_RELPATH = os.path.join("receipt-schema", "evidence-contract.json")
-_POLICY_CACHE_PATH = "~/.synaptory/.cache/policy.json"
+_POLICY_CACHE_RELPATH = os.path.join(".cache", "policy.json")
 
 
 def _default_plugin_root() -> str:
-    """Plugin root: $CLAUDE_PLUGIN_ROOT, else two dirs up from this file's dir."""
-    env_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+    """Runtime root holding receipt-schema/: $SYNAPTORY_PLUGIN_ROOT, else inferred.
+
+    Two layouts carry this module, at different depths:
+      source tree      core/lib/          -> core/           (one dir up)
+      composed package <pkg>/hooks/lib/   -> <pkg>/          (two dirs up)
+    Probe for the schema dir rather than assuming a fixed depth.
+    """
+    env_root = _host_env().plugin_root().strip()
     if env_root:
         return env_root
-    here = os.path.dirname(os.path.abspath(__file__))  # plugin-claude/hooks/lib
-    return os.path.dirname(os.path.dirname(here))      # plugin-claude/
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+    if os.path.isdir(os.path.join(parent, "receipt-schema")):
+        return parent
+    return os.path.dirname(parent)
 
 
 def _apply_policy_overlay(contract: dict[str, Any]) -> dict[str, Any]:
@@ -417,7 +434,9 @@ def _apply_policy_overlay(contract: dict[str, Any]) -> dict[str, Any]:
     Any read failure leaves the contract untouched (fail-safe).
     """
     try:
-        with open(os.path.expanduser(_POLICY_CACHE_PATH), "r") as f:
+        from host_env import state_dir
+
+        with open(os.path.join(state_dir(), _POLICY_CACHE_RELPATH), "r") as f:
             cached = json.load(f)
         schema = cached.get("payload", {}).get("receipt_schema", {})
         if not isinstance(schema, dict):
@@ -673,6 +692,36 @@ _ROLE_OBLIGATIONS: dict[str, list[str]] = {
 }
 
 
+def _runtime_identity_lines(contract: dict[str, Any] | None = None) -> list[str]:
+    """The runtime-identity stanza for the injected envelope (#342, Epic #339).
+
+    Every field here is COPIED from the dispatch contract the kernel hands the
+    agent, never invented. That is the whole design: the kernel already knows
+    which attempt it authorized, so an agent that derives any of these itself
+    is guessing, and a guessed attempt id is worse than an absent one because
+    it looks like evidence.
+
+    Stamped as soft-required during the migration window. The kernel enforces
+    on MISMATCH rather than on absence (see advance_kernel), so an agent that
+    omits these still advances on the dispatch binding; what it loses is
+    attempt-scoped evidence, which is exactly what the pilot exists to
+    produce. Requiring presence is a later tightening that belongs with the
+    managed runner.
+    """
+    del contract  # reserved: the field list is contract-independent today
+    return [
+        "- Runtime identity (copy VERBATIM from the dispatch contract you were "
+        "given; never derive or invent these): `attempt_id`, `dispatch_id`",
+        "- When the dispatch contract carries them, also copy: `cycle_id`, "
+        "`manifest_hash`, `workstream_id`, `adapter_profile_id`, `placement`, "
+        "`capability_profile`, `stage_profile`, `runtime_family`, "
+        "`source_revision`, and the exact model id the runtime reported",
+        "- On a FAILED or cancelled attempt, add `failure_class` from the "
+        "versioned vocabulary. A miss that closes unclassified is the one "
+        "thing the evidence model does not allow.",
+    ]
+
+
 def render_envelope(
     agent_type: str,
     active_checks: list[str] | None = None,
@@ -725,6 +774,7 @@ def render_envelope(
             "- Soft-required (warn now, error later): `token_usage` "
             "{input, output, cache_read, cache_write, stage}, `story_dod`"
         )
+        lines.extend(_runtime_identity_lines(contract))
         lines.append("")
         lines.append("### verification_commands — two forms, only one is proof")
         lines.append(

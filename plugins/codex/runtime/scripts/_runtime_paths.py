@@ -1,0 +1,50 @@
+"""Locate the shared `lib/` directory from a script under `core/scripts/`.
+
+The same script file ships under three layouts, at three different depths
+relative to the shared Python library:
+
+    source tree        core/scripts/x.py                    -> core/lib
+    composed Cursor    <pkg>/skills/_shared/scripts/x.py    -> <pkg>/hooks/lib
+    composed Codex     <pkg>/runtime/scripts/x.py           -> <pkg>/hooks/lib
+
+Probing for a known module beats hard-coding a parent count, which silently
+resolves to the wrong directory when the tree is rearranged (that is exactly
+what broke when the runtime moved out of plugin-claude/ into core/).
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# Any module guaranteed to live in the shared lib dir.
+_SENTINEL = "story_pipeline.py"
+
+
+def find_lib_dir(start: str | Path | None = None) -> Path:
+    """Return the shared lib directory, or a best-effort guess if not found.
+
+    `start` defaults to this file's directory (the scripts dir).
+    """
+    here = Path(start).resolve() if start else Path(__file__).resolve().parent
+    if here.is_file():
+        here = here.parent
+
+    candidates = [
+        here.parent / "lib",                 # core/scripts -> core/lib
+        here.parent.parent / "hooks" / "lib",  # <pkg>/runtime/scripts -> <pkg>/hooks/lib
+        here.parents[2] / "hooks" / "lib" if len(here.parents) > 2 else None,
+    ]
+    for candidate in candidates:
+        if candidate is not None and (candidate / _SENTINEL).is_file():
+            return candidate
+
+    # Env override is a last resort: hosts set it to their runtime root.
+    for var in ("SYNAPTORY_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+        root = os.environ.get(var, "").strip()
+        if root and (Path(root) / "hooks" / "lib" / _SENTINEL).is_file():
+            return Path(root) / "hooks" / "lib"
+        if root and (Path(root) / "lib" / _SENTINEL).is_file():
+            return Path(root) / "lib"
+
+    return here.parent / "lib"

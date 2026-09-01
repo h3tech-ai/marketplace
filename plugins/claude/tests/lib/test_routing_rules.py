@@ -155,3 +155,79 @@ def test_routing_case(case: dict, routing_rules: dict):
             f"mode {expected_mode!r} missing expected skill {skill!r}; "
             f"skills_involved={matched['skills_involved']}"
         )
+
+
+# ── Dangling mode references (#245) ───────────────────────────────────────────
+#
+# The router used to arbitrate toward a mode named "Verify" that was never in
+# the modes array and had no mode file behind it, so "audit my code before
+# launch" fell through to Review — whose own docs say it does not do security.
+# These two tests make that class of rot fail the suite instead of shipping.
+
+# "Use Review (not Secure) when …" — both names must be real modes.
+_MODE_PAIR_RE = re.compile(r"Use (.+?) \(not (.+?)\)")
+
+
+@pytest.mark.unit
+def test_mode_tiebreakers_name_real_modes(routing_rules: dict, modes_by_name: dict):
+    """Every mode named in a `modes[].tiebreaker` must exist in the modes array."""
+    for entry in routing_rules["modes"]:
+        tiebreaker = entry.get("tiebreaker")
+        if not tiebreaker:
+            continue
+        match = _MODE_PAIR_RE.search(tiebreaker)
+        assert match, (
+            f"mode {entry['mode']!r} has a tiebreaker that does not follow the "
+            f"'Use X (not Y) when …' convention: {tiebreaker!r}"
+        )
+        for named in match.groups():
+            assert named in modes_by_name, (
+                f"mode {entry['mode']!r} arbitrates against {named!r}, which is "
+                f"not a mode in routing-rules.json. Known: {sorted(modes_by_name)}"
+            )
+
+
+@pytest.mark.unit
+def test_global_tiebreaker_conflicts_name_real_modes(
+    routing_rules: dict, modes_by_name: dict
+):
+    """Single-word sides of a `tiebreakers[].conflict` must be real mode names.
+
+    Multi-word sides describe an intent ("write tests + story ID"), not a mode,
+    and are not checked.
+    """
+    known = {name.lower() for name in modes_by_name}
+    for entry in routing_rules["tiebreakers"]:
+        conflict = entry["conflict"]
+        if " vs " not in conflict:
+            continue
+        for side in conflict.split(" vs "):
+            side = side.strip()
+            if " " in side:
+                continue
+            assert side.lower() in known, (
+                f"tiebreaker {conflict!r} names mode {side!r}, which does not "
+                f"exist in routing-rules.json. Known: {sorted(modes_by_name)}"
+            )
+
+
+@pytest.mark.unit
+def test_secure_mode_is_routable_and_reaches_compliance_engineer(modes_by_name: dict):
+    """#245 — Secure exists, is standalone, and dispatches the compliance-engineer."""
+    assert "Secure" in modes_by_name, (
+        "Secure mode is missing; security-audit requests fall through to Review"
+    )
+    secure = modes_by_name["Secure"]
+    assert secure.get("lifecycle") == "standalone"
+    assert "compliance-engineer" in secure["skills_involved"]
+
+
+@pytest.mark.unit
+def test_no_mode_file_referenced_by_routing_notes_is_missing(routing_rules: dict):
+    """A `modes/<file>.md` named in a routing note must exist on disk."""
+    modes_dir = PLUGIN_ROOT / "skills" / "synaptory" / "modes"
+    for entry in routing_rules["modes"]:
+        for ref in re.findall(r"modes/(\S+?\.md)", entry.get("notes", "")):
+            assert (modes_dir / ref).is_file(), (
+                f"mode {entry['mode']!r} points at modes/{ref}, which does not exist"
+            )

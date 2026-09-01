@@ -1,44 +1,20 @@
 #!/usr/bin/env python3
 # Copyright 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
-"""synaptory doctor — self-service activation diagnostic.
+"""synaptory doctor — CLI-session diagnostic.
 
-Plain-text report showing token source, format, signature, expiry, backend
-mode (local vs. control-plane), public-key fingerprint, and session dir.
-Every SessionStart failure path funnels here so the user sees an actionable
-message, not a JSON blob.
+Auth is owned by the synaptory CLI (SAD: the plugin does not parse access
+tokens). This report shells out to `synaptory whoami --check` the same way
+SessionStart does.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
-from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import access_token_client as atc  # noqa: E402
-import session_manager as sm  # noqa: E402
-
-
-def _find_token() -> tuple[str | None, str]:
-    env = os.environ.get("SYNAPTORY_ACCESS_TOKEN")
-    if env:
-        return env.strip(), "environment variable SYNAPTORY_ACCESS_TOKEN"
-    home = os.path.expanduser("~/.synaptory-access-token")
-    if os.path.exists(home):
-        try:
-            with open(home) as f:
-                return f.read().strip(), home
-        except OSError as e:
-            return None, f"{home} (unreadable: {e})"
-    proj_dir = os.environ.get("CLAUDE_PROJECT_DIR", ".")
-    proj = os.path.join(proj_dir, ".synaptory-access-token")
-    if os.path.exists(proj):
-        try:
-            with open(proj) as f:
-                return f.read().strip(), proj
-        except OSError as e:
-            return None, f"{proj} (unreadable: {e})"
-    return None, ""
+import host_env
 
 
 def _python_info() -> str:
@@ -46,30 +22,24 @@ def _python_info() -> str:
     return f"{v.major}.{v.minor}.{v.micro} ({sys.executable})"
 
 
-def _pubkey_info() -> str:
-    fp = atc.public_key_fingerprint()
-    if fp == "missing":
-        return "MISSING — re-install synaptory from the marketplace."
-    return f"ok (fingerprint {fp})"
-
-
-def _cp_info() -> str:
-    url = sm._control_plane_url()
-    offline = os.environ.get("SYNAPTORY_OFFLINE") == "1"
-    if not url:
-        return "unset (using local mode)"
-    if offline:
-        return f"{url} (SYNAPTORY_OFFLINE=1 — using local mode)"
-    cli = sm._resolve_cli_binary(url)
+def _run_cli(args: list[str]) -> tuple[int | None, str]:
+    cli_name = "synaptory-local" if host_env.local_plugin_runtime() else "synaptory"
+    override = os.environ.get("SYNAPTORY_CLI_BIN", "").strip()
+    cli = override if override and os.path.isfile(override) and os.access(override, os.X_OK) else shutil.which(cli_name)
     if not cli:
-        kind = "synaptory-local" if sm._cli_url_is_local(url) else "synaptory"
-        return (
-            f"{url} (CLI missing — falling back to local; "
-            f"install {kind} to enable)"
+        return None, f"{cli_name} CLI not found or build identity does not match this plugin"
+    try:
+        proc = subprocess.run(
+            [cli, *args],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
         )
-    if sm._control_plane_reachable(url):
-        return f"{url} (reachable; CLI at {cli})"
-    return f"{url} (UNREACHABLE — falling back to local; CLI at {cli})"
+        out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return proc.returncode, out
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
 
 
 def run() -> int:
@@ -78,144 +48,37 @@ def run() -> int:
         "synaptory doctor",
         "================",
         f"Python:        {_python_info()}",
-        f"Public key:    {_pubkey_info()}",
-        f"Control-plane: {_cp_info()}",
     ]
-
-    token, source = _find_token()
-    if not token:
+    rc, out = _run_cli(["whoami", "--check"])
+    if rc is None:
+        cli_name = "synaptory-local" if host_env.local_plugin_runtime() else "synaptory"
         lines += [
-            "Token:         NOT FOUND",
+            "CLI:           NOT FOUND",
             "",
-            "No access token found. Checked in order:",
-            "  1. $SYNAPTORY_ACCESS_TOKEN (env)",
-            "  2. ~/.synaptory-access-token",
-            "  3. $CLAUDE_PROJECT_DIR/.synaptory-access-token",
-            "",
-            "Fix: ask your team lead for a personal token (SYNAPTORY1.…), then:",
-            '    echo "SYNAPTORY1..." > ~/.synaptory-access-token',
-            "    chmod 600 ~/.synaptory-access-token",
-            "Restart your Claude Code session.",
+            f"Install the {cli_name} CLI, then run `{cli_name} login`.",
+            "Doctor no longer reads plugin access-token files — the CLI is",
+            "the only auth path.",
             "",
         ]
         print("\n".join(lines))
         return 1
-
-    lines.append(f"Token:         found ({source})")
-
-    # Format detection — before signature verification.
-    if token.startswith("SYNAPTORY1."):
-        parts = token.split(".")
-        if len(parts) == 3:
-            lines.append("Format:        SYNAPTORY1 (current)")
-        else:
-            lines += [
-                "Format:        SYNAPTORY1 but malformed",
-                "",
-                f"Token has {len(parts)} dot-separated segments; expected 3.",
-                "Re-download the token — it may have been truncated or corrupted",
-                "on copy/paste. Watch out for trailing whitespace or line breaks.",
-            ]
-            print("\n".join(lines))
-            return 1
-    elif token.startswith("HIRO.2."):
+    lines.append(
+        f"whoami --check: {'ok' if rc == 0 else 'FAILED'} (exit {rc})"
+    )
+    if out:
+        lines.append(out)
+    if rc != 0:
+        cli_name = "synaptory-local" if host_env.local_plugin_runtime() else "synaptory"
         lines += [
-            "Format:        HIRO.2 (legacy 4-segment — REMOVED in v2.1.17)",
             "",
-            "Your token uses the old HIRO.2. 4-segment format. It was accepted",
-            "during the v2.1.16 compat window and is now rejected. Ask your team",
-            "lead to re-issue your token in SYNAPTORY1. format:",
-            "    ./synaptory access-token your.email@company.com 2027-12-31 <password>",
+            f"Fix: `{cli_name} login` then re-run doctor.",
+            "",
         ]
         print("\n".join(lines))
         return 1
-    elif token.startswith("HIRO-1-"):
-        lines += [
-            "Format:        HIRO-1 (legacy v1 — REMOVED in v2.1.17)",
-            "",
-            "Your token uses the old HIRO-1 format, which was removed in v2.1.17.",
-            "Ask your team lead to re-issue your token in SYNAPTORY1. format:",
-            "    ./synaptory access-token your.email@company.com 2027-12-31 <password>",
-        ]
-        print("\n".join(lines))
-        return 1
-    else:
-        lines += [
-            "Format:        UNRECOGNIZED",
-            "",
-            f"Token starts with {token[:10]!r}. Expected `SYNAPTORY1.`.",
-            "Your token is corrupted or was copied incompletely.",
-            "Ask your team lead to re-send it; do not trim the `SYNAPTORY1.` prefix.",
-        ]
-        print("\n".join(lines))
-        return 1
-
-    # Signature + payload.
-    try:
-        payload = atc.parse_access_token(token)
-    except ValueError as e:
-        lines += [
-            "Signature:     FAILED",
-            "",
-            f"{e}",
-            "",
-            "Common causes:",
-            "  - Token was signed by a different plugin build.",
-            "  - Token was modified on copy/paste.",
-            "  - Shipped public key file is missing or corrupted.",
-            f"  - Fingerprint on this machine: {atc.public_key_fingerprint()}",
-            "Ask your team lead for a token built for this plugin version.",
-        ]
-        print("\n".join(lines))
-        return 1
-    except RuntimeError as e:
-        lines += [
-            "Signature:     BUILD ERROR",
-            "",
-            f"{e}",
-        ]
-        print("\n".join(lines))
-        return 1
-    lines.append(f"Signature:     ok  (upn={payload['upn']})")
-
-    # Expiry.
-    try:
-        exp = datetime.strptime(payload["exp"], "%Y-%m-%d")
-    except (KeyError, ValueError):
-        lines += [
-            "Expiry:        MALFORMED",
-            "Contact your team lead to re-issue this token.",
-        ]
-        print("\n".join(lines))
-        return 1
-    days_left = (exp - datetime.now()).days
-    if days_left < 0:
-        lines += [
-            f"Expiry:        EXPIRED on {payload['exp']} ({-days_left} days ago)",
-            "",
-            "Contact your team lead for renewal.",
-        ]
-        print("\n".join(lines))
-        return 1
-    lines.append(f"Expiry:        ok  ({payload['exp']}, {days_left} days left)")
-
-    # Role / watermark / session dir.
-    lines.append(f"Role:          {payload.get('role', 'member')}")
-    lines.append(f"Watermark:     {atc.get_access_token_watermark(token)}")
-    sd = atc.get_session_dir()
-    lines.append(f"Session dir:   {sd if sd else '(none — run a new session to activate)'}")
-
-    # Stored session record.
-    mgr = sm.SessionManager(access_token=token)
-    rec = mgr.whoami()
-    if rec:
-        lines.append(
-            f"Session rec:   cached — exp {rec.expires_at.isoformat()}, "
-            f"project {rec.project_id or '(none)'}, role {rec.role or '(none)'}"
-        )
-    else:
-        lines.append("Session rec:   (none cached yet)")
-
+    _, who = _run_cli(["whoami"])
+    if who:
+        lines.append(who)
     lines += ["", "All checks passed.", ""]
     print("\n".join(lines))
     return 0

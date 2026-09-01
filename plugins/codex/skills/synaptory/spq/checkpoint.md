@@ -1,0 +1,463 @@
+# Checkpoint. Close the Cycle with a Customer Demonstration
+
+> **Lifecycle state:** `CHECKPOINT`
+> **Participants:** Orchestrator (integration clone), PO, TW, stakeholders (user)
+> **Output:** demonstration of the integrated increment, Cycle acceptance, harvested MethodSignals, backlog updates
+> **Human gate:** YES. Demo plus acceptance.
+> **Adapted from:** `ceremonies/sprint-review.md`
+
+Checkpoint is SPQ's Sprint Review. Two differences change how it is run, and
+both matter more than the vocabulary:
+
+1. **It demos from `dev`, not from a workstream branch.** Sync already merged
+   every workstream into `sync/cycle-{N}` and the lead promoted that to `dev` by
+   PR (see `spq/sync.md` step 5). If that PR has not landed, Checkpoint has
+   nothing current to demonstrate: stop and say so rather than demoing the
+   previous Cycle.
+2. **Retro is deliberately absent as a state.** SPQ has no retro event. Process
+   learning is folded in here as **MethodSignals** (Step 6) rather than added as
+   a state `SYN-LIF-013` does not sanction. Skipping Step 6 does not make the
+   Cycle faster, it makes ten weeks of delivery produce no method evidence,
+   which is half the reason SPQ is being piloted at all.
+
+---
+
+## Prerequisites
+
+```bash
+MCP `get_state`
+# require: lifecycle_state == "CHECKPOINT";  N = current_cycle
+MCP `get_status`
+```
+
+`summary` returns `sync` (the recorded barrier verdict for this Cycle),
+`work_units` counted by sub-state including `cancelled`, `dod` (the aggregate),
+and `cycle_tracker_binding`. The `sync` block must be green for the current
+Cycle: reaching `CHECKPOINT` without it means someone used
+`transition --force`, and the increment on `dev` is not the one the barrier
+proved.
+
+**Confirm `dev` carries the Cycle.** The integration branch head recorded in
+`sync.head_sha` must be an ancestor of `dev`. If the promotion PR is still open,
+present that and stop; do not merge it yourself (Git Safety Rules, rule 4).
+
+---
+
+## Step 1. Deploy the increment to preview (auto-detected)
+
+Check `.synaptory.yaml` → `project.framework`.
+
+**Web app** (nextjs, express, fastapi, gin, sveltekit, nuxt, remix): deploy a
+preview **from `dev`**.
+
+```
+Read("${PLUGIN_ROOT}/skills/synaptory/modes/preview.md")
+```
+
+**Asset-exhaustive smoke check. REQUIRED before presenting the URL.** A
+root-only `curl` returning 200 proves nothing about a demo: a deploy that
+silently dropped `.next/static` still serves 200 with every stylesheet and
+script 404ing. Run the check against the preview URL plus every completed Work
+Unit's route:
+
+```bash
+python3 "${PLUGIN_ROOT}/hooks/lib/preview_asset_check.py" {PREVIEW_URL} \
+  /route-of-WU-042 /route-of-WU-043
+```
+
+Exit 0 means every referenced same-origin asset returned 200. **Present the
+preview URL only after the check passes.** On failure the increment is not
+demoable: route to `pe` (deploy-artifact copy step) or `se` (broken reference) in
+the owning workstream, fix, re-run the check. Never suppress stderr on a copy of
+a deploy-critical build output; a failed copy must fail the deploy step.
+
+**Non-web project** (CLI, library, infrastructure, mobile): skip the preview and
+note `Preview skipped, {project_type} project`.
+
+---
+
+## Step 2. TW generates the Cycle reports
+
+```bash
+TW_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "technical-writer")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
+```
+
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not write the Cycle reports inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="TW Cycle {N} report", prompt=<self-contained prompt per the wrapper>)`: see `${PLUGIN_ROOT}/skills/_shared/backends/${TW_BACKEND}.md`. The TW writes its receipt to `${RECEIPTS_DIR}/CHECKPOINT-{N}-tw.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
+
+**TW prompt context:**
+- Cycle `{N}`, the Cycle goal, and the promoted `dev` sha
+- Completed Work Units **per workstream**, with their DoD results
+- The barrier verdict from `summary.sync`: criteria passed, workstreams
+  integrated, cleared sha. This is the one place the reader learns that the
+  increment was integrated rather than assembled for the demo
+- Cut Work Units with their `cut_reason`, which belong in the report rather than
+  quietly missing from it
+- Receipt data across all workstreams (metrics, findings, verification results)
+
+**TW output:**
+- Cycle quality report → `reports/cycle-{N}-quality.md`
+- Cycle progress report → `reports/cycle-{N}-progress.md`
+
+```json
+{
+  "story_id": "CHECKPOINT-3",
+  "role": "technical-writer",
+  "backend": "claude",
+  "model": "claude-sonnet-4-6",
+  "artifacts": [
+    "reports/cycle-3-quality.md",
+    "reports/cycle-3-progress.md"
+  ],
+  "metrics": {
+    "work_units_reported": 29,
+    "work_units_scope": "manifest",
+    "workstreams": 3,
+    "work_units_cut": 1
+  },
+  "verification_commands": [
+    {"command": "test -s reports/cycle-3-quality.md", "exit_code": 0, "summary": "quality report present, non-empty"},
+    "test -s reports/cycle-3-progress.md"
+  ],
+  "verification_summary": "Cycle 3 reports written for 3 workstreams",
+  "token_usage": {
+    "input": 33800,
+    "output": 9400,
+    "cache_read": 21000,
+    "cache_write": 2600,
+    "stage": "tw-docs"
+  },
+  "completed_at": "2026-08-14T13:05:00Z"
+}
+```
+
+---
+
+## Step 3. Demonstrate the increment
+
+Present the increment organised by Cycle goal, grouped **by workstream** so the
+stakeholder sees one system rather than N streams of activity.
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CYCLE {N} CHECKPOINT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Cycle Goal:   {CYCLE_GOAL}
+  Demoing from: dev @ {sha}      (integrated at Sync, barrier GREEN 5/5)
+  {PREVIEW_URL if web app}
+
+  Completed Work Units:
+  ┌────────────┬────────────┬──────────────────────────┬────────┬─────────────────────┐
+  │ Work Unit  │ Workstream │ Title                    │ Status │ Evidence            │
+  ├────────────┼────────────┼──────────────────────────┼────────┼─────────────────────┤
+  │ WU-042     │ frame      │ Sign-in with MFA         │ Done   │ tests pass, demoed  │
+  │ WU-043     │ spine      │ Password reset           │ Done   │ tests pass, demoed  │
+  │ WU-051     │ exec       │ Batch export             │ Done   │ tests pass, demoed  │
+  │ WU-052     │ exec       │ Export scheduling        │ Cut    │ returned to backlog │
+  └────────────┴────────────┴──────────────────────────┴────────┴─────────────────────┘
+
+  Cycle  (all counts across the whole manifest, {workstreams} workstreams):
+    Work Units:  {done}/{admitted} done, {cut} cut
+    Integration: barrier green, {workstreams} workstreams, {criteria}/5 criteria
+    Tests:       {tests_passing}/{tests_total} passing on the integrated tree
+
+  This clone:
+    Cycles closed here: {cycles_completed}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Never print a manifest-wide count beside a seat-local one unlabelled
+
+`work_units_*` and `cycles_completed` are counted over **different scopes**, and
+a rollup that puts them side by side without saying so is unreadable — a reader
+seeing `work_units_reported: 6` next to `cycles_completed: 2/2` has no way to
+know the `6` is every workstream and the `2/2` is this clone alone (#334 G15).
+
+- Manifest-wide, on the integration seat: `work_units_total`, `work_units_done`,
+  `work_units_cut` and the `dod` aggregate, all summed from the readiness
+  records the workstreams published at Sync.
+- Seat-local, always: `cycles_completed`, and `summary.work_units` (this clone's
+  board, which on the integration seat is empty by design).
+
+`close_cycle` records which one produced the counts — read `work_units_scope`
+(`manifest` or `seat`) and `work_units_source` (`sync_readiness_records`,
+`barrier_tally` or `local_board`) off the archived record, and `summary.scope`
+for the live figures. Label the scope in the rendered block and in the TW
+report, or report every figure at one scope. Do not mix them silently.
+
+### Say what the evidence actually supports, and no more
+
+**Do not present the Checkpoint demo as evidence-backed across all five DoD
+checks.** `SYN-LIF-013` defines Checkpoint as *"a customer demonstration layered
+on the per-Work-Unit Prove gates"*, and in production only one of those five
+gates has a populated signal. Measured over an 11-day prod window, of 296
+receipts carrying `story_dod`: `tests_pass` appeared 238 times, while
+`build_succeeds`, `no_critical_findings`, `code_reviewed` and
+`coverage_no_decrease` each appeared **zero** times (§13.3). Agents populate
+their own keys instead, which the validator only warns about.
+
+So the honest claim at pilot scope is **"tests pass, demonstrated"**. Use that
+wording in the Evidence column and in the TW report. Concretely:
+
+- Write `tests pass, demoed` rather than `DoD ✓ Pass` or `5/5 gates green`.
+- When a Work Unit's receipt genuinely carries a canonical key, name that key.
+  Do not generalise one populated check into a claim about the set.
+- The per-Work-Unit **local** gate (`evaluate_story_dod` against
+  `active_dod_checks`) is a different code path from the receipt field and may
+  well be healthier. Only the control-plane-visible signal was measured, so cite
+  the local gate as the local gate, not as `/quality` evidence.
+- This is a pre-existing V1 gap tracked separately, not SPQ's to fix here. It is
+  written down so the first Checkpoint is not where it gets discovered.
+
+For a Work Unit with a DoD warning, expand the detail rather than averaging it
+away:
+
+```
+  ⚠ WU-051 DoD detail:
+    ✓ tests_pass. 96 passed, 0 failed
+    ? build_succeeds, not reported by the receipt (unevaluated, not passing)
+    ✗ no_critical_findings. 1 high-severity finding, non-critical, not blocking
+    ? code_reviewed, not reported
+    ? coverage_no_decrease, not reported
+```
+
+---
+
+## Step 4. Per-Work-Unit acceptance walk (signal-gated)
+
+**Trigger:** `.synaptory.yaml` sets `sprint.review.per_story_acceptance: true`,
+which is the default. The SE→QE→CR pipeline then routes each Work Unit to
+`awaiting_acceptance` rather than `done`, and the PO walks the queue with an
+Accept or Reject decision per unit. This is the audit-trail gate for HIPAA /
+SOC2 / HITRUST work: code can pass automated review and still be unfit for
+product reasons. When explicitly `false` (unattended runs), skip to Step 5.
+
+Read the queue:
+
+```bash
+MCP `get_state`
+```
+
+For each Work Unit, present its id and title, its DoD detail in the Step 3 shape,
+its receipt paths, and the five decisions. Then:
+
+```bash
+# Accept → done, tracker → DONE
+MCP `spq_lifecycle` {"operation": "accept_story", "accepted_by": "{PO_EMAIL_OR_ROLE}", "story_id": "{WU-ID}"}
+
+# Reject → reason class + free-form feedback, appended to rejection_feedback
+MCP `spq_lifecycle` {"operation": "reject_story", "reason": "needs-fix|redo|defer|cancel", "feedback": "{PO free-form text}", "rejected_by": "{PO_EMAIL_OR_ROLE}", "story_id": "{WU-ID}"}
+```
+
+| Reason | Work Unit state | Tracker column | Cycle membership |
+|---|---|---|---|
+| `needs-fix` | `in_progress` | In Progress | stays in the current Cycle |
+| `redo` | `queued` | To Do | stays in the current Cycle |
+| `defer` | `queued` (carry over) | To Do | moves to the next Cycle |
+| `cancel` | `cancelled` | Done + `cancelled` tag | removed from velocity |
+
+> **Acceptance-criteria changes go in `--feedback`.** `scrum_state_machine.py`
+> accepts repeated `--ac-change` flags on `reject_story`; the `spq` CLI does not
+> parse that flag yet, so an AC change passed as `--ac-change` is silently
+> dropped. Write it into the `--feedback` text, where the next SE dispatch will
+> see it, and have the PO update the criteria in the tracker.
+
+**A rejection at Checkpoint is a Sync problem, not only a Cycle problem.** The
+barrier already cleared on this tree. A `needs-fix` or `redo` means the next fix
+lands on a workstream branch and must go through the barrier again before it is
+demonstrable. Say that plainly to the lead: the choice is `defer` (clean, next
+Cycle) or accepting that this Cycle reopens `CYCLE_EXECUTION` work and re-runs
+Sync. Do not silently patch on `dev`.
+
+Every accept and reject writes a `story_accept` / `story_reject` event to
+`.synaptory/.orchestrator/events.jsonl` with `accepted_by` / `rejected_by`. For
+compliance sign-off that is the canonical record.
+
+---
+
+## Step 5. Capture stakeholder feedback
+
+```
+  Your feedback on Cycle {N}:
+  1. Looks good, no feedback
+  2. I have feedback (describe)
+  3. Chat about specific Work Units
+```
+
+Record feedback to `.synaptory/.orchestrator/sprint-feedback.md`. The next
+`COMMIT` reads it, alongside the MethodSignals from Step 6.
+
+---
+
+## Step 6. Harvest MethodSignals (do not skip)
+
+MethodSignals are the deliverable that feeds v2's method work (D19), and
+Checkpoint is the only place they are harvested. They reuse the existing
+append-only store at `.synaptory/signals/signals.jsonl`. **There is no
+`method-signals.jsonl` and you must not create one**: `signals.py` already
+implements exactly this shape and the planning loop already reads it.
+
+```bash
+MCP `spq_lifecycle` {"operation": "record_method_signal", "summary": "{one sentence, and name the state it occurred in}", "kind": "{KIND}"}
+```
+
+The verb writes to the Cycle's `method_signals` list in state **and** mirrors into
+`signals.py` with `kind: "method_signal"`, `source: "spq/checkpoint"`, and the
+Cycle number attached automatically. The CLI takes the kind positionally and the
+summary via `--summary`; it accepts no structured `data`, so **put the lifecycle
+state into the summary text** or it is lost.
+
+Record every place the SPQ mapping chafed. Suggested kinds:
+
+| Kind | Record when |
+|---|---|
+| `state_skipped` | a state had to be skipped or run as a formality |
+| `criterion_waived` | a Sync criterion was waived or overridden (each `accepted_digest_deltas` entry is one of these) |
+| `vocabulary_confusion` | Cycle / Work Unit / workstream vocabulary confused an agent or a human |
+| `profile_straddle` | a dispatch acted as more than one v2 execution profile |
+| `barrier_cost` | the barrier's wall-clock or a scope cut it forced |
+
+**Profile straddles are the specific thing to watch for.** v2 replaces nine
+personas with four portable execution profiles (Analyst, Planner, Producer,
+Prover), and three of V1's nine agents straddle them: `po` spans Analyst and
+Planner, `pe` spans Planner and Producer, `qe` spans Planner (the Cycle test
+spec) and Prover (verification). That is not a mapping error, it is the open
+question, and whether four profiles plus skills is sufficient is exactly what
+real delivery can answer. Record each straddle with the state it happened in.
+
+```bash
+MCP `spq_lifecycle` {"operation": "record_method_signal", "summary": "COMMIT: qe acted as Planner (Cycle test spec) then Prover (WU-043 verification) in one dispatch", "kind": "profile_straddle"}
+```
+
+Two or three signals per Cycle is a healthy rate. Zero means nobody looked.
+
+---
+
+## Step 7. PO updates the backlog
+
+Dispatch when Step 5 produced feedback, Step 4 produced any rejection, or Sync
+cut a Work Unit.
+
+```bash
+PO_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
+# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
+# workstream path, not `.orchestrator/receipts/`, and the readiness gate
+# resolves the same way, so a hardcoded path is a receipt no gate sees.
+RECEIPTS_DIR=$(python3 "${PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
+```
+
+> **MANDATORY: Spawn this agent via the `Agent()` tool, do not process the feedback inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO Cycle {N} backlog update", prompt=<self-contained prompt per the wrapper>)`: see `${PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `${RECEIPTS_DIR}/CHECKPOINT-{N}-po.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
+
+> **The PO dispatch prompt MUST instruct the agent to write `token_usage.stage: "pro-brd"` explicitly.** `project-owner` is deliberately absent from the receipt validator's `ROLE_STAGE_FALLBACK` because it spans three stages (`pro-discovery`, `pro-brd`, `pro-ux-spec`) and the validator cannot pick one, and the prefix fallback deliberately omits `pro-` for the same reason. Omit it and the PO's cost attribution is lost **silently**: the receipt still validates and still ships, it just contributes nothing to `/cost`. `pro-brd` is the stage at both `COMMIT` and `CHECKPOINT`. The other eight roles resolve through the fallback map and may omit it.
+
+**PO prompt context:**
+- Stakeholder feedback from Step 5
+- Every rejection from Step 4, with reason class and free-form text
+- Work Units cut at Sync, with `cut_reason`, for re-admission or re-sizing
+- MethodSignals from Step 6, which the next `COMMIT` reads
+- The current backlog and the workstream discriminator (label or Linear project)
+  each item belongs to
+
+**PO actions:** create Work Units from feedback, re-prioritise, re-size the units
+whose cut at Sync means `COMMIT` mis-sized them, update acceptance criteria, and
+assign each new unit to a workstream.
+
+```json
+{
+  "story_id": "CHECKPOINT-3",
+  "role": "project-owner",
+  "backend": "claude",
+  "model": "claude-opus-4-8",
+  "artifacts": [
+    ".synaptory/project-owner/cycle-3-feedback-triage.md"
+  ],
+  "metrics": {
+    "work_units_created": 4,
+    "work_units_resized": 2,
+    "rejections_processed": 1
+  },
+  "verification_commands": [
+    {"command": "test -s .synaptory/project-owner/cycle-3-feedback-triage.md", "exit_code": 0, "summary": "triage note present"},
+    {"command": "bash scripts/backlog-lint.sh", "exit_code": 0, "summary": "4 new Work Units carry a workstream label and ACs"}
+  ],
+  "verification_summary": "Cycle 3 feedback triaged into 4 new Work Units",
+  "token_usage": {
+    "input": 28700,
+    "output": 8100,
+    "cache_read": 15900,
+    "cache_write": 2200,
+    "stage": "pro-brd"
+  },
+  "completed_at": "2026-08-14T13:50:00Z"
+}
+```
+
+---
+
+## Step 8. TW report check
+
+Confirm `${RECEIPTS_DIR}/CHECKPOINT-{N}-tw.json` exists before closing the
+Cycle. `RECEIPTS_DIR` is as resolved in Step 2; re-resolve it here if this step
+runs in a fresh shell. Inside a Cycle it is the SPQ workstream path, which is
+where `checkpoint_readiness` looks. Without the report the Cycle has no
+documented demonstration, metrics, or feedback, and the next `COMMIT` has no
+context to feed forward.
+
+`close_cycle` enforces this gate. It validates the TW receipt schema, pseudo
+Work Unit id, role, verification exit codes, and any active Codex lifecycle
+dispatch binding. Missing, malformed, failed, or superseded evidence refuses
+the close; re-run Step 2 and do not use `--force` for ordinary delivery.
+
+---
+
+## Step 9. Close the Cycle
+
+```bash
+# loop to the next Cycle
+MCP `spq_lifecycle` {"operation": "close_cycle", "proceed_to": "COMMIT"}
+
+# or hand over for release
+MCP `spq_lifecycle` {"operation": "close_cycle", "proceed_to": "ACCEPTANCE"}
+```
+
+`close_cycle` archives the Cycle into `cycles_completed` with its DoD aggregate,
+its `work_units_done` / `work_units_cut` counts, the `work_units_scope` /
+`work_units_source` those counts were computed under, and its barrier verdict,
+clears `current_stories`, `cycle_goal` and `sync`, then transitions. Clearing `sync` is
+deliberate: the next Cycle must earn its own barrier, and `open_cycle` clears it
+again for the same reason.
+
+Choose `ACCEPTANCE` when the increment is what the customer is going to operate,
+not merely when the backlog is empty. Ask:
+
+```
+  Cycle {N} closed. Next:
+  1. Open Cycle {N+1} (COMMIT)
+  2. Prepare for release (ACCEPTANCE)
+  3. Chat about this
+```
+
+Then:
+
+```
+{IF COMMIT}:     → Read("${PLUGIN_ROOT}/skills/synaptory/spq/commit.md")
+{IF ACCEPTANCE}: → Read("${PLUGIN_ROOT}/skills/synaptory/spq/acceptance.md")
+```
+
+---
+
+## Receipt ledger for this state
+
+| Receipt | Author | `story_id` | `stage` |
+|---|---|---|---|
+| `CHECKPOINT-{N}-tw.json` | TW subagent | `CHECKPOINT-{N}` | `tw-docs` |
+| `CHECKPOINT-{N}-po.json` | PO subagent | `CHECKPOINT-{N}` | `pro-brd` (**explicit, never derived**) |
+
+`CHECKPOINT-{N}` satisfies the required `^[A-Z][A-Z0-9]*-\d+$` story-id pattern.
+Both receipts are expected for a Checkpoint that produced any feedback or
+rejection; a Checkpoint that produces neither still owes the TW receipt.

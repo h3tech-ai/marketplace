@@ -46,6 +46,42 @@
     ]
   },
   {
+    "description": "standalone security audit routes to Secure (#245)",
+    "trigger_signal": "security audit",
+    "expected_mode": "Secure",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "compliance-engineer"
+    ]
+  },
+  {
+    "description": "pre-launch hardening routes to Secure, not a nonexistent Verify (#245)",
+    "trigger_signal": "harden this before launch",
+    "expected_mode": "Secure",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "compliance-engineer"
+    ]
+  },
+  {
+    "description": "OWASP request routes to Secure",
+    "trigger_signal": "check this against OWASP top 10",
+    "expected_mode": "Secure",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "compliance-engineer"
+    ]
+  },
+  {
+    "description": "plain code review still routes to Review, not Secure",
+    "trigger_signal": "review my code",
+    "expected_mode": "Review",
+    "expected_lifecycle": "standalone",
+    "expected_skills_include": [
+      "code-reviewer"
+    ]
+  },
+  {
     "description": "architecture design routes to Architect",
     "trigger_signal": "design",
     "expected_mode": "Architect",
@@ -72,8 +108,8 @@
     "expected_skills_include": []
   },
   {
-    "description": "opening a slice routes to the SPQ lifecycle",
-    "trigger_signal": "open slice 3",
+    "description": "opening a cycle routes to the SPQ lifecycle",
+    "trigger_signal": "open cycle 3",
     "expected_mode": "SPQ",
     "expected_lifecycle": "spq",
     "expected_skills_include": [
@@ -91,7 +127,7 @@
     ]
   },
   {
-    "description": "checkpoint closes the slice after integration",
+    "description": "checkpoint closes the cycle after integration",
     "trigger_signal": "checkpoint",
     "expected_mode": "Checkpoint",
     "expected_lifecycle": "spq",

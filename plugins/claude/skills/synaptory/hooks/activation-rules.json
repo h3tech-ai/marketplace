@@ -228,7 +228,7 @@
         "(?:before|prior to).*(?:launch|production|release|deploy)"
       ],
       "priority": "high",
-      "recommendation": "This looks like a pre-launch hardening task. Use /synaptory Verify mode to run parallel security, QA, and code review."
+      "recommendation": "This looks like a pre-launch hardening task. Use /synaptory Secure mode for a scoped STRIDE + OWASP audit by the Compliance Engineer, or /synaptory Release for the full pre-launch pass (security, QA, infra, docs, review)."
     },
     {
       "skill": "synaptory",

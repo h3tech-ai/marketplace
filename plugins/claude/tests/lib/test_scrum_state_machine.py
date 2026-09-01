@@ -281,11 +281,11 @@ def test_transition_story_to_done_emits_evidence_dod_natural_path(
     import gate_emitter
     monkeypatch.setattr(
         gate_emitter, "emit_evidence_dod_accepted",
-        lambda story_id, who: calls.append(("approved", story_id)) or True,
+        lambda story_id, who, **_kwargs: calls.append(("approved", story_id)) or True,
     )
     monkeypatch.setattr(
         gate_emitter, "emit_evidence_dod_rejected",
-        lambda story_id, who, reason: calls.append(("rejected", story_id)) or True,
+        lambda story_id, who, reason, **_kwargs: calls.append(("rejected", story_id)) or True,
     )
 
     add_story(project, "US-200", title="ev-dod natural path")
@@ -321,11 +321,11 @@ def test_transition_story_to_done_skips_emit_via_awaiting_acceptance(
     import gate_emitter
     monkeypatch.setattr(
         gate_emitter, "emit_evidence_dod_accepted",
-        lambda story_id, who: calls.append(("approved", story_id)) or True,
+        lambda story_id, who, **_kwargs: calls.append(("approved", story_id)) or True,
     )
     monkeypatch.setattr(
         gate_emitter, "emit_evidence_dod_rejected",
-        lambda story_id, who, reason: calls.append(("rejected", story_id)) or True,
+        lambda story_id, who, reason, **_kwargs: calls.append(("rejected", story_id)) or True,
     )
 
     add_story(project, "US-201", title="ev-dod via awaiting")
@@ -467,3 +467,58 @@ def test_add_story_cli_passes_acceptance_criteria(project: str, monkeypatch):
     story = next(s for s in read_state(project)["current_stories"] if s["id"] == "US-400")
     assert story["ui_bearing"] is True
     assert story["acceptance_criteria"]  # ACs were persisted, not dropped
+
+
+# ── #304: the serial path now gates `depends_on` in this lifecycle too ─────
+
+
+def test_serial_dispatch_now_gates_depends_on():
+    """An intentional behaviour change, asserted here so nobody reverts it.
+
+    `create_story` populates `depends_on` for all three lifecycles (#134
+    GAP-6), and with story parallelism defaulting off the serial path was the
+    ONLY path -- and it was ungated, so a queued story could start against an
+    unfinished upstream. The gate is deliberately not conditioned on
+    build_mode: #304 objects to serial and parallel dispatch disagreeing about
+    one contract. A project holding aspirational or stale edges (the shipped
+    prompts described `depends_on` as a batch filter) can set
+    `resilience.dependency_gate: warn` for one release.
+    """
+    from story_pipeline import next_action
+
+    def _unit(sid, state, **kw):
+        return {"id": sid, "title": sid, "state": state, **kw}
+
+    board = {
+        "version": "2.0",
+        "build_mode": "scrum",
+        "lifecycle_state": "SPRINT_EXECUTION",
+        "current_sprint": 2,
+        "current_stories": [
+            _unit("US-02", "queued", depends_on=["US-01"]),
+        ],
+    }
+    out = next_action(board)
+    assert out["action"] == "deps_blocked", out
+    assert out["dependencies_held"][0]["story_id"] == "US-02"
+
+
+def test_serial_dispatch_skips_a_blocked_unit_instead_of_starving_the_queue():
+    from story_pipeline import next_action
+
+    def _unit(sid, state, **kw):
+        return {"id": sid, "title": sid, "state": state, **kw}
+
+    board = {
+        "version": "2.0",
+        "build_mode": "scrum",
+        "lifecycle_state": "SPRINT_EXECUTION",
+        "current_sprint": 2,
+        "current_stories": [
+            _unit("US-02", "queued", depends_on=["US-01"]),
+            _unit("US-01", "queued"),
+        ],
+    }
+    out = next_action(board)
+    assert out["action"] == "dispatch_se"
+    assert out["story_id"] == "US-01", "blocked FIFO head starved the queue"

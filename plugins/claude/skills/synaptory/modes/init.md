@@ -35,13 +35,13 @@ empty tracker/DoR and the user had to hand-edit generated YAML afterwards.
 1. Detect project structure: language (package.json, go.mod, pyproject.toml), framework (Next.js, NestJS, FastAPI, Gin), infrastructure (Dockerfile, Terraform, K8s, CI/CD), architecture (monolith/microservices/monorepo)
 2. Classify health: greenfield (no code) vs brownfield (existing codebase)
 3. **Run the Configuration Interview (below)** — confirm every high-stakes field with the user, seeding each question's default from detection.
-4. Generate `.synaptory.yaml` from the template at `${CLAUDE_PLUGIN_ROOT}/skills/_shared/templates/synaptory.yaml.tmpl`, applying the confirmed answers.
+4. Generate `.synaptory.yaml` from the template at `Bash("synaptory skills get templates/synaptory.yaml.tmpl")`, applying the confirmed answers.
 5. Scaffold tracker description templates into `docs/templates/` (if not already present)
 6. Write `.synaptory/.orchestrator/init-answers.md` (decisions + defaults applied) and print a summary of the final configuration.
 
 ```python
 Skill(skill="synaptory:init")
-# The init logic reads from: ${CLAUDE_PLUGIN_ROOT}/skills/_shared/templates/synaptory.yaml.tmpl
+# The init logic reads from: Bash("synaptory skills get templates/synaptory.yaml.tmpl")
 # Output: .synaptory.yaml at project root
 ```
 
@@ -50,7 +50,7 @@ Skill(skill="synaptory:init")
 ## Configuration Interview
 
 Confirm each field with `AskUserQuestion`. Follow the pattern used by
-`${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols/socratic-gate.md`: the detected value is
+`.synaptory/.protocols/socratic-gate.md`: the detected value is
 the first option labelled **"(Recommended)"**, alternatives carry a one-line trade-off,
 and "Chat about this" is always last. Never write a field the user has not seen.
 
@@ -190,15 +190,17 @@ story_exists = Glob(f"{templates_dir}/story.md")
 if not story_exists:
     Bash(f'mkdir -p {templates_dir}')
 
-    # Try to copy built-in defaults from the plugin source (plain .md files).
-    # In the published plugin these are encrypted (.md.enc), so copy may fail — that's fine,
-    # the scaffolding below generates them inline as a fallback.
-    builtin_dir = f"${{CLAUDE_PLUGIN_ROOT}}/skills/_shared/templates/tracker"
-    for src_name, dst_name in [("user-story.md", "story.md"), ("task.md", "task.md"), ("epic.md", "epic.md"), ("bug.md", "bug.md")]:
+    # Built-in defaults are control-plane delivered, not packaged (ADR-016), so
+    # there is no plugin directory to copy them out of. The previous version of
+    # this block copied the templates out of the package and explained the
+    # failure as ".md.enc in the published plugin" — a mechanism ADR-016 removed,
+    # so the copy simply always failed and the inline fallback always ran.
+    for cp_name, dst_name in [("user-story", "story.md"), ("task", "task.md"), ("epic", "epic.md"), ("bug", "bug.md")]:
         dst_path = f"{templates_dir}/{dst_name}"
         if not Glob(dst_path):
-            # Try plain .md first (dev environment), skip if not found (published plugin uses .enc)
-            result = Bash(f'cp "{builtin_dir}/{src_name}" "{dst_path}" 2>/dev/null && echo OK || echo SKIP')
+            # Fetch the body, then write it. Falls through to the inline
+            # scaffolding below when the fetch fails (offline, or not signed in).
+            result = Bash(f'synaptory skills get "templates/tracker/{cp_name}" > "{dst_path}" 2>/dev/null && test -s "{dst_path}" && echo OK || echo SKIP')
             if "SKIP" in result:
                 # Generate minimal template inline as fallback
                 # These provide section headings that _load_template_sections() reads
@@ -395,7 +397,7 @@ Bash(f'printf "%s" \'{claude_section}\' | python3 "${{CLAUDE_PLUGIN_ROOT}}/hooks
 if not Glob("README.md"):
     readme_section = f"""# {{project_name}}
 
-> Built with [synaptory](https://github.com/h3tech-ai/synaptory) delivery pipeline.
+> Built with [synaptory](https://github.com/h3tech-ai/synaptory-v1) delivery pipeline.
 
 ## Quick Start
 

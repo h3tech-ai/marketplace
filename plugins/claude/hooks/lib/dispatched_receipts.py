@@ -1,0 +1,112 @@
+"""Canonical receipts for the story dispatches that are currently active.
+
+The SubagentStop verify hook used to pick the receipt to VALIDATE by newest
+mtime, so a receipt belonging to another story or role could satisfy the
+gate (#340; the shipping half of the same mtime race was #287/#290). The
+kernel's `execute_dispatch` records `mcp_active_dispatches[role_abbrev]` on
+the story it authorizes, which is exactly the (story, role) set a
+SubagentStop can be closing. This helper reads that binding and resolves
+each active (story, role) through the kernel's own canonical resolver, so
+the hook validates the receipt the dispatch contract named instead of
+whichever file happens to be newest on disk.
+
+Output contract, one line each, consumed by synaptory-verify-receipt.sh:
+
+    status=bound|none
+    <absolute receipt path>     (existing canonical receipts, newest first)
+
+`status=none` means no pipeline state, no story carries an active dispatch,
+or this helper failed: the hook falls back to newest-by-mtime, the pre-#340
+behavior (legacy sessions, ceremony receipts with pseudo story ids).
+`status=bound` with no paths means a dispatch is active but its canonical
+receipt is not on disk: the hook must treat the receipt as MISSING rather
+than validating an unrelated file.
+
+Pure logic + filesystem reads. No subprocess, no network. Layer-1 testable.
+Python 3.9 compatible: this file is projected into every host package.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from typing import List, Optional, Tuple
+
+
+def _canonical(project_dir: str, story_id: str, abbrev: str) -> Optional[str]:
+    """The one path this (story, role) may satisfy, or None.
+
+    `advance_kernel.canonical_receipt_path` is the single resolver the
+    advance gate itself uses (spec- and SPQ-aware, refuses symlinks and
+    escapes), so selection and consumption cannot disagree. A refusal or
+    resolver error yields None: the binding still counts as existing, and
+    the hook treats the receipt as missing rather than falling back to
+    whichever file is newest.
+    """
+    try:
+        import advance_kernel as ak
+
+        return str(ak.canonical_receipt_path(str(project_dir), story_id, abbrev))
+    except Exception:  # noqa: BLE001 - selection must never crash the hook
+        return None
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def bound_receipts(project_dir: str) -> Tuple[bool, List[str]]:
+    """Return (binding_exists, existing canonical receipt paths, newest first).
+
+    `binding_exists` is True when at least one story on the board carries an
+    `mcp_active_dispatches` entry, whether or not its receipt is on disk yet.
+    """
+    import story_pipeline as sp
+
+    state = sp._read_state(str(project_dir))
+    binding_exists = False
+    paths: List[str] = []
+    for story in state.get("current_stories") or []:
+        if not isinstance(story, dict):
+            continue
+        dispatches = story.get("mcp_active_dispatches")
+        if not isinstance(dispatches, dict) or not dispatches:
+            continue
+        story_id = str(story.get("id") or "")
+        if not story_id:
+            continue
+        for abbrev in dispatches:
+            binding_exists = True
+            path = _canonical(project_dir, story_id, str(abbrev))
+            if path and os.path.isfile(path) and path not in paths:
+                paths.append(path)
+    paths.sort(key=_mtime, reverse=True)
+    return binding_exists, paths
+
+
+def _cli() -> int:  # pragma: no cover - thin CLI wrapper
+    """Entry point for the SubagentStop hook:
+
+        dispatched_receipts.py <project_dir>
+
+    Always exits 0; the hook falls back to newest-by-mtime on `status=none`,
+    and this helper reports `status=none` on any internal failure so its own
+    bugs can never block a session.
+    """
+    if len(sys.argv) < 2:
+        print("status=none")
+        return 0
+    try:
+        binding_exists, paths = bound_receipts(sys.argv[1])
+    except Exception:  # noqa: BLE001 - fail open to the mtime fallback
+        binding_exists, paths = False, []
+    print("status=bound" if binding_exists else "status=none")
+    for path in paths:
+        print(path)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(_cli())

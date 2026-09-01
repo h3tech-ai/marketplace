@@ -73,7 +73,7 @@ def test_https_github_fetch_uses_ephemeral_askpass(repo_root: Path, tmp_path: Pa
     result, capture = _run(
         repo_root,
         tmp_path,
-        origin="https://github.com/h3tech-ai/synaptory.git",
+        origin="https://github.com/h3tech-ai/synaptory-v1.git",
         token=secret,
     )
 
@@ -95,7 +95,7 @@ def test_fetch_without_token_uses_normal_git_behavior(repo_root: Path, tmp_path:
     result, capture = _run(
         repo_root,
         tmp_path,
-        origin="https://github.com/h3tech-ai/synaptory.git",
+        origin="https://github.com/h3tech-ai/synaptory-v1.git",
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -112,7 +112,7 @@ def test_current_repo_token_wins_over_marketplace_release_pat(
     result, capture = _run(
         repo_root,
         tmp_path,
-        origin="https://github.com/h3tech-ai/synaptory.git",
+        origin="https://github.com/h3tech-ai/synaptory-v1.git",
         token=marketplace_secret,
         repo_token=repo_secret,
     )
@@ -128,7 +128,7 @@ def test_https_github_fetch_clears_persisted_authorization_header(
     result, capture = _run(
         repo_root,
         tmp_path,
-        origin="https://github.com/h3tech-ai/synaptory.git",
+        origin="https://github.com/h3tech-ai/synaptory-v1.git",
         repo_token="current-repo-token",
     )
 
@@ -146,13 +146,13 @@ def test_credentialed_github_origin_is_sanitized_before_askpass(
         tmp_path,
         origin=(
             "https://release-bot:"
-            f"{stale_secret}@github.com/h3tech-ai/synaptory.git"
+            f"{stale_secret}@github.com/h3tech-ai/synaptory-v1.git"
         ),
         repo_token=repo_secret,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "set_url=https://github.com/h3tech-ai/synaptory.git" in capture
+    assert "set_url=https://github.com/h3tech-ai/synaptory-v1.git" in capture
     assert "argv=-c credential.helper=" in capture
     assert f"password={repo_secret}" in capture
     assert stale_secret not in capture + result.stdout + result.stderr
@@ -167,12 +167,12 @@ def test_credentialed_github_origin_is_sanitized_without_replacement_token(
         tmp_path,
         origin=(
             "https://release-bot:"
-            f"{stale_secret}@github.com/h3tech-ai/synaptory.git"
+            f"{stale_secret}@github.com/h3tech-ai/synaptory-v1.git"
         ),
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "set_url=https://github.com/h3tech-ai/synaptory.git" in capture
+    assert "set_url=https://github.com/h3tech-ai/synaptory-v1.git" in capture
     assert "argv=fetch --prune origin main" in capture
     assert "username=" not in capture
     assert stale_secret not in capture + result.stdout + result.stderr

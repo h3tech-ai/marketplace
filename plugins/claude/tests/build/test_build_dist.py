@@ -83,9 +83,11 @@ def fresh_build(repo_root: Path, tmp_path_factory) -> Path:
     codex_plugin_json = (
         repo_root / "plugin-codex" / "plugins" / "synaptory" / ".codex-plugin" / "plugin.json"
     )
+    cursor_cp_url = repo_root / "plugin-cursor" / "hooks" / "lib" / "cp-url"
     pinned = version_file.read_text(encoding="utf-8").strip()
     before = {p: p.read_text(encoding="utf-8") for p in (
-        version_file, plugin_json, cursor_plugin_json, codex_plugin_json
+        version_file, plugin_json, cursor_plugin_json, codex_plugin_json,
+        cursor_cp_url,
     )
               if p.exists()}
     try:
@@ -264,9 +266,11 @@ def test_codex_package_and_catalog_present(fresh_build: Path, repo_root: Path):
     codex_plugin = marketplace_root / "plugins" / "codex"
     manifest = codex_plugin / ".codex-plugin" / "plugin.json"
     metadata = codex_plugin / ".codex-plugin" / "build-metadata.json"
+    control_plane_url = codex_plugin / "hooks" / "lib" / "cp-url"
     catalog = marketplace_root / ".agents" / "plugins" / "marketplace.json"
     assert manifest.is_file()
     assert metadata.is_file()
+    assert control_plane_url.is_file()
     assert catalog.is_file()
     plugin_data = json.loads(manifest.read_text(encoding="utf-8"))
     catalog_data = json.loads(catalog.read_text(encoding="utf-8"))
@@ -276,6 +280,9 @@ def test_codex_package_and_catalog_present(fresh_build: Path, repo_root: Path):
         "source": "local",
         "path": "./plugins/codex",
     }
+    assert control_plane_url.read_text(encoding="utf-8").strip() == os.environ.get(
+        "SYNAPTORY_CP_URL", "http://localhost:8080"
+    ).rstrip("/")
 
 
 @pytest.mark.build

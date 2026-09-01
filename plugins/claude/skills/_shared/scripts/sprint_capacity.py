@@ -22,6 +22,28 @@ import sys
 import os
 
 
+def _host_env():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _runtime_paths import find_lib_dir
+
+    sys.path.insert(0, str(find_lib_dir()))
+    import host_env
+
+    return host_env
+
+
+def _host_project_dir():
+    return _host_env().project_dir()
+
+
+def _host_plugin_root():
+    return _host_env().plugin_root()
+
+
+
 # Story size → estimated human review hours
 REVIEW_HOURS = {
     "XS": 0.5,
@@ -33,7 +55,7 @@ REVIEW_HOURS = {
 
 
 def get_tracker_cli(project_dir):
-    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+    plugin_root = _host_plugin_root()
     if plugin_root:
         return f"python3 {plugin_root}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir {project_dir}"
     # Fallback: assume tracker_cli.py is in the same directory

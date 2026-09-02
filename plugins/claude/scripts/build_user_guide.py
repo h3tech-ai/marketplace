@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a single-file HTML user guide from docs/user-guide Markdown sources."""
+"""Build the full user guide and standalone getting-started HTML."""
 
 from __future__ import annotations
 
@@ -24,17 +24,23 @@ BRAND_PATH = REPO_ROOT / "docs" / "h3t_brand_identity.json"
 VENDOR_MERMAID = REPO_ROOT / "plugin-claude" / "scripts" / "vendor" / "mermaid.min.js"
 DEFAULT_OUTPUT   = REPO_ROOT / "dist" / "user-guide.html"
 WEB_DIST_OUTPUT  = REPO_ROOT / "web" / "dist" / "docs" / "user-guide.html"
+DEFAULT_GETTING_STARTED_OUTPUT = REPO_ROOT / "dist" / "getting-started.html"
+WEB_GETTING_STARTED_OUTPUT = REPO_ROOT / "web" / "dist" / "docs" / "getting-started.html"
+REPOSITORY_BLOB_ROOT = "https://github.com/h3tech-ai/synaptory-v1/blob/main"
+FALLBACK_GUIDE_HREF: str | None = None
 
 DOC_GROUPS = [
     ("Start", ["index.md", "getting-started.md", "install-cli.md"]),
     (
-        "Concepts",
+        "SPQ Concepts",
         [
             "concepts/platform.md",
             "concepts/architecture.md",
             "concepts/identity-and-access.md",
             "concepts/personas.md",
             "concepts/delivery-lifecycle.md",
+            "concepts/spq-cycle-model.md",
+            "concepts/hosts-and-runtimes.md",
             "concepts/modes.md",
             "concepts/agents.md",
             "concepts/engagement-modes.md",
@@ -45,16 +51,23 @@ DOC_GROUPS = [
     (
         "Guides",
         [
-            "guides/scrum-delivery.md",
-            "guides/kanban-delivery.md",
             "guides/spq-delivery.md",
             "spq-setup-runbook.md",
-            "guides/multi-spec.md",
-            "guides/release.md",
+            "guides/coordination-cycles.md",
             "guides/resuming-pipelines.md",
             "guides/using-the-control-plane.md",
+            "guides/release.md",
             "guides/inviting-members.md",
+            "guides/migrate-to-spq.md",
             "guides/migrate-from-hiro-crew.md",  # transitional — remove post-cutover
+        ],
+    ),
+    (
+        "Legacy",
+        [
+            "guides/scrum-delivery.md",
+            "guides/kanban-delivery.md",
+            "guides/multi-spec.md",
         ],
     ),
     (
@@ -72,6 +85,10 @@ DOC_GROUPS = [
             "troubleshooting.md",
         ],
     ),
+]
+
+GETTING_STARTED_GROUPS = [
+    ("Start", ["getting-started.md", "install-cli.md"]),
 ]
 
 
@@ -180,22 +197,28 @@ def parse_headings(doc: Document) -> None:
 
 def render_inline(text: str, current_doc: Document, link_map: dict[tuple[str, str | None], str]) -> str:
     code_spans: list[str] = []
+    links: list[str] = []
+
+    def stash_link(match: re.Match[str]) -> str:
+        label = render_inline(match.group(1), current_doc, link_map)
+        target = match.group(2).strip()
+        resolved = resolve_link(current_doc.rel_path, target, link_map)
+        attrs = ' target="_blank" rel="noreferrer"' if resolved.startswith("http") else ""
+        links.append(
+            f'<a href="{html.escape(resolved, quote=True)}"{attrs}>{label}</a>'
+        )
+        return f"@@LINK{len(links) - 1}@@"
 
     def stash_code(match: re.Match[str]) -> str:
         code_spans.append(f"<code>{html.escape(match.group(1))}</code>")
         return f"@@CODE{len(code_spans) - 1}@@"
 
+    # Links must be protected before emphasis parsing: otherwise underscores in
+    # a resolved URL (for example ``synaptory_api``) are interpreted as
+    # Markdown emphasis after the anchor has been generated.
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", stash_link, text)
     text = re.sub(r"`([^`]+)`", stash_code, text)
     text = html.escape(text)
-
-    def repl_link(match: re.Match[str]) -> str:
-        label = render_inline(match.group(1), current_doc, link_map)
-        target = match.group(2).strip()
-        resolved = resolve_link(current_doc.rel_path, target, link_map)
-        attrs = ' target="_blank" rel="noreferrer"' if resolved.startswith("http") else ""
-        return f'<a href="{html.escape(resolved, quote=True)}"{attrs}>{label}</a>'
-
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", repl_link, text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
     text = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", text)
     text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", text)
@@ -203,6 +226,8 @@ def render_inline(text: str, current_doc: Document, link_map: dict[tuple[str, st
 
     for idx, code in enumerate(code_spans):
         text = text.replace(f"@@CODE{idx}@@", code)
+    for idx, link in enumerate(links):
+        text = text.replace(f"@@LINK{idx}@@", link)
     return text
 
 
@@ -223,9 +248,23 @@ def resolve_link(current_rel: str, target: str, link_map: dict[tuple[str, str | 
     try:
         rel_path = target_path.relative_to(DOCS_ROOT.resolve()).as_posix()
     except ValueError:
+        try:
+            repo_rel = target_path.relative_to(REPO_ROOT.resolve()).as_posix()
+        except ValueError:
+            return target
+        if target_path.exists() and target_path.is_file():
+            suffix = f"#{fragment}" if fragment else ""
+            return f"{REPOSITORY_BLOB_ROOT}/{repo_rel}{suffix}"
         return target
     frag_key = slugify(fragment) if fragment else None
-    return link_map.get((rel_path, frag_key)) or link_map.get((rel_path, None)) or target
+    resolved = link_map.get((rel_path, frag_key)) or link_map.get((rel_path, None))
+    if resolved:
+        return resolved
+    if FALLBACK_GUIDE_HREF and target_path.suffix == ".md" and target_path.exists():
+        doc_anchor = slugify(rel_path.removesuffix(".md").replace("/", "-"))
+        anchor = f"{doc_anchor}-{frag_key}" if frag_key else doc_anchor
+        return f"{FALLBACK_GUIDE_HREF}#{anchor}"
+    return target
 
 
 def render_markdown(doc: Document, link_map: dict[tuple[str, str | None], str]) -> str:
@@ -526,7 +565,10 @@ def build_html(
     hero_src = None  # banner removed to reduce file size
 
     title_doc = title or (docs[0].title if docs else "synaptory User Guide")
-    subtitle = "Single-file documentation build for offline distribution."
+    if title_doc == "Synaptory Getting Started":
+        subtitle = "Install a host, configure SPQ, and start your first governed Cycle."
+    else:
+        subtitle = "SPQ-first delivery guidance for Claude Code, Codex, and Cursor."
 
     # Inline the vendored mermaid bundle only when a diagram is present, so
     # diagram-free builds stay lean and the output remains fully offline.
@@ -1016,6 +1058,23 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output HTML path")
     parser.add_argument("--no-web", action="store_true", help="Skip secondary write to web/dist/docs/")
     parser.add_argument(
+        "--no-getting-started",
+        action="store_true",
+        help="Skip the standalone getting-started build.",
+    )
+    parser.add_argument(
+        "--getting-started-output",
+        type=Path,
+        default=None,
+        help="Override standalone getting-started output path.",
+    )
+    parser.add_argument(
+        "--getting-started-web-output",
+        type=Path,
+        default=None,
+        help="Override standalone getting-started web output path.",
+    )
+    parser.add_argument(
         "--docs-root",
         type=Path,
         default=None,
@@ -1026,7 +1085,7 @@ def main() -> int:
         type=Path,
         default=None,
         help="JSON manifest of ordered {group, files} entries (and optional "
-             "title). Default: the built-in v1.x DOC_GROUPS.",
+             "title). Default: the built-in user-guide DOC_GROUPS.",
     )
     parser.add_argument(
         "--web-output",
@@ -1065,7 +1124,8 @@ def main() -> int:
     # Reassign module-level source/output constants from CLI args so the same
     # script can build either guide. Defaults preserve the v1.x behavior when
     # no flag is passed. Functions read these globals, so reassign before build.
-    global DOCS_ROOT, DOC_GROUPS, WEB_DIST_OUTPUT
+    global DOCS_ROOT, DOC_GROUPS, WEB_DIST_OUTPUT, FALLBACK_GUIDE_HREF
+    default_sources = args.docs_root is None and args.manifest is None
     manifest_title: str | None = None
     if args.docs_root is not None:
         DOCS_ROOT = args.docs_root.resolve()
@@ -1106,6 +1166,44 @@ def main() -> int:
             title=title,
         )
         print(f"Wrote {WEB_DIST_OUTPUT}")
+
+    if default_sources and not args.no_getting_started:
+        full_groups = DOC_GROUPS
+        DOC_GROUPS = GETTING_STARTED_GROUPS
+        FALLBACK_GUIDE_HREF = "user-guide.html"
+        getting_started_output = (
+            args.getting_started_output.resolve()
+            if args.getting_started_output is not None
+            else (
+                DEFAULT_GETTING_STARTED_OUTPUT
+                if args.output == DEFAULT_OUTPUT
+                else args.output.resolve().with_name("getting-started.html")
+            )
+        )
+        build(
+            getting_started_output,
+            version=version_label,
+            built_at=built_at_label,
+            git_sha=git_sha_label,
+            title="Synaptory Getting Started",
+        )
+        print(f"Wrote {getting_started_output}")
+        if not args.no_web:
+            getting_started_web_output = (
+                args.getting_started_web_output.resolve()
+                if args.getting_started_web_output is not None
+                else WEB_GETTING_STARTED_OUTPUT
+            )
+            build(
+                getting_started_web_output,
+                version=version_label,
+                built_at=built_at_label,
+                git_sha=git_sha_label,
+                title="Synaptory Getting Started",
+            )
+            print(f"Wrote {getting_started_web_output}")
+        DOC_GROUPS = full_groups
+        FALLBACK_GUIDE_HREF = None
     return 0
 
 

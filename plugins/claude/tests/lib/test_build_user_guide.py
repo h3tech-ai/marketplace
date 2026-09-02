@@ -12,6 +12,8 @@ container images, single-file user guide) must carry the same /VERSION.
 from __future__ import annotations
 
 import importlib.util
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +68,123 @@ def test_doc_groups_includes_every_user_guide_markdown(builder_module):
         f"DOC_GROUPS references files that don't exist under docs/user-guide/. "
         f"Either create them or remove from build_user_guide.py: {sorted(extra)}"
     )
+
+
+@pytest.mark.unit
+def test_spq_content_precedes_legacy_compatibility(builder_module):
+    """The full guide's information architecture must teach SPQ first."""
+    groups = [group for group, _files in builder_module.DOC_GROUPS]
+    assert groups.index("SPQ Concepts") < groups.index("Guides")
+    assert groups.index("Guides") < groups.index("Legacy")
+
+    ordered = [
+        rel for _group, files in builder_module.DOC_GROUPS for rel in files
+    ]
+    assert ordered.index("guides/spq-delivery.md") < ordered.index(
+        "guides/scrum-delivery.md"
+    )
+    assert ordered.index("concepts/hosts-and-runtimes.md") < ordered.index(
+        "guides/scrum-delivery.md"
+    )
+
+
+@pytest.mark.unit
+def test_getting_started_build_covers_all_hosts_and_spq(tmp_path):
+    """The builder emits both promised HTML artifacts from default sources."""
+    guide = tmp_path / "user-guide.html"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_BUILDER_PATH),
+            "--output",
+            str(guide),
+            "--no-web",
+            "--built-at",
+            "",
+            "--no-git-sha",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    onboarding = tmp_path / "getting-started.html"
+    assert guide.exists()
+    assert onboarding.exists()
+    full_rendered = guide.read_text(encoding="utf-8")
+    rendered = onboarding.read_text(encoding="utf-8")
+    assert "Claude Code" in rendered
+    assert "Codex" in rendered
+    assert "Cursor IDE" in rendered
+    assert "build_mode: &quot;spq&quot;" in rendered
+    assert "Discovery" in rendered
+    assert "user-guide.html#concepts-hosts-and-runtimes" in rendered
+    relative_markdown_href = re.compile(
+        r'href="(?!https?://|mailto:|#)[^"]+\.md(?:#[^"]*)?"'
+    )
+    assert not relative_markdown_href.search(full_rendered)
+    assert not relative_markdown_href.search(rendered)
+
+
+@pytest.mark.unit
+def test_user_guide_local_markdown_links_exist(builder_module):
+    """Reader-facing Markdown links must point at existing files and headings."""
+    docs_root = _REPO_ROOT / "docs" / "user-guide"
+    missing: list[str] = []
+    missing_fragments: list[str] = []
+    heading_cache: dict[Path, set[str]] = {}
+    link_pattern = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+    for source in docs_root.rglob("*.md"):
+        for target in link_pattern.findall(source.read_text(encoding="utf-8")):
+            target = target.strip()
+            if target.startswith(("http://", "https://", "mailto:")):
+                continue
+            file_part, _separator, fragment = target.partition("#")
+            resolved = source.resolve() if not file_part else (
+                source.parent / file_part
+            ).resolve()
+            if not resolved.exists():
+                missing.append(
+                    f"{source.relative_to(docs_root)} -> {target}"
+                )
+                continue
+            if fragment and resolved.suffix == ".md" and resolved.is_relative_to(docs_root):
+                if resolved not in heading_cache:
+                    headings = set()
+                    for line in resolved.read_text(encoding="utf-8").splitlines():
+                        match = re.match(r"^#{1,6}\s+(.*)$", line)
+                        if match:
+                            headings.add(
+                                builder_module.slugify(
+                                    builder_module.strip_inline_markdown(match.group(1))
+                                )
+                            )
+                    heading_cache[resolved] = headings
+                if builder_module.slugify(fragment) not in heading_cache[resolved]:
+                    missing_fragments.append(
+                        f"{source.relative_to(docs_root)} -> {target}"
+                    )
+    assert not missing, "Broken local documentation links:\n" + "\n".join(missing)
+    assert not missing_fragments, (
+        "Broken local documentation fragments:\n" + "\n".join(missing_fragments)
+    )
+
+
+@pytest.mark.unit
+def test_primary_guides_do_not_document_private_lifecycle_commands():
+    """Public SPQ docs must route state changes through hosts/MCP, not internals."""
+    docs_root = _REPO_ROOT / "docs" / "user-guide"
+    primary = [
+        docs_root / "getting-started.md",
+        docs_root / "guides" / "spq-delivery.md",
+        docs_root / "reference" / "commands.md",
+        docs_root / "troubleshooting.md",
+    ]
+    forbidden = re.compile(r"python3\s+[^\n`]*(?:state_machine|tracker_cli)\.py")
+    violations = [str(path) for path in primary if forbidden.search(path.read_text())]
+    assert not violations, f"Private implementation commands exposed in: {violations}"
 
 
 @pytest.mark.unit
@@ -219,3 +338,26 @@ def test_render_markdown_hides_front_matter_and_resolves_local_fragment(
     assert "status: Drafting" not in rendered
     assert '<a href="#spec-details">Jump to details</a>' in rendered
     assert '<h2 id="spec-details">Details</h2>' in rendered
+
+
+@pytest.mark.unit
+def test_render_inline_preserves_underscores_in_repository_links(builder_module):
+    """Resolved repository URLs must not be reparsed as Markdown emphasis."""
+    doc = builder_module.Document(
+        rel_path="concepts/identity-and-access.md",
+        group="Test",
+        order=0,
+        source_path=_REPO_ROOT / "docs" / "user-guide" / "concepts" / "identity-and-access.md",
+        title="Identity and Access",
+        doc_anchor="identity-and-access",
+    )
+
+    rendered = builder_module.render_inline(
+        "[watermark.py](../../../api/synaptory_api/watermark.py)", doc, {}
+    )
+
+    assert (
+        'href="https://github.com/h3tech-ai/synaptory-v1/blob/main/'
+        'api/synaptory_api/watermark.py"' in rendered
+    )
+    assert "<em>" not in rendered

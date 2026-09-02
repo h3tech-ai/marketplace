@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "host": "codex",
-  "version": "1.2.0",
-  "build_hash": "adb01919855d4a8caa4bb89f04727effd038b7db10dd1c25af9286e6a44ba8ee",
+  "version": "1.2.1",
+  "build_hash": "7428991781ecf0bb7c7699b9925c846f6a9b4ce327a8567880c7117875367143",
   "files": {
-    ".codex-plugin/plugin.json": "1cddcc8cfee6f094d5ea4febffa9c64c36e1835ca11854fc0be87d124a2740e7",
+    ".codex-plugin/plugin.json": "83a63291a7e12b2b9128ae2c4c34152b5d7f389b745870582a4afae2f1d8b2d2",
     ".mcp.json": "bf3bdf25426b5628fc8e689ec992150d1465f9baed9ccc044eb7d4da624cdcaf",
     "README.md": "3c14ef028a10174d8bc2b3293831404bfc0cd0af5daa527453dfd8106dbb0b17",
     "assets/agent-templates/code-reviewer.toml": "446ca6d2c5e8aa35c0b3d6ffccc5ad09c2e01afb136552ef630ead0e3255af94",

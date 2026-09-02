@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Synaptory Getting Started</title>
+  <meta name="synaptory-version" content="v1.2.1">
+  <meta name="synaptory-built-at" content="2026-09-02T05:18:43Z">
+  
+  <style>
+    :root {
+      --brand: #E00000;
+      --brand-ink: #000000;
+      --bg: #FFFFFF;
+      --surface: #ffffff;
+      --surface-alt: #E6E6E6;
+      --muted: #666666;
+      --white: #FFFFFF;
+      --table-head: #E00000;
+      --table-head-ink: #FFFFFF;
+      --table-border: #E6E6E6;
+      --shadow: 0 18px 45px rgba(0, 0, 0, 0.08);
+      --radius: 18px;
+      --radius-sm: 10px;
+      --content-max: 860px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: Inter, Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--brand-ink);
+      background:
+        radial-gradient(circle at top left, rgba(224, 0, 0, 0.08), transparent 28rem),
+        linear-gradient(180deg, #fff 0%, #faf8f7 100%);
+    }
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre { font-family: Courier, monospace; }
+    .page {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr) 240px;
+      gap: 24px;
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .sidebar, .outline {
+      position: sticky;
+      top: 20px;
+      align-self: start;
+      max-height: calc(100vh - 40px);
+      overflow: auto;
+      background: rgba(255, 255, 255, 0.88);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(0, 0, 0, 0.06);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .sidebar { padding: 22px 18px; }
+    .outline { padding: 20px 16px; }
+    .brand-lockup {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    }
+    .brand-mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--brand), #2e0000);
+      display: grid;
+      place-items: center;
+      color: var(--white);
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      flex: 0 0 auto;
+      overflow: hidden;
+    }
+    .brand-mark img { width: 100%; height: 100%; object-fit: cover; }
+    .brand-text strong {
+      display: block;
+      font-size: 1rem;
+      line-height: 1.1;
+    }
+    .brand-text span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.84rem;
+      margin-top: 4px;
+    }
+    .nav-group + .nav-group { margin-top: 22px; }
+    .nav-group-title {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 8px;
+    }
+    .nav-link {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      padding: 8px 10px;
+      border-radius: 10px;
+      color: var(--brand-ink);
+    }
+    .nav-link span {
+      color: var(--brand);
+      font-weight: 700;
+      min-width: 22px;
+    }
+    .nav-link:hover {
+      background: rgba(224, 0, 0, 0.06);
+      text-decoration: none;
+    }
+    main {
+      min-width: 0;
+    }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      border-radius: 28px;
+      background:
+        linear-gradient(120deg, rgba(0, 0, 0, 0.92), rgba(40, 0, 0, 0.82)),
+        linear-gradient(135deg, var(--brand), #1c1c1c);
+      color: var(--white);
+      box-shadow: var(--shadow);
+      margin-bottom: 24px;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -8% -35% auto;
+      width: 320px;
+      height: 320px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(224, 0, 0, 0.55), transparent 70%);
+      pointer-events: none;
+    }
+    .hero-inner {
+      position: relative;
+      z-index: 1;
+      padding: 44px 40px;
+      max-width: 760px;
+    }
+    .hero-kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.14);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 14px;
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4.6vw, 3.36rem);
+      line-height: 1.08;
+      letter-spacing: -0.025em;
+      word-break: normal;
+      overflow-wrap: break-word;
+      hyphens: none;
+    }
+    .hero p {
+      margin: 12px 0 0;
+      max-width: 58ch;
+      color: rgba(255, 255, 255, 0.84);
+      font-size: 1.04rem;
+    }
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    .hero-chip {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      font-size: 0.82rem;
+    }
+    .chapter {
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid rgba(0, 0, 0, 0.06);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      padding: 28px 34px;
+    }
+    .chapter + .chapter { margin-top: 18px; }
+    .chapter-kicker {
+      color: var(--brand);
+      font-size: 0.8rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 18px;
+    }
+    .chapter-body {
+      max-width: var(--content-max);
+    }
+    h1, h2, h3, h4, h5, h6 {
+      scroll-margin-top: 20px;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+      margin: 0;
+    }
+    h1 { font-size: 1.60rem; margin-bottom: 16px; }
+    h2 {
+      font-size: 1.40rem;
+      margin: 34px 0 14px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(0, 0, 0, 0.08);
+    }
+    h3 { font-size: 1.20rem; margin: 26px 0 12px; }
+    h4 { font-size: 1.10rem; margin: 20px 0 10px; }
+    p, ul, ol, blockquote, .table-wrap, pre, hr {
+      margin: 14px 0;
+    }
+    ul, ol {
+      padding-left: 1.3rem;
+    }
+    li + li { margin-top: 8px; }
+    hr {
+      border: 0;
+      height: 1px;
+      background: linear-gradient(90deg, var(--brand), transparent);
+    }
+    blockquote {
+      margin-left: 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--brand);
+      background: rgba(224, 0, 0, 0.05);
+      border-radius: 0 14px 14px 0;
+    }
+    .code-block {
+      overflow: auto;
+      background: #121212;
+      color: #f5f5f5;
+      padding: 16px 18px;
+      border-radius: 16px;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+    }
+    code {
+      background: rgba(224, 0, 0, 0.08);
+      color: #750000;
+      padding: 0.12rem 0.38rem;
+      border-radius: 6px;
+      font-size: 0.94em;
+    }
+    pre code {
+      background: none;
+      color: inherit;
+      padding: 0;
+      border-radius: 0;
+    }
+    .mermaid {
+      background: #ffffff;
+      border: 1px solid rgba(0, 0, 0, 0.06);
+      border-radius: 16px;
+      padding: 16px;
+      margin: 14px 0;
+      overflow: auto;
+      text-align: center;
+      white-space: normal;
+      font-family: Inter, Roboto, sans-serif;
+      line-height: 1.3;
+    }
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid var(--table-border);
+      border-radius: 16px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+    }
+    th, td {
+      text-align: left;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--table-border);
+      vertical-align: top;
+    }
+    th {
+      background: var(--table-head);
+      color: var(--table-head-ink);
+      font-weight: 700;
+    }
+    tbody tr:nth-child(even) td {
+      background: rgba(0, 0, 0, 0.02);
+    }
+    .outline-title {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+    }
+    .outline-doc, .outline-sub {
+      display: block;
+      padding: 6px 8px;
+      border-radius: 8px;
+      color: var(--brand-ink);
+    }
+    .outline-doc {
+      font-weight: 600;
+      margin-top: 8px;
+    }
+    .outline-sub {
+      color: var(--muted);
+      padding-left: 16px;
+      font-size: 0.95rem;
+    }
+    .outline-doc:hover, .outline-sub:hover {
+      background: rgba(224, 0, 0, 0.05);
+      text-decoration: none;
+    }
+    .footer {
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+      padding: 20px 0 10px;
+    }
+    @media (max-width: 1220px) {
+      .page {
+        grid-template-columns: 260px minmax(0, 1fr);
+      }
+      .outline {
+        display: none;
+      }
+    }
+    @media (max-width: 860px) {
+      .page {
+        grid-template-columns: 1fr;
+        padding: 14px;
+      }
+      .sidebar, .outline {
+        position: static;
+        max-height: none;
+      }
+      .hero-inner {
+        padding: 30px 22px;
+      }
+      .chapter {
+        padding: 22px 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <aside class="sidebar">
+      <div class="brand-lockup">
+        <div class="brand-mark">H3T</div>
+        <div class="brand-text">
+          <strong>H3Tech</strong>
+          <span>synaptory documentation</span>
+        </div>
+      </div>
+      <div class="nav-group"><div class="nav-group-title">Start</div><a class="nav-link" href="#getting-started"><span>01</span>Getting Started</a><a class="nav-link" href="#install-cli"><span>02</span>Install the synaptory CLI</a></div>
+    </aside>
+    <main>
+      <section class="hero">
+        <div class="hero-inner">
+          <div>
+            <div class="hero-kicker">H3Tech · Single-File Guide</div>
+            <h1>Synaptory Getting Started</h1>
+            <p>Install a host, configure SPQ, and start your first governed Cycle.</p>
+            <div class="hero-meta">
+              <div class="hero-chip">2 chapters</div>
+              <div class="hero-chip" data-stamp="version">v1.2.1</div><div class="hero-chip" data-stamp="built-at">built 2026-09-02T05:18:43Z</div>
+            </div>
+          </div>
+        </div>
+      </section>
+      
+<section class="chapter" id="getting-started">
+  <div class="chapter-kicker">Start · 01</div>
+  <div class="chapter-body">
+    <h1 id="getting-started-getting-started">Getting Started</h1>
+<p>This guide takes a new user from installation to the first governed SPQ Cycle on Claude Code, Codex, or Cursor.</p>
+<h2 id="getting-started-what-you-will-set-up">What you will set up</h2>
+<p>Synaptory has two required components:</p>
+<ol>
+<li>A host plugin for Claude Code, Codex, or Cursor.</li><li>The <code>synaptory</code> CLI, shared across hosts and projects on the same laptop.</li>
+</ol>
+<p>Runtime federation is optional and comes later. First establish a working SPQ project on one host.</p>
+<h2 id="getting-started-1-choose-a-host">1. Choose a host</h2>
+<div class="table-wrap"><table><thead><tr><th>Host</th><th>Minimum and scope</th><th>Invocation</th><th>Important boundary</th></tr></thead><tbody><tr><td><strong>Claude Code</strong></td><td>Claude Code 2.1.196 or newer</td><td><code>/synaptory</code></td><td>Full host-native hook surface. Reload after installation or update.</td></tr><tr><td><strong>Codex</strong></td><td>Codex CLI 0.147.0 or newer; standard, non-regulated SPQ</td><td><code>$synaptory</code></td><td>Project bootstrap is dry-run first, installs nine managed profiles, and requires a new task after apply.</td></tr><tr><td><strong>Cursor IDE</strong></td><td>Staff Team marketplace or licensed local install</td><td><code>/synaptory</code></td><td>SPQ is certified. Reload the window after install.</td></tr><tr><td><strong>Cursor CLI/headless</strong></td><td><code>cursor-agent</code> with project MCP preflight</td><td><code>/synaptory</code> in the agent prompt</td><td>The IDE&#x27;s local-plugin directory is not loaded by the CLI; preflight is mandatory.</td></tr></tbody></table></div>
+<p>Use a single host as the writer for an active governed stage. Sharing the same repository does not create a supported cross-host handoff workflow.</p>
+<h2 id="getting-started-2-install-the-cli-and-sign-in">2. Install the CLI and sign in</h2>
+<p>Install once per laptop:</p>
+<pre class="code-block" data-lang="bash"><code># macOS / Linux
+curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash</code></pre>
+<pre class="code-block" data-lang="powershell"><code># Windows PowerShell
+iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex</code></pre>
+<p>Then sign in with your organization identity:</p>
+<pre class="code-block" data-lang="bash"><code>synaptory login
+synaptory whoami
+synaptory projects list</code></pre>
+<p>For a machine without a browser, use <code>synaptory login --device</code>. See <a href="#install-cli">Install the CLI</a> for PATH, update, checksum, and keychain details.</p>
+<h2 id="getting-started-macos-linux">3. Install the host plugin</h2>
+<h3 id="getting-started-windows-powershell">Claude Code</h3>
+<p>Run these commands inside Claude Code:</p>
+<pre class="code-block" data-lang="text"><code>/plugin marketplace add https://github.com/h3tech-ai/marketplace
+/plugin install synaptory@h3tech-ai</code></pre>
+<p>Restart Claude Code or reload the window. For automatic updates, open <code>/plugin</code>, select the <code>h3tech-ai</code> marketplace, and turn Auto-update on.</p>
+<p>Verify with:</p>
+<pre class="code-block" data-lang="text"><code>/synaptory doctor</code></pre>
+<h3 id="getting-started-3-install-the-host-plugin">Codex</h3>
+<p>Run these commands in a terminal:</p>
+<pre class="code-block" data-lang="bash"><code>codex plugin marketplace add https://github.com/h3tech-ai/marketplace
+codex plugin add synaptory@synaptory-dev</code></pre>
+<p>Start a new Codex task and invoke <code>$synaptory</code>. On the first project run, Synaptory checks readiness and presents a bootstrap dry-run if the managed profiles or project configuration are missing. Review the planned files, confirm apply, and then start another new task so Codex discovers the nine profiles.</p>
+<p>Codex refuses regulated <code>baa_enforced</code> projects on this standard path. Do not interpret a successful install as regulated certification.</p>
+<h3 id="getting-started-claude-code">Cursor IDE</h3>
+<p>An organization administrator imports GitHub repository <code>h3tech-ai/marketplace</code> into the Cursor Team marketplace and makes the <strong>synaptory</strong> plugin available. Install it from the team catalog, then run:</p>
+<pre class="code-block" data-lang="bash"><code>synaptory skills sync --host cursor</code></pre>
+<p>Reload Cursor and verify with <code>/synaptory doctor</code>.</p>
+<p>Synaptory is not distributed through the public cursor.com marketplace because that marketplace requires open-source packages.</p>
+<h3 id="getting-started-codex">Cursor CLI or CI</h3>
+<p>The IDE convention <code>~/.cursor/plugins/local</code> is not loaded by <code>cursor-agent</code>. For a licensed checkout, wire and verify the project MCP before every headless run:</p>
+<pre class="code-block" data-lang="bash"><code>python3 plugin-cursor/scripts/preflight.py --project &lt;project&gt; --write
+cd &lt;project&gt;
+cursor-agent mcp enable synaptory
+python3 plugin-cursor/scripts/preflight.py --project &lt;project&gt;</code></pre>
+<p>The final command must print <code>ready:</code> and exit 0. For an explicit plugin path, use <code>agent --plugin-dir ./plugin-cursor</code>.</p>
+<h2 id="getting-started-cursor-ide">4. Bind the repository to a project</h2>
+<p>At the repository root, identify the Control Plane project and select SPQ explicitly:</p>
+<pre class="code-block" data-lang="yaml"><code># .synaptory.yaml
+project_id: &quot;my-project&quot;
+build_mode: &quot;spq&quot;
+engagement_mode: &quot;structured&quot;
+
+tracker:
+  backend: &quot;local&quot;</code></pre>
+<p>You can ask the host to generate the file:</p>
+<pre class="code-block" data-lang="text"><code>Initialize this project for governed SPQ delivery.</code></pre>
+<p>Review the proposed file before approving it. In particular, confirm <code>project_id</code>, <code>build_mode: spq</code>, repository paths, and tracker configuration.</p>
+<blockquote><p><strong>Why explicit?</strong> SPQ is the recommended lifecycle, but the current compatibility default for an omitted <code>build_mode</code> is still Scrum. Explicit configuration prevents a new project from entering the legacy lifecycle.</p></blockquote>
+<h2 id="getting-started-cursor-cli-or-ci">5. Define durable workstreams</h2>
+<p>Workstreams are product or code areas, not people or temporary crews. A minimal starting shape might be:</p>
+<pre class="code-block" data-lang="yaml"><code>spq:
+  workstreams:
+    - id: &quot;product&quot;
+      shared_owner: true
+    - id: &quot;integration&quot;
+      integration: true
+  sync:
+    promote_to: &quot;dev&quot;
+    mode: &quot;all_or_nothing&quot;
+    integration_mode: &quot;at_sync&quot;
+    accept_unverified_events: false</code></pre>
+<p>Larger projects can add durable lanes such as <code>identity</code>, <code>billing</code>, or <code>platform</code>. Do not name workstreams after the current engineer or runtime.</p>
+<h2 id="getting-started-4-bind-the-repository-to-a-project">6. Start the first Cycle</h2>
+<p>Give Synaptory an outcome, not an instruction to mutate lifecycle files:</p>
+<pre class="code-block" data-lang="text"><code>Use SPQ to deliver account sign-in with audit logging. Start Discovery and
+show me the baseline before Commit.</code></pre>
+<p>The normal path is:</p>
+<ol>
+<li><strong>Discovery</strong> frames the outcome, constraints, workstreams, and evidence expectations.</li><li><strong>Baseline approval</strong> is a human gate. Review and explicitly approve or request changes.</li><li><strong>Commit</strong> admits a non-empty set of ready Work Units and seals the Cycle manifest.</li><li><strong>Cycle Execution</strong> dispatches the exact next role for each Work Unit, applies its stage/capability routing overlay, and validates its receipt.</li><li><strong>Sync entry</strong> waits for the human confirmation that workstream heads and readiness records are committed and pushed.</li><li><strong>Sync</strong> integrates the selected heads and runs the configured regression, journey, and shared-digest checks.</li><li><strong>Clear Sync</strong> is a human gate and is allowed only on a green integration verdict.</li><li><strong>Checkpoint</strong> records the increment and asks whether to open another Cycle or proceed to Acceptance.</li><li><strong>Acceptance</strong> runs the release roles and stops for the final human release decision.</li>
+</ol>
+<p>At any boundary, ask:</p>
+<pre class="code-block" data-lang="text"><code>/synaptory status</code></pre>
+<p>On Codex, use <code>$synaptory</code> and ask for status in the same request. Do not run the lifecycle Python modules directly and never edit <code>.synaptory/.orchestrator/pipeline-state.json</code>.</p>
+<h2 id="getting-started-synaptory-yaml">7. Add runtime federation only when needed</h2>
+<p>The host-native path is enough for the first Cycle. To inspect the runtimes the machine can serve:</p>
+<pre class="code-block" data-lang="bash"><code>synaptory runtimes list
+synaptory runtimes doctor</code></pre>
+<p>Runtime selection remains inert until an enabled <code>runtimes:</code> policy is present in an SPQ project. The selected delivery role maps to one of four capability profiles, and policy cannot select anything outside <code>allowed_profiles</code>. Capability profiles do not grant authority; the dispatch envelope does.</p>
+<p>Read <a href="user-guide.html#concepts-hosts-and-runtimes">Hosts and Runtimes</a> before enabling it.</p>
+<h2 id="getting-started-5-define-durable-workstreams">8. Know which release layer you need</h2>
+<ul>
+<li>Several workstreams sharing one Cycle and one Sync barrier: continue with</li>
+</ul>
+<p><a href="user-guide.html#guides-spq-delivery">SPQ Delivery</a>.</p>
+<ul>
+<li>Several independent child Cycles running at different cadences but shipping</li>
+</ul>
+<p>together: use a <a href="user-guide.html#guides-coordination-cycles">Coordination Cycle</a>.</p>
+<ul>
+<li>Existing Scrum, Kanban, or Multi-Spec project: follow</li>
+</ul>
+<p><a href="user-guide.html#guides-migrate-to-spq">Migrating to SPQ</a>.</p>
+<h2 id="getting-started-6-start-the-first-cycle">Next reading</h2>
+<ul>
+<li><a href="user-guide.html#concepts-spq-cycle-model">SPQ Cycle Model</a></li><li><a href="user-guide.html#spq-setup-runbook">SPQ Setup Runbook</a></li><li><a href="user-guide.html#concepts-enforcement">Enforcement</a></li><li><a href="user-guide.html#reference-config">Configuration Reference</a></li><li><a href="user-guide.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+  </div>
+</section>
+
+
+<section class="chapter" id="install-cli">
+  <div class="chapter-kicker">Start · 02</div>
+  <div class="chapter-body">
+    <h1 id="install-cli-install-the-synaptory-cli">Install the synaptory CLI</h1>
+<p>The <code>synaptory</code> CLI handles sign-in, session state, governed skill/policy delivery, diagnostics, telemetry, and optional Runtime Bridge operations. Install it once per laptop — the same install works across Claude Code, Codex, Cursor, and every Synaptory project you can access.</p>
+<p>The CLI is shipped separately from all host plugins. The download script detects your OS/architecture, verifies SHA-256, and places the binary on your <code>$PATH</code>.</p>
+<hr>
+<h2 id="install-cli-macos-linux">macOS / Linux</h2>
+<pre class="code-block" data-lang="bash"><code>curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash</code></pre>
+<p>That&#x27;s it. The script:</p>
+<ul>
+<li>Detects <code>darwin-arm64</code>, <code>darwin-amd64</code>, <code>linux-amd64</code>, or <code>linux-arm64</code>.</li><li>Resolves <code>latest.json</code>, then downloads the versioned binary and <code>sha256sums.txt</code> from <code>synaptory.h3t.co/cli/</code>.</li><li>Verifies the SHA-256 before installing.</li><li>Installs to <code>~/.local/bin/synaptory</code>.</li><li>Tells you the line to add to <code>~/.zshrc</code> / <code>~/.bashrc</code> if <code>~/.local/bin</code> isn&#x27;t on your <code>$PATH</code>.</li>
+</ul>
+<p>After install:</p>
+<pre class="code-block" data-lang="bash"><code>synaptory version           # confirm the CLI is on PATH
+synaptory login             # sign in via Entra (browser opens)</code></pre>
+<p>The <code>login</code> step prints the projects you can see right after sign-in, so you&#x27;ll know immediately whether the operator has provisioned you correctly.</p>
+<h3 id="install-cli-custom-install-location">Custom install location</h3>
+<p>Set <code>SYNAPTORY_CLI_PREFIX</code> if <code>~/.local</code> isn&#x27;t where you want it:</p>
+<pre class="code-block" data-lang="bash"><code>SYNAPTORY_CLI_PREFIX=$HOME/Tools curl -fsSL .../cli/install.sh | bash
+# installs to $HOME/Tools/bin/synaptory</code></pre>
+<h3 id="install-cli-installs-to-home-tools-bin-synaptory">Updating the CLI</h3>
+<p>Re-run the same one-liner. The script is idempotent and overwrites with the latest version.</p>
+<h3 id="install-cli-updating-the-cli">Uninstall</h3>
+<pre class="code-block" data-lang="bash"><code>rm ~/.local/bin/synaptory
+synaptory logout            # if you want the keychain cleared first</code></pre>
+<hr>
+<h2 id="install-cli-uninstall">Windows</h2>
+<pre class="code-block" data-lang="powershell"><code>iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex</code></pre>
+<p>The script:</p>
+<ul>
+<li>Detects amd64 (the only Windows build we publish).</li><li>Resolves <code>latest.json</code>, then downloads <code>synaptory-windows-amd64.exe</code> and <code>sha256sums.txt</code> from <code>synaptory.h3t.co/cli/</code>.</li><li>Verifies the SHA-256.</li><li>Installs to <code>%USERPROFILE%\bin\synaptory.exe</code>.</li><li>Adds <code>%USERPROFILE%\bin</code> to your <strong>user</strong> <code>PATH</code> if it isn&#x27;t already (no admin needed; survives reboot).</li>
+</ul>
+<p>If the script added a directory to <code>PATH</code>, <strong>open a new PowerShell window</strong> so the updated <code>PATH</code> is loaded. Then:</p>
+<pre class="code-block" data-lang="powershell"><code>synaptory version
+synaptory login</code></pre>
+<h3 id="install-cli-windows">Updating</h3>
+<p>Re-run the same one-liner.</p>
+<h3 id="install-cli-updating">Uninstall</h3>
+<pre class="code-block" data-lang="powershell"><code>Remove-Item &quot;$env:USERPROFILE\bin\synaptory.exe&quot;
+synaptory logout            # not strictly required; the keychain entry is harmless</code></pre>
+<hr>
+<h2 id="install-cli-uninstall-2">Commands every user should know</h2>
+<p>These are the commands you&#x27;ll run directly. Hooks call the rest for you.</p>
+<div class="table-wrap"><table><thead><tr><th>Command</th><th>What it does</th></tr></thead><tbody><tr><td><code>synaptory login</code></td><td>Open a browser, sign in via Entra. Session is cached in the OS keychain. <strong>No <code>--project</code> flag</strong> — one sign-in covers every project you&#x27;re a member of.</td></tr><tr><td><code>synaptory whoami</code></td><td>Print the cached UPN and session expiry. First check when something feels wrong.</td></tr><tr><td><code>synaptory projects list</code></td><td>List the projects you can see, with your role in each.</td></tr><tr><td><code>synaptory status</code></td><td>Full diagnostic — control-plane URL, session state, skill cache, outbox depth.</td></tr><tr><td><code>synaptory logout</code></td><td>Clear the cached session. The next governed host session will prompt you to sign in again.</td></tr><tr><td><code>synaptory version</code></td><td>Print the CLI version. Useful when reporting issues.</td></tr></tbody></table></div>
+<h3 id="install-cli-commands-every-user-should-know">Less common, but good to know</h3>
+<div class="table-wrap"><table><thead><tr><th>Command</th><th>When to use it</th></tr></thead><tbody><tr><td><code>synaptory skills list</code></td><td>See which skills are in your local cache.</td></tr><tr><td><code>synaptory outbox flush</code></td><td>Manually flush queued telemetry if the control plane was unreachable. Normally automatic on session start.</td></tr><tr><td><code>synaptory projects current</code></td><td>Print the project slug resolved from <code>.synaptory.yaml</code> / <code>SYNAPTORY_PROJECT_ID</code>.</td></tr></tbody></table></div>
+<h3 id="install-cli-less-common-but-good-to-know">Switching projects</h3>
+<p>You don&#x27;t. The same session works across every project you&#x27;re a member of. The CLI auto-detects which project you&#x27;re in by walking up from your current directory looking for <code>.synaptory.yaml</code>:</p>
+<pre class="code-block" data-lang="yaml"><code># .synaptory.yaml
+project_id: taskflow-pilot</code></pre>
+<p>Telemetry and skill fetches stamp that slug onto requests. The server checks your membership against <code>project_members</code> per request — if you&#x27;ve been removed from a project, the next call returns 403 and the CLI quarantines the event for the operator to review.</p>
+<hr>
+<h2 id="install-cli-switching-projects">What happens behind the scenes</h2>
+<p>You won&#x27;t normally run these operations. Claude Code uses native session hooks; Codex and Cursor obtain the same governance outcomes through their project bootstrap, supported hooks, and MCP integration:</p>
+<ol>
+<li>The host integration checks CLI/session readiness. If the cached session cannot be refreshed, it stops governed mutation and asks you to sign in.</li><li>It refreshes the project&#x27;s governed skill and policy cache.</li><li>It loads host-native instructions/rules and reads canonical lifecycle state.</li><li>It flushes durable telemetry when connectivity is available.</li>
+</ol>
+<p>If any of those fail, you&#x27;ll see a clear error message pointing at the fix.</p>
+<hr>
+<h2 id="install-cli-synaptory-yaml">Troubleshooting</h2>
+<div class="table-wrap"><table><thead><tr><th>Symptom</th><th>Fix</th></tr></thead><tbody><tr><td><code>command not found: synaptory</code></td><td>The install dir isn&#x27;t on <code>$PATH</code>. Rerun the install one-liner; it prints the line to add to your shell rc.</td></tr><tr><td><code>synaptory: control plane URL not configured</code></td><td>The CLI binary you installed was built without <code>SYNAPTORY_CP_URL</code> stamped in. Ask your H3Tech operator for a rebuilt binary.</td></tr><tr><td><code>synaptory: Entra OAuth is not configured</code></td><td>Same operator-side issue — the Entra tenant/client IDs weren&#x27;t stamped at build time.</td></tr><tr><td><code>login: you are not a member of any project yet</code></td><td>Your sign-in worked but the operator hasn&#x27;t added your UPN to any project. Email <strong>ops@h3t.co</strong> with your UPN.</td></tr><tr><td><code>403 user is not an active member of project &#x27;&lt;slug&gt;&#x27;</code> mid-session</td><td>Either you&#x27;ve been removed from the project, or the slug in <code>.synaptory.yaml</code> is wrong. Run <code>synaptory projects list</code> to see what you can access.</td></tr><tr><td>Session expired mid-work</td><td>Run <code>synaptory login</code> again. No <code>--project</code> flag is needed; start a fresh host turn if the integration asks you to reload state.</td></tr><tr><td>macOS Gatekeeper blocks the binary</td><td>Run <code>xattr -d com.apple.quarantine ~/.local/bin/synaptory</code>. The binary is unsigned for the pilot; production builds will be notarized.</td></tr></tbody></table></div>
+<p>For anything else, run <code>synaptory status</code> and include the output when you report the issue to ops.</p>
+  </div>
+</section>
+
+      <div class="footer">Built from <code>docs/user-guide/*.md</code> with the H3Tech brand palette.</div>
+    </main>
+    <aside class="outline">
+      <div class="outline-title">Section Outline</div>
+      <a class="outline-doc" href="#getting-started">Getting Started</a><a class="outline-sub" href="#getting-started-what-you-will-set-up">What you will set up</a><a class="outline-sub" href="#getting-started-1-choose-a-host">1. Choose a host</a><a class="outline-sub" href="#getting-started-2-install-the-cli-and-sign-in">2. Install the CLI and sign in</a><a class="outline-sub" href="#getting-started-3-install-the-host-plugin">3. Install the host plugin</a><a class="outline-sub" href="#getting-started-4-bind-the-repository-to-a-project">4. Bind the repository to a project</a><a class="outline-doc" href="#install-cli">Install the synaptory CLI</a><a class="outline-sub" href="#install-cli-macos-linux">macOS / Linux</a><a class="outline-sub" href="#install-cli-windows">Windows</a><a class="outline-sub" href="#install-cli-commands-every-user-should-know">Commands every user should know</a><a class="outline-sub" href="#install-cli-what-happens-behind-the-scenes">What happens behind the scenes</a><a class="outline-sub" href="#install-cli-troubleshooting">Troubleshooting</a>
+    </aside>
+  </div>
+  
+</body>
+</html>

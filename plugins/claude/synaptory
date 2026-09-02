@@ -462,12 +462,13 @@ with open(p, 'w') as f:
   # Build single-file HTML user guide. Pass the version explicitly so the
   # hero stamps are consistent with the rest of the release (CLI, plugin,
   # marketplace.json, container images all carry the same /VERSION). The
-  # builder also writes web/dist/docs/user-guide.html as a side effect —
-  # that's the file the prod-fs publish step copies to /mnt/pgdata/web-dist/docs/.
+  # builder also writes web/dist/docs/user-guide.html and
+  # web/dist/docs/getting-started.html as side effects — those are the files
+  # the prod-fs publish step copies to /mnt/pgdata/web-dist/docs/.
   SYNAPTORY_VERSION="${new_ver}" python3 "$USER_GUIDE_BUILDER" \
     --output "${OUTPUT_DIR}/GUIDE.html" \
     --version "${new_ver}"
-  echo "  Built GUIDE.html (v${new_ver})"
+  echo "  Built GUIDE.html + getting-started.html (v${new_ver})"
   echo ""
 
   # ── Stub generation + IP-content removal ───────────────────────────────────
@@ -1392,11 +1393,17 @@ _deploy_prod() {
   echo "  publishing CLI → /mnt/pgdata/web-dist/cli/"
   cp -av "${REPO_ROOT}/web/dist/cli/." /mnt/pgdata/web-dist/cli/ >/dev/null
 
-  # 4. Publish single-page user guide.
+  # 4. Publish generated documentation.
   local guide_src="${REPO_ROOT}/web/dist/docs/user-guide.html"
-  if [ -f "$guide_src" ]; then
+  local getting_started_src="${REPO_ROOT}/web/dist/docs/getting-started.html"
+  if [ -f "$guide_src" ] || [ -f "$getting_started_src" ]; then
     mkdir -p /mnt/pgdata/web-dist/docs/
-    cp -f "$guide_src" /mnt/pgdata/web-dist/docs/user-guide.html
+    if [ -f "$guide_src" ]; then
+      cp -f "$guide_src" /mnt/pgdata/web-dist/docs/user-guide.html
+    fi
+    if [ -f "$getting_started_src" ]; then
+      cp -f "$getting_started_src" /mnt/pgdata/web-dist/docs/getting-started.html
+    fi
   fi
 
   # 5. Roll compose forward via infra/scripts/deploy.sh.

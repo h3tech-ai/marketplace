@@ -1,26 +1,42 @@
 {
-  "version": "1.2.1",
-  "build_hash": "d7bd3b6b54b1fa986782499c159a32a78756c2eed1bd23dd78810edaa0f9c347",
-  "built_at": "2026-09-02T05:18:48Z",
-  "manifest_file_count": 185,
+  "version": "1.3.0",
+  "build_hash": "8e87db1ae8979c98b566d7c92b50227787136c7cbc723f9a2998f044009be177",
+  "built_at": "2026-09-16T09:46:31Z",
+  "manifest_file_count": 199,
   "ai_bom": {
     "model_pins": {
-      "schema_version": "1.2",
-      "description": "Exact Claude model IDs pinned per tier for plugin-claude/. HC0-F2: healthcare customers require reproducible behavior \u2014 'opus' or 'sonnet' aliases can drift as Anthropic releases new versions. This file is the source of truth; ./synaptory build copies it into the distribution and the AI-BOM generator reads it.",
-      "last_reviewed": "2026-07-07",
+      "schema_version": "1.3",
+      "description": "Exact Claude model IDs pinned per tier for plugin-claude/. HC0-F2: healthcare customers require reproducible behavior \u2014 'opus' or 'sonnet' aliases can drift as Anthropic releases new versions. READ `binding` BELOW BEFORE QUOTING THIS FILE: #519 measured that the pin does not reach a dispatch, so this file records INTENT, not the weights that ran. ./synaptory build copies it into the distribution and the AI-BOM generator reads it.",
+      "last_reviewed": "2026-09-04",
       "pinned_by": "H3Tech Inc.",
-      "runtime_variants_note": "Claude Code surfaces 1M-context variants via suffixes like '-1m' or '[1m]' in the SDK Usage.model field (e.g. 'claude-opus-4-7-1m'). Per Anthropic's Long-context-pricing policy these variants bill at IDENTICAL per-token rates as the base model \u2014 they are NOT separate SKUs. The control-plane pricing logic strips known suffixes before lookup; see api/synaptory_api/routers/analytics.py::_normalise_model_id and ::_PRICED_VARIANT_SUFFIXES. Adding new variants here is informational only; cost computation is automatic once the suffix is in _PRICED_VARIANT_SUFFIXES.",
+      "binding": {
+        "what_the_pin_controls": "Nothing on the dispatch path. The Claude Code Agent() tool's `model` parameter accepts only the tier aliases sonnet|opus|haiku|fable and rejects an exact id with InputValidationError, so the ALIAS is the only value a dispatch can carry and Anthropic's own aliasing resolves it. No file in core/, no hook, and no CLI path reads this file; its readers are markdown prose, the AI-BOM generator, model_pin_check.py and tests.",
+        "what_the_pin_is_for": "Two things it does deliver. (1) It is the recorded statement of which exact id H3Tech INTENDS each tier to use, shipped in build-metadata.json as ai_bom.model_pins, so a change of intent is a reviewable diff. (2) It is the reference set model_pin_check.py compares an observed receipt against, which is the only automated way drift between intent and observation gets reported.",
+        "what_it_is_not": "It is NOT evidence of the weights a dispatch ran on, and no auditor or regulated customer may be told a dispatch is reproducible against these ids. What is reproducible is the TIER ROUTING in backends/claude.md Step 2. See #519 and the pinning section of claude.md.",
+        "tier_alias_is_a_routing_label": "`opus` / `sonnet` / `haiku` are ROUTING labels, not capability guarantees. Nothing here asserts an ordering between the tiers on any measured axis; the cost_tier field states price, which is a published fact, and says nothing about capability. A role is routed to a tier for the reason recorded in that tier's notes, and 'premium' must not be read as 'stronger'.",
+        "measurement": "Claude Code 2.1.236, 2026-09-03, nine real dispatches (#519 / PR #525). Alias-to-id resolution is a server-side decision that can change on any day and was not measured on Bedrock, Vertex, Foundry, or any gateway deployment."
+      },
+      "runtime_variants_note": "Claude Code surfaces 1M-context variants via suffixes like '-1m' or '[1m]' in the SDK Usage.model field (e.g. 'claude-opus-5-1m'). Per Anthropic's Long-context-pricing policy these variants bill at IDENTICAL per-token rates as the base model \u2014 they are NOT separate SKUs. The control-plane pricing logic strips known suffixes before lookup; see api/synaptory_api/routers/analytics.py::_normalise_model_id and ::_PRICED_VARIANT_SUFFIXES. Adding new variants here is informational only; cost computation is automatic once the suffix is in _PRICED_VARIANT_SUFFIXES. A previous PIN is not a runtime variant and must never be listed as one \u2014 the two mean different things, and conflating them would make the checker accept an id no dispatch can reach.",
       "tiers": {
         "opus": {
-          "model_id": "claude-opus-4-8",
-          "family": "claude-4.8",
+          "model_id": "claude-opus-5",
+          "family": "claude-5",
           "cost_tier": "premium",
           "baa_covered": true,
           "runtime_variants": [
-            "claude-opus-4-8-1m",
-            "claude-opus-4-8[1m]"
+            "claude-opus-5-1m",
+            "claude-opus-5[1m]"
           ],
-          "notes": "Used by strategic roles: project-owner, solution-architect, compliance-engineer, research-advisor. The 1M variants run when Claude Code is configured for >200K context; they bill identically to the base model."
+          "decision": {
+            "outcome": "rolled",
+            "decided_on": "2026-09-04",
+            "issue": 441,
+            "previous_model_id": "claude-opus-4-8",
+            "observed_model_id": "claude-opus-5",
+            "observation_class": "subagent-dispatch",
+            "reason": "The pin named claude-opus-4-8 while every measured dispatch on this tier ran claude-opus-5 (#519 cells A-D and I: subagent dispatches through both the marketplace install and the --plugin-dir sideload, with and without an ambient CLI model default; cell E1 corroborates at session level). Rolling makes the AI-BOM statement true and stops model_pin_check.py refusing the HONEST receipts of five routed roles while staying silent on a forged one \u2014 a checker that fires on the honest case and not the dishonest one is worse than none. It changes NO weights: the alias binds and the pin does not, so nothing about the running system moves. It also removes #441's original worry rather than answering it: the premium tier is no longer a generation behind the standard one, because the running system never was \u2014 both tiers resolve to the claude-5 generation. Rolling does not restore reproducibility; only a dispatch-mechanism change could, and #519 scoped that out."
+          },
+          "notes": "Used by the strategic roles (project-owner, solution-architect, compliance-engineer, research-advisor) and, since #434, by code-reviewer; quality-engineer joined in #483. Both provers sit here for weight-level decorrelation, not for seniority: running a work unit's prover on the producer's exact weights makes every judgment-heavy check a same-model check. CR reads diffs; QE decides per-case outcomes for the acceptance set sealed at COMMIT (#406), including whether a case it could not run is legitimately blocked. This is partial decorrelation inside one runtime family; cross-runtime separation is pilot 1 territory and is not wired on the product dispatch path (#396 finding 1). The 1M variants run when Claude Code is configured for >200K context; they bill identically to the base model. A receipt naming claude-opus-4-8 is a finding after this roll, not history: no dispatch on this host was ever measured reaching that id through the `opus` alias (#519 cell E3 reached it only via an explicit session-level --model claude-opus-4-8)."
         },
         "sonnet": {
           "model_id": "claude-sonnet-5",
@@ -31,7 +47,16 @@
             "claude-sonnet-5-1m",
             "claude-sonnet-5[1m]"
           ],
-          "notes": "Used by executor roles: software-engineer, quality-engineer, platform-engineer, technical-writer, code-reviewer. Anthropic is running a $2/$10 per-MTok intro rate through 2026-08-31; the control-plane cost table pins the $3/$15 list rate."
+          "decision": {
+            "outcome": "kept",
+            "decided_on": "2026-09-04",
+            "issue": 441,
+            "previous_model_id": "claude-sonnet-5",
+            "observed_model_id": "claude-sonnet-5",
+            "observation_class": "session-level",
+            "reason": "The pin already names the id the alias resolves to (#519 cell E2, session-level --model sonnet). That agreement is a COINCIDENCE, not an enforcement \u2014 it is why this whole class of defect stayed invisible for four of nine roles and for the most-dispatched path until #434 moved CR onto `opus`. Nothing to roll to: claude-sonnet-5 is the current sonnet."
+          },
+          "notes": "Used by executor roles: software-engineer, platform-engineer, technical-writer. code-reviewer LEFT this tier in #434 and quality-engineer in #483, so a work unit's producing and proving dispatches do not run on identical weights; do not move either back without re-reading those issues. Anthropic ran a $2/$10 per-MTok intro rate through 2026-08-31; the control-plane cost table pins the $3/$15 list rate from 2026-09-01."
         },
         "haiku": {
           "model_id": "claude-haiku-4-5",
@@ -39,9 +64,27 @@
           "cost_tier": "economy",
           "baa_covered": true,
           "runtime_variants": [],
+          "decision": {
+            "outcome": "kept",
+            "decided_on": "2026-09-04",
+            "issue": 441,
+            "previous_model_id": "claude-haiku-4-5",
+            "observed_model_id": "claude-haiku-4-5",
+            "observation_class": "session-level",
+            "reason": "The pin names the id the alias resolves to (#519 cell C ran the main session on --model haiku and it reported claude-haiku-4-5). Read the observation_class: that is a SESSION-level measurement, and no synaptory role routes to this tier, so no subagent dispatch has been measured on it. Nothing to roll to either \u2014 claude-haiku-4-5 is the current haiku. #434 rejected this tier for a prover on the ground that it is the weaker one; that judgment is recorded there and is not re-derived here."
+          },
           "notes": "Not currently used by synaptory roles; reserved for future low-latency auxiliaries. Anthropic does NOT publish a 1M variant for Haiku 4.5 \u2014 treat 'claude-haiku-4-5-1m' model IDs as unsupported."
         }
       }
+    },
+    "binding": {
+      "binds_dispatch": false,
+      "model_identity_source": "receipt-authored",
+      "hc0_f2_status": "not-deliverable-in-v1",
+      "what_this_records": "the exact model IDs this build INTENDS each tier alias to mean, as a reviewable diff",
+      "what_this_is_not": "evidence of which weights ran. No component reads these pins on a dispatch path, the Agent tool accepts tier aliases only, and the model field on a receipt is written by the dispatched agent about itself and is authenticated by nothing",
+      "decided": "2026-09-06",
+      "issue": "https://github.com/h3tech-ai/synaptory-v1/issues/596"
     }
   },
   "provenance": {

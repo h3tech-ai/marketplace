@@ -15,6 +15,13 @@ Flags:
 CLI: python3 checklist.py <project_dir> [flags]
 """
 
+# PEP 604 (`str | None`) is used in annotations below and is a runtime TypeError
+# on Python 3.9, which is the floor this shared runtime ships to. Deferring
+# annotation evaluation is what makes the module importable there at all --
+# `verify_all.py` imports it inside a `try/except ImportError`, and a TypeError
+# escaped that guard.
+from __future__ import annotations
+
 import json
 import os
 import subprocess

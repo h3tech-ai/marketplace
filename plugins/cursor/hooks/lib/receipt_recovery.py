@@ -146,10 +146,29 @@ def find_receipt_in_transcript(transcript_path: str | Path) -> dict[str, Any] | 
     return None
 
 
+#: The marker sentinel for "SubagentStart could not name one assignment".
+#: Kept in step with `dispatched_receipts._AMBIGUOUS`, and compared here
+#: rather than imported so recovery still refuses if that module is absent.
+_AMBIGUOUS = "?ambiguous"
+
+
+def _role_key(role: str) -> str:
+    """Abbrev if the role is known, else a deterministic slug. Comparing on
+    this makes `quality-engineer` and `qe` the same role."""
+    role = (role or "").strip()
+    if not role:
+        return ""
+    return ROLE_ABBREV.get(role) or re.sub(
+        r"[^a-z0-9]+", "-", role.lower()
+    ).strip("-")
+
+
 def recover_from_transcript(
     transcript_path: str | Path,
     receipts_dir: str | Path,
     story_id_hint: str | None = None,
+    expect_role: str = "",
+    expect_story: str = "",
 ) -> Path | None:
     """Scan the transcript for a receipt JSON, write it to disk, return
     the new path. Returns None when no receipt could be recovered.
@@ -160,13 +179,41 @@ def recover_from_transcript(
         `.synaptory/.orchestrator/pipeline-state.json`).
       - `role_abbrev` is derived from the receipt's `role` field via
         ROLE_ABBREV. Unknown roles fall back to a `safe_role` slug.
+
+    `expect_role` and `expect_story` carry the assignment SubagentStart
+    recorded on the marker, and recovery is bound by them exactly as
+    filesystem selection is (#396). Recovery reaches further than selection
+    does, into text the agent produced rather than files it wrote, so an
+    unconstrained recovery reintroduced precisely the receipt selection had
+    just refused: an ambiguous marker plus an unrelated receipt in the
+    transcript produced a clean pass. Three refusals:
+
+      - `expect_story` is the ambiguity sentinel: refuse outright. Nothing
+        here can attribute the receipt, and writing it to disk would make an
+        unattributed body look like this agent's work on every later run.
+      - the receipt declares a different role than the one dispatched: refuse.
+        A QE stop must not be answered by an SE receipt in the same transcript.
+      - the receipt declares a different story than the one assigned: refuse.
     """
     receipt = find_receipt_in_transcript(transcript_path)
     if receipt is None:
         return None
 
-    story_id = receipt.get("story_id") or story_id_hint
+    if expect_story == _AMBIGUOUS:
+        return None
+
     role = receipt.get("role") or ""
+    if expect_role and _role_key(role) != _role_key(expect_role):
+        return None
+
+    declared_story = str(receipt.get("story_id") or "")
+    if expect_story and declared_story and declared_story != expect_story:
+        return None
+
+    # The assignment is a better hint than the board's `current_story_id`,
+    # which is whatever the orchestrator last set and need not be this
+    # agent's work.
+    story_id = declared_story or expect_story or story_id_hint
     role_abbrev = ROLE_ABBREV.get(role)
     if not role_abbrev:
         # Fall back to a sanitised slug so the filename is at least
@@ -189,7 +236,8 @@ def recover_from_transcript(
 def _cli() -> int:  # pragma: no cover — thin CLI wrapper
     """Entry point for the shell hook:
 
-        receipt_recovery.py <transcript_path> <receipts_dir> [story_id_hint]
+        receipt_recovery.py <transcript_path> <receipts_dir> \
+            [story_id_hint] [expect_role] [expect_story]
 
     Prints the path of the recovered file on stdout, or nothing if no
     receipt could be recovered. Always exits 0 so the hook can decide
@@ -200,7 +248,11 @@ def _cli() -> int:  # pragma: no cover — thin CLI wrapper
     if len(sys.argv) < 3:
         return 0
     hint = sys.argv[3] if len(sys.argv) > 3 else None
-    result = recover_from_transcript(sys.argv[1], sys.argv[2], hint)
+    expect_role = sys.argv[4] if len(sys.argv) > 4 else ""
+    expect_story = sys.argv[5] if len(sys.argv) > 5 else ""
+    result = recover_from_transcript(
+        sys.argv[1], sys.argv[2], hint, expect_role, expect_story
+    )
     if result is not None:
         print(str(result))
     return 0

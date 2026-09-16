@@ -26,6 +26,34 @@ What it does (in order):
 
 Re-running on an already-multi-spec project is a no-op (prints a diagnostic
 and exits 0).
+
+An SPQ project is REFUSED, and that is a decision, not an omission (#529)
+------------------------------------------------------------------------
+Multi-Spec and SPQ are alternative layouts, not layers. #303/#304/#305 moved
+SPQ off the v3.0 envelope into its own native store, and `ADR-035` then refused
+the old layout BY NAME rather than converting it: the SPQ-native migrator that
+used to carry projects in that one legal direction is gone, because pilot state
+carried no audit value worth a converter. Wrapping an SPQ project into v3.0
+therefore produces a layout nothing reads and nothing will migrate away from,
+which is not a migration.
+
+What running it anyway did, measured on a Cycle opened by `open_cycle`:
+
+  1. The identity pointer is wrapped to `specs.<primary>.spq`, so no Cycle
+     identity resolves from it any more. `next_action`, advance and the gates
+     all lose the Cycle: the lifecycle is inoperable.
+  2. When an SPQ-native migrator still existed, the recovery named in that
+     refusal completed with rc=0 and `warnings: []` and re-pointed the project
+     at a NEW, EMPTY Cycle `0-<hash>` at seq 0, while the real Cycle, its Work
+     Units and its sealed manifest stayed on disk, listed in `spq/index.json`,
+     and unreachable. There is now no recovery at all, which makes the refusal
+     below the only thing standing between an operator and an unrecoverable
+     project.
+
+So the board is not deleted; it is silently replaced by an empty one. That is
+worse than a refusal in exactly the way this epic keeps finding: a zero that
+means "nothing was recovered" wearing the representation of one that means
+"nothing to recover".
 """
 
 from __future__ import annotations
@@ -57,6 +85,7 @@ sys.path.insert(0, str(HOOKS_LIB))
 sys.path.insert(0, str(TRACKER_DIR.parent))  # scripts/ for the tracker package
 
 # Imports below depend on the sys.path tweaks above.
+import pipeline_board  # type: ignore  # noqa: E402
 import spec_state  # type: ignore  # noqa: E402
 from tracker.config import TrackerConfig  # type: ignore  # noqa: E402
 
@@ -64,9 +93,100 @@ from tracker.config import TrackerConfig  # type: ignore  # noqa: E402
 CACHE_FILES = ("tracker-id-map.json", "tracker-data.json", "backlog-order.json")
 ORCHESTRATOR_REL = ".synaptory/.orchestrator"
 
+SPQ_REFUSAL = (
+    "this project is build_mode 'spq', and an SPQ project is not migratable to "
+    "Multi-Spec.\n"
+    "\n"
+    "Multi-Spec (v3.0) and SPQ are ALTERNATIVE layouts, not layers. #303/#304/"
+    "#305 moved SPQ off the v3.0 envelope into its own native store, and\n"
+    "`ADR-035` then refused the old layout by name rather than converting it — "
+    "so the output of this migration is a layout nothing reads and nothing\n"
+    "will migrate away from. Running it would wrap the identity pointer under "
+    "specs.<primary>.spq, after which no Cycle identity resolves and the\n"
+    "real Cycle, its Work Units and its sealed manifest are orphaned on disk.\n"
+    "\n"
+    "There is no --force for this, and there is no recovery script: the "
+    "SPQ-native migrator was removed with `ADR-035`, because pilot state\n"
+    "carried no audit value worth a converter. An SPQ project already wrapped "
+    "into v3.0 has to open a fresh Cycle — `open_cycle` writes the board at\n"
+    "    .synaptory/.orchestrator/spq/cycles/<cycle-id>/execution-state.json\n"
+    "and leaves pipeline-state.json a mode+identity pointer.\n"
+    "If you meant to change the project's lifecycle, that is a lifecycle "
+    "decision and not a storage migration."
+)
+
 
 def _utc_stamp() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _spq_refusal(project_dir: Path) -> str | None:
+    """The refusal text when this project is SPQ, else None.
+
+    Routed through `pipeline_board.read_board` rather than re-reading the
+    layout here (#514/#529): the accessor knows every lifecycle and reports
+    `build_mode` whether or not the board itself could be read — which matters,
+    because an SPQ project already on the retired v3.0 layout is precisely the
+    one whose board is unreadable AND the one this script must not touch. That
+    unreadability is `pipeline_board.RETIRED_V3_REFUSAL`; it moved into the
+    accessor when the state machine stopped refusing the old pointer itself.
+    """
+    board = pipeline_board.read_board(str(project_dir))
+    declared = _declared_build_mode(project_dir)
+
+    # TWO AUTHORITIES, AND EITHER ONE REFUSES (#396). The board's `build_mode`
+    # DEFAULTS to scrum when there is no pointer to read it from, so a project
+    # whose `.synaptory.yaml` says `build_mode: spq` and whose native Cycle
+    # store still exists was classified as non-SPQ the moment its pointer went
+    # missing. That is the destructive path this refusal exists to close,
+    # reached through a damaged pointer rather than a healthy one: the run
+    # returned 0, wrote a Scrum Multi-Spec state, and left the Cycle orphaned
+    # beside it.
+    #
+    # Disagreement is a refusal too, not a vote. Two authorities that do not
+    # agree about the lifecycle mean this project's shape is unknown, and a
+    # migration that rewrites the board is the last thing to do while it is.
+    if board.build_mode != "spq" and declared != "spq":
+        return None
+    detail = SPQ_REFUSAL
+    if declared == "spq" and board.build_mode != "spq":
+        detail += (
+            "\n\n`.synaptory.yaml` declares `build_mode: spq` while the board "
+            "reports %r. The board's build_mode defaults to scrum when there "
+            "is no pointer to read, so a missing or damaged pointer is not "
+            "evidence that this project is not SPQ." % board.build_mode
+        )
+    elif declared not in ("", "spq") and board.build_mode == "spq":
+        detail += (
+            "\n\nThe board reports SPQ while `.synaptory.yaml` declares "
+            "`build_mode: %s`. The two authorities disagree, so the project's "
+            "lifecycle is unknown and nothing here may rewrite its board."
+            % declared
+        )
+    if not board.available:
+        detail += "\n\nThe SPQ board could not be read either: %s" % (
+            "; ".join(board.problems) or "unknown reason"
+        )
+    return detail
+
+
+def _declared_build_mode(project_dir: Path) -> str:
+    """`.synaptory.yaml`'s `build_mode`, or "" when it cannot be read.
+
+    The config authority, independent of the board. "" rather than a default,
+    because this caller must be able to tell "the project says scrum" from
+    "the project could not be asked", and a default would erase that.
+    """
+    try:
+        import runtime_selector
+    except ImportError:  # pragma: no cover - partial install
+        return ""
+    try:
+        if not (Path(project_dir) / ".synaptory.yaml").is_file():
+            return ""
+        return str(runtime_selector.read_build_mode(str(project_dir)) or "")
+    except Exception:  # noqa: BLE001 - an unreadable config declares nothing
+        return ""
 
 
 def _is_already_multispec(state_path: Path) -> bool:
@@ -292,6 +412,15 @@ def migrate(
     yes: bool = False,
 ) -> int:
     state_path = project_dir / ORCHESTRATOR_REL / "pipeline-state.json"
+
+    # SPQ first, BEFORE the already-multi-spec check. An SPQ project already
+    # wrapped into a v3.0 envelope satisfies `spec_state.is_multispec`, so that
+    # check would return 0 with "nothing to do" — a success message for the
+    # exact corrupted state this refusal exists to name.
+    refusal = _spq_refusal(project_dir)
+    if refusal is not None:
+        print("[migrate-to-multispec] REFUSED: %s" % refusal, file=sys.stderr)
+        return 2
 
     if _is_already_multispec(state_path):
         print("[migrate-to-multispec] state is already multi-spec — nothing to do.")

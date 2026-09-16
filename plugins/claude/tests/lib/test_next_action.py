@@ -936,10 +936,16 @@ def test_scrum_wrapper_attaches_parallel_batch_when_enabled(tmp_path: Path):
     par = out["parallel"]
     assert par["eligible"] is True
     # batch[0] is ALWAYS the serial action, so an orchestrator that ignores
-    # the block behaves exactly as before.
-    assert par["batch"][0] == {
+    # the block behaves exactly as before. The invariant is the DISPATCH
+    # IDENTITY, not the absence of other keys: each member also carries its own
+    # per-story `dod` contract, and for the lead that block must equal the
+    # top-level one or the two would name different contracts for one dispatch.
+    lead = par["batch"][0]
+    assert {k: lead[k] for k in ("story_id", "action", "role")} == {
         "story_id": "US-1", "action": "dispatch_se", "role": "se",
     }
+    assert lead["dod"]["active_checks"] == out["dod"]["active_checks"]
+    assert lead["dod"]["tier"] == out["dod"]["tier"]
     assert [b["story_id"] for b in par["batch"]] == ["US-1", "US-2"]
     assert par["max_concurrent"] == 3
     assert par["isolation"] == "worktree"
@@ -1075,3 +1081,118 @@ def test_deps_blocked_is_in_the_action_contract():
 
     assert "deps_blocked" in NEXT_ACTIONS
     assert "deps_blocked" not in CONTINUE_ELIGIBLE
+
+
+# ─── the board does not repeat a promotion the gate refused ─────────────────
+
+
+def _reviewing_board(refusal: str | None = None, evidence: str = "") -> dict:
+    story = {
+        "id": "WU-3552",
+        "title": "conditional gate",
+        "state": "reviewing",
+        "pipeline_log": [],
+        "receipts": [],
+        "labels": [],
+        "depends_on": [],
+    }
+    if refusal:
+        story["dod_gate_refusal"] = {
+            "reason": refusal,
+            "at": "2026-09-03T00:00:00Z",
+            "evidence": evidence,
+        }
+    return {"build_mode": "spq", "current_stories": [story]}
+
+
+def test_the_first_pass_still_offers_the_promotion(tmp_path):
+    """The DoD gate is what should refuse a red unit, with its own typed
+    reason, and it cannot do that if the board never offers the edge. This is
+    the property the cross-host contract asserts, so the fix for the loop must
+    not quietly replace `dod_failed` with a generic mismatch."""
+    action = next_action(_reviewing_board(), receipts_dir=str(tmp_path))
+    assert action["action"] == "promote_story", action
+    assert action["transition_to"] == "done", action
+
+
+def test_a_refused_promotion_is_not_advertised_again(tmp_path):
+    """#396, the deterministic dead end:
+
+        next_action  -> promote_story / done
+        advance      -> dod_failed, story stays in reviewing
+        next_action  -> promote_story / done
+
+    A compliant orchestrator retries an action that cannot succeed, forever.
+    The kernel records why the gate refused, and the board routes to the agent
+    that owes the missing result.
+    """
+    refusal = (
+        "DoD gate: user-facing acceptance (ui_acceptance) has not passed"
+    )
+    action = next_action(_reviewing_board(refusal), receipts_dir=str(tmp_path))
+
+    assert action["action"] != "promote_story", (
+        "the board advertised the promotion the gate had just refused: %r" % action
+    )
+    assert action["action"] == "recover_blocked", action
+    assert action.get("transition_to") in (None, ""), action
+    assert action["recovery"]["gate"] == "ui_acceptance", action
+    # The remediation role, never the SE retry ladder, which cannot clear a
+    # conditional gate and would loop in a different way.
+    assert action["role"] == action["recovery"]["role"], action
+    assert action["role"] != "se", action
+
+
+def test_an_unrelated_refusal_note_does_not_reroute(tmp_path):
+    """A note that names no known gate still routes somewhere deliberate
+    rather than back to the promotion."""
+    action = next_action(
+        _reviewing_board("DoD gate: something nobody mapped"),
+        receipts_dir=str(tmp_path),
+    )
+    assert action["action"] == "recover_blocked", action
+    assert action["recovery"]["gate"] == "unknown", action
+
+
+def test_a_refusal_about_evidence_that_changed_is_ignored(tmp_path):
+    """The note is scoped to the evidence it judged, and this is the failure
+    mode that matters more than the loop: an engineer who dispatched the
+    remediation, produced the missing result and came back would find the board
+    still routing to remediation and the advance refused as
+    `next_action_mismatch`, with no way to clear it. The Cursor MCP suite
+    caught it on a coverage fix (#396).
+    """
+    from story_pipeline import receipt_evidence_digest
+
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    (receipts / "WU-3552-cr.json").write_text("{}", encoding="utf-8")
+    stale = "sha-of-the-evidence-that-was-refused"
+    current = receipt_evidence_digest(str(receipts), "WU-3552")
+    assert current and current != stale
+
+    action = next_action(
+        _reviewing_board("DoD gate: ui_acceptance has not passed", stale),
+        receipts_dir=str(receipts),
+    )
+    assert action["action"] == "promote_story", (
+        "a refusal about evidence that has since changed still blocked the "
+        "retry: %r" % action
+    )
+
+
+def test_a_refusal_about_the_same_evidence_still_routes(tmp_path):
+    """And it must not become a no-op: the same evidence gets the same
+    answer, which is what breaks the loop."""
+    from story_pipeline import receipt_evidence_digest
+
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    (receipts / "WU-3552-cr.json").write_text("{}", encoding="utf-8")
+    same = receipt_evidence_digest(str(receipts), "WU-3552")
+
+    action = next_action(
+        _reviewing_board("DoD gate: ui_acceptance has not passed", same),
+        receipts_dir=str(receipts),
+    )
+    assert action["action"] == "recover_blocked", action

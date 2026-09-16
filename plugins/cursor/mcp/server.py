@@ -3,7 +3,13 @@
 
 Tools: doctor, get_status, get_state, next_action, advance, validate_receipt,
 begin_dispatch, begin_lifecycle_dispatch, initialize, transition,
-request_acceptance, accept_story, tracker_*, and the SPQ Cycle verbs.
+request_acceptance, accept_story, tracker_*, the SPQ ceremony verbs
+(approve_baseline, open_cycle, hydrate_cycle, record_sync, close_cycle) and the
+shared `spq_*` manifest/ledger surface from `spq_mcp`.
+
+THE CEREMONY LIST IS EXHAUSTIVE, and short on purpose. Every verb here exists
+in `spq_state_machine`; nothing is advertised that the runtime cannot run, and
+`TOOLS` records the six that were removed and why (ADR-035).
 
 `advance` validates the receipt first and refuses without a valid one —
 that is the Cursor fail-closed gate (`subagentStop` cannot deny finished work).
@@ -19,6 +25,7 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -41,6 +48,7 @@ for p in (MCP_DIR, LIB, SCRIPTS, SCRIPTS / "tracker"):
 # The shared gate. Every advance/dispatch check lives here so all three hosts
 # enforce one contract; this server only supplies Cursor-specific policy.
 import advance_kernel  # noqa: E402
+import runtime_contracts  # noqa: E402
 import mcp_transport  # noqa: E402
 import spq_next  # noqa: E402
 from auth_status import authentication_status  # noqa: E402
@@ -322,18 +330,22 @@ def tool_next_action(args: dict[str, Any]) -> dict[str, Any]:
     if blocked:
         return blocked
     mode = _build_mode(project)
-    sm = _lifecycle(project)
-    selected = sm.next_action(project)
     if mode == "spq":
-        if selected.get("action") == "not_in_execution":
-            selected = spq_next.lifecycle_next_action(Path(project))
-        elif selected.get("action") == "await_sync":
-            from state_machine import read_state  # type: ignore
-
-            selected = spq_next.sync_boundary_next_action(
-                Path(project), selected, read_state(project) or {}
-            )
-    return {"next_action": selected, "build_mode": mode}
+        # ONE CALL, not a dispatcher result patched afterwards. The two
+        # `elif` branches this replaces keyed on `not_in_execution` and
+        # `await_sync` -- the first because the host filled in every ceremony
+        # stage itself, the second because Sync was a state with a human gate.
+        # Neither exists: `spq_state_machine.next_action` answers for all four
+        # stages, and `await_sync` is gone because the absence of a Sync event
+        # blocks nothing. Keeping the sentinel-and-patch shape would have left
+        # the enrichment reachable only when the kernel happened to say
+        # `not_in_execution`, which under SPQ it no longer does.
+        return {
+            "next_action": spq_next.lifecycle_next_action(Path(project)),
+            "build_mode": mode,
+        }
+    sm = _lifecycle(project)
+    return {"next_action": sm.next_action(project), "build_mode": mode}
 
 
 def tool_validate_receipt(args: dict[str, Any]) -> dict[str, Any]:
@@ -490,9 +502,207 @@ def tool_begin_dispatch(args: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "next_action": selected,
+        # #690. Top-level, matching Codex. It rides inside `next_action` on
+        # both hosts already, but an authorization that supersedes a receipt
+        # should not make the operator dig for the reason it was allowed to:
+        # `recovery.verdict == "attempt_not_live"` is what says this dispatch
+        # is the successor of a dead attempt rather than an ordinary retry.
+        "recovery": selected.get("recovery"),
         "archived_receipt": decision.extra.get("archived_receipt"),
+        "archived_receipt_digest": decision.extra.get("archived_receipt_digest"),
         "retry_count": decision.extra.get("retry_count"),
+        # The governed runtime surface (#396 finding 1). The kernel selects an
+        # adapter profile and mints a dispatch envelope; a host that dropped
+        # them left Auto/Prefer/Pin unable to affect a real dispatch and gave
+        # the operator no way to see which runtime was chosen or to hand the
+        # envelope to the bridge. Absent on a project that has not opted in,
+        # which is what `runtime.state == "inert"` says.
+        **_runtime_surface(decision),
     }
+
+
+def _runtime_surface(decision: Any) -> dict[str, Any]:
+    """The selection account and the dispatch envelope, when there is one.
+
+    Kept out of `receipt_contract`: that block describes the EVIDENCE the agent
+    must produce, while these describe the authority it runs under. Folding one
+    into the other would make a host that reads only the receipt shape look
+    like it had honoured the envelope.
+    """
+    account = decision.extra.get("runtime_selection")
+    if not account:
+        return {}
+    surface: dict[str, Any] = {"runtime": account}
+    envelope = decision.extra.get("dispatch_envelope")
+    if envelope:
+        surface["dispatch_envelope"] = envelope
+        surface["runtime_execute_hint"] = (
+            "Hand this envelope to `synaptory runtime execute --envelope -` "
+            "rather than running the agent directly: the control plane signs "
+            "it at registration and the bridge verifies that signature before "
+            "it prepares anything."
+        )
+    return surface
+
+
+def tool_execute_through_runtime(args: dict[str, Any]) -> dict[str, Any]:
+    """Run a dispatch through the SELECTED runtime, not this host's own agent.
+
+    Surfacing an envelope was not integration (#396): the host displayed the
+    selection and then spawned its native agent regardless, so Auto/Prefer/Pin
+    could be shown and could not change which executor ran. This is the
+    deterministic boundary. It invokes the Runtime Bridge with the
+    control-plane-signed envelope and returns the attempt record, so a
+    cross-family dispatch is a tool call rather than a suggestion the model may
+    or may not follow.
+
+    The kernel enforces the other half: a receipt produced by a family the
+    dispatch did not select is refused at advance, so skipping this tool does
+    not quietly succeed.
+    """
+    envelope = args.get("dispatch_envelope")
+    if not isinstance(envelope, dict) or not envelope:
+        return {
+            "executed": False,
+            "error": (
+                "no dispatch envelope: call begin_dispatch first and pass the "
+                "`dispatch_envelope` it returned. A dispatch with no envelope "
+                "is not a governed one and runs through the host's own agent."
+            ),
+        }
+    cli = _runtime_cli()
+    if not cli:
+        return {
+            "executed": False,
+            "error": (
+                "no synaptory CLI resolved for this installation, so the "
+                "selected runtime cannot be invoked. The dispatch must not "
+                "fall back to this host's agent: the selection chose "
+                "%s." % (envelope.get("runtime_family") or "another runtime")
+            ),
+        }
+    # THE REQUESTED PROJECT, explicitly (#396). The tool schema takes
+    # `project_dir` and this ignored it, so the bridge walked upward from the
+    # MCP SERVER's working directory: outside a project it refused, and inside
+    # a different checkout it ran the selected runtime there and stored the
+    # attempt there, while the envelope named the intended project.
+    project = str(_project(args))
+    proc = subprocess.run(
+        [
+            cli, "runtime", "execute",
+            "--envelope", "-", "--json",
+            "--project-dir", project,
+        ],
+        input=json.dumps(envelope),
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=project,
+    )
+    payload: dict[str, Any] = {
+        "executed": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "runtime_family": envelope.get("runtime_family"),
+        "adapter_profile_id": envelope.get("adapter_profile_id"),
+    }
+    try:
+        payload["attempt"] = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        payload["stdout"] = proc.stdout[-4000:]
+    if proc.returncode != 0:
+        payload["error"] = (proc.stderr or proc.stdout)[-4000:]
+
+    # RECONCILE THE BOARD with the generation the bridge actually held (#396).
+    #
+    # The kernel mints a LOCAL random fencing token at dispatch; the control
+    # plane issues the authoritative one at claim. Without this the two never
+    # meet, and a correctly claimed receipt is refused as `fencing_token_stale`
+    # against the local value. This is the caller `reconcile_dispatch` was
+    # written for, and the host is where it belongs: the Go bridge has no path
+    # to the Python kernel, and the host has both.
+    #
+    # Best effort AFTER the run: a reconciliation failure must not discard an
+    # attempt that already executed, and the reason is reported rather than
+    # swallowed so an operator can see why the receipt will be refused.
+    attempt = payload.get("attempt")
+    if isinstance(attempt, dict):
+        payload["reconciled"] = _reconcile_board(project, envelope, attempt)
+    return payload
+
+
+def _reconcile_board(
+    project: str, envelope: dict[str, Any], attempt: dict[str, Any]
+) -> dict[str, Any]:
+    """Put the claim's generation and the run's outcome on the dispatch binding.
+
+    ON THE RECORD'S OWN AUTHORITY, never on the envelope's. The first version
+    read `fencing_token` and `state` from the record but `attempt_id`, story
+    and role from the ENVELOPE, so whatever the bridge reported was relabelled
+    as the requested attempt and the kernel's exact-attempt guard could never
+    fire: envelope A in, a record for B out, and B's generation landed on A's
+    binding. So the two documents are matched first, and the identity passed
+    down is the REPORTED one, which leaves the kernel's guard as a second
+    refusal rather than a formality (#396).
+    """
+    problems = runtime_contracts.attempt_record_disagreements(envelope, attempt)
+    if problems:
+        return {"applied": False, "reason": "; ".join(problems)}
+    # ONLY A CP-CONFIRMED CLOSE IS PROJECTED. A holder that was fenced out or
+    # asked to cancel can still finish its adapter and describe itself as
+    # completed; adopting that puts a stale generation and a state the control
+    # plane never accepted onto the board, and turns evidence that says stop
+    # into a receipt that can advance.
+    if not runtime_contracts.attempt_close_confirmed(attempt):
+        return {
+            "applied": False,
+            "reason": (
+                "the control plane did not confirm a terminal close for this "
+                "attempt, so its generation and state are this process's own "
+                "opinion and must not be projected onto the board"
+            ),
+        }
+    token = str(attempt.get("fencing_token") or "")
+    state = str(attempt.get("state") or "")
+    if not token and not state:
+        return {"applied": False, "reason": "the bridge reported no generation or state"}
+    try:
+        decision = advance_kernel.reconcile_dispatch(
+            project,
+            str(attempt.get("story_id") or ""),
+            str(attempt.get("role") or ""),
+            attempt_id=str(attempt.get("attempt_id") or ""),
+            fencing_token=token,
+            attempt_state=state,
+            # #492. The record already carries WHY the attempt ended, from the
+            # control plane's own close, and until this was forwarded the
+            # board learned only THAT it ended. Passed through rather than
+            # normalized here: the kernel owns the closed vocabulary, and a
+            # host that quietly dropped a class it did not like would make a
+            # human cancellation indistinguishable from a technical failure.
+            failure_class=str(attempt.get("failure_class") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"applied": False, "reason": "reconciliation failed: %s" % exc}
+    return {
+        "applied": bool(decision.allowed),
+        "reason": decision.reason,
+        "code": decision.code,
+    }
+
+
+def _runtime_cli() -> str:
+    """The synaptory binary this installation is stamped for, or "".
+
+    Reuses the shared resolver rather than searching PATH: an unstamped tree
+    addresses no control plane, and inventing one here would be the #320
+    fall-through in a new place.
+    """
+    try:
+        from gate_emitter import _resolve_cli  # type: ignore
+
+        return _resolve_cli() or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def tool_begin_lifecycle_dispatch(args: dict[str, Any]) -> dict[str, Any]:
@@ -521,8 +731,30 @@ def tool_begin_lifecycle_dispatch(args: dict[str, Any]) -> dict[str, Any]:
         import spq_state_machine as module  # type: ignore
 
         state = module.read_state(str(project))
+        if not selected.get("receipt_path"):
+            return {
+                "authorized": False,
+                "error": (
+                    "next_action selected %s but named no receipt path, so "
+                    "there is nothing to bind this dispatch to"
+                    % selected.get("action")
+                ),
+                "next_action": selected,
+            }
         path = Path(str(selected["receipt_path"]))
-        receipts_root = Path(module._resolve_receipts_dir(str(project))).resolve()
+        # `spq_paths.receipts_dir`, because `spq_state_machine` has no
+        # `_resolve_receipts_dir`: the containment check that keeps a lifecycle
+        # receipt inside the Cycle's receipts directory raised `AttributeError`
+        # and every Checkpoint and Acceptance dispatch on this host failed at
+        # the check meant to protect it. One derivation, and it is the one
+        # `spq_mcp.lifecycle_next_action` builds the path from.
+        import spq_paths  # type: ignore
+
+        receipts_root = Path(
+            spq_paths.receipts_dir(str(project), str(state.get("_cycle_id") or ""))
+        )
+        receipts_root.mkdir(parents=True, exist_ok=True)
+        receipts_root = receipts_root.resolve()
         if path.is_symlink() or receipts_root.is_symlink():
             return {"authorized": False, "error": "lifecycle receipt path may not be a symlink"}
         path = path.resolve()
@@ -630,6 +862,25 @@ def _json_list(value: Any) -> list:
     raise ValueError("work_units must be a JSON array")
 
 
+def _json_object(value: Any) -> dict | None:
+    """A JSON object argument, or None for absent.
+
+    None rather than `{}`: `open_cycle` treats an empty block as "no verifier
+    sealed", and a caller who passed nothing must reach that path rather than
+    seal an empty `verification` key that reads as a configured one.
+    """
+    if value is None or value == "" or value == {}:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("verification must be a JSON object")
+        return parsed or None
+    raise ValueError("verification must be a JSON object")
+
+
 def _spq_call(
     project: str, name: str, *a: Any, skip_readiness: bool = False, **kw: Any
 ) -> dict[str, Any]:
@@ -641,12 +892,65 @@ def _spq_call(
         if blocked:
             return blocked
     import spq_state_machine as spq  # type: ignore
-    from sync_barrier import BarrierError  # type: ignore
+
+    # `sync_barrier.BarrierError` used to be imported HERE, at the top of this
+    # helper, and `sync_barrier` is deleted (ADR-035). Every SPQ ceremony tool
+    # on this host routes through `_spq_call`, so that one dead import took the
+    # whole ceremony surface down with `ImportError` before any verb ran -- a
+    # host with no reachable lifecycle, reported as a missing module.
+    #
+    # The refusal types are now resolved LAZILY and by name, and a module that
+    # will not import contributes no type rather than aborting the call. The
+    # tuple is built rather than written as a literal for exactly the reason
+    # above: this helper must not be the thing that fails when a runtime module
+    # is renamed.
+    refusals: tuple = (ValueError, TypeError, json.JSONDecodeError)
+    for module_name, error_name in (
+        ("cycle_barrier", "BarrierError"),
+        ("cycle_records", "DeclarationError"),
+        ("cycle_lifecycle", "LifecycleError"),
+        ("method_events", "MethodEventError"),
+        ("spq_paths", "IdentityError"),
+    ):
+        try:
+            module = __import__(module_name)
+        except ImportError:
+            continue
+        error = getattr(module, error_name, None)
+        if isinstance(error, type) and issubclass(error, BaseException):
+            refusals = refusals + (error,)
 
     try:
         return getattr(spq, name)(project, *a, **kw)
-    except (ValueError, TypeError, json.JSONDecodeError, BarrierError) as exc:
+    except refusals as exc:
         return {"error": str(exc)}
+
+
+def _spq_unit_mutation(project: str, verb: str, *a: Any, **kw: Any) -> dict[str, Any]:
+    """A per-Work-Unit board mutation, through `story_pipeline`.
+
+    `accept_story`, `request_acceptance`, `reject_story` and `unblock_story`
+    were imported from `spq_state_machine`, which has never had them: they are
+    lifecycle-NEUTRAL board mutations and they live on `story_pipeline`, which
+    all three lifecycles share. Under SPQ every one of those imports raised
+    `ImportError`, so a Work Unit could be dispatched and verified on this host
+    and then not accepted on it.
+
+    `story_pipeline` takes the state dict and leaves persistence to its caller,
+    which is why this reads, mutates and writes through the same guarded
+    helpers the rest of the lifecycle uses instead of telling the operator to
+    shell a script the host forbids.
+    """
+    import spq_state_machine as spq  # type: ignore
+    import story_pipeline as pipeline  # type: ignore
+
+    state = spq.read_state(project)
+    try:
+        result = getattr(pipeline, verb)(state, *a, project_dir=project, **kw)
+    except (ValueError, TypeError, KeyError) as exc:
+        return {"error": str(exc)}
+    spq._write_state(project, state)
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 def tool_accept_story(args: dict[str, Any]) -> dict[str, Any]:
@@ -656,12 +960,15 @@ def tool_accept_story(args: dict[str, Any]) -> dict[str, Any]:
         return blocked
     story_id = str(args.get("story_id") or "")
     accepted_by = str(args.get("accepted_by") or "")
-    mode = _build_mode(project)
+    if not accepted_by:
+        # Acceptance is a HUMAN gate. An unattributed sign-off records the one
+        # thing an acceptance record exists to carry as absent.
+        return {"error": "accepted_by is required to accept a Work Unit"}
+    if _build_mode(project) == "spq":
+        return _spq_unit_mutation(project, "accept_story", story_id, accepted_by)
     try:
-        if mode == "spq":
-            from spq_state_machine import accept_story  # type: ignore
-        else:
-            from scrum_state_machine import accept_story  # type: ignore
+        from scrum_state_machine import accept_story  # type: ignore
+
         return accept_story(project, story_id, accepted_by)
     except (ValueError, TypeError) as exc:
         return {"error": str(exc)}
@@ -673,12 +980,11 @@ def tool_request_acceptance(args: dict[str, Any]) -> dict[str, Any]:
     if blocked:
         return blocked
     story_id = str(args.get("story_id") or "")
-    mode = _build_mode(project)
+    if _build_mode(project) == "spq":
+        return _spq_unit_mutation(project, "request_acceptance", story_id)
     try:
-        if mode == "spq":
-            from spq_state_machine import request_acceptance  # type: ignore
-        else:
-            from scrum_state_machine import request_acceptance  # type: ignore
+        from scrum_state_machine import request_acceptance  # type: ignore
+
         return request_acceptance(project, story_id)
     except (ValueError, TypeError) as exc:
         return {"error": str(exc)}
@@ -691,14 +997,18 @@ def tool_initialize(args: dict[str, Any]) -> dict[str, Any]:
         return blocked
     if _state_path(project).exists():
         return {"error": "initialize refused: pipeline state already exists"}
-    ws = str(args.get("workstream_id") or "").strip() or None
     try:
-        sm = _lifecycle(project)
-        if _build_mode(project) == "spq" or ws:
+        # THE LANE ARGUMENT IS GONE from the list, and its absence is the
+        # change rather than a tidy-up. A clone no longer needs to know which
+        # lane it is, because there is one board per Cycle -- and while
+        # `spq.initialize` still swallows unknown kwargs, keeping the argument
+        # would have let a caller believe it seeded an identity nothing
+        # reads.
+        if _build_mode(project) == "spq":
             import spq_state_machine as spq  # type: ignore
 
-            return spq.initialize(project, workstream_id=ws)
-        return sm.initialize(project)
+            return spq.initialize(project)
+        return _lifecycle(project).initialize(project)
     except (ValueError, TypeError) as exc:
         return {"error": str(exc)}
 
@@ -709,177 +1019,214 @@ def tool_transition(args: dict[str, Any]) -> dict[str, Any]:
     if blocked:
         return blocked
     to_state = str(args.get("to_state") or args.get("lifecycle") or "")
-    force = args.get("force")
-    if isinstance(force, str):
-        force = force.strip().lower() in ("1", "true", "yes")
     try:
+        if _build_mode(project) == "spq":
+            # NO `force`. `cycle_lifecycle.check_transition` holds no such
+            # parameter, and `C-12` puts the recovery hatch outside the
+            # executing agent's reach -- an argument is not outside it. The
+            # predecessor's `force=True` moved a project from DISCOVERY to
+            # CHECKPOINT in one call, skipping Commit, execution and the
+            # barrier. Passing it here would now be a `TypeError` presented to
+            # the model as a lifecycle refusal, which is the worst of both.
+            import spq_state_machine as spq  # type: ignore
+
+            return spq.transition(project, to_state)
+        force = args.get("force")
+        if isinstance(force, str):
+            force = force.strip().lower() in ("1", "true", "yes")
         return _lifecycle(project).transition(project, to_state, force=bool(force))
     except (ValueError, TypeError) as exc:
         return {"error": str(exc)}
 
 
 def tool_approve_baseline(args: dict[str, Any]) -> dict[str, Any]:
+    """The Discovery human gate. `baseline_ref` is not optional.
+
+    An approval that does not name the revision it approved is a boolean with a
+    signature on it: the next Cycle seals against a baseline nobody can point
+    at, and `cycle_barrier.assert_baseline_unchanged` has nothing to compare.
+    """
+    approved_by = str(args.get("approved_by") or "").strip()
+    baseline_ref = str(args.get("baseline_ref") or "").strip()
+    if not approved_by:
+        return {"error": "approved_by is required for the Discovery human gate"}
+    if not baseline_ref:
+        return {
+            "error": (
+                "baseline_ref is required: the approval records the exact "
+                "revision whose scope, timeline and cost were approved"
+            )
+        }
+    calibration = args.get("calibration")
+    if calibration is not None and not isinstance(calibration, dict):
+        return {"error": "calibration must be an object (the measured sample)"}
     return _spq_call(
         _project(args), "approve_baseline",
-        approved_by=args.get("approved_by"),
+        approved_by=approved_by,
+        baseline_ref=baseline_ref,
+        calibration=calibration,
     )
 
 
 def tool_open_cycle(args: dict[str, Any]) -> dict[str, Any]:
+    """The Commit: seal an admitted set that cannot be edited afterwards.
+
+    The argument list is the declaration, not a convenience shape. It replaces
+    `(cycle_number, goal, work_units, tracker_cycle)`, whose four values map
+    onto exactly one of the things a Cycle now commits to -- `open_cycle` has
+    not taken a cycle NUMBER since the identity became a Cycle id, and it never
+    took a tracker cycle at all, so every call through the old shape was a
+    `TypeError` reported to the model as a lifecycle error.
+
+    `repository`, `trunk_ref`, `source_region` and `engineering_lead` are
+    required because sealing refuses without them: a declaration with no
+    repository, no trunk to integrate to, no region it may address, or no
+    accountable Lead is not a commitment. `crew` is optional -- a Crew grants
+    nothing (`SC-MTH-012`), so an unnamed one changes no barrier admission.
+    """
     project = _project(args)
     try:
-        units = _json_list(args.get("work_units"))
-        cycle_n = args.get("cycle_number")
-        tracker = args.get("tracker_cycle")
+        units = _json_list(args.get("admitted_units"))
+        if not units:
+            return {"error": "admitted_units must be a non-empty array"}
         return _spq_call(
             project,
             "open_cycle",
-            int(cycle_n) if cycle_n not in (None, "") else None,
-            str(args.get("goal") or ""),
-            units,
-            tracker_cycle=int(tracker) if tracker not in (None, "") else None,
+            goal=str(args.get("goal") or ""),
+            repository=str(args.get("repository") or ""),
+            trunk_ref=str(args.get("trunk_ref") or ""),
+            source_region=_json_list(args.get("source_region")),
+            admitted_units=units,
+            engineering_lead=str(args.get("engineering_lead") or ""),
+            crew=_json_list(args.get("crew")),
+            shared_path_owners=_json_list(args.get("shared_path_owners")),
+            baseline_ref=str(args.get("baseline_ref") or ""),
+            cycle_id=str(args.get("cycle_id") or "") or None,
+            specification_refs=_json_list(args.get("specification_refs")),
+            readmits=_json_list(args.get("readmits")),
+            verification=_json_object(args.get("verification")),
         )
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         return {"error": str(exc)}
 
 
 def tool_hydrate_cycle(args: dict[str, Any]) -> dict[str, Any]:
+    """Join this clone to a Cycle, BY CYCLE ID.
+
+    Through `spq_mcp.hydrate_cycle`, which is where the body lives so that the
+    manifest-hash refusal exists on both hosts rather than on whichever was
+    edited last. The Codex server calls the same function.
+
+    A fresh clone deliberately has no gitignored pipeline state, and this is its
+    guarded creation path, so requiring SPQ state and dispatch readiness before
+    it would make the documented operation impossible. Authentication and the
+    compliance refusal still apply, and every dispatch after hydration meets the
+    normal doctor gate.
+    """
     project = _project(args)
-    try:
-        units = _json_list(args.get("work_units"))
-        tracker = args.get("tracker_cycle")
-        ws = str(args.get("workstream_id") or "").strip() or None
-        cycle_n = args.get("cycle_number")
-        if cycle_n not in (None, "") and (
-            not isinstance(cycle_n, int) or isinstance(cycle_n, bool)
-        ):
-            try:
-                cycle_n = int(cycle_n)
-            except (TypeError, ValueError):
-                return {"error": "cycle_number is required for hydrate_cycle and must be an integer"}
-        if not _state_path(project).is_file():
-            blocked = _require_not_baa(project) or _require_authenticated(Path(project))
-            if blocked:
-                return blocked
-            if spq_next.configured_build_mode(Path(project)) != "spq":
-                return {"error": "SPQ lifecycle tools require build_mode: spq"}
-            if not isinstance(units, list) or not units:
-                return {"error": "work_units must be a non-empty array"}
-            if cycle_n in (None, ""):
-                return {"error": "cycle_number is required for hydrate_cycle and must be an integer"}
-            import spq_state_machine as spq  # type: ignore
+    cycle_id = str(args.get("cycle_id") or "").strip()
+    if not cycle_id:
+        return {"error": "cycle_id is required for hydrate_cycle"}
+    fresh = not _state_path(project).is_file()
+    blocked = _require_not_baa(project)
+    if blocked:
+        return blocked
+    if fresh:
+        blocked = _require_authenticated(Path(project))
+        if blocked:
+            return blocked
+        if spq_next.configured_build_mode(Path(project)) != "spq":
+            return {"error": "SPQ lifecycle tools require build_mode: spq"}
+        import spq_state_machine as spq  # type: ignore
 
-            spq.initialize(project, workstream_id=ws)
-            return spq.hydrate_cycle(
-                project,
-                int(cycle_n),
-                units,
-                goal=str(args.get("goal") or ""),
-                tracker_cycle=int(tracker) if tracker not in (None, "") else None,
-                workstream_id=ws,
+        spq.initialize(project)
+    else:
+        blocked = _require_execution_ready(Path(project))
+        if blocked:
+            return blocked
+    import spq_mcp  # type: ignore
+
+    return spq_mcp.hydrate_cycle({
+        "project_dir": project,
+        "cycle_id": cycle_id,
+        "manifest_hash": args.get("manifest_hash"),
+    })
+
+
+def tool_record_sync(args: dict[str, Any]) -> dict[str, Any]:
+    """Record that a cross-Cycle wait cleared. It unblocks nothing.
+
+    The dependency does that. This is the surviving half of the four Sync verbs
+    this host used to expose: `declare_sync_ready`, `evaluate_sync` and
+    `clear_sync` all belonged to Sync-as-a-state with a quorum of per-lane
+    readiness records behind it, and none of the three has an implementation to
+    call. What is left is a record with no authority -- which is exactly what
+    §6 says Sync is, and why every field here names a dependency rather than an
+    approver.
+    """
+    # READ FROM THE CONSTANT, never restated. `method_events.SYNC_RESOLUTIONS`
+    # is the closed set, and a copy of it here is the same defect that shipped
+    # three different barrier-criteria counts in one product.
+    import method_events  # type: ignore
+
+    allowed = tuple(method_events.SYNC_RESOLUTIONS)
+    resolution = str(args.get("resolution") or "").strip()
+    if resolution not in allowed:
+        return {
+            "error": (
+                "resolution must be one of %s -- \"it cleared somehow\" is not "
+                "a record anyone can act on later." % ", ".join(allowed)
             )
-        return _spq_call(
-            project,
-            "hydrate_cycle",
-            int(cycle_n) if cycle_n not in (None, "") else None,
-            units,
-            goal=str(args.get("goal") or ""),
-            tracker_cycle=int(tracker) if tracker not in (None, "") else None,
-            workstream_id=ws,
-        )
-    except (ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
-        return {"error": str(exc)}
-
-
-def tool_declare_sync_ready(args: dict[str, Any]) -> dict[str, Any]:
-    cycle_n = args.get("cycle_number")
-    ws = str(args.get("workstream") or "").strip() or None
-    declared_by = str(args.get("declared_by") or "").strip() or None
+        }
     return _spq_call(
         _project(args),
-        "declare_sync_ready",
-        cycle_n=int(cycle_n) if cycle_n not in (None, "") else None,
-        workstream=ws,
-        declared_by=declared_by,
+        "record_sync",
+        waiting_unit_id=str(args.get("waiting_unit_id") or ""),
+        producing_cycle_id=str(args.get("producing_cycle_id") or ""),
+        resolution=resolution,
     )
 
 
-def tool_evaluate_sync(args: dict[str, Any]) -> dict[str, Any]:
-    cycle_n = args.get("cycle_number")
-    use_cache = args.get("use_cache")
-    if isinstance(use_cache, str):
-        use_cache = use_cache.strip().lower() in ("1", "true", "yes")
-    elif use_cache is None:
-        use_cache = True
+def tool_promote_cycle(args: dict[str, Any]) -> dict[str, Any]:
+    """Authorize one atomic promotion of this Cycle's candidate.
+
+    It does not merge. What it records is that no other candidate, no moved
+    trunk and no second promotion can hide behind the authorization -- and the
+    verdict it authorizes against is derived by the kernel, not supplied here.
+    """
     return _spq_call(
         _project(args),
-        "evaluate_sync",
-        cycle_n=int(cycle_n) if cycle_n not in (None, "") else None,
-        use_cache=bool(use_cache),
-    )
-
-
-def tool_clear_sync(args: dict[str, Any]) -> dict[str, Any]:
-    cycle_n = args.get("cycle_number")
-    return _spq_call(
-        _project(args),
-        "clear_sync",
-        cycle_n=int(cycle_n) if cycle_n not in (None, "") else None,
-        cleared_by=args.get("cleared_by"),
+        "promote_cycle",
+        principal=str(args.get("principal") or ""),
+        rationale=str(args.get("rationale") or ""),
     )
 
 
 def tool_close_cycle(args: dict[str, Any]) -> dict[str, Any]:
-    force = args.get("force")
-    if isinstance(force, str):
-        force = force.strip().lower() in ("1", "true", "yes")
+    """Record the close of a Cycle whose barrier the KERNEL evaluated.
+
+    THIS TOOL TOOK `barrier_verdict` FROM ITS CALLER, and on this surface the
+    caller is the agent the barrier is judging. A hand-shaped object with
+    `green: true` and a criteria map closed a Cycle with no evaluation, no
+    observed trunk and no promotion behind it. The refusals in front of the
+    argument checked its SHAPE -- green, non-empty criteria, a matching cycle
+    and declaration hash -- which narrowed what had to be forged without
+    changing that forging was the route.
+    #
+    `spq_state_machine.close_cycle` now derives the verdict from
+    `run_barrier` and requires a successful promotion under that verdict's own
+    operation identity, from the committed barrier ledger. So this tool passes
+    no verdict, and there is nothing here for a caller to shape.
+    #
+    `integrated_sha` is gone with it: the trunk revision is observable, and a
+    caller able to name it is a caller able to claim an integration that never
+    happened.
+    """
     return _spq_call(
         _project(args),
         "close_cycle",
-        proceed_to=str(args.get("proceed_to") or "COMMIT"),
-        force=bool(force),
-    )
-
-
-# ── Coordination Cycle ceremony (#305) ───────────────────────────────────────
-# A release is not a lifecycle state, but opening, revising and clearing one are
-# ceremony ACTS and are gated exactly like opening a Cycle. The reads live on the
-# shared `spq_*` tools, which arrive via `_spq_tools()` below.
-
-
-def tool_open_coordination_cycle(args: dict[str, Any]) -> dict[str, Any]:
-    children = args.get("children")
-    if not isinstance(children, list) or not children:
-        return {"error": "children must be a non-empty array"}
-    return _spq_call(
-        _project(args),
-        "open_coordination_cycle",
-        release_goal=str(args.get("release_goal") or ""),
-        children=children,
-        dependency_edges=args.get("dependency_edges") or [],
-        coordination_seq=args.get("coordination_seq"),
-        baseline_sha=str(args.get("baseline_sha") or ""),
-        created_by=str(args.get("created_by") or ""),
-    )
-
-
-def tool_revise_coordination_manifest(args: dict[str, Any]) -> dict[str, Any]:
-    return _spq_call(
-        _project(args),
-        "revise_coordination_manifest",
-        coordination_cycle_id=args.get("coordination_cycle_id"),
-        drop_child=str(args.get("drop_child") or ""),
-        reason=str(args.get("reason") or ""),
-        revised_by=str(args.get("revised_by") or ""),
-    )
-
-
-def tool_clear_release(args: dict[str, Any]) -> dict[str, Any]:
-    return _spq_call(
-        _project(args),
-        "clear_release",
-        coordination_cycle_id=args.get("coordination_cycle_id"),
-        cleared_by=args.get("cleared_by"),
+        principal=str(args.get("principal") or ""),
+        rationale=str(args.get("rationale") or ""),
     )
 
 
@@ -950,6 +1297,23 @@ TOOLS: dict[str, Any] = {
             "required": ["story_id"],
         },
     },
+    "execute_through_runtime": {
+        "fn": tool_execute_through_runtime,
+        "description": (
+            "Run a governed dispatch through the SELECTED runtime via the "
+            "Runtime Bridge. Required when begin_dispatch returned a "
+            "dispatch_envelope: the selection decides which executor runs, and "
+            "a receipt from another family is refused at advance."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string"},
+                "dispatch_envelope": {"type": "object"},
+            },
+            "required": ["dispatch_envelope"],
+        },
+    },
     "begin_lifecycle_dispatch": {
         "fn": tool_begin_lifecycle_dispatch,
         "description": (
@@ -993,67 +1357,79 @@ TOOLS: dict[str, Any] = {
     },
     "initialize": {
         "fn": tool_initialize,
-        "description": "Seed lifecycle state. Pass workstream_id on an SPQ clone.",
+        "description": "Seed lifecycle state for this project.",
         "schema": mcp_transport.INITIALIZE_SCHEMA,
     },
     "transition": {
         "fn": tool_transition,
-        "description": "Transition the lifecycle (e.g. CYCLE_EXECUTION → SYNC).",
+        "description": (
+            "Transition the lifecycle stage. Under SPQ the four stages are "
+            "DISCOVERY, CYCLE, ACCEPTANCE, COMPLETE."
+        ),
         "schema": mcp_transport.TRANSITION_SCHEMA,
     },
     "approve_baseline": {
         "fn": tool_approve_baseline,
-        "description": "SPQ: approve the Discovery baseline and enter COMMIT.",
+        "description": (
+            "SPQ: approve the Discovery baseline, naming the revision approved."
+        ),
         "schema": mcp_transport.APPROVE_BASELINE_SCHEMA,
     },
     "open_cycle": {
         "fn": tool_open_cycle,
-        "description": "SPQ: admit Work Units and open a Cycle from COMMIT.",
+        "description": (
+            "SPQ Commit: seal an admitted set, a source region and an "
+            "accountable Engineering Lead into one Cycle declaration."
+        ),
         "schema": mcp_transport.OPEN_CYCLE_SCHEMA,
     },
     "hydrate_cycle": {
         "fn": tool_hydrate_cycle,
-        "description": "SPQ: bring a workstream clone into Cycle execution.",
+        "description": "SPQ: join this clone to a Cycle by its id.",
         "schema": mcp_transport.HYDRATE_CYCLE_SCHEMA,
     },
-    "declare_sync_ready": {
-        "fn": tool_declare_sync_ready,
-        "description": "SPQ: write this workstream's readiness record.",
-        "schema": mcp_transport.DECLARE_SYNC_READY_SCHEMA,
+    "record_sync": {
+        "fn": tool_record_sync,
+        "description": (
+            "SPQ: record that a cross-Cycle wait cleared, and how. It "
+            "unblocks nothing -- a satisfied dependency does that."
+        ),
+        "schema": mcp_transport.RECORD_SYNC_SCHEMA,
     },
-    "evaluate_sync": {
-        "fn": tool_evaluate_sync,
-        "description": "SPQ: evaluate the Sync barrier on the integration clone.",
-        "schema": mcp_transport.EVALUATE_SYNC_SCHEMA,
-    },
-    "clear_sync": {
-        "fn": tool_clear_sync,
-        "description": "SPQ: clear the barrier and transition SYNC → CHECKPOINT.",
-        "schema": mcp_transport.CLEAR_SYNC_SCHEMA,
+    "promote_cycle": {
+        "fn": tool_promote_cycle,
+        "description": (
+            "SPQ Checkpoint: authorize one atomic promotion of this Cycle's "
+            "candidate. It does not merge."
+        ),
+        "schema": mcp_transport.PROMOTE_CYCLE_SCHEMA,
     },
     "close_cycle": {
         "fn": tool_close_cycle,
-        "description": "SPQ: close the Cycle at CHECKPOINT.",
+        "description": (
+            "SPQ Checkpoint: record the close of a Cycle whose barrier the "
+            "kernel evaluated and whose promotion it can find."
+        ),
         "schema": mcp_transport.CLOSE_CYCLE_SCHEMA,
     },
-    "open_coordination_cycle": {
-        "fn": tool_open_coordination_cycle,
-        "description": (
-            "SPQ: open a Coordination Cycle pinning exact child increments."
-        ),
-        "schema": mcp_transport.OPEN_COORDINATION_SCHEMA,
-    },
-    "revise_coordination_manifest": {
-        "fn": tool_revise_coordination_manifest,
-        "description": "SPQ: revise the release — today, drop a late child.",
-        "schema": mcp_transport.REVISE_COORDINATION_SCHEMA,
-    },
-    "clear_release": {
-        "fn": tool_clear_release,
-        "description": "SPQ: clear a green release and emit the release gate.",
-        "schema": mcp_transport.CLEAR_RELEASE_SCHEMA,
-    },
 }
+# SIX CEREMONY TOOLS WERE REMOVED HERE, and removed from DISCOVERY with them,
+# which is the half that matters: a tool a host advertises is a promise a fresh
+# install makes to whichever model reads its `tools/list`.
+#
+#   declare_sync_ready, evaluate_sync, clear_sync
+#       Sync as a lifecycle state with a quorum of per-lane readiness records.
+#       `C-02` makes Sync a recorded event that blocks nothing and the barrier
+#       moves to Checkpoint over the admitted set, so all three had no
+#       implementation left to call. `record_sync` is what survives.
+#   the three release-composition verbs
+#       That layer existed only because integration was deferred; every Cycle
+#       integrates to the shared trunk at its own Checkpoint now, so there is
+#       no parent to gather anything.
+#
+# All six resolved through `getattr(spq_state_machine, ...)`, so each was an
+# `AttributeError` dressed as a lifecycle error -- discoverable, callable, and
+# incapable of succeeding.
 
 TOOLS.update(_spq_tools())
 

@@ -10,7 +10,31 @@ Runs all checklist.py checks PLUS:
 Called before Sprint Review or Release readiness check.
 
 CLI: python3 verify_all.py <project_dir> [--json] [--mode <mode>]
+
+Three statuses, and the third exists because of #529
+-----------------------------------------------------
+``passed``        something was validated, and it held.
+``failed``        something was validated, and it did not hold.
+``unverifiable``  NOTHING WAS VALIDATED. The subject could not be read, or this
+                  verifier holds no rule to judge it against.
+
+That third status is the whole point of #529. ``verify_state_machine`` used to
+return ``passed`` on an SPQ project having validated nothing: its ``if scrum /
+elif kanban`` chain had no ``else``, and on the SPQ pointer ``lifecycle_state``
+is ``""``, so both branches were skipped and the function fell through to its
+initialiser. Measured on a board produced by ``open_cycle``::
+
+    {"name": "State Machine", "status": "passed", "errors": [],
+     "build_mode": "spq", "lifecycle_state": "", "transitions_completed": 0}
+
+A green verifier is consumed as evidence — it is what someone points at to say
+the state machine is sound — so a pass that means "validated, and it held" and
+a pass that means "nothing was validated" must never share a representation.
+Every check here therefore records ``checks_performed``, and an empty
+``checks_performed`` cannot be ``passed``.
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -21,9 +45,17 @@ from pathlib import Path
 from typing import Any
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-HOOKS_LIB_DIR = os.path.join(os.path.dirname(SCRIPTS_DIR), "..", "..", "hooks", "lib")
+sys.path.insert(0, SCRIPTS_DIR)
 
-# Add hooks lib to path for imports
+# The shared lib dir sits at a different depth per layout (core/lib in the
+# source tree, <pkg>/hooks/lib once composed), so probe rather than count
+# parents. The hard-coded `dirname(SCRIPTS_DIR)/../../hooks/lib` this replaces
+# resolved to the REPOSITORY'S PARENT in the source tree, so every import below
+# failed silently there and `verify_receipt_chain` degraded to an
+# is-this-valid-JSON check without ever saying so.
+from _runtime_paths import find_lib_dir  # noqa: E402
+
+HOOKS_LIB_DIR = str(find_lib_dir(SCRIPTS_DIR))
 sys.path.insert(0, HOOKS_LIB_DIR)
 
 try:
@@ -32,18 +64,72 @@ except ImportError:
     validate_receipt = None
 
 try:
-    from scrum_state_machine import read_state as scrum_read_state
-except ImportError:
-    scrum_read_state = None
+    import pipeline_board
+except ImportError:  # pragma: no cover - projection accident
+    pipeline_board = None
 
 try:
-    from kanban_state_machine import read_state as kanban_read_state
-except ImportError:
-    kanban_read_state = None
+    from story_pipeline import receipts_dir_for as _receipts_dir_for
+except ImportError:  # pragma: no cover - projection accident
+    _receipts_dir_for = None
 
 # v2 lifecycle states for validation
 SCRUM_STATES = ["INCEPTION", "SPRINT_PLANNING", "SPRINT_EXECUTION", "SPRINT_REVIEW", "SPRINT_RETRO", "SPRINT_CLOSE", "RELEASE", "COMPLETE"]
 KANBAN_STATES = ["DISCOVER", "READY", "EXECUTION", "REVIEW", "RELEASE", "COMPLETE"]
+
+#: The status a check reports when it validated nothing. Distinct from
+#: ``skipped`` (there was nothing to validate, and we know that because we
+#: looked) and from ``passed``. It never aggregates into ``all_passed``.
+UNVERIFIABLE = "unverifiable"
+
+
+def _states_for(build_mode: str) -> list[str] | None:
+    """The legal lifecycle states for a build mode, or None when this verifier
+    holds no list for it.
+
+    ``None`` must never certify. SPQ's list is IMPORTED from the state machine
+    that owns it rather than re-typed here: a second copy of a lifecycle's
+    states is the same class of defect as a second copy of its board layout,
+    and if the import fails there is nothing to validate against, which is a
+    fact to report rather than a check to skip.
+    """
+    if build_mode == "scrum":
+        return list(SCRUM_STATES)
+    if build_mode == "kanban":
+        return list(KANBAN_STATES)
+    if build_mode == "spq":
+        try:
+            from spq_state_machine import SPQ_STATES
+        except Exception:  # noqa: BLE001 - unimportable is unverifiable
+            return None
+        return list(SPQ_STATES)
+    return None
+
+
+def _unverifiable(result: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Report that nothing was validated, and why. Never ``passed``."""
+    result["status"] = UNVERIFIABLE
+    result["reason"] = reason
+    result["errors"].append("nothing was validated: %s" % reason)
+    return result
+
+
+def _receipts_dir(project_dir: str) -> str:
+    """THE receipts directory for this project, on whatever layout it is on.
+
+    ``story_pipeline.receipts_dir_for`` is the single authoritative resolver
+    (SPQ cycle home / multi-spec slot / flat). Hard-coding
+    ``.orchestrator/receipts`` here made every receipt check on an SPQ project
+    report ``skipped: No receipts directory`` while a Cycle's receipts sat in
+    the cycle home next door — a skip that aggregates as a pass.
+    """
+    if _receipts_dir_for is not None:
+        try:
+            return _receipts_dir_for(project_dir, intended=False)
+        except Exception:  # noqa: BLE001 - fall back to the historical path
+            pass
+    return os.path.join(project_dir, ".synaptory", ".orchestrator", "receipts")
+
 
 try:
     from mode_reader import get_engagement_mode
@@ -52,7 +138,6 @@ except ImportError:
         return "autonomous"
 
 # Import checklist runner
-sys.path.insert(0, SCRIPTS_DIR)
 try:
     from checklist import run_checklist
 except ImportError:
@@ -61,9 +146,7 @@ except ImportError:
 
 def verify_receipt_chain(project_dir: str) -> dict[str, Any]:
     """Verify all receipts in the pipeline are valid with artifacts on disk."""
-    receipts_dir = os.path.join(
-        project_dir, ".synaptory", ".orchestrator", "receipts"
-    )
+    receipts_dir = _receipts_dir(project_dir)
 
     result: dict[str, Any] = {
         "name": "Receipt Chain",
@@ -116,10 +199,21 @@ def verify_receipt_chain(project_dir: str) -> dict[str, Any]:
 
 
 def verify_state_machine(project_dir: str) -> dict[str, Any]:
-    """Verify v2 lifecycle state is valid and history is consistent."""
+    """Verify the lifecycle state on THIS project's board is a legal one.
+
+    Reads through ``pipeline_board.read_board``, which resolves the board on
+    every lifecycle and — the reason it exists — always answers whether the
+    board was READABLE alongside what is on it. The previous implementation
+    opened ``pipeline-state.json`` directly and read ``lifecycle_state`` off
+    it, which on SPQ is a mode + identity pointer carrying no lifecycle at all.
+
+    Every slot is validated, not just the first: on the v3.0 Multi-Spec layout
+    checking only ``active_spec`` would be the same defect one layout over.
+    """
     result: dict[str, Any] = {
         "name": "State Machine",
         "status": "passed",
+        "checks_performed": [],
         "errors": [],
     }
 
@@ -131,47 +225,119 @@ def verify_state_machine(project_dir: str) -> dict[str, Any]:
         result["reason"] = "No pipeline state file"
         return result
 
-    try:
-        with open(state_path) as f:
-            state = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        result["status"] = "failed"
-        result["errors"].append("pipeline-state.json is corrupt or unreadable")
+    if pipeline_board is None:
+        return _unverifiable(
+            result,
+            "the shared board accessor (pipeline_board) could not be imported, "
+            "so no board was read",
+        )
+
+    board = pipeline_board.read_board(project_dir)
+    result["build_mode"] = board.build_mode
+    result["layout"] = board.layout
+    result["board_source"] = board.source
+
+    if not board.available:
+        problems = "; ".join(board.problems) or "unknown reason"
+        if board.layout == "none":
+            # An existing file we could not parse is a real failure, and was
+            # already reported as one.
+            result["status"] = "failed"
+            result["errors"].append(
+                "pipeline-state.json is corrupt or unreadable: %s" % problems
+            )
+            return result
+        return _unverifiable(result, "the board could not be read: %s" % problems)
+
+    states = _states_for(board.build_mode)
+    if states is None:
+        return _unverifiable(
+            result,
+            "this verifier holds no lifecycle state list for build_mode %r, so "
+            "the lifecycle state was compared against nothing" % board.build_mode,
+        )
+
+    result["lifecycle_state"] = board.lifecycle_state
+    transitions = 0
+    # SLOTS THAT NAMED NO LIFECYCLE, so a pass cannot be reported over them
+    # (#396). One readable slot used to supply a `checks_performed` entry and
+    # carry the whole result to `passed` while another slot was never
+    # validated: the error was appended and nothing read it.
+    unvalidated: list[str] = []
+    for label, sub in board.substates:
+        where = ("spec %s" % label) if label else board.build_mode
+        transitions += len(sub.get("lifecycle_history") or [])
+        value = str(sub.get("lifecycle_state") or "")
+        if not value:
+            # Not a pass and not a failure: there was a board, and it named no
+            # lifecycle, so there was nothing to compare.
+            result["errors"].append(
+                "%s: the board carries no lifecycle_state, so none was validated"
+                % where
+            )
+            unvalidated.append(where)
+            continue
+        result["checks_performed"].append(
+            "%s lifecycle_state %s is one of the %d legal %s states"
+            % (where, value, len(states), board.build_mode)
+        )
+        if value not in states:
+            result["status"] = "failed"
+            result["errors"].append(
+                "Unrecognized %s lifecycle state: %s (expected one of %s)"
+                % (board.build_mode, value, states)
+            )
+
+    result["transitions_completed"] = transitions
+
+    if not result["checks_performed"] and result["status"] != "failed":
+        return _unverifiable(
+            result,
+            "a board was read but no slot on it named a lifecycle_state, so no "
+            "state was validated",
+        )
+    # A MEASURED FAILURE OUTRANKS AN UNMEASURED SLOT: "this state is illegal"
+    # is a stronger statement than "this one was not read", and the caller
+    # should see the first.
+    if result["status"] == "failed":
         return result
-
-    build_mode = state.get("build_mode", "")
-    lifecycle_state = state.get("lifecycle_state", "")
-    result["build_mode"] = build_mode
-    result["lifecycle_state"] = lifecycle_state
-
-    # Validate lifecycle state is recognized
-    if build_mode == "scrum":
-        if lifecycle_state and lifecycle_state not in SCRUM_STATES:
-            result["status"] = "failed"
-            result["errors"].append(
-                f"Unrecognized Scrum lifecycle state: {lifecycle_state} (expected one of {SCRUM_STATES})"
-            )
-    elif build_mode == "kanban":
-        if lifecycle_state and lifecycle_state not in KANBAN_STATES:
-            result["status"] = "failed"
-            result["errors"].append(
-                f"Unrecognized Kanban lifecycle state: {lifecycle_state} (expected one of {KANBAN_STATES})"
-            )
-
-    # Check lifecycle history is consistent
-    history = state.get("lifecycle_history", [])
-    result["transitions_completed"] = len(history)
-
+    # EVERY DECLARED SLOT, OR NOT A PASS. A Multi-Spec board can be partly
+    # readable, and `read_board` says so in `problems` while still reporting
+    # `available`. The first cut consulted those problems only when the board
+    # was wholly unavailable, so a malformed sibling slot, a slot that is not
+    # an object, and an `active_spec` naming a slot that does not exist all
+    # returned `passed` next to an error saying nothing was validated. #529's
+    # rule is that an unread subject and a validated subject cannot share a
+    # green representation.
+    if unvalidated:
+        return _unverifiable(
+            result,
+            "%s named no lifecycle_state, so the board was validated in part "
+            "and reported in whole" % ", ".join(unvalidated),
+        )
+    if board.problems:
+        return _unverifiable(
+            result,
+            "the board was read with unresolved problems, so some of it was "
+            "never validated: %s" % "; ".join(board.problems),
+        )
     return result
 
 
 def verify_story_receipts(project_dir: str) -> dict[str, Any]:
-    """Verify story-scoped receipts exist for completed stories."""
+    """Verify story-scoped receipts exist for completed stories.
+
+    Two reads, both of which used to be layout-blind: the board (through
+    ``read_board``, so Work Units on an SPQ Cycle are seen) and the receipts
+    directory (through ``story_pipeline.receipts_dir_for``, so the SPQ cycle
+    home is searched rather than the flat one that does not exist there).
+    """
     result: dict[str, Any] = {
         "name": "Story Receipt Coverage",
         "status": "passed",
         "stories_checked": 0,
         "stories_with_receipts": 0,
+        "checks_performed": [],
         "errors": [],
     }
 
@@ -183,24 +349,44 @@ def verify_story_receipts(project_dir: str) -> dict[str, Any]:
         result["reason"] = "No pipeline state file"
         return result
 
+    if pipeline_board is None:
+        return _unverifiable(
+            result,
+            "the shared board accessor (pipeline_board) could not be imported, "
+            "so no board was read",
+        )
+
+    board = pipeline_board.read_board(project_dir)
+    result["build_mode"] = board.build_mode
+    result["layout"] = board.layout
+    if not board.available:
+        return _unverifiable(
+            result,
+            "the board could not be read: %s"
+            % ("; ".join(board.problems) or "unknown reason"),
+        )
+
+    result["stories_on_board"] = len(board.stories)
+    done_stories = [s for s in board.stories if s.get("state") == "done"]
+    if not done_stories:
+        # A real skip: the board WAS read, and it holds no completed story to
+        # check. Recorded with the count so it cannot be confused with a read
+        # that never happened.
+        result["status"] = "skipped"
+        result["reason"] = (
+            "the board holds %d item(s) and none is done, so there is no "
+            "completed story to check receipts for" % len(board.stories)
+        )
+        return result
+
+    receipts_dir = _receipts_dir(project_dir)
+    result["receipts_dir"] = receipts_dir
     try:
-        with open(state_path) as f:
-            state = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        result["status"] = "skipped"
-        result["reason"] = "pipeline-state.json unreadable"
-        return result
-
-    # Check receipts for completed stories
-    receipts_dir = os.path.join(project_dir, ".synaptory", ".orchestrator", "receipts")
-    if not os.path.isdir(receipts_dir):
-        result["status"] = "skipped"
-        result["reason"] = "No receipts directory"
-        return result
-
-    receipt_files = {f for f in os.listdir(receipts_dir) if f.endswith(".json")}
-    stories = state.get("current_stories", [])
-    done_stories = [s for s in stories if s.get("state") == "done"]
+        receipt_files = {
+            f for f in os.listdir(receipts_dir) if f.endswith(".json")
+        }
+    except OSError:
+        receipt_files = set()
 
     for story in done_stories:
         story_id = story.get("id", "")
@@ -209,10 +395,16 @@ def verify_story_receipts(project_dir: str) -> dict[str, Any]:
         result["stories_checked"] += 1
         # Check for at least an SE receipt for each done story
         se_receipt = f"{story_id}-se.json"
+        result["checks_performed"].append(
+            "done story %s has an SE receipt" % story_id
+        )
         if se_receipt in receipt_files:
             result["stories_with_receipts"] += 1
         else:
-            result["errors"].append(f"Done story {story_id} missing SE receipt ({se_receipt})")
+            result["errors"].append(
+                f"Done story {story_id} missing SE receipt ({se_receipt}) "
+                f"in {receipts_dir}"
+            )
             result["status"] = "failed"
 
     return result
@@ -223,9 +415,7 @@ def verify_remediation_chains(project_dir: str) -> dict[str, Any]:
 
     Remediation chain: finding receipt → remediation receipt → verification receipt.
     """
-    receipts_dir = os.path.join(
-        project_dir, ".synaptory", ".orchestrator", "receipts"
-    )
+    receipts_dir = _receipts_dir(project_dir)
 
     result: dict[str, Any] = {
         "name": "Remediation Chains",
@@ -493,7 +683,12 @@ def run_all_verifications(
 
     total_duration_ms = int((time.monotonic() - total_start) * 1000)
 
-    # Aggregate
+    # Aggregate. `unverifiable` is deliberately NOT in the passing set: a check
+    # that validated nothing cannot contribute to a verdict of PASSED, which is
+    # the whole of #529 one level up from the individual checks.
+    unverifiable = [
+        c["name"] for c in pipeline_checks if c["status"] == UNVERIFIABLE
+    ]
     all_passed = all(
         c["status"] in {"passed", "skipped"} for c in pipeline_checks
     )
@@ -505,6 +700,7 @@ def run_all_verifications(
         "mode": mode,
         "autonomous": autonomous,
         "all_passed": all_passed,
+        "unverifiable": unverifiable,
         "total_duration_ms": total_duration_ms,
         "checklist": checklist_result,
         "pipeline_checks": pipeline_checks,
@@ -525,15 +721,32 @@ def format_output(result: dict[str, Any], detailed: bool = False) -> str:
         lines.append(f"  {icon} Validation Checklist    {s['passed']}/{s['total']} passed")
 
     # Pipeline checks
+    _ICONS = {"passed": "✓", "failed": "✗", UNVERIFIABLE: "?"}
     for check in result.get("pipeline_checks", []):
-        icon = "✓" if check["status"] == "passed" else "✗" if check["status"] == "failed" else "○"
+        icon = _ICONS.get(check["status"], "○")
         lines.append(f"  {icon} {check['name']:<24} {check['status']}")
+        if check["status"] == UNVERIFIABLE and check.get("reason"):
+            lines.append(f"      nothing was validated: {check['reason']}")
         if detailed and check.get("errors"):
             for err in check["errors"][:5]:
                 lines.append(f"      {err}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    verdict = "PASSED" if result["all_passed"] else "FAILED"
+    # UNVERIFIABLE is named in the verdict, not folded into FAILED: "this did
+    # not hold" and "this was never checked" are different things to tell an
+    # operator, and collapsing them is the defect one level up.
+    failed = [c["name"] for c in result.get("pipeline_checks", [])
+              if c["status"] == "failed"]
+    if result["all_passed"]:
+        verdict = "PASSED"
+    elif failed:
+        verdict = "FAILED"
+        if result.get("unverifiable"):
+            verdict += " (and NOT VERIFIED: %s)" % ", ".join(result["unverifiable"])
+    elif result.get("unverifiable"):
+        verdict = "NOT VERIFIED (%s)" % ", ".join(result["unverifiable"])
+    else:
+        verdict = "FAILED"
     lines.append(f"  Verdict: {verdict}    ⏱ {result['total_duration_ms']}ms")
 
     return "\n".join(lines)

@@ -1,20 +1,35 @@
-"""Layer 1 — the Cycle dependency ledger (#303 §3/§4).
+"""Layer 1 — the Cycle dependency ledger (#303 §3/§4, migrated for #640/#644).
 
-Without this, a cross-workstream `depends_on` edge can never resolve: the #304
-gate refuses it forever, which is safe but useless. These tests pin the property
-that makes it useful AND still safe:
+Without this, a `depends_on` edge declaring anything stronger than `done` can
+never resolve: the #304 gate refuses it forever, which is safe but useless.
+These tests pin the property that makes it useful AND still safe:
 
-    an upstream event can unblock a downstream Work Unit in another workstream,
-    but only when the consumer can actually check the claim.
+    a recorded event can unblock a dependent Work Unit, but only when the
+    consumer can actually check the claim.
 
 The last clause is the whole design. `spq.sync.accept_unverified_events`
 defaults to false, so a claim-only condition fails closed. That has a real cost
--- a plain-string cross-workstream `depends_on` becomes unusable and the PO must
-name a verifiable condition -- and it is the only way "an upstream event safely
-unblocks downstream work" is true rather than aspirational.
+-- a plain-string `depends_on` becomes usable only for board state, and the PO
+must name a verifiable condition -- and it is the only way "an upstream event
+safely unblocks downstream work" is true rather than aspirational.
+
+WHAT THE WORKSTREAM'S RETIREMENT CHANGED HERE, and what it did not
+-------------------------------------------------------------------------------
+`SPD-194` retires the Workstream, so there is no second lane: one Cycle, one
+Crew, one board, one events directory, one integration ref. Three properties in
+this file had a lane as their SUBJECT and are gone with it, deleted rather than
+left passing vacuously -- a lane publishing about another lane's unit, per-lane
+events directories, and a lane hydrating a slice of the board.
+
+Everything else survives with a different owner. "A stronger condition than
+`done` is a ledger fact, not a board fact" used to be the cross-lane branch's
+job and is now the only branch there is, which makes it MORE load-bearing rather
+than less: every admitted unit is local now, so if the local branch trusted
+board state the whole mechanism would be decorative.
 """
 
 from __future__ import annotations
+
 
 import json
 import subprocess
@@ -22,11 +37,13 @@ from pathlib import Path
 
 import pytest
 
+import cycle_records as cr
 import spq_ledger as lg
-import spq_manifest as mf
 import spq_paths as sp
 import spq_state_machine as sm
 import story_pipeline as story
+
+from _spq_fixture import CYCLE_KWARGS, unit as _fx_unit
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -37,7 +54,8 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def cycle(tmp_path: Path, monkeypatch):
-    """A real repo with a two-workstream Cycle open and a sealed manifest."""
+    """A real repo with one Cycle open, two admitted units and a sealed
+    declaration. WU-DOWN waits on WU-UP for `integrated`."""
     project = tmp_path / "proj"
     project.mkdir()
     _git(project, "init", "-q")
@@ -46,29 +64,16 @@ def cycle(tmp_path: Path, monkeypatch):
     (project / "f.txt").write_text("x", encoding="utf-8")
     _git(project, "add", "-A")
     _git(project, "commit", "-qm", "init")
-    (project / ".synaptory.yaml").write_text(
-        'build_mode: spq\n'
-        'spq:\n'
-        '  workstreams:\n'
-        '    - id: "spine"\n'
-        '      shared_owner: true\n'
-        '    - id: "frame"\n',
-        encoding="utf-8",
-    )
-    monkeypatch.delenv(sp.ENV_WORKSTREAM, raising=False)
+    (project / ".synaptory.yaml").write_text("build_mode: spq\n", encoding="utf-8")
     monkeypatch.delenv("SYNAPTORY_ACTIVE_SPEC", raising=False)
 
-    sm.initialize(str(project), workstream_id="frame")
-    sm.approve_baseline(str(project), approved_by="t")
-    sm.open_cycle(
-        str(project), 1, "cycle 1",
-        [
-            {"id": "WU-UP", "title": "upstream", "labels": ["ws:spine"],
-             "outputs": [{"kind": "contract", "id": "contracts/auth"}]},
-            {"id": "WU-DOWN", "title": "downstream", "labels": ["ws:frame"],
-             "depends_on": [{"unit_id": "WU-UP", "condition": "integrated"}]},
-        ],
-    )
+    sm.initialize(str(project))
+    sm.approve_baseline(str(project), approved_by="t", baseline_ref="baseline-1",
+        calibration={"sample_units": 1, "measured_hours": 1})
+    sm.open_cycle(str(project), goal="cycle 1", admitted_units=[
+            _fx_unit("WU-UP", title="upstream", outputs=[{"kind": "contract", "id": "contracts/auth"}]),
+            _fx_unit("WU-DOWN", title="downstream", depends_on=[{"unit_id": "WU-UP", "condition": "integrated"}]),
+        ], **CYCLE_KWARGS)
     cycle_id = sm.identity(str(project)).cycle_id
     # The integration ref must exist: `integrated` is verified by ancestry
     # against it, and a missing ref is correctly a refusal rather than a pass.
@@ -76,32 +81,23 @@ def cycle(tmp_path: Path, monkeypatch):
     return project, cycle_id
 
 
-def _as_workstream_clone(project: Path, workstream: str) -> dict:
-    """Make this repo look like a FRESH workstream clone, then hydrate.
-
-    The fixture opens the Cycle here, so the repo is simultaneously the
-    integration clone -- and hydration correctly reports "already executing"
-    because the board is already on the authoritative manifest. A real
-    workstream clone has the committed manifest and NO execution state, which
-    is what this reproduces.
-    """
-    import spq_paths
-
-    ident = sm.identity(str(project))
-    state_path = Path(
-        spq_paths.execution_state_path(str(project), ident.cycle_id, workstream)
-    )
-    if state_path.exists():
-        state_path.unlink()
-    spq_paths.write_pin(str(project), workstream)
-    return sm.hydrate_cycle(str(project), 1, [], workstream_id=workstream)
-
-
 def _unit(project: Path, unit_id: str) -> dict:
     return next(
         u for u in sm.read_state(str(project))["current_stories"]
         if u["id"] == unit_id
     )
+
+
+def _set_state(project: Path, unit_id: str, value: str) -> None:
+    """Move a unit on the board without going through the DoD gate.
+
+    A fixture concern, not a shortcut under test: these tests are about what
+    the LEDGER proves, and driving a full SE/QE/CR pipeline to reach `done`
+    would make every one of them a test of the gate instead.
+    """
+    state = sm.read_state(str(project))
+    next(u for u in state["current_stories"] if u["id"] == unit_id)["state"] = value
+    sm._write_state(str(project), state)
 
 
 def _dep_verdict(project: Path, unit_id: str) -> dict:
@@ -115,42 +111,44 @@ def _dep_verdict(project: Path, unit_id: str) -> dict:
 # ── the headline property ──────────────────────────────────────────────────
 
 
-def test_a_cross_workstream_edge_is_blocked_until_the_event_exists(cycle):
-    """Before the ledger existed this could NEVER resolve. The refusal must
-    name the owning workstream, not report an unknown id -- the operator's next
-    step is completely different.
+def test_a_conditioned_edge_is_blocked_until_the_event_exists(cycle):
+    """Before the ledger existed this could NEVER resolve.
 
     Two distinct unsatisfied states, and the distinction is worth keeping:
     "we have never looked" (no cache) versus "we looked and there is nothing"
     (refreshed, no event). Both fail closed; only the second means chasing the
-    other workstream rather than running a refresh.
+    producer rather than running a refresh.
+
+    The refusal no longer names an owning workstream, because there is no
+    second owner to name: `SPD-194` leaves a unit owned by the Cycle that
+    admitted it, and `dep_context` reports an EMPTY owner map rather than an
+    absent one so a resolver reads "no other owner" instead of "unknown".
     """
     project, cycle_id = cycle
 
     # Never refreshed: we genuinely do not know, and the detail says so.
     never_looked = _dep_verdict(project, "WU-DOWN")["unmet"][0]
     assert never_looked["reason_code"] == story.DEP_LEDGER_STALE
-    assert never_looked["owner_workstream"] == "spine", "still name the owner"
+    assert "refresh_ledger" in never_looked["detail"]
 
-    # Refreshed with nothing published: now the answer is about the workstream.
+    # Refreshed with nothing published: now the answer is about the producer.
     manifest = sm.read_manifest(str(project), cycle_id)
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
     looked = _dep_verdict(project, "WU-DOWN")["unmet"][0]
-    assert looked["reason_code"] == story.DEP_OTHER_WORKSTREAM
-    assert looked["owner_workstream"] == "spine"
+    assert looked["reason_code"] == story.DEP_CONDITION_UNVERIFIED
+    assert "no such event is recorded" in looked["detail"]
 
 
 def test_a_verified_integration_event_unblocks_the_downstream_unit(cycle):
-    """#303's whole point: an upstream event unblocks a dependent Work Unit in
-    ANOTHER workstream, without that workstream's board being visible here."""
+    """#303's whole point: a recorded, VERIFIED event unblocks a dependent Work
+    Unit, where board state alone never could."""
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
 
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
-        commit_sha=head,
+        unit_id="WU-UP", condition="integrated", commit_sha=head,
     )
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
 
@@ -160,9 +158,9 @@ def test_a_verified_integration_event_unblocks_the_downstream_unit(cycle):
 def test_next_action_dispatches_the_downstream_unit_once_unblocked(cycle):
     """End to end through the shipped path, not just the resolver."""
     project, cycle_id = cycle
-    # The board must be this lane's PROJECTION -- WU-DOWN only. The fixture's
-    # open_cycle admitted both units, which is the integration clone's view.
-    _as_workstream_clone(project, "frame")
+    # WU-UP is finished on the board; the edge still holds WU-DOWN, because
+    # `integrated` is not something the board can answer.
+    _set_state(project, "WU-UP", "done")
     state = sm.read_state(str(project))
     context = story.dep_context(str(project), state)
     assert context["story_manifest_hash"] == state["manifest_hash"]
@@ -175,8 +173,7 @@ def test_next_action_dispatches_the_downstream_unit_once_unblocked(cycle):
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
-        commit_sha=head,
+        unit_id="WU-UP", condition="integrated", commit_sha=head,
     )
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
 
@@ -197,8 +194,7 @@ def test_integrated_refuses_a_sha_that_is_not_on_the_integration_ref(cycle):
     with pytest.raises(lg.LedgerError, match="not an ancestor"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="spine", unit_id="WU-UP", condition="integrated",
-            commit_sha="0" * 40,
+            unit_id="WU-UP", condition="integrated", commit_sha="0" * 40,
         )
 
 
@@ -208,8 +204,28 @@ def test_integrated_requires_a_sha(cycle):
     with pytest.raises(lg.LedgerError, match="requires --sha"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="spine", unit_id="WU-UP", condition="integrated",
+            unit_id="WU-UP", condition="integrated",
         )
+
+
+def test_the_integration_ref_has_one_definition(cycle):
+    """The ref an `integrated` claim is checked against is derived, not read
+    off the declaration.
+
+    `cycle_records` seals no `integration_ref`: the per-lane branches the
+    predecessor's manifest enumerated are gone. Reading the absent key returned
+    `""`, which makes `git merge-base --is-ancestor <sha> ''` fail and reads as
+    "not integrated" for work that is -- a fail-closed that never opens. An
+    explicit ref on the declaration still wins, so a project that pins one is
+    not overridden by the default.
+    """
+    project, cycle_id = cycle
+    manifest = sm.read_manifest(str(project), cycle_id)
+    assert "integration_ref" not in manifest, "the declaration seals no ref"
+    assert lg.integration_ref(manifest) == sp.integration_branch(cycle_id)
+    assert lg.integration_ref(dict(manifest, integration_ref="refs/heads/x")) == (
+        "refs/heads/x"
+    )
 
 
 def _incremental_attestation(project: Path, manifest: dict, candidate: str) -> dict:
@@ -217,14 +233,15 @@ def _incremental_attestation(project: Path, manifest: dict, candidate: str) -> d
         "mode": "incremental",
         "merge_requires": ["regression_green"],
     }
-    manifest["manifest_hash"] = mf.compute_hash(manifest)
+    body = {k: v for k, v in manifest.items() if k != cr.HASH_FIELD}
+    manifest[cr.HASH_FIELD] = cr.compute_hash(body)
     return lg.build_incremental_evaluation(
         cycle_id=manifest["cycle_id"],
-        manifest_hash=manifest["manifest_hash"],
+        manifest_hash=manifest[cr.HASH_FIELD],
         unit_id="WU-UP",
         candidate_sha=candidate,
         evaluated_head=candidate,
-        integration_ref=manifest["integration_ref"],
+        integration_ref=lg.integration_ref(manifest),
         checks={"regression_green": {"passed": True, "required": True}},
         evaluated_at="2026-08-27T00:00:00Z",
     )
@@ -238,7 +255,7 @@ def test_incremental_integrated_requires_the_tree_bound_evaluation(cycle):
 
     out = lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
+        unit_id="WU-UP", condition="integrated",
         commit_sha=candidate, evaluation=attestation,
     )
     verification = out["event"]["verification"]
@@ -256,12 +273,12 @@ def test_incremental_evaluation_is_invalid_after_the_integration_ref_moves(cycle
     (project / "after-evaluation.txt").write_text("changed\n", encoding="utf-8")
     _git(project, "add", "after-evaluation.txt")
     _git(project, "commit", "-qm", "change integration after evaluation")
-    _git(project, "branch", "-f", manifest["integration_ref"], "HEAD")
+    _git(project, "branch", "-f", lg.integration_ref(manifest), "HEAD")
 
     with pytest.raises(lg.LedgerError, match="re-run evaluate-incremental"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="spine", unit_id="WU-UP", condition="integrated",
+            unit_id="WU-UP", condition="integrated",
             commit_sha=candidate, evaluation=attestation,
         )
 
@@ -274,20 +291,19 @@ def test_contract_published_requires_a_digest(cycle):
     with pytest.raises(lg.LedgerError, match="requires an output digest"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="spine", unit_id="WU-UP",
-            condition="contract_published",
+            unit_id="WU-UP", condition="contract_published",
             output={"kind": "contract", "id": "contracts/auth"},
         )
 
 
 def test_a_claim_only_condition_is_refused_by_default(cycle):
-    """Cross-workstream `done` is unverifiable from here -- the other clone's
-    board is not visible -- so it must not silently license a dispatch."""
+    """`done` is the producer's own claim about itself, so it must not silently
+    license a dispatch that declared something stronger."""
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="done",
+        unit_id="WU-UP", condition="done",
     )
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
     verdict = _dep_verdict(project, "WU-DOWN")
@@ -304,38 +320,48 @@ def test_verify_condition_reports_claim_only_as_none_not_false(cycle):
     assert verdict["verified"] is None
 
 
-# ── ownership ──────────────────────────────────────────────────────────────
-
-
-def test_a_workstream_cannot_publish_about_another_lanes_unit(cycle):
-    """Otherwise a dependency gets satisfied by someone with no knowledge of
-    it -- the exact failure the owner map exists to prevent."""
-    project, cycle_id = cycle
-    manifest = sm.read_manifest(str(project), cycle_id)
-    with pytest.raises(lg.LedgerError, match="owned by workstream"):
-        lg.publish(
-            str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="frame", unit_id="WU-UP", condition="done",
-        )
+# ── admission is the ownership check ───────────────────────────────────────
 
 
 def test_publishing_about_an_unadmitted_unit_is_refused(cycle):
+    """The surviving half of the old owner check.
+
+    The predecessor also refused a publish about "another lane's Work Unit".
+    That guard's subject is gone: `SPD-194` leaves a unit owned by the Cycle
+    that admitted it, so admission IS the ownership question and a second
+    check would compare an id against a lane that does not exist.
+
+    This is also the arm that caught the re-point defect: `spq_ledger` asked
+    the retired `spq_manifest.owners`, which reads `work_units` and therefore
+    answered `{}` for a sealed declaration -- so every publish refused with
+    "not admitted" for a unit the Cycle had admitted.
+    """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
+    assert lg.admitted_ids(manifest) == ["WU-UP", "WU-DOWN"]
     with pytest.raises(lg.LedgerError, match="not admitted"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="spine", unit_id="GHOST", condition="done",
+            unit_id="GHOST", condition="done",
         )
 
 
-def test_cycle_integrated_cannot_be_published_from_inside_a_cycle(cycle):
+def test_cycle_integrated_is_no_longer_a_condition_at_all(cycle):
+    """It was the CROSS-Cycle condition, owned by the Coordination Cycle.
+
+    `SPD-194` retires that Cycle: work that cannot be ordered cannot be split,
+    so it is co-admitted to one Cycle and there is no second Cycle to wait on.
+    The refusal stays -- stronger than before, since the condition is now
+    unknown rather than merely unpublishable -- and it names the retirement so
+    a caller carrying the old vocabulary learns why from the message.
+    """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
-    with pytest.raises(lg.LedgerError, match="#305"):
+    assert "cycle_integrated" not in cr.DEP_CONDITIONS
+    with pytest.raises(lg.LedgerError, match="retired with the Coordination Cycle"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=manifest,
-            workstream_id="spine", unit_id="WU-UP", condition="cycle_integrated",
+            unit_id="WU-UP", condition="cycle_integrated",
         )
 
 
@@ -346,17 +372,17 @@ def test_events_are_content_addressed_and_self_deduplicating():
     """Content addressing maps straight onto the control plane's
     client_event_id idempotency index without a second scheme."""
     kwargs = dict(cycle_id="7-abc12345", manifest_hash="sha256:x",
-                  workstream_id="spine", unit_id="WU-1",
-                  condition="integrated", commit_sha="dead", published_at="t")
+                  unit_id="WU-1", condition="integrated",
+                  commit_sha="dead", published_at="t")
     assert lg.build_event(**kwargs)["event_id"] == lg.build_event(**kwargs)["event_id"]
     other = dict(kwargs, commit_sha="beef")
     assert lg.build_event(**kwargs)["event_id"] != lg.build_event(**other)["event_id"]
 
 
 def test_the_strongest_recorded_condition_wins():
-    manifest = {"cycle_id": "7-abc12345", "manifest_hash": "sha256:x"}
+    manifest = {"cycle_id": "7-abc12345", cr.HASH_FIELD: "sha256:x"}
     base = dict(cycle_id="7-abc12345", manifest_hash="sha256:x",
-                workstream_id="spine", unit_id="WU-1", published_at="t")
+                unit_id="WU-1", published_at="t")
     snap = {"events": [
         lg.build_event(condition="done", **base) | {"verification": {"verified": True}},
         lg.build_event(condition="integrated", **base) | {"verification": {"verified": True}},
@@ -370,19 +396,23 @@ def test_a_weaker_event_does_not_satisfy_a_stronger_declared_condition(cycle):
     manifest = sm.read_manifest(str(project), cycle_id)
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="done",
+        unit_id="WU-UP", condition="done",
     )
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
     assert _dep_verdict(project, "WU-DOWN")["met"] is False
 
 
-def test_events_from_another_cycle_or_manifest_revision_are_ignored():
+def test_events_from_another_cycle_or_declaration_revision_are_ignored():
     """An event recorded against a superseded admitted set may describe a unit
     that no longer exists; letting it satisfy an edge resolves against a Cycle
-    that is gone."""
-    manifest = {"cycle_id": "7-abc12345", "manifest_hash": "sha256:x"}
-    base = dict(workstream_id="spine", unit_id="WU-1", condition="integrated",
-                published_at="t")
+    that is gone.
+
+    The revision is compared against the declaration's OWN hash key. Reading
+    the retired `manifest_hash` off a sealed declaration yields `""`, which
+    skips the comparison entirely and admits an event from any revision.
+    """
+    manifest = {"cycle_id": "7-abc12345", cr.HASH_FIELD: "sha256:x"}
+    base = dict(unit_id="WU-1", condition="integrated", published_at="t")
     snap = {"events": [
         lg.build_event(cycle_id="9-zzzzzzzz", manifest_hash="sha256:x", **base),
         lg.build_event(cycle_id="7-abc12345", manifest_hash="sha256:OTHER", **base),
@@ -398,15 +428,14 @@ def test_a_satisfying_event_still_satisfies_when_the_cache_is_old(cycle):
 
     A stale cache can only be MISSING newer events, and "not satisfied" is
     already the fail-closed direction -- so staleness affects reporting
-    quality, not safety. Blocking here would strand a workstream whose
-    upstream genuinely did integrate."""
+    quality, not safety. Blocking here would strand a unit whose upstream
+    genuinely did integrate."""
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
-        commit_sha=head,
+        unit_id="WU-UP", condition="integrated", commit_sha=head,
     )
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
 
@@ -425,7 +454,7 @@ def test_a_satisfying_event_still_satisfies_when_the_cache_is_old(cycle):
 
 def test_a_stale_cache_with_no_event_says_so_in_the_reason(cycle):
     """When the edge is NOT satisfied and the cache is behind, the operator
-    needs both facts: who owns the upstream, and that a refresh might change
+    needs both facts: that nothing is recorded, and that a refresh might change
     the answer."""
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
@@ -437,7 +466,6 @@ def test_a_stale_cache_with_no_event_says_so_in_the_reason(cycle):
 
     unmet = _dep_verdict(project, "WU-DOWN")["unmet"][0]
     assert unmet["reason_code"] == story.DEP_LEDGER_STALE
-    assert unmet["owner_workstream"] == "spine", "still name the owner"
     assert "refresh_ledger" in unmet["detail"]
 
 
@@ -481,29 +509,21 @@ def test_story_states_and_valid_transitions_are_unchanged():
 
 def test_publishing_integrated_stamps_the_board(cycle):
     project, cycle_id = cycle
-    manifest = sm.read_manifest(str(project), cycle_id)
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
-    # spine is a separate CLONE in reality, so give it a hydrated board here
-    # before switching to it -- re-pinning alone would point at an execution
-    # state that was never written.
-    sm.hydrate_cycle(str(project), 1, [], workstream_id="spine")
-    state = sm.read_state(str(project))
-    next(u for u in state["current_stories"] if u["id"] == "WU-UP")["state"] = "done"
-    sm._write_state(str(project), state)
+    _set_state(project, "WU-UP", "done")
     sm.publish_event(
         str(project), unit_id="WU-UP", condition="integrated", commit_sha=head
     )
-    state = sm.read_state(str(project))
-    unit = next(u for u in state["current_stories"] if u["id"] == "WU-UP")
+    unit = _unit(project, "WU-UP")
     assert unit["integration"]["status"] == "integrated"
     assert unit["integration"]["commit_sha"] == head
+    assert unit["integration"]["integration_ref"] == sp.integration_branch(cycle_id)
 
 
 def test_publishing_integrated_refuses_a_non_done_unit(cycle):
     """An ancestor SHA proves placement, not that the Work Unit passed DoD."""
-    project, _cycle_id = cycle
+    project, cycle_id = cycle
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
-    sm.hydrate_cycle(str(project), 1, [], workstream_id="spine")
 
     with pytest.raises(ValueError, match="must be done"):
         sm.publish_event(
@@ -511,22 +531,31 @@ def test_publishing_integrated_refuses_a_non_done_unit(cycle):
         )
 
     assert not list(Path(sp.committed_events_dir(
-        str(project), sm.identity(str(project)).cycle_id, "spine"
+        str(project), cycle_id
     )).glob("*.json")), "a refused publication must not leave an event behind"
 
 
 # ── operator observability ─────────────────────────────────────────────────
 
 
-def test_dep_status_names_the_edge_the_owner_and_the_reason(cycle):
+def test_dep_status_names_the_edge_and_the_reason(cycle):
     """#304's AC: an unresolved dependency must be observable to the operator.
-    `deps_blocked` says the loop halted; this says which edge and what to do."""
+    `deps_blocked` says the loop halted; this says which edge and what to do.
+
+    Also the arm that caught the delegation defect: the replacement's
+    `dep_status` forwarded to `story_dep_status(project_dir, state, unit_id)`,
+    which is not that function's signature, so the verb raised `TypeError` on
+    every call and #304's AC had no implementation at all.
+    """
     project, _cycle_id = cycle
     report = sm.dep_status(str(project))
     down = next(u for u in report["units"] if u["unit_id"] == "WU-DOWN")
     assert down["dependencies_met"] is False
-    assert down["unmet"][0]["owner_workstream"] == "spine"
+    assert down["unmet"][0]["reason_code"] in (
+        story.DEP_LEDGER_STALE, story.DEP_CONDITION_UNVERIFIED
+    )
     assert report["manifest_present"] is True
+    assert report["cycle_id"] == _cycle_id
 
 
 def test_dep_status_distinguishes_a_local_only_event_from_nothing_published(cycle):
@@ -535,20 +564,18 @@ def test_dep_status_distinguishes_a_local_only_event_from_nothing_published(cycl
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
+
+    # Nothing published: no event is pending a push.
+    assert sm.dep_status(str(project))["events_pending_push"] == []
+
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
-        commit_sha=head,
+        unit_id="WU-UP", condition="integrated", commit_sha=head,
     )
-    # Seen from the CONSUMER lane, which still owns WU-DOWN.
     report = sm.dep_status(str(project))
+    assert "WU-UP" in report["events_pending_push"]
     down = next(u for u in report["units"] if u["unit_id"] == "WU-DOWN")
-    assert down["dependencies_met"] is False
-
-    # Seen from the PRODUCER lane, the event is written but unpushed.
-    sm.hydrate_cycle(str(project), 1, [], workstream_id="spine")
-    producer = sm.dep_status(str(project))
-    assert "WU-UP" in producer["events_pending_push"]
+    assert down["unmet"][0]["reason_code"] == "dep_event_local_only"
 
 
 def test_publish_prints_the_push_command(cycle):
@@ -560,160 +587,163 @@ def test_publish_prints_the_push_command(cycle):
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
     result = lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
-        commit_sha=head,
+        unit_id="WU-UP", condition="integrated", commit_sha=head,
     )
     assert "git push" in result["push_command"]
     assert ".synaptory/cycles" in result["push_command"]
 
 
-def test_events_land_in_per_workstream_directories(cycle):
-    """One shared events file would make every mid-Cycle publish a merge
-    conflict between workstreams."""
+def test_each_publication_is_its_own_file_under_the_cycles_events_dir(cycle):
+    """ONE shared events FILE would make every mid-Cycle publish a conflict.
+
+    The predecessor's answer was one directory per lane, which only mattered
+    because a lane was the thing publishing; `SPD-194` leaves one directory per
+    Cycle. The anti-conflict property survives at the file level, which is
+    where it always did the work: a publication is an append of a NEW file, so
+    two clones publishing about different units never touch the same blob.
+    """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     head = _git(project, "rev-parse", "HEAD").stdout.strip()
-    result = lg.publish(
+    first = lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="integrated",
-        commit_sha=head,
+        unit_id="WU-UP", condition="integrated", commit_sha=head,
     )
-    assert Path(result["path"]).parent.name == "spine"
+    second = lg.publish(
+        str(project), cycle_id=cycle_id, manifest=manifest,
+        unit_id="WU-UP", condition="contract_published",
+        output={"kind": "contract", "id": "contracts/auth", "digest": "sha256:z"},
+        verify=False,
+    )
+    events_dir = Path(sp.committed_events_dir(str(project), cycle_id))
+    assert Path(first["path"]).parent == events_dir
+    assert Path(second["path"]).parent == events_dir
+    assert first["path"] != second["path"]
+    assert len(list(events_dir.glob("*.json"))) == 2
 
 
 # ── review findings on ca8efc2, one regression test each ───────────────────
 
 
-def test_a_same_id_manifest_revision_still_reprojects(cycle):
+def _revise(project: Path, cycle_id: str, reason: str, units: list) -> dict:
+    return sm.revise_manifest(
+        str(project), cycle_id=cycle_id, reason=reason, revised_by="po",
+        admitted_units=units,
+    )
+
+
+def test_a_same_id_declaration_revision_still_reprojects(cycle):
     """Review finding P1(1).
 
-    Comparing Work Unit ID SETS treated matching ids as proof the projection was
-    current. A superseding manifest that keeps the same ids while changing
-    `depends_on` returned `already executing`, so the clone kept stale unit data
-    AND the old manifest hash -- then declared readiness against a revision the
-    Cycle had moved past. The hash is the only thing that answers "am I current".
+    Comparing Work Unit ID SETS treated matching ids as proof the projection
+    was current. A superseding declaration that keeps the same ids while
+    changing `depends_on` returned `already executing`, so the board kept stale
+    unit data AND the old hash -- then declared readiness against a revision
+    the Cycle had moved past. The hash is the only thing that answers "am I
+    current".
+
+    Migration note: `revise_manifest` seals the supersession and writes NOTHING
+    to the board, so without a re-projection on hydration a revision reaches no
+    unit at all. That is what this arm now also covers.
     """
     project, cycle_id = cycle
-    _as_workstream_clone(project, "frame")
     assert _unit(project, "WU-DOWN")["depends_on"], "fixture should have an edge"
+    before = sm.read_state(str(project))["manifest_hash"]
 
-    # Same ids, different dependency graph.
-    revised = sm.revise_manifest(
-        str(project), cycle_id=cycle_id, reason="drop the edge", revised_by="po",
-    )
-    for unit in revised["work_units"]:
-        if unit["id"] == "WU-DOWN":
-            unit["depends_on"] = []
-    revised["manifest_hash"] = mf.compute_hash(
-        {k: v for k, v in revised.items() if k != "manifest_hash"}
-    )
-    path = Path(sp.manifest_path(str(project), cycle_id))
-    path.chmod(0o644)
-    path.write_text(json.dumps(revised), encoding="utf-8")
+    revised = _revise(project, cycle_id, "drop the edge", [
+        _fx_unit("WU-UP", title="upstream"),
+        _fx_unit("WU-DOWN", title="downstream", depends_on=[]),
+    ])
+    assert revised["declaration_hash"] != before
 
-    result = sm.hydrate_cycle(str(project), 1, [], workstream_id="frame")
-    assert result.get("reprojected") is True, result.get("reason")
-    assert sm.read_state(str(project))["manifest_hash"] == revised["manifest_hash"]
+    result = sm.hydrate_cycle(str(project), cycle_id=cycle_id)
+    assert result.get("reprojected") is True, result
+    assert sm.read_state(str(project))["manifest_hash"] == revised["declaration_hash"]
     assert _unit(project, "WU-DOWN")["depends_on"] == [], _unit(project, "WU-DOWN")
 
 
 def test_reprojection_preserves_in_flight_state_and_receipts(cycle):
-    """Re-projecting refreshes manifest-owned FIELDS; it must not reset a unit
-    that has started, which would orphan its receipts."""
+    """Re-projecting refreshes declaration-owned FIELDS; it must not reset a
+    unit that has started, which would orphan its receipts."""
     project, cycle_id = cycle
-    _as_workstream_clone(project, "frame")
-    sm.transition_story(str(project), "WU-DOWN", "in_progress")
+    _set_state(project, "WU-DOWN", "in_progress")
+    state = sm.read_state(str(project))
+    next(u for u in state["current_stories"] if u["id"] == "WU-DOWN")["receipts"] = [
+        "WU-DOWN-se.json"
+    ]
+    sm._write_state(str(project), state)
 
-    revised = sm.revise_manifest(
-        str(project), cycle_id=cycle_id, reason="retitle", revised_by="po",
-    )
-    for unit in revised["work_units"]:
-        if unit["id"] == "WU-DOWN":
-            unit["title"] = "renamed downstream"
-    revised["manifest_hash"] = mf.compute_hash(
-        {k: v for k, v in revised.items() if k != "manifest_hash"}
-    )
-    path = Path(sp.manifest_path(str(project), cycle_id))
-    path.chmod(0o644)
-    path.write_text(json.dumps(revised), encoding="utf-8")
+    _revise(project, cycle_id, "retitle", [
+        _fx_unit("WU-UP", title="upstream"),
+        _fx_unit("WU-DOWN", title="renamed downstream",
+                 depends_on=[{"unit_id": "WU-UP", "condition": "integrated"}]),
+    ])
+    sm.hydrate_cycle(str(project), cycle_id=cycle_id)
 
-    sm.hydrate_cycle(str(project), 1, [], workstream_id="frame")
     unit = _unit(project, "WU-DOWN")
     assert unit["state"] == "in_progress", "started work must not be reset"
-    assert unit["title"] == "renamed downstream", "manifest fields must refresh"
+    assert unit["receipts"] == ["WU-DOWN-se.json"], "receipts must survive"
+    assert unit["title"] == "renamed downstream", "declaration fields must refresh"
 
 
 def test_reprojection_refreshes_labels_and_ui_classification(cycle):
-    """Manifest revisions cannot leave an old fail-open UI classification."""
+    """Declaration revisions cannot leave an old fail-open UI classification."""
     project, cycle_id = cycle
-    _as_workstream_clone(project, "frame")
     assert _unit(project, "WU-DOWN")["ui_bearing"] is False
 
-    revised = sm.revise_manifest(
-        str(project), cycle_id=cycle_id, reason="add UI surface", revised_by="po",
-    )
-    for unit in revised["work_units"]:
-        if unit["id"] == "WU-DOWN":
-            unit["title"] = "Render the account dashboard"
-            unit["labels"] = ["ws:frame", "surface:web"]
-            unit["acceptance_criteria"] = ["The dashboard renders account data"]
-    revised["manifest_hash"] = mf.compute_hash(
-        {k: v for k, v in revised.items() if k != "manifest_hash"}
-    )
-    path = Path(sp.manifest_path(str(project), cycle_id))
-    path.chmod(0o644)
-    path.write_text(json.dumps(revised), encoding="utf-8")
+    _revise(project, cycle_id, "add UI surface", [
+        _fx_unit("WU-UP", title="upstream"),
+        _fx_unit(
+            "WU-DOWN",
+            title="Render the account dashboard",
+            labels=["surface:web"],
+            acceptance_criteria=["The dashboard screen renders account data"],
+            depends_on=[{"unit_id": "WU-UP", "condition": "integrated"}],
+        ),
+    ])
+    sm.hydrate_cycle(str(project), cycle_id=cycle_id)
 
-    sm.hydrate_cycle(str(project), 1, [], workstream_id="frame")
     unit = _unit(project, "WU-DOWN")
-    assert unit["labels"] == ["ws:frame", "surface:web"]
+    assert unit["labels"] == ["surface:web"]
     assert unit["ui_bearing"] is True
 
 
-def test_a_weaker_event_does_not_satisfy_a_locally_owned_unit(cycle):
+def test_a_weaker_event_does_not_satisfy_a_unit_on_this_board(cycle):
     """Review finding P1(2).
 
     The locally-owned branch checked only that SOME event existed, so a `done`
-    event satisfied an edge declaring `integrated`. Ownership changes who can
-    publish the event, not what the event has to prove.
+    event satisfied an edge declaring `integrated`. Ownership changed who could
+    publish the event, not what the event had to prove -- and with the
+    Workstream retired this IS the only branch, so the check carries the whole
+    mechanism rather than a corner of it.
     """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
-    # Both units on ONE board, so WU-UP is locally owned from WU-DOWN's view.
     lg.publish(
         str(project), cycle_id=cycle_id, manifest=manifest,
-        workstream_id="spine", unit_id="WU-UP", condition="done",
+        unit_id="WU-UP", condition="done",
     )
     lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
-    sm.transition_story(str(project), "WU-UP", "in_progress")
-    for state in ("testing", "reviewing", "done"):
-        try:
-            sm.transition_story(str(project), "WU-UP", state)
-        except Exception:
-            break
+    _set_state(project, "WU-UP", "done")
 
     verdict = _dep_verdict(project, "WU-DOWN")
     assert verdict["met"] is False, "a done event must not satisfy `integrated`"
 
 
-def test_an_unverified_event_does_not_satisfy_a_locally_owned_unit():
+def test_an_unverified_event_does_not_satisfy_a_unit_on_this_board():
     """Same finding, isolated: verification is checked for local units too."""
     ctx = {
         "cycle_id": "7",
-        "workstream_id": "frame",
         "manifest_present": True,
         "admitted": ["WU-01", "WU-02"],
-        "owners": {"WU-01": "frame", "WU-02": "frame"},
+        "owners": {},
         "satisfied": {"WU-01": {"condition": "integrated", "verified": False}},
     }
     state = {
         "build_mode": "spq",
         "current_stories": [
-            {"id": "WU-01", "state": "done"},
-            {
-                "id": "WU-02", "state": "queued",
-                "depends_on": [{"unit_id": "WU-01", "condition": "integrated"}],
-            },
+            _fx_unit("WU-01", state="done"),
+            _fx_unit("WU-02", state="queued", depends_on=[{"unit_id": "WU-01", "condition": "integrated"}]),
         ],
     }
     verdict = story.story_dep_status(
@@ -727,56 +757,60 @@ def test_a_malformed_work_unit_id_cannot_escape_the_events_directory(cycle):
     """Review finding P1(4).
 
     A Work Unit id is interpolated into an event FILENAME, so any id the
-    manifest admits becomes a path segment. Validated at admission AND checked
-    for containment at the write, because the containment check must not depend
-    on validation having run -- an older plugin's manifest, or a direct caller,
-    must still not place a file outside the events directory.
+    declaration admits becomes a path segment. Validated at admission AND
+    checked for containment at the write, because the containment check must
+    not depend on validation having run -- an older plugin's declaration, or a
+    direct caller, must still not place a file outside the events directory.
     """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     poisoned = json.loads(json.dumps(manifest))
-    poisoned["work_units"][0]["id"] = "../../../../escaped"
-    poisoned["work_units"][0]["owner_workstream"] = "spine"
+    poisoned[cr.UNITS_FIELD][0]["id"] = "../../../../escaped"
 
     with pytest.raises(lg.LedgerError, match="not a valid Work Unit id"):
         lg.publish(
             str(project), cycle_id=cycle_id, manifest=poisoned,
-            workstream_id="spine", unit_id="../../../../escaped",
-            condition="done",
+            unit_id="../../../../escaped", condition="done",
         )
     assert not (Path(project).parent / "escaped.json").exists()
     assert not list(Path(project).parent.glob("*escaped*"))
 
 
-def test_the_manifest_refuses_a_malformed_work_unit_id_at_admission(cycle):
-    """The boundary that decides what is admitted is where this belongs."""
+def test_the_declaration_refuses_a_malformed_work_unit_id_at_admission(cycle):
+    """The boundary that decides what is admitted is where this belongs.
+
+    The replacement's `cycle_records` validated a unit's kind, criteria and
+    path scope but NOT its id shape, so the admission half of the pair was
+    gone and only the write-time containment check remained. A containment
+    check is defence in depth; it is not the place a traversing id is supposed
+    to be rejected.
+    """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
     for bad in ("../evil", "a/b", "..", ".hidden", "-lead"):
         poisoned = json.loads(json.dumps(manifest))
-        poisoned["work_units"][0]["id"] = bad
-        problems = mf.validate(poisoned)
+        poisoned[cr.UNITS_FIELD][0]["id"] = bad
+        problems = cr.problems(poisoned)
         assert any("safe path segment" in p for p in problems), (bad, problems)
 
 
-# ── #305: an unreadable ref is not an empty ref ────────────────────────────
+# ── an unreadable ref is not an empty ref ──────────────────────────────────
 #
 # `refresh` used to `continue` past any `ls-tree` failure and set
-# `refresh_ok = fetch_ok`, i.e. the top-level fetch alone. So a child ref this
-# clone could not read produced `fresh: True` with zero events from it --
-# "I could not read spine" rendered identically to "spine has published
-# nothing". For one consumer asking about one upstream that was survivable,
-# because no-event is already the fail-closed direction. For anything
-# AGGREGATING across refs -- which is what a Coordination Cycle's release
-# readiness is -- it is a green built on silence.
+# `refresh_ok = fetch_ok`, i.e. the top-level fetch alone. So a ref this clone
+# could not read produced `fresh: True` with zero events from it -- "I could
+# not read it" rendered identically to "nothing has been published". For one
+# consumer asking about one upstream that was survivable, because no-event is
+# already the fail-closed direction. For anything AGGREGATING across the
+# Cycle -- which release readiness is -- it is a green built on silence.
 
 
-def test_a_branch_nobody_has_pushed_yet_is_not_unreadable(cycle):
+def test_a_ref_nobody_has_pushed_yet_is_not_unreadable(cycle):
     """The normal state at the start of every Cycle.
 
-    No workstream has pushed, so no `origin/cycle/<id>/ws/<ws>` ref resolves.
+    Nobody has pushed, so `origin/cycle/<id>/integration` does not resolve.
     Counting that as unreadable would make the ledger permanently stale until
-    the last lane pushes -- a fail-closed that never opens.
+    the first push -- a fail-closed that never opens.
     """
     project, cycle_id = cycle
     manifest = sm.read_manifest(str(project), cycle_id)
@@ -808,7 +842,9 @@ def test_a_ref_that_resolves_but_cannot_be_listed_blocks(cycle, monkeypatch):
     cache = lg.refresh(str(project), cycle_id, manifest=manifest, fetch=False)
 
     assert cache["refresh_ok"] is False
-    assert [u["workstream"] for u in cache["unreadable_refs"]] == ["spine", "frame"]
+    assert [u["ref"] for u in cache["unreadable_refs"]] == [
+        "origin/%s" % sp.integration_branch(cycle_id)
+    ]
     assert "unreadable refs" in cache["refresh_detail"]
     snap = lg.snapshot(str(project), cycle_id)
     assert snap["fresh"] is False, "an incomplete refresh must fail closed"

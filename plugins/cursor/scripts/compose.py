@@ -43,6 +43,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 GENERATED_PY = (
@@ -190,37 +191,54 @@ def with_generated_header(text: str, path: Path) -> str:
     return header + stripped
 
 
+def write_text_atomic(dst: Path, text: str, *, mode: int) -> None:
+    """Put `text` at `dst` in ONE step, so a concurrent reader never sees less.
+
+    `Path.write_text` truncates and then writes. A reader that opens the file in
+    between gets an empty or half-written module -- and this compose runs against
+    the TRACKED tree from two test suites (#568 mechanism 2), so "a concurrent
+    reader" is not hypothetical. Writing a sibling temp file and `os.replace`-ing
+    it over the target is atomic for a regular file on every POSIX filesystem, so
+    an importer sees either the whole old file or the whole new one.
+
+    The temp file is created in `dst`'s own directory because `rename(2)` cannot
+    cross filesystems, and it is created by US, which is what lets the chmod
+    below be unconditional: `chmod(2)` needs ownership, not write permission, and
+    the previous in-place version had to test-before-chmod to survive the release
+    runner (`release.yml` chowns the workspace to `ghrunner`, makes it `a+w`, then
+    builds as `synap`; an unconditional chmod on a file it did not own raised
+    EPERM and broke the 1.2.0 release after a clean build, with nothing
+    published). Owning the temp removes that failure mode rather than dodging it.
+
+    Setting the mode BEFORE the replace also closes a smaller window the old code
+    left open: a hook could previously exist without its execute bit for as long
+    as it took the following `chmod` to land.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dst.parent), prefix="." + dst.name + ".", suffix=".compose-tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def copy_text(src: Path, dst: Path, rewrite=None) -> None:
     text = src.read_text(encoding="utf-8")
     if rewrite is not None:
         text = rewrite(text)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(with_generated_header(text, dst), encoding="utf-8")
-    # Text rewrite drops the execute bit. Cursor hooks invoke
-    # `_resolve-cli.sh` (and siblings) as programs, so they must stay +x.
-    #
-    # Only chmod when a bit is actually MISSING. `chmod(2)` requires ownership,
-    # not write permission, so an unconditional call fails with EPERM wherever
-    # the builder can write a file it does not own -- which is exactly the
-    # release runner: `release.yml` chowns the workspace to `ghrunner` and makes
-    # it `a+w`, then runs the build as `synap`. Every tracked `.sh` is already
-    # mode 100755, so after `chmod -R a+w` the exec bits are present and this
-    # call was a no-op that could only fail. It broke the 1.2.0 release at the
-    # `plugin-cursor compose` step, after a clean build, with nothing published.
-    if os.access(src, os.X_OK) or src.suffix == ".sh":
-        mode = dst.stat().st_mode
-        wanted = mode | 0o111
-        if wanted != mode:
-            try:
-                dst.chmod(wanted)
-            except PermissionError as exc:
-                raise PermissionError(
-                    "cannot make %s executable: %s. The composed hook is "
-                    "invoked as a program, so a non-executable copy is a real "
-                    "failure -- but check ownership first: chmod needs the file "
-                    "to be OWNED by the builder, not merely writable by it."
-                    % (dst, exc)
-                ) from exc
+    # Text rewrite drops the execute bit. Cursor hooks invoke `_resolve-cli.sh`
+    # (and siblings) as programs, so they must stay +x. Because the atomic write
+    # substitutes a brand-new inode, the mode has to be stated rather than
+    # inherited from whatever was at `dst` before.
+    mode = 0o755 if (os.access(src, os.X_OK) or src.suffix == ".sh") else 0o644
+    write_text_atomic(dst, with_generated_header(text, dst), mode=mode)
 
 
 def rewrite_cursor_host(text: str) -> str:
@@ -241,6 +259,16 @@ def rewrite_cursor_host(text: str) -> str:
     text = text.replace("${CLAUDE_PLUGIN_ROOT}", "${PLUGIN_ROOT}")
     text = text.replace("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT")
     text = _directives().apply_tool_names(text, "cursor")
+    # Claude plugin agents are namespaced as `synaptory:<role>`, while Cursor's
+    # generated agent files are installed as the plain `<role>` name. This is a
+    # dispatch-field rewrite, not a prose translation: leaving the namespace in
+    # `subagent_type=` makes Cursor request an agent that does not exist; leaving
+    # `general-purpose` there bypasses Cursor's governed role hook entirely.
+    text = re.sub(
+        r'(\bsubagent_type\s*=\s*["\'])synaptory:',
+        r"\1",
+        text,
+    )
     text = text.replace(".claude-plugin/plugin.json", ".cursor-plugin/plugin.json")
     return text
 
@@ -273,13 +301,97 @@ def rewrite_cursor_markdown(
     return rewrite_cursor_host(text)
 
 
+def _copy_binary_atomic(src: Path, dst: Path) -> None:
+    """`shutil.copy2` for images, without the truncate-then-fill window."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dst.parent), prefix="." + dst.name + ".", suffix=".compose-tmp"
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _prune(dst: Path, produced: set, keep: set) -> None:
+    """Delete what this compose did NOT produce, bottom-up.
+
+    `produced` and `keep` hold paths relative to `dst`. Everything else under
+    `dst` is debris from an older composition and goes, which is what the old
+    `rmtree` achieved -- but only for the files that actually changed, so a
+    re-compose of unchanged sources deletes nothing at all.
+    """
+    if not dst.is_dir():
+        return
+    for root, dirs, files in os.walk(dst, topdown=False):
+        here = Path(root)
+        rel_dir = here.relative_to(dst)
+        for name in files:
+            rel = rel_dir / name
+            if rel in produced or rel in keep or name in keep:
+                continue
+            (here / name).unlink(missing_ok=True)
+        for name in dirs:
+            candidate = here / name
+            rel = rel_dir / name
+            if rel in produced or name in keep:
+                continue
+            try:
+                candidate.rmdir()
+            except OSError:
+                pass  # still holds something kept -- leave it alone
+
+
 def _copytree_text(
-    src: Path, dst: Path, rewrite=None, skip_names=(), markdown_only_rewrite=False
+    src: Path,
+    dst: Path,
+    rewrite=None,
+    skip_names=(),
+    markdown_only_rewrite=False,
+    keep_names=(),
 ) -> None:
+    """Mirror `src` onto `dst` WITHOUT ever emptying `dst`.
+
+    This used to `shutil.rmtree(dst)` and rebuild. `plugin-cursor/hooks/lib` is
+    one of the destinations, and two suites run this compose against the tracked
+    source tree -- `conformance/conftest.py`'s session-scoped autouse fixture and
+    `plugin-claude/tests/build/test_build_dist.py` via `./synaptory build`. #568
+    measured the result by polling the directory at 1 ms: 44 samples in which
+    `spq_state_machine.py` simply did not exist, 69 in which the directory was
+    partially populated, 1 in which the directory itself was gone. A concurrent
+    importer landing in that window gets ImportError for a module that is in git.
+
+    **Why not build-into-temp-then-swap.** That is the obvious shape and it does
+    not work on a directory: `os.replace` is `rename(2)`, which refuses a
+    non-empty destination directory -- ENOTEMPTY, errno 66 on macOS and 39 on
+    Linux (measured, not assumed). Emptying or moving the destination first
+    reintroduces exactly the window being closed. A true atomic directory swap
+    needs either `hooks/lib` to BE a symlink (it is 53 tracked real files, and
+    the build's `rsync -aL` and the host packagers assume real files), or
+    `renameat2(RENAME_EXCHANGE)` / `renamex_np(RENAME_SWAP)` -- two different
+    non-portable syscalls, neither exposed by Python, and RENAME_EXCHANGE is not
+    supported on every Linux filesystem.
+
+    So the atomicity is moved down one level, to the unit where `rename(2)` does
+    work. Every file is replaced atomically and stale files are pruned afterwards,
+    which buys the property that actually matters here: **a path that exists both
+    before and after a compose is never absent during one.** The residual window
+    is a reader seeing some files new and some old, which for a re-compose of
+    unchanged sources is no window at all -- the steady-state case in both suites
+    writes identical bytes and deletes nothing.
+
+    `skip_names` now means "neither copy nor prune". Under the old rmtree it
+    meant "do not copy, then delete anyway", which quietly ate the gitignored
+    `hooks/lib/cp-url.local` that `./synaptory deploy local` writes.
+    """
     skipped = set(skip_names)
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True)
+    keep = set(keep_names) | skipped
+    produced: set = set()
+    dst.mkdir(parents=True, exist_ok=True)
     for root, dirs, files in os.walk(src):
         dirs[:] = [
             d for d in dirs if d not in {".git", "__pycache__"} and d not in skipped
@@ -287,23 +399,27 @@ def _copytree_text(
         rel = Path(root).relative_to(src)
         target_dir = dst / rel
         target_dir.mkdir(parents=True, exist_ok=True)
+        if rel != Path("."):
+            produced.add(rel)
         for name in files:
             if name in skipped or name.endswith((".pyc", ".pyo")):
                 continue
             s = Path(root) / name
             d = target_dir / name
+            produced.add(rel / name)
             file_rewrite = rewrite
             if markdown_only_rewrite and s.suffix.lower() != ".md":
                 file_rewrite = rewrite_cursor_host
             if name in HOST_NEUTRAL_FILES:
                 file_rewrite = None
             if s.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"}:
-                shutil.copy2(s, d)
+                _copy_binary_atomic(s, d)
             else:
                 try:
                     copy_text(s, d, rewrite=file_rewrite)
                 except UnicodeDecodeError:
-                    shutil.copy2(s, d)
+                    _copy_binary_atomic(s, d)
+    _prune(dst, produced, keep)
 
 
 def _patch_plugin_env(text: str) -> str:
@@ -325,7 +441,7 @@ def _stamp_plugin_json(path: Path, version: str) -> None:
     data["version"] = version
     if "cli_min_version" in data:
         data["cli_min_version"] = version
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(path, json.dumps(data, indent=2) + "\n", mode=0o644)
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
@@ -527,7 +643,11 @@ def generate_agent_md(
             f"After those reads, follow `${{PLUGIN_ROOT}}/roles/{role}/SKILL.md`.",
             _receipt_block(role),
         ]
-        (dest_agents / f"{role}.md").write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+        write_text_atomic(
+            dest_agents / f"{role}.md",
+            "\n\n".join(parts) + "\n",
+            mode=0o644,
+        )
 
 
 def compose(src_plugin: Path, dest: Path, version: str, core: Path) -> None:
@@ -539,19 +659,27 @@ def compose(src_plugin: Path, dest: Path, version: str, core: Path) -> None:
     lib_src = core / "lib"
     lib_dst = dest / "hooks" / "lib"
     keep_overlay = overlay_py_text
+    # `cursor_hook.py` is authored here, not composed, so the mirror must leave
+    # it alone rather than delete it and have us write it back: this directory is
+    # imported by concurrent suites (#568 mechanism 2) and a delete/rewrite pair
+    # is a window in which the overlay module does not exist.
     _copytree_text(
         lib_src,
         lib_dst,
         rewrite=rewrite_cursor_host,
         skip_names=("cp-url.local",),
+        keep_names=("cursor_hook.py",),
     )
-    if keep_overlay is not None:
-        overlay_hook_py.write_text(keep_overlay, encoding="utf-8")
+    if keep_overlay is not None and not overlay_hook_py.is_file():
+        # Safety net only. `keep_names` above means the mirror never removes it,
+        # so the normal path leaves the authored file completely untouched --
+        # same inode, same mtime -- rather than destroying and re-creating it.
+        write_text_atomic(overlay_hook_py, keep_overlay, mode=0o644)
 
     # Default CP URL for the committed tree (Team marketplace IS this git
     # folder). Local testing writes gitignored hooks/lib/cp-url.local via
     # `./synaptory deploy local` — do not honour runtime URL env vars.
-    (lib_dst / "cp-url").write_text(DEFAULT_CP_URL + "\n", encoding="utf-8")
+    write_text_atomic(lib_dst / "cp-url", DEFAULT_CP_URL + "\n", mode=0o644)
 
     # --- Claude hook scripts (adapters wrap these) ---
     for sh in (src_plugin / "hooks").glob("*.sh"):
@@ -572,6 +700,20 @@ def compose(src_plugin: Path, dest: Path, version: str, core: Path) -> None:
     schema_src = core / "receipt-schema"
     if schema_src.is_dir():
         _copytree_text(schema_src, dest / "receipt-schema", rewrite=rewrite_cursor_host)
+
+    # --- certified adapter-profile table ---
+    # `runtime_selector` resolves this relative to its OWN module, which sits
+    # at hooks/lib here, so the table lands beside it rather than at the top of
+    # the package. Without it the packaged selector loaded zero profiles and
+    # denied every governed dispatch with `no-eligible-profile`, which reads as
+    # a policy problem when it is a packaging one (#396).
+    fixtures_src = core / "runtime-fixtures"
+    if fixtures_src.is_dir():
+        _copytree_text(
+            fixtures_src,
+            dest / "hooks" / "runtime-fixtures",
+            rewrite=rewrite_cursor_host,
+        )
 
     # --- shared scripts (tracker, reports, etc.) — not protocols/templates ---
     scripts_src = core / "scripts"
@@ -605,9 +747,11 @@ def compose(src_plugin: Path, dest: Path, version: str, core: Path) -> None:
         copy_text(routing, skill_dst / "routing-rules.json")
 
     # --- role bodies (not scanned as Cursor agents; those are agents/*.md) ---
+    # Same reason as `_copytree_text`: no blanket rmtree of a directory another
+    # process may be reading. Each role is mirrored in place and roles that left
+    # the ROSTER are pruned afterwards (#568 mechanism 2).
     roles_dst = dest / "roles"
-    if roles_dst.exists():
-        shutil.rmtree(roles_dst)
+    roles_dst.mkdir(parents=True, exist_ok=True)
     for role in ROSTER:
         src = src_plugin / "agents" / role
         if not src.is_dir():
@@ -620,6 +764,9 @@ def compose(src_plugin: Path, dest: Path, version: str, core: Path) -> None:
             ),
             markdown_only_rewrite=True,
         )
+    for stale in sorted(roles_dst.iterdir()):
+        if stale.is_dir() and stale.name not in ROSTER:
+            shutil.rmtree(stale)
 
     generate_agent_md(src_plugin, dest / "agents", version)
 
@@ -634,7 +781,7 @@ def compose(src_plugin: Path, dest: Path, version: str, core: Path) -> None:
     if plugin_json.is_file():
         _stamp_plugin_json(plugin_json, version)
 
-    (dest / "VERSION").write_text(version + "\n", encoding="utf-8")
+    write_text_atomic(dest / "VERSION", version + "\n", mode=0o644)
 
     print(f"composed plugin-cursor → {dest} (v{version})", file=sys.stderr)
 

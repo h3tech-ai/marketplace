@@ -51,7 +51,7 @@ Dispatch the Technical Writer agent to generate sprint reports.
 TW_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "technical-writer")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool — do not write the sprint reports inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="TW sprint report", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${TW_BACKEND}.md`. The TW writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-tw.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool — do not write the sprint reports inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="synaptory:technical-writer", description="TW sprint report", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${TW_BACKEND}.md`. The TW writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-tw.json` as its last action.
 
 **TW prompt context:**
 - Sprint number, goal
@@ -315,7 +315,7 @@ If stakeholder feedback was captured, dispatch PO to process it:
 PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool — do not process the feedback inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO backlog update from sprint feedback", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-po-feedback.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Agent()` tool — do not process the feedback inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="synaptory:project-owner", description="PO backlog update from sprint feedback", prompt=<self-contained prompt per the wrapper>)` — see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-po-feedback.json` as its last action.
 
 **PO prompt context:**
 - Stakeholder feedback from Step 5

@@ -289,18 +289,71 @@ def test_transition_story_to_done_emits_evidence_dod_natural_path(
     )
 
     add_story(project, "US-200", title="ev-dod natural path")
+    # #403 — this test used to walk a story to done with NO receipts and
+    # assert that the emit fired on the rejected branch, calling that "the
+    # right behaviour for no evidence at all". It was half right: the CP
+    # correctly saw a rejection, while the board showed `done`, which is the
+    # exact shape the criteria gap exists to remove. The story must now carry
+    # evidence to complete, so the fixture gives it evidence and this test
+    # goes back to asserting only what it is named for: exactly one emit.
+    _write_receipt(
+        project, "US-200", "software-engineer",
+        verification_commands=[{"command": "npm run build", "exit_code": 0}],
+    )
+    _write_receipt(
+        project, "US-200", "quality-engineer",
+        verification_commands=[{"command": "npm test", "exit_code": 0}],
+        metrics={"coverage_delta": "+0.1%"},
+    )
     transition_story(project, "US-200", "in_progress")
     transition_story(project, "US-200", "testing")
     transition_story(project, "US-200", "reviewing")
-    transition_story(project, "US-200", "done")
+    state = transition_story(project, "US-200", "done")
 
-    # Exactly one evidence_dod event fires per story completion. The
-    # rejection vs approval depends on the DoD result; here DoD has no
-    # receipts to evaluate, so all checks return passed=None (not True),
-    # which lands on the rejected branch — and that's the right
-    # behaviour for "no evidence at all".
+    story = next(s for s in state["current_stories"] if s["id"] == "US-200")
+    assert story["state"] == "done", story.get("blocked_reason")
+    # Exactly one evidence_dod event fires per story completion.
     assert len(calls) == 1
     assert calls[0][1] == "US-200"
+
+
+@pytest.mark.unit
+def test_story_with_no_evidence_at_all_is_blocked_not_done(
+    project: str, monkeypatch
+):
+    """#403 — the shape the criteria gap exists to remove.
+
+    A story with no receipts has nothing to evaluate tests_pass or
+    build_succeeds from. Before, it completed: `passed` was None on every
+    required check, the DoD verdict said not-passed, the CP was told
+    `rejected`, and the board said `done`. The two halves disagreed and the
+    board half won.
+
+    Now the required checks declare a criteria gap, the gate blocks, and the
+    computed verdict is persisted and shipped from the blocked path so the
+    reason the story stopped is not the one signal that never leaves the
+    machine.
+    """
+    shipped: list[dict] = []
+    import gate_emitter
+    monkeypatch.setattr(
+        gate_emitter, "emit_evidence_dod_evaluated",
+        lambda story_id, **kw: shipped.append({"story_id": story_id, **kw}) or True,
+    )
+
+    add_story(project, "US-403", title="no evidence at all")
+    transition_story(project, "US-403", "in_progress")
+    transition_story(project, "US-403", "testing")
+    transition_story(project, "US-403", "reviewing")
+    state = transition_story(project, "US-403", "done")
+
+    story = next(s for s in state["current_stories"] if s["id"] == "US-403")
+    assert story["state"] == "blocked"
+    assert "criteria gap" in (story.get("blocked_reason") or "")
+    # The blocked path records the verdict and ships it.
+    assert story["dod"] is not None
+    assert story["dod"]["checks"]["tests_pass"]["result"] == "criteria_gap_declared"
+    assert shipped and shipped[0]["story_id"] == "US-403"
 
 
 @pytest.mark.unit
@@ -329,6 +382,18 @@ def test_transition_story_to_done_skips_emit_via_awaiting_acceptance(
     )
 
     add_story(project, "US-201", title="ev-dod via awaiting")
+    # #403 — evidence so the gate lets the story past `reviewing`; without it
+    # the redirect under test never happens because the criteria gap fires
+    # first (the gate is checked before the acceptance routing, by design).
+    _write_receipt(
+        project, "US-201", "software-engineer",
+        verification_commands=[{"command": "npm run build", "exit_code": 0}],
+    )
+    _write_receipt(
+        project, "US-201", "quality-engineer",
+        verification_commands=[{"command": "npm test", "exit_code": 0}],
+        metrics={"coverage_delta": "+0.1%"},
+    )
     transition_story(project, "US-201", "in_progress")
     transition_story(project, "US-201", "testing")
     transition_story(project, "US-201", "reviewing")
@@ -356,6 +421,18 @@ def test_transition_story_to_done_auto_evaluates_dod(project: str):
     zero evaluated stories.
     """
     add_story(project, "US-104", title="Regression cover", backends={})
+    # #403 — evidence so the story actually lands on `done`, which is the
+    # branch that auto-evaluates. (The blocked path records `dod` too now, so
+    # the assertion would pass either way; the test is about the done branch.)
+    _write_receipt(
+        project, "US-104", "software-engineer",
+        verification_commands=[{"command": "npm run build", "exit_code": 0}],
+    )
+    _write_receipt(
+        project, "US-104", "quality-engineer",
+        verification_commands=[{"command": "npm test", "exit_code": 0}],
+        metrics={"coverage_delta": "+0.1%"},
+    )
     transition_story(project, "US-104", "in_progress")
     transition_story(project, "US-104", "testing")
     transition_story(project, "US-104", "reviewing")

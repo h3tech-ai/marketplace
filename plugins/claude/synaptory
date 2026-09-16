@@ -606,16 +606,43 @@ import json, sys
 from datetime import datetime, timezone
 
 # HC0-F3: embed an AI-BOM (model-pins contents) into build metadata so the
-# distribution carries a verifiable record of exactly which models the plugin
-# dispatches to. (Per-model USD rates are no longer a pinned file — since #162
-# they are derived from this org's Anthropic billing at runtime; see
-# api/synaptory_api/anthropic_billing.py.)
+# distribution carries a record of which models this build INTENDS to dispatch
+# to. It is NOT a record of which weights ran: nothing on the dispatch path
+# reads model-pins.json, the Agent tool accepts tier aliases only, and a
+# receipt's model field is written by the dispatched agent about itself
+# (#519, #596). The
+# caveat is written INTO the emitted object below rather than left in this
+# comment, because an auditor reads build-metadata.json and never reads this
+# file. (Per-model USD rates are not pinned here: they live in the control
+# plane's signed `pricing_versions` table, maintained at /pricing.)
 try:
     with open('${model_pins_src}', 'r') as f:
         model_pins = json.load(f)
 except FileNotFoundError:
     model_pins = {'error': 'model-pins.json not found at build time'}
-ai_bom = {'model_pins': model_pins}
+ai_bom = {
+    'model_pins': model_pins,
+    # Shipped with the data, not beside it. HC0-F2 is recorded NOT DELIVERABLE
+    # IN V1 (#596, brd-plugin FR-PLUGIN-071), and a reader who takes this
+    # object for execution provenance is reading it wrong.
+    'binding': {
+        'binds_dispatch': False,
+        'model_identity_source': 'receipt-authored',
+        'hc0_f2_status': 'not-deliverable-in-v1',
+        'what_this_records': (
+            'the exact model IDs this build INTENDS each tier alias to mean, '
+            'as a reviewable diff'
+        ),
+        'what_this_is_not': (
+            'evidence of which weights ran. No component reads these pins on a '
+            'dispatch path, the Agent tool accepts tier aliases only, and the '
+            'model field on a receipt is written by the dispatched agent about '
+            'itself and is authenticated by nothing'
+        ),
+        'decided': '2026-09-06',
+        'issue': 'https://github.com/h3tech-ai/synaptory-v1/issues/596',
+    },
+}
 
 meta = {
     'version': '${new_ver}',
@@ -1016,11 +1043,34 @@ cmd_test() {
     # Layer 1 (unit) + Layer 2 (hook integration). The full e2e suite
     # ([Layer 3](e2e/scenarios/)) runs separately via ./synaptory e2e.
     echo ""
-    echo "  Running pytest (plugin-claude/tests/ + plugin-cursor/tests/)..."
+    echo "  Running pytest (plugin-claude/ + plugin-cursor/ + plugin-codex/ + scripts/)..."
     echo ""
     local pytest_dirs=(plugin-claude/tests plugin-cursor/tests)
     if [[ -d plugin-codex/tests ]]; then
       pytest_dirs+=(plugin-codex/tests)
+    fi
+    # scripts/tests covers the identity broker (scripts/h3t-github), the guard
+    # shim (scripts/h3t-tool-guard), the identity audit and the policy fan-out.
+    # It had a real suite and no automation: nothing under .github/workflows/
+    # named it and it was not in this array, so it only ever ran when someone
+    # remembered to type the path. Both guard defects to date (#656, #667) were
+    # found by hand, and the suite that would have caught them was already
+    # written. It belongs here rather than in a CI-only step so the same
+    # command covers it locally, which is where the refusal path is exercised.
+    #
+    # Hermetic except for one dependency: test_h3t_github.py resolves a real
+    # `git` on PATH outside the guard shim, and fails without one. Every runner
+    # that checks the repository out has it; a bare container may not.
+    #
+    # Running it HERE rather than only in CI also buys a second shell for free.
+    # The guard is `#!/bin/sh` and the tests exec it through that shebang, so
+    # the interpreter under test is whichever `/bin/sh` the host provides:
+    # bash 3.2 in sh-mode on a macOS laptop, dash on ubuntu-latest. #667 was a
+    # resolution bug in exactly that layer and was verified by hand against
+    # both. This is that pair, automated, without a shell matrix -- so a
+    # CI-only step would have covered dash and dropped the bash 3.2 half.
+    if [[ -d scripts/tests ]]; then
+      pytest_dirs+=(scripts/tests)
     fi
     if python3 -m pytest "${pytest_dirs[@]}" -q --no-header 2>&1; then
       :
@@ -1075,7 +1125,11 @@ _build_docker_images() {
   # Docker Desktop VM cap (parallel builds OOMed during `apt-get install
   # build-essential`).
   local images=(
-    "api:infra/docker/Dockerfile.api:api"
+    # CONTEXT `.`, not `api`: Dockerfile.api copies `core/lib` for the shared
+    # DoD evaluator (#435 direction A), and `core/` is not reachable from an
+    # `api/` context. See the comment in that Dockerfile for what the narrow
+    # context cost.
+    "api:infra/docker/Dockerfile.api:."
     "web:web/Dockerfile:web"
     "fixture-idp:infra/docker/Dockerfile.fixture-idp:api"
     "backup:infra/docker/Dockerfile.backup:infra/docker"

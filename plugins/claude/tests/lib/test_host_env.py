@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import host_env
 import pytest
 
@@ -207,3 +210,27 @@ def test_ambient_local_channel_is_a_determinate_signal(monkeypatch, tmp_path):
 
     assert host_env.local_plugin_runtime() is True
     assert host_env.plugin_channel_source() == "SYNAPTORY_CHANNEL=local"
+
+
+def test_a_child_of_the_stamp_free_runtime_names_no_channel(stamp_free_runtime):
+    """The subprocess half of `_neutralise_runtime_stamp` (conftest).
+
+    `RUNTIME_STAMP_DIR` is the runtime module's own directory, so a test that
+    execs `core/lib/<module>.py` reads whatever stamp `./synaptory deploy local`
+    left there and resolves the ambient installed CLI -- which is how 23 SPQ
+    barrier tests failed only on a laptop that had deployed locally. Tests exec
+    a stamp-free copy instead; this asserts the copy actually is one, in the
+    child, where it matters.
+    """
+    for name in host_env.CP_URL_FILENAMES:
+        assert not (stamp_free_runtime.lib / name).exists()
+
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import host_env; print(repr(host_env.plugin_channel_source()))"],
+        cwd=str(stamp_free_runtime.lib),
+        env={**stamp_free_runtime.env(), "PYTHONPATH": str(stamp_free_runtime.lib)},
+        capture_output=True, text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "''", probe.stdout

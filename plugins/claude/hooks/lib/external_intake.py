@@ -1,0 +1,1035 @@
+#!/usr/bin/env python3
+# Copyright (c) 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
+"""Admit an artifact the platform did not produce, so a sign-off can bind to it.
+
+Why this module exists
+----------------------
+The pipeline has one entry point and it is a producing stage: `queued ->
+in_progress` is bound to `("software-engineer", "se")` in
+`advance_kernel.TRANSITION_RECEIPT`, and `next_action` selects `dispatch_se`
+for a queued unit. There is no edge that admits an artifact somebody else
+produced.
+
+The consequence lands on the sign-off, not on the dispatch.
+`story_pipeline._story_candidate_digest` derives the candidate identity two
+ways -- the kernel's consumed-receipt ledger, or a hash over the unit's own
+receipt bytes -- and both are deliberately internal. For a verify-only job
+(an outside party produces the deliverable, the platform only checks it) there
+is no in-platform receipt to digest, so the strongest sign-off available was an
+UNBACKED one naming what was missing. Honest, and not a verify-only job
+(#495, proposal section 5 S4).
+
+The tension, and how it is resolved
+-----------------------------------
+Two requirements pull against each other:
+
+* **#403's rule:** a judged verdict must not choose its own subject, so the
+  digest is DERIVED and never an argument.
+* **S4's requirement:** the candidate is external, so its identity can only
+  arrive from outside.
+
+They reconcile on WHEN and BY WHOM, not on whether the digest is supplied. The
+digest is fixed at INTAKE -- before any checking runs -- over bytes this module
+READ, and it is WRITE-ONCE THROUGH THE ADMISSION API: `admit` refuses a second
+record for the same unit. That is not immutability against the project
+principal, who can edit the file directly, as the section below says plainly
+and as `conformance/contract.json` records as the reason
+`cp_external_candidate_intake` is still a declared gap. The two statements sat
+twenty lines apart in this docstring and the absolute one was wrong (#592
+re-review). A verdict still cannot pick its subject;
+it inherits one that was fixed before the checking stage existed. That is
+`SP-WRK-007`'s shape (criteria before producing) applied to identity instead of
+criteria.
+
+WHAT THIS DOES NOT GIVE, stated here rather than discovered later
+-----------------------------------------------------------------
+**The submitter can still choose the bytes their own sign-off will bind to.**
+An intake record is a file in the project, written by whoever runs the verb,
+and `admitted_by` is a caller-supplied string exactly as `accepted_by` is on
+`story_pipeline.accept_story`. Nothing on this host authenticates either
+principal, so "a different actor fixed the digest" is RECORDED and not
+enforced. That is the same footing as `mcp_consumed_receipts` -- the ledger
+this derivation takes precedence over is also just a list in a JSON file the
+same principal can edit -- so intake is not held to a weaker standard than
+what it displaces, and not to a stronger one either.
+
+What it does give, and what the negative tests hold:
+
+1. The digest is over bytes read here, never over a value a caller claimed.
+   The record's own `candidate_digest` field is re-derived from the artifact on
+   EVERY read, so a hand-written record claiming a digest the bytes do not
+   hash to binds nothing.
+2. Substituting the artifact after intake is detectable, and the sign-off then
+   binds to nothing rather than to the substitute.
+3. A unit with both an intake record and an in-platform producing receipt has
+   two candidates and binds to NEITHER, so intake cannot be used to redirect an
+   in-platform unit's sign-off onto an unrelated file.
+4. An intake-bound verdict says so (`candidate_source`), so no reader can
+   mistake it for one bound to produced receipts.
+
+Making the principal separation real needs a secret the submitter does not hold
+or a server-side fact they cannot mint -- #435's option 2/3 territory, and
+#486's for the acceptance edge. Both are open.
+
+Python 3.9 compatible: this file is projected into every host package.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from typing import Any, Dict, List, Optional
+
+#: Record format, on the record so a later shape change is a version bump
+#: rather than a silent reinterpretation of old records.
+SCHEMA = "synaptory.external_intake/1"
+
+#: Where intake records live, as the leaf of the receipts directory's parent.
+#: SCOPED THE SAME WAY RECEIPTS ARE, deliberately: `receipts_dir_for` exists
+#: because a unit id is not unique across cycles, so an intake record keyed
+#: only by unit id under a project-level directory would collide exactly where
+#: receipts do not.
+INTAKE_LEAF = "intake"
+
+#: The unit id is a path segment here, so it is constrained rather than
+#: trusted. A rejected id is a refusal with a reason, never a traversal.
+_UNIT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+def _stage_profiles() -> Dict[str, str]:
+    """`{abbrev: stage_profile}` from the canonical roster, or `{}`.
+
+    DERIVED, NEVER RESTATED (#396). The first cut of this module hard-coded
+    `PRODUCING_ABBREVS = ("se",)` and treated every other abbrev as a possible
+    verifier, which disagreed with `runtime_contracts.DISPATCH_STAGE_PROFILE`
+    on two roles: `tw` and `pe` are PRODUCING there. So a technical-writer
+    receipt carrying the candidate's digest was counted as the verifying stage,
+    and an unchecked candidate reached `judged` through a role that verifies
+    nothing. A local subset of a table that already exists is a second source
+    of truth, and this is what a second source of truth costs.
+
+    Empty on a partial install rather than raising: a missing roster makes
+    every role unknown, and an unknown role is not a verifier, which is the
+    fail-closed direction.
+    """
+    try:
+        import runtime_contracts
+    except ImportError:  # pragma: no cover - partial host install
+        return {}
+    table = getattr(runtime_contracts, "DISPATCH_STAGE_PROFILE", None)
+    return dict(table) if isinstance(table, dict) else {}
+
+
+#: `_role_from_receipt` returns this when the two role fields contradict each
+#: other. It is deliberately NOT the empty string: "this document does not say
+#: which stage ran" and "this document says two different things" are different
+#: facts, and only the first one may fall back to the filename. Collapsing them
+#: would make a self-contradictory receipt inherit whatever its filename claims,
+#: which is the opposite of what the disagreement is evidence of.
+_ROLE_CONFLICT = "?conflict"
+
+
+def _role_from_receipt(receipt: dict) -> str:
+    """The role name this receipt declares, with `role` authoritative.
+
+    `role` is the canonical field: the receipt schema requires it and
+    `receipt_validator` reads it everywhere it decides anything. `agent` is an
+    optional legacy spelling that older receipts still carry.
+
+    Reading `agent or role` therefore let the OPTIONAL field override the
+    REQUIRED one, and nothing compared the two (#592 review, finding 5). A
+    receipt whose canonical `role` is `technical-writer` and whose legacy
+    `agent` says `quality-engineer` was read as QE, so it earned eligibility
+    to verify a candidate on the strength of a field the validator does not
+    treat as canonical.
+
+    A disagreement is refused rather than resolved. The two fields are written
+    by the same hand, so neither authenticates the other, but they are supposed
+    to be the same fact spelled two ways: when they are not, the document is
+    not evidence about which stage ran, and picking either one is choosing
+    which claim to believe. This mirrors the filename/body conflict rule that
+    `_receipt_abbrev` already applies below, which is the guard this function
+    was missing rather than a new policy.
+    """
+    role = str(receipt.get("role") or "").strip().lower()
+    legacy = str(receipt.get("agent") or "").strip().lower()
+    if role and legacy and role != legacy:
+        return _ROLE_CONFLICT
+    return role or legacy
+
+
+def _declared_abbrev(receipt: Dict[str, Any]) -> str:
+    """The role abbrev the receipt's BODY declares, or "".
+
+    No filename fallback, and that is the point (#396). A verifying receipt is
+    the evidence that a checking stage ran, and a file called `US-901-qe.json`
+    holding `{"candidate_digest": "..."}` is a filename, not a stage: it
+    declares no role, records no work, and satisfies nothing. Eligibility to
+    verify therefore reads only what the document says about itself, while the
+    producing-stage CONFLICT below still honours the filename, because there
+    the fallback is the strict direction.
+    """
+    declared = _role_from_receipt(receipt)
+    if not declared or declared == _ROLE_CONFLICT:
+        return ""
+    try:
+        import runtime_contracts
+        by_name = getattr(runtime_contracts, "_ROLE_ABBREV_BY_NAME", {}) or {}
+    except ImportError:  # pragma: no cover - partial host install
+        by_name = {}
+    return by_name.get(declared, declared if len(declared) <= 3 else "")
+
+
+def _receipt_is_valid(path: str, project_dir: str) -> bool:
+    """Whether the receipt at `path` satisfies the receipt contract.
+
+    A verifying receipt must be a RECEIPT (#396). The scan used to require only
+    a matching `candidate_digest`, so a two-key stub with no role, story id,
+    completion time, artifacts or verification commands proved a stage had run.
+    `receipt_validator` already states what a receipt is; asking it here is the
+    difference between "a file exists" and "a stage recorded work".
+
+    A tree with no validator answers False, so a partial install refuses to
+    bind rather than binding on nothing.
+    """
+    try:
+        import receipt_validator
+    except ImportError:  # pragma: no cover - partial host install
+        return False
+    try:
+        return bool(receipt_validator.validate_receipt(path, project_dir).valid)
+    except Exception:  # noqa: BLE001 - an unvalidatable receipt is not valid
+        return False
+
+
+def _receipt_abbrev(name: str, receipt: Dict[str, Any]) -> str:
+    """The role abbrev this receipt is FOR, or "" when the two spellings
+    disagree.
+
+    A receipt names its role twice: in the filename (`WU-1-qe.json`) and in the
+    body (`agent: quality-engineer`). They are written by the same hand, so
+    neither authenticates the other, but a DISAGREEMENT is still evidence that
+    something is wrong, and reading whichever one happens to be convenient is
+    how a `-tw` file claiming to be a QE (or the reverse) would slip past.
+    """
+    stem = name[: -len(".json")] if name.endswith(".json") else name
+    from_name = stem.rsplit("-", 1)[-1].strip().lower()
+    declared = _role_from_receipt(receipt)
+    if declared == _ROLE_CONFLICT:
+        # The body contradicts itself, so the filename is not a tie-breaker:
+        # there is no tie, there is a document that cannot be believed.
+        return ""
+    if not declared:
+        return from_name
+    try:
+        import runtime_contracts
+        by_name = getattr(runtime_contracts, "_ROLE_ABBREV_BY_NAME", {}) or {}
+    except ImportError:  # pragma: no cover - partial host install
+        by_name = {}
+    from_body = by_name.get(declared, declared if len(declared) <= 3 else "")
+    if from_body and from_name and from_body != from_name:
+        return ""
+    return from_body or from_name
+
+
+#: Kept for the callers that import it. The value is derived so it cannot drift
+#: from the roster the rest of the platform dispatches against.
+PRODUCING_ABBREVS = tuple(
+    sorted(a for a, stage in (_stage_profiles() or {}).items() if stage == "producing")
+) or ("se",)
+
+#: The stage profile a receipt must carry to be the verifying stage. One value,
+#: named once, so "which roles verify" is answerable without reading a list.
+VERIFYING_STAGE = "verifying"
+
+
+class IntakeRefused(Exception):
+    """An admission that was refused, with a machine-readable `code`."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class IntakeRead:
+    """The answer to two questions, never one (`pipeline_board` precedent).
+
+    *Is there an admission here at all* (`admitted`, `problems`) and *what
+    candidate does it bind to* (`candidate_digest`). A record that exists but
+    cannot be trusted is `admitted=True` with `problems` and NO digest -- it
+    must never read as "no intake", because falling back to the in-platform
+    derivations there would let a substituted artifact produce a verdict that
+    looks backed.
+    """
+
+    __slots__ = (
+        "admitted", "record", "candidate_digest", "problems", "source",
+        "verified_by",
+        "awaiting_verification",
+    )
+
+    def __init__(
+        self,
+        admitted: bool = False,
+        record: Optional[Dict[str, Any]] = None,
+        candidate_digest: Optional[str] = None,
+        problems: Optional[List[str]] = None,
+        source: str = "",
+        verified_by: Optional[List[str]] = None,
+        awaiting_verification: bool = False,
+    ) -> None:
+        self.admitted = admitted
+        self.record = record if record is not None else {}
+        self.candidate_digest = candidate_digest
+        self.problems = problems if problems is not None else []
+        self.source = source
+        # The receipt filenames that matched as the verifying stage. CARRIED
+        # OUT rather than kept private because whether that stage was
+        # AUTHORIZED is a question about the Work Unit's dispatch history,
+        # which lives on the story and not in this module (#495 P2). Naming
+        # them here is what lets the holder of the story ask it without this
+        # module reaching into pipeline state.
+        self.verified_by = verified_by if verified_by is not None else []
+        # Admitted, intact, and simply not checked YET -- as opposed to a
+        # candidate that cannot be established. A sign-off treats both as
+        # unbacked; only `next_action` needs them apart, so that it can
+        # dispatch the verifier this flag says is missing.
+        self.awaiting_verification = bool(awaiting_verification)
+
+    @property
+    def binds(self) -> bool:
+        """True only when an admission exists AND yields a usable candidate."""
+        return bool(self.admitted and self.candidate_digest and not self.problems)
+
+    @property
+    def why_absent(self) -> Optional[str]:
+        """One line for a verdict's `unbacked_reason`; None when it binds."""
+        if self.binds:
+            return None
+        if not self.admitted:
+            return (
+                "no external candidate was admitted for this unit, so there is "
+                "no intake record for a verdict to inherit a subject from"
+            )
+        return (
+            "an external candidate was admitted for this unit but no longer "
+            "yields a candidate identity: %s" % "; ".join(self.problems)
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "admitted": self.admitted,
+            "binds": self.binds,
+            "candidate_digest": self.candidate_digest,
+            "record": self.record,
+            "problems": self.problems,
+            "source": self.source,
+            "verified_by": self.verified_by,
+            "awaiting_verification": self.awaiting_verification,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics
+        return "IntakeRead(admitted=%r, binds=%r, problems=%r)" % (
+            self.admitted, self.binds, self.problems,
+        )
+
+
+# ── paths ────────────────────────────────────────────────────────────────────
+
+
+def _receipts_dir(project_dir: str, *, intended: bool) -> str:
+    """The unit's receipts directory, from the one authoritative resolver.
+
+    Imported lazily: `story_pipeline` imports THIS module for its candidate
+    derivation, so a module-level import here would be a cycle.
+    """
+    from story_pipeline import receipts_dir_for  # local: see docstring
+
+    return receipts_dir_for(project_dir, intended=intended)
+
+
+def intake_dir(project_dir: str) -> str:
+    """The intake directory for this project, beside its receipts directory.
+
+    `intended=True` on purpose: the intake directory is named before anything
+    has been written to it, which is the same reason the dispatch contract
+    resolves the scoped receipts path whether or not it exists yet.
+    """
+    return os.path.join(
+        os.path.dirname(_receipts_dir(project_dir, intended=True)), INTAKE_LEAF
+    )
+
+
+def record_path(project_dir: str, unit_id: str) -> str:
+    """Where `unit_id`'s intake record lives."""
+    return os.path.join(intake_dir(project_dir), "%s.intake.json" % unit_id)
+
+
+def _check_unit_id(unit_id: str) -> str:
+    text = str(unit_id or "").strip()
+    if not _UNIT_ID_RE.match(text):
+        raise IntakeRefused(
+            "unit_id_rejected",
+            "unit id %r is not a safe path segment; an intake record is named "
+            "after the unit, so the id is constrained rather than trusted"
+            % (unit_id,),
+        )
+    return text
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _digest_bytes(body: bytes) -> str:
+    return "sha256:%s" % hashlib.sha256(body).hexdigest()
+
+
+def _relative_to_project(project_dir: str, artifact_path: str) -> str:
+    """The artifact's path relative to the project, or a refusal.
+
+    A candidate must live inside the project. Two reasons, and neither is
+    tidiness: the record has to stay readable when the project moves, and a
+    recorded absolute path pointing outside the tree is a re-read this module
+    cannot promise still names the same bytes.
+    """
+    project_real = os.path.realpath(project_dir)
+    artifact_real = os.path.realpath(artifact_path)
+    prefix = project_real.rstrip(os.sep) + os.sep
+    if not artifact_real.startswith(prefix):
+        raise IntakeRefused(
+            "artifact_outside_project",
+            "the candidate %s is outside the project %s; admit a copy inside "
+            "the project so the recorded path names bytes that can be re-read"
+            % (artifact_path, project_dir),
+        )
+    return os.path.relpath(artifact_real, project_real)
+
+
+# ── admit ────────────────────────────────────────────────────────────────────
+
+
+def _authority_at_intake(
+    project_dir: str,
+    unit_id: str,
+    digest: str,
+    admitted_by: str,
+    source_note: Optional[str],
+) -> Dict[str, Any]:
+    """Record the intake fact where the admitting principal cannot rewrite it.
+
+    Returns `intake_authority`'s verdict, or a `not_connected` stand-in when
+    that module is unavailable. IMPORT FAILURE IS NOT AN OUTAGE and must not be
+    a problem: a host package that composed without this module has no control
+    plane wire at all, which is the same world as an unstamped tree. A stamped
+    tree WITH the module and a broken CLI is the `problem` case, and that one is
+    the module's own to report.
+    """
+    try:
+        import intake_authority
+    except Exception:  # noqa: BLE001 - no wire is the offline world
+        return {
+            "state": "not_connected",
+            "authority": "none",
+            "detail": "this runtime has no intake-authority wire",
+        }
+    verdict = intake_authority.record_intake(
+        project_dir,
+        unit_id,
+        digest,
+        # NOT the admitting principal. `produced_by` is who made the artifact,
+        # and for a verify-only job that is outside the platform: passing the
+        # admitter here would make the control plane's self-approval refusal
+        # fire on every intake, refusing the legitimate case.
+        produced_by="",
+        rationale=(str(source_note).strip() if source_note else ""),
+    )
+    return dict(verdict, authority=verdict.get("authority", "none"))
+
+
+def admit_external_candidate(
+    project_dir: str,
+    unit_id: str,
+    artifact_path: str,
+    *,
+    admitted_by: str,
+    source_note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Admit an external artifact as `unit_id`'s candidate. Returns the record.
+
+    The digest is computed HERE, over bytes read from `artifact_path`. There is
+    no parameter for it, by construction rather than by validation: an intake
+    that accepted a claimed digest would move #403's forgery one step earlier
+    instead of removing it.
+
+    Refuses (`IntakeRefused`, with a `code`) when:
+
+    * `unit_id` is not a safe path segment (`unit_id_rejected`);
+    * the artifact is missing, unreadable or not a regular file
+      (`artifact_unreadable`);
+    * the artifact is outside the project (`artifact_outside_project`);
+    * this unit already has an intake record (`already_admitted`) -- the record
+      is write-once THROUGH THIS API, so changing the candidate means a new
+      job. It is not immutable against the project principal, who can edit the
+      file; that is the declared gap, not a property this refusal provides;
+    * this unit already has receipts (`unit_already_receipted`) -- intake
+      precedes checking, which is the whole point of it, and a unit that
+      already produced in-platform receipts is not a verify-only job. Without
+      this refusal an intake record could redirect an in-platform unit's
+      sign-off off the work it produced and onto an unrelated file.
+
+    `admitted_by` is recorded, not verified. See the module docstring: no host
+    authenticates it, and claiming otherwise would be the exact class of error
+    #493 corrected (a presence check is not an authorization check).
+    """
+    unit = _check_unit_id(unit_id)
+    if not os.path.isdir(project_dir):
+        raise IntakeRefused(
+            "project_missing", "no project directory at %s" % project_dir
+        )
+    principal = str(admitted_by or "").strip()
+    if not principal:
+        raise IntakeRefused(
+            "admitted_by_required",
+            "intake needs a named principal: the record's whole purpose is to "
+            "say who fixed the candidate and when, before any checking ran",
+        )
+    if not os.path.isfile(artifact_path):
+        raise IntakeRefused(
+            "artifact_unreadable",
+            "no readable candidate artifact at %s" % artifact_path,
+        )
+    relative = _relative_to_project(project_dir, artifact_path)
+    try:
+        with open(artifact_path, "rb") as handle:
+            body = handle.read()
+    except OSError as exc:
+        raise IntakeRefused(
+            "artifact_unreadable",
+            "the candidate at %s could not be read (%s), so no digest could be "
+            "computed over the bytes admitted" % (artifact_path, exc),
+        )
+
+    existing = sorted(
+        os.path.basename(p) for p in _story_receipt_names(project_dir, unit)
+    )
+    if existing:
+        raise IntakeRefused(
+            "unit_already_receipted",
+            "unit %s already has receipts (%s). Intake precedes checking: a "
+            "candidate admitted after receipts exist would fix an identity "
+            "later than the work that was already judged against it, and on an "
+            "in-platform unit it would redirect the sign-off onto an unrelated "
+            "file" % (unit, ", ".join(existing)),
+        )
+
+    digest = _digest_bytes(body)
+
+    # THE AUTHORITATIVE FACT IS ESTABLISHED FIRST, and a failure to establish
+    # it refuses the admission (#495 P3). Recording locally and then trying
+    # would leave a record claiming an authority nothing holds, which is worse
+    # than refusing: a later read could not tell it from a rewritten one.
+    #
+    # HERE RATHER THAN IN THE MCP VERB, because there are two entry points to
+    # this module (the verb and the module CLI) and a guarantee implemented at
+    # one of them is not a guarantee. `produced_by` is the ADMITTING principal
+    # here only when nothing better is known; for a verify-only job the
+    # producer is outside the platform and the caller passes it.
+    authority = _authority_at_intake(project_dir, unit, digest, principal, source_note)
+    if authority.get("state") == "problem":
+        raise IntakeRefused(
+            "authority_unavailable",
+            "this project is connected to a control plane and the intake fact "
+            "could not be recorded there, so admitting locally would claim an "
+            "authority nothing holds: %s" % authority.get("detail", ""),
+        )
+
+    record = {
+        "schema": SCHEMA,
+        "unit_id": unit,
+        "candidate_digest": digest,
+        "artifact_path": relative.replace(os.sep, "/"),
+        "artifact_bytes": len(body),
+        "admitted_at": _now(),
+        "admitted_by": principal,
+        # WHICH WORLD THIS WAS ADMITTED IN, on the record so no reader has to
+        # guess. `control-plane` means the digest above is a copy of a fact
+        # held out of this principal's reach; `local` means it is not, and
+        # carries the declared limit with it.
+        "authority": authority.get("authority", "none"),
+    }
+    if authority.get("decision_id"):
+        record["authority_decision_id"] = str(authority["decision_id"])
+    if source_note is not None and str(source_note).strip():
+        record["source_note"] = str(source_note).strip()
+
+    target = record_path(project_dir, unit)
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    except OSError as exc:
+        raise IntakeRefused(
+            "record_unwritable", "could not create %s (%s)" % (target, exc)
+        )
+    payload = json.dumps(record, indent=2, sort_keys=True) + "\n"
+    # O_EXCL is the immutability, and it is a real one for the second-admit
+    # case rather than a convention: a second admission fails at the syscall.
+    # It is NOT a defence against the principal rewriting the file (the mode
+    # below stops an accident, not a forger) -- see the module docstring.
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    except FileExistsError:
+        raise IntakeRefused(
+            "already_admitted",
+            "unit %s already has an intake record at %s; this API admits a "
+            "candidate once, so changing it means a new job"
+            % (unit, target),
+        )
+    except OSError as exc:
+        raise IntakeRefused(
+            "record_unwritable", "could not write %s (%s)" % (target, exc)
+        )
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(payload)
+    except OSError as exc:
+        try:
+            os.chmod(target, 0o644)
+            os.unlink(target)
+        except OSError:  # pragma: no cover - best effort
+            pass
+        raise IntakeRefused(
+            "record_unwritable",
+            "the intake record at %s was left incomplete (%s) and was removed, "
+            "so no partial admission survives" % (target, exc),
+        )
+    return record
+
+
+# ── read ─────────────────────────────────────────────────────────────────────
+
+
+def _story_receipt_names(project_dir: str, unit_id: str) -> List[str]:
+    """Receipt filenames for this unit, across the layouts it may live in."""
+    names: List[str] = []
+    seen = set()
+    prefix = "%s-" % unit_id
+    dirs = []
+    for intended in (False, True):
+        try:
+            dirs.append(_receipts_dir(project_dir, intended=intended))
+        except Exception:  # noqa: BLE001 - a read must not fail on layout
+            continue
+    try:
+        from story_pipeline import companion_receipt_dirs
+
+        expanded = []
+        for directory in dirs:
+            expanded.extend(companion_receipt_dirs(directory))
+        dirs = expanded
+    except Exception:  # noqa: BLE001 - companions are an optimisation here
+        pass
+    for directory in dirs:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            if not (name.startswith(prefix) and name.endswith(".json")):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            names.append(os.path.join(directory, name))
+    return names
+
+
+def _record_problems(record: Any, unit_id: str) -> List[str]:
+    problems: List[str] = []
+    if not isinstance(record, dict):
+        return ["the intake record is not an object"]
+    if record.get("unit_id") != unit_id:
+        # A record for one unit sitting at another unit's path would bind the
+        # wrong verdict to the wrong artifact, so the record names its own
+        # subject and the name is checked rather than inferred from the path.
+        problems.append(
+            "the intake record at this unit's path names unit %r, not %r"
+            % (record.get("unit_id"), unit_id)
+        )
+    if record.get("schema") != SCHEMA:
+        problems.append(
+            "the intake record declares schema %r, not %r" % (
+                record.get("schema"), SCHEMA,
+            )
+        )
+    for field in ("unit_id", "candidate_digest", "artifact_path", "admitted_by",
+                  "admitted_at"):
+        value = record.get(field)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(
+                "the intake record's %s is missing or not a non-empty string"
+                % field
+            )
+    return problems
+
+
+def _conflicting_subject_problems(
+    project_dir: str, unit_id: str, digest: str
+) -> "tuple[List[str], List[str], bool]":
+    """`(problems, verified_by, awaiting)` from receipts about what was verified.
+
+    `awaiting` is True for exactly one shape: nothing conflicts and no verifier
+    has run yet. It is reported SEPARATELY from the problem it produces because
+    the two readers need opposite things from it (#495 P2). A sign-off must
+    treat an unverified candidate as unbacked, which the problem does. But
+    `next_action` has to select the verifying dispatch for that unit, and it
+    cannot do that if "nobody has verified this yet" is indistinguishable from
+    "this candidate is broken" -- which would make the verifier undispatchable
+    precisely because it had not run, a deadlock rather than a refusal.
+
+    Two checks over one directory scan:
+
+    * a PRODUCING receipt (`-se`) means the unit produced work in-platform, so
+      there are two candidates and no way to tell which the sign-off is about.
+      It binds to neither, which is the honest floor rather than a guess.
+    * a receipt that NAMES a `candidate_digest` and names a different one is
+      verifying something other than what was admitted.
+
+    And a third, added by #396: a candidate that NOBODY CHECKED is not a
+    verified candidate. The first cut refused a receipt naming different bytes
+    and accepted a receipt naming none, which sounds like the same leniency
+    the two-sided cases get and is not: with no verifying receipt at all there
+    is no checking to have been done against anything, and a judged sign-off
+    over an unchecked artifact says a stage ran that never did. #495's
+    criterion is that the verifying stage runs AGAINST the admitted candidate,
+    so both halves of that sentence have to hold.
+
+    Scoped to the intake path on purpose. This does not make
+    `candidate_digest` required on receipts generally, which would be a
+    receipt-contract change and is still not this ticket's to make. It makes
+    it required of the receipt a verify-only unit is signed off on, which is
+    the one place the digest is the whole point.
+    """
+    problems: List[str] = []
+    verified_by: List[str] = []
+    stages = _stage_profiles()
+    for path in sorted(_story_receipt_names(project_dir, unit_id)):
+        name = os.path.basename(path)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(receipt, dict):
+            continue
+        abbrev = _receipt_abbrev(name, receipt)
+        stage = stages.get(abbrev, "")
+        if stage == "producing":
+            problems.append(
+                "receipt %s is a producing-stage receipt, so this unit has both "
+                "an admitted external candidate and in-platform produced work; "
+                "a verdict cannot tell which it is about" % name
+            )
+            continue
+        claimed = receipt.get("candidate_digest")
+        if isinstance(claimed, str) and claimed.strip() and claimed.strip() != digest:
+            problems.append(
+                "receipt %s names candidate %s, not the admitted candidate %s, "
+                "so the checking it records was done against different bytes"
+                % (name, claimed.strip(), digest)
+            )
+        elif isinstance(claimed, str) and claimed.strip() == digest:
+            # THE VERIFYING STAGE, and only it, AND IT MUST BE A RECEIPT. A
+            # file naming the right bytes still checked nothing unless the role
+            # its body declares is one that verifies, and unless the document
+            # satisfies the receipt contract: a two-key stub in a `-qe.json`
+            # file records no work at all.
+            # Three things, and all of them: the body declares a verifying
+            # role, the filename agrees with it, and the document satisfies the
+            # receipt contract. Dropping the filename check would let a
+            # `-tw.json` claiming to be a QE bind, which is the case #396's
+            # previous round closed; reading the filename INSTEAD is what let a
+            # two-key stub bind, which is the case this round closes.
+            declared = _declared_abbrev(receipt)
+            filename_abbrev = _receipt_abbrev(name, receipt)
+            if stages.get(declared, "") != VERIFYING_STAGE or not filename_abbrev:
+                problems.append(
+                    "receipt %s names the admitted candidate but declares no "
+                    "verifying role (%s), so nothing it records is a check of "
+                    "these bytes. A verifying receipt must declare one of %s "
+                    "in its own body."
+                    % (
+                        name,
+                        declared or "none",
+                        ", ".join(
+                            sorted(
+                                a for a, st in stages.items()
+                                if st == VERIFYING_STAGE
+                            )
+                        ) or "a verifying role",
+                    )
+                )
+            elif not _receipt_is_valid(path, project_dir):
+                problems.append(
+                    "receipt %s names the admitted candidate and declares a "
+                    "verifying role, but it is not a valid receipt, so it "
+                    "records no work that could have checked these bytes"
+                    % name
+                )
+            else:
+                verified_by.append(name)
+    awaiting = not problems and not verified_by
+    if awaiting:
+        problems.append(
+            "no receipt binds a verifying stage to the admitted candidate %s, "
+            "so nothing on record checked these bytes; a sign-off here would "
+            "report a verification that did not happen. A verifying receipt "
+            "for this unit must carry `candidate_digest`." % digest
+        )
+    return problems, verified_by, awaiting
+
+
+def read_intake(project_dir: Optional[str], unit_id: str) -> IntakeRead:
+    """Read `unit_id`'s admission and re-derive its candidate from the bytes.
+
+    The digest on the record is treated as a CLAIM and re-checked on every
+    read, against the artifact it names. That is what makes a hand-written
+    record worthless unless it happens to be true, and it is what makes a
+    post-intake substitution detectable rather than merely discouraged.
+    """
+    if not project_dir:
+        return IntakeRead()
+    try:
+        unit = _check_unit_id(unit_id)
+    except IntakeRefused as exc:
+        return IntakeRead(admitted=False, problems=[exc.message])
+    try:
+        target = record_path(project_dir, unit)
+    except Exception as exc:  # noqa: BLE001 - layout resolution must not raise here
+        return IntakeRead(
+            admitted=False,
+            problems=["the intake directory could not be resolved: %s" % exc],
+        )
+    if not os.path.exists(target):
+        return IntakeRead(admitted=False, source=target)
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError) as exc:
+        # Something IS here, so this is never reported as "no intake".
+        return IntakeRead(
+            admitted=True,
+            problems=["the intake record at %s could not be read: %s" % (target, exc)],
+            source=target,
+        )
+
+    problems = _record_problems(record, unit)
+    if problems:
+        return IntakeRead(
+            admitted=True, record=record if isinstance(record, dict) else {},
+            problems=problems, source=target,
+        )
+
+    recorded_digest = str(record["candidate_digest"]).strip()
+    artifact = os.path.join(project_dir, str(record["artifact_path"]))
+    # The record is a file the same principal can write, so its path is
+    # re-contained on the way out as well as on the way in: a hand-written
+    # `../../..` would otherwise make this read bytes outside the project.
+    project_real = os.path.realpath(project_dir)
+    if not os.path.realpath(artifact).startswith(
+        project_real.rstrip(os.sep) + os.sep
+    ):
+        return IntakeRead(
+            admitted=True, record=record, problems=[
+                "the intake record names an artifact outside the project (%s), "
+                "which is not a candidate this project can be judged on"
+                % record["artifact_path"]
+            ],
+            source=target,
+        )
+    try:
+        with open(artifact, "rb") as handle:
+            body = handle.read()
+    except OSError as exc:
+        return IntakeRead(
+            admitted=True, record=record, problems=[
+                "the admitted candidate %s could not be re-read (%s), so the "
+                "verdict would name bytes nobody can produce"
+                % (record["artifact_path"], exc)
+            ],
+            source=target,
+        )
+    actual = _digest_bytes(body)
+    if actual != recorded_digest:
+        return IntakeRead(
+            admitted=True, record=record, problems=[
+                "the admitted candidate %s now hashes to %s, not the admitted "
+                "%s: the artifact changed after intake"
+                % (record["artifact_path"], actual, recorded_digest)
+            ],
+            source=target,
+        )
+    # THE HALF THAT CLOSES THE REWRITE (#495 P3). Everything above compares the
+    # record against the artifact, and both are files this principal owns, so a
+    # matched pair proves only internal consistency: rewrite the digest, swap
+    # the bytes, and the pair matches again. This asks the store the principal
+    # cannot reach what was admitted, and disagreement is the LOCAL record
+    # being wrong.
+    authoritative = _authoritative_digest(project_dir, unit)
+    if authoritative.get("problems"):
+        return IntakeRead(
+            admitted=True, record=record,
+            problems=list(authoritative["problems"]), source=target,
+        )
+
+    conflicts, verified_by, awaiting = _conflicting_subject_problems(
+        project_dir, unit, actual
+    )
+    if conflicts:
+        return IntakeRead(
+            admitted=True, record=record, problems=conflicts, source=target,
+            verified_by=verified_by, awaiting_verification=awaiting,
+        )
+    return IntakeRead(
+        admitted=True, record=record, candidate_digest=actual, source=target,
+        verified_by=verified_by,
+    )
+
+
+def _authoritative_digest(project_dir: str, unit_id: str) -> Dict[str, Any]:
+    """`{"problems": [...]}` when the out-of-reach store disagrees, else `{}`.
+
+    Four answers, and the two middle ones are why this is not a one-liner.
+
+    * `not_connected`  -- no store exists to disagree with. The local record
+      stands with its declared limit, exactly as it did before P3.
+    * `problem`        -- connected and unreadable. REFUSED: a connected
+      project whose authority cannot be read has less evidence than an offline
+      one, not more, and treating unreachable as unconfigured is how a
+      connected project silently acquires the offline guarantee (#507).
+    * recorded, empty  -- connected, and nothing was authoritatively admitted
+      for this unit. A local record claiming otherwise was written outside the
+      admission path or the store's row was never made; either way the local
+      file is not evidence.
+    * recorded, digest -- compared. A mismatch is the rewrite this exists to
+      catch, and the message says which side is authoritative so an operator
+      does not "fix" the control plane to match a forged file.
+    """
+    try:
+        import intake_authority
+    except Exception:  # noqa: BLE001 - no wire is the offline world
+        return {}
+    verdict = intake_authority.read_intake_fact(project_dir, unit_id)
+    state = verdict.get("state")
+    if state == intake_authority.NOT_CONNECTED:
+        return {}
+    if state == intake_authority.PROBLEM:
+        return {"problems": [
+            "this project is connected to a control plane and the "
+            "authoritative intake fact for %s could not be read, so what was "
+            "admitted cannot be established: %s"
+            % (unit_id, verdict.get("detail", ""))
+        ]}
+    recorded = str(verdict.get("subject_digest") or "").strip()
+    if not recorded:
+        return {"problems": [
+            "the control plane holds no admitted candidate for %s, so the "
+            "local intake record is not evidence that anything was admitted. "
+            "Admit the candidate through the product surface so the fact is "
+            "recorded where the admitting principal cannot rewrite it."
+            % unit_id
+        ]}
+    local = str((_read_local_digest(project_dir, unit_id) or "")).strip()
+    if local and local != recorded:
+        return {"problems": [
+            "the intake record for %s names candidate %s while the control "
+            "plane records %s as admitted. The control plane is authoritative: "
+            "the local record was changed after intake, and the sign-off binds "
+            "to nothing until the artifact and the record match what was "
+            "admitted." % (unit_id, local, recorded)
+        ]}
+    return {}
+
+
+def _read_local_digest(project_dir: str, unit_id: str) -> Optional[str]:
+    """The digest the local record claims, without re-entering `read_intake`."""
+    try:
+        with open(record_path(project_dir, unit_id), "r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError, IntakeRefused):
+        return None
+    if not isinstance(record, dict):
+        return None
+    value = record.get("candidate_digest")
+    return str(value).strip() if isinstance(value, str) else None
+
+
+# ── module CLI ───────────────────────────────────────────────────────────────
+#
+# One entrypoint, matching the `session_manager.py` / `pipeline_board.py`
+# convention. It is NO LONGER THE ONLY ONE: #495 P1 registered
+# `spq_external_intake_admit` in `spq_mcp`, the registry every host merges, so
+# intake is now host-native on all three and inherits each host's policy gate.
+# This comment used to read "NO host exposes an intake verb yet", which was the
+# honest statement of #396's finding 1 ("components built, not wired into the
+# product path") and became the thing that finding warns about once the wiring
+# landed. Reachability is not authority: the record is still a file in the
+# project, which is the half `cp_external_candidate_intake` still declares.
+
+
+def _usage() -> int:
+    sys.stderr.write(
+        "Usage:\n"
+        "  external_intake.py admit <project_dir> <unit_id> <artifact_path> "
+        "--admitted-by <principal> [--source-note <text>]\n"
+        "  external_intake.py read <project_dir> <unit_id>\n"
+    )
+    return 2
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        return _usage()
+    action = args.pop(0)
+    if action == "read":
+        if len(args) != 2:
+            return _usage()
+        result = read_intake(args[0], args[1])
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+        return 0 if result.binds else 1
+    if action != "admit":
+        return _usage()
+    positional: List[str] = []
+    admitted_by = ""
+    source_note: Optional[str] = None
+    while args:
+        item = args.pop(0)
+        if item == "--admitted-by" and args:
+            admitted_by = args.pop(0)
+        elif item == "--source-note" and args:
+            source_note = args.pop(0)
+        elif item.startswith("--"):
+            return _usage()
+        else:
+            positional.append(item)
+    if len(positional) != 3:
+        return _usage()
+    try:
+        record = admit_external_candidate(
+            positional[0], positional[1], positional[2],
+            admitted_by=admitted_by, source_note=source_note,
+        )
+    except IntakeRefused as exc:
+        print(json.dumps({"refused": exc.code, "reason": exc.message}, indent=2))
+        return 1
+    print(json.dumps(record, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI
+    sys.exit(main())

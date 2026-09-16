@@ -21,11 +21,26 @@ REPO = Path(__file__).resolve().parents[3]
 WAIT_FOR = REPO / "core" / "scripts" / "wait_for.py"
 
 
+@pytest.fixture(autouse=True)
+def _cwd_outside_the_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run every `wait_for` child from a throwaway cwd.
+
+    `_emit_wait_timeout` addresses its `events.jsonl` breadcrumb at
+    `host_env.project_dir()`, which falls through to `os.getcwd()` when no
+    project dir is named. `CLAUDE_PROJECT_DIR=""` below reads as UNSET, not as
+    "no project", so "keep telemetry emit inert" is not what happened: the
+    child wrote `.synaptory/.orchestrator/` into the checkout the suite was
+    running from, and `.synaptory/*` is gitignored so nothing showed (#380).
+    The child inherits this cwd, so the breadcrumb lands under `tmp_path`.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 def _run(*args: str, env_extra: dict | None = None) -> tuple[int, dict, str]:
     env = {
         **os.environ,
         "SYNAPTORY_WAIT_FLOOR_S": "0.05",  # fast polling in tests
-        "CLAUDE_PROJECT_DIR": "",  # keep telemetry emit inert
+        "CLAUDE_PROJECT_DIR": "",  # reads as unset -- see the fixture above
         "PATH": "/usr/bin:/bin",  # no synaptory CLI on PATH
     }
     if env_extra:

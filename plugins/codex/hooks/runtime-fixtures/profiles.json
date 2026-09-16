@@ -1,0 +1,63 @@
+[
+  {
+    "profile_id": "claude-local-v1",
+    "runtime_family": "claude-code",
+    "placement": "local",
+    "pinned_version": "PIN-AT-PHASE-B",
+    "capability_profiles": [
+      "analyst",
+      "planner",
+      "producer",
+      "prover"
+    ],
+    "capabilities": [
+      "workspace.write",
+      "process.test",
+      "receipt.v2"
+    ]
+  },
+  {
+    "profile_id": "codex-local-v1",
+    "runtime_family": "codex",
+    "placement": "local",
+    "pinned_version": "PIN-AT-PHASE-B",
+    "capability_profiles": [
+      "producer",
+      "prover"
+    ],
+    "capabilities": [
+      "workspace.write",
+      "process.test",
+      "receipt.v2"
+    ]
+  },
+  {
+    "profile_id": "cursor-local-readonly-v1",
+    "runtime_family": "cursor-agent",
+    "placement": "local",
+    "pinned_version": "PIN-AT-PHASE-B",
+    "capability_profiles": [
+      "prover"
+    ],
+    "capabilities": [
+      "workspace.read",
+      "receipt.v2"
+    ]
+  },
+  {
+    "profile_id": "claude-managed-standard-v1",
+    "runtime_family": "claude-code",
+    "placement": "managed-laptop",
+    "pinned_version": "2.1.236",
+    "capability_profiles": [
+      "producer",
+      "prover"
+    ],
+    "capabilities": [
+      "workspace.write",
+      "process.test",
+      "receipt.v2",
+      "network.allowlist"
+    ]
+  }
+]

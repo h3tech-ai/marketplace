@@ -1,0 +1,7 @@
+{"seq": 1, "ts": "2026-09-01T12:00:00Z", "kind": "attempt/started", "attempt_id": "att_01J6XYZ123", "payload": {"profile": "claude-managed-standard-v1", "placement": "managed-laptop", "model_id": "claude-runtime-reported-id"}, "privacy_safe": true}
+{"seq": 2, "ts": "2026-09-01T12:00:03Z", "kind": "tool/call", "attempt_id": "att_01J6XYZ123", "payload": {"tool": "bash", "summary": "run the migration harness", "duration_ms": 1200}, "privacy_safe": true}
+{"seq": 3, "ts": "2026-09-01T12:00:09Z", "kind": "file/write", "attempt_id": "att_01J6XYZ123", "payload": {"path": "infra/migrations/0001_init.sql", "size_bytes": 2048}, "privacy_safe": true}
+{"seq": 4, "ts": "2026-09-01T12:01:40Z", "kind": "budget/update", "attempt_id": "att_01J6XYZ123", "payload": {"budget_kind": "wall_clock_seconds", "consumed": 100, "remaining": 3500}, "privacy_safe": true}
+{"seq": 5, "ts": "2026-09-01T12:02:10Z", "kind": "step/complete", "attempt_id": "att_01J6XYZ123", "payload": {"label": "migrations apply cleanly", "result": "pass", "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"}, "privacy_safe": true}
+{"seq": 6, "ts": "2026-09-01T12:02:12Z", "kind": "runtime/error", "attempt_id": "att_01J6XYZ123", "payload": {"error_kind": "tool_timeout", "diagnostic_level": "warning"}, "privacy_safe": true}
+{"seq": 7, "ts": "2026-09-01T12:02:30Z", "kind": "attempt/status", "attempt_id": "att_01J6XYZ123", "payload": {"status": "completed"}, "privacy_safe": true}

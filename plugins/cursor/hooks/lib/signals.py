@@ -29,10 +29,33 @@ Kinds harvested today:
   dod_gate_hotspot    — a DoD check that failed on 2+ stories
   blocked_story       — a story left blocked (with its reason)
   replay_mismatch     — attested evidence that did not reproduce (#179 E1)
+  board_unreadable    — the harvest could not read a board at all, so "no
+                        signals" this run means "not measured" rather than
+                        "measured, and there was nothing" (#514)
 
 File-only and fail-safe: every write is best-effort append; a missing store
 reads as no signals. Like all pipeline state, the store lives under
 `.synaptory/` and never ships anywhere.
+
+Where the board comes from (#514)
+---------------------------------
+MethodSignals are SPQ machinery — the SPQ design §12.2 folds process learning
+into Checkpoint and emits MethodSignals precisely because SPQ has no retro
+state. So this generator must read the SPQ board, and `pipeline-state.json` is
+not it: SPQ strips that file to a pointer at `open_cycle`.
+
+The board therefore comes from `pipeline_board.read_board`, the one accessor
+that knows every layout. Two things about that are deliberate:
+
+  * **It is explicit.** Before #514 the SPQ read here was *transitively*
+    correct — `story_pipeline._read_state` happens to resolve SPQ — and nothing
+    in this file said so. A refactor swapping that call for a plain
+    `json.load(pipeline-state.json)` would have reintroduced the defect with
+    every test still green, which is how four separate readers acquired it.
+  * **An unreadable board is not an empty one.** `read_board` reports failure
+    on the Board rather than raising or returning `[]`, and this harvest turns
+    that into a `board_unreadable` signal. A retro that silently harvested
+    nothing was indistinguishable from a Cycle with nothing to learn.
 """
 
 from __future__ import annotations
@@ -172,6 +195,21 @@ def _read_events(project_dir: str | os.PathLike) -> list[dict[str, Any]]:
     return events
 
 
+def _stories_in(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every story on an already-loaded state dict, whatever layout it is in.
+
+    Covers the v3.0 Multi-Spec envelope as well as a flat board: a caller that
+    passes the full file and reads only the top-level `current_stories` is the
+    same defect one layout over.
+    """
+    try:
+        from pipeline_board import stories_in_state
+    except ImportError:  # pragma: no cover - accessor absent from a projection
+        return [s for s in (state.get("current_stories") or [])
+                if isinstance(s, dict)]
+    return stories_in_state(state)
+
+
 def harvest_pipeline_signals(
     project_dir: str | os.PathLike,
     state: dict[str, Any] | None = None,
@@ -181,15 +219,28 @@ def harvest_pipeline_signals(
     """Distil the current board + event log into signals and append them.
 
     Pure over its inputs when `state`/`events` are passed (tests); otherwise
-    reads pipeline-state.json and events.jsonl. Returns the written records.
+    resolves the board through `pipeline_board.read_board`, which is the only
+    reader that knows where each lifecycle keeps it. Returns the written
+    records.
     """
+    board = None
+    board_error = None
+    stories: list[dict[str, Any]] = []
     if state is None:
+        # A missing accessor is REPORTED, not swallowed. This module is
+        # fail-safe by contract (a retro must not die because a signal could
+        # not be written), and the pre-#514 code honoured that with a bare
+        # `except Exception: state = {}` — which is precisely how "the board
+        # was never read" became indistinguishable from "the board was empty".
         try:
-            from story_pipeline import _read_state
-
-            state = _read_state(str(project_dir))
-        except Exception:
-            state = {}
+            from pipeline_board import read_board
+        except ImportError as exc:  # pragma: no cover - projection accident
+            board_error = "cannot import pipeline_board: %s" % exc
+        else:
+            board = read_board(str(project_dir))
+            stories = board.stories
+    else:
+        stories = _stories_in(state)
     if events is None:
         events = _read_events(project_dir)
 
@@ -208,10 +259,36 @@ def harvest_pipeline_signals(
         if rec:
             written.append(rec)
 
+    # 0. Could a board be read at all? A retro that harvested nothing because
+    #    it looked in the wrong file must not be recorded as a Cycle with
+    #    nothing to learn. Only fires when a state file EXISTS and the board
+    #    behind it could not be read — a project with no pipeline state at all
+    #    is a fresh project, not a failed read.
+    _state_file = os.path.join(
+        str(project_dir), ".synaptory", ".orchestrator", "pipeline-state.json"
+    )
+    if board_error is not None:
+        _emit(
+            "board_unreadable",
+            "harvest could not read the board: %s" % board_error,
+            {"problems": [board_error]},
+            key="board_unreadable:import:%s" % board_error,
+        )
+    elif (board is not None and not board.available
+            and os.path.exists(_state_file)):
+        detail = "; ".join(board.problems) or "unknown reason"
+        _emit(
+            "board_unreadable",
+            f"harvest could not read the {board.build_mode} board: {detail}",
+            {"build_mode": board.build_mode, "layout": board.layout,
+             "problems": list(board.problems), "source_path": board.source},
+            key=f"board_unreadable:{board.build_mode}:{detail}",
+        )
+
     # 1. Recurring failure classes — the BEA5-F1 ledger already hashes
     #    failure reasons per (story, role); a hash seen twice+ means the
     #    generator repeated the exact same failure.
-    for story in state.get("current_stories", []) or []:
+    for story in stories:
         sid = str(story.get("id", ""))
         for role, hashes in (story.get("retry_failure_hashes") or {}).items():
             for reason_hash, n in Counter(hashes).items():

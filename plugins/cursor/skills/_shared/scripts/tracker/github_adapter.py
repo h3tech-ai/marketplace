@@ -27,6 +27,7 @@ ID convention:
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -38,13 +39,25 @@ from .base import (
 from .transport.github_transport import GitHubTransport
 
 
+def _warn(message: str) -> None:
+    """Report a degraded side effect on stderr.
+
+    The adapter's job is the item it was asked to create; a side effect that
+    could not be applied must not fail that, and must not vanish either.
+    stderr keeps the tracker CLI's JSON on stdout intact.
+    """
+    print(f"  ⚠ tracker/github: {message}", file=sys.stderr)
+
+
 # ── Issue Type Definitions ───────────────────────────────────────────────
 
 # Types synaptory expects. Defaults (Bug, Feature, Task) exist on every repo.
 # Epic and Story are custom types created during initialization.
 REQUIRED_ISSUE_TYPES = {
-    "Epic":    {"color": "PURPLE", "description": "Epic — groups related features and stories"},
-    "Story":   {"color": "BLUE",   "description": "User story — deliverable unit of work"},
+    # Colors are chosen not to collide with the GitHub defaults an
+    # organization already has: Feature is blue, so Story is not.
+    "Epic":    {"color": "PURPLE", "description": "Groups related features and stories"},
+    "Story":   {"color": "GREEN",  "description": "User story: deliverable unit of work"},
     # These are GitHub defaults — no need to create:
     # "Bug":   exists
     # "Feature": exists
@@ -243,7 +256,13 @@ class GitHubAdapter(ArtifactAdapter):
                 else config.github.repo)
         if not repo:
             repo = self._detect_repo()
-        self.transport = GitHubTransport(repo)
+        # Which identity this project's tracker writes as. Project-level only:
+        # a per-spec override is deliberately absent, because the identity a
+        # write is attributed to is a policy for the whole project, not a
+        # detail one spec gets to vary.
+        self.transport = GitHubTransport(
+            repo, cli_command=config.github.cli_command
+        )
         self.prefix = config.github.label_prefix
         self.points_prefix = config.github.points_label_prefix
         # Per-spec milestone prefix override allows spec teams to namespace
@@ -631,8 +650,11 @@ class GitHubAdapter(ArtifactAdapter):
             if epic_num:
                 try:
                     self.transport.add_sub_issue(epic_num, issue["number"])
-                except AdapterError:
-                    pass  # Sub-issue API may not be available
+                except AdapterError as exc:
+                    _warn(
+                        f"story #{issue['number']} was not linked under epic "
+                        f"#{epic_num}: {exc}"
+                    )
 
         return story
 
@@ -762,8 +784,11 @@ class GitHubAdapter(ArtifactAdapter):
             if parent_num:
                 try:
                     self.transport.add_sub_issue(parent_num, issue["number"])
-                except AdapterError:
-                    pass
+                except AdapterError as exc:
+                    _warn(
+                        f"ticket #{issue['number']} was not linked under parent "
+                        f"#{parent_num}: {exc}"
+                    )
         return {"id": str(issue["number"]), "title": title, "type": ticket_type,
                 "url": issue.get("url", "")}
 
@@ -1076,13 +1101,23 @@ class GitHubAdapter(ArtifactAdapter):
             )
 
     def _set_issue_type(self, issue_number: int, type_name: str) -> None:
-        """Set the issue type on an issue. No-op if type not available."""
-        type_id = self._get_type_ids().get(type_name)
-        if type_id:
-            try:
-                self.transport.set_issue_type(issue_number, type_id)
-            except AdapterError:
-                pass  # Degrade silently — labels still identify the issue
+        """Set the issue type on an issue, reporting a type that did not stick.
+
+        Creating the item is the caller's real work, so a type that cannot be
+        applied does not fail it.  It is reported instead of swallowed: this
+        used to `pass`, which left a whole backlog untyped with no record of
+        why, and made the reads that search by type return nothing.
+        """
+        if type_name not in self._get_type_ids():
+            _warn(
+                f"issue #{issue_number} left untyped: {self.transport.repo} has "
+                f"no issue type named {type_name!r}"
+            )
+            return
+        try:
+            self.transport.set_issue_type(issue_number, type_name)
+        except AdapterError as exc:
+            _warn(f"issue #{issue_number} type {type_name!r} was not applied: {exc}")
 
     def _ensure_ref_label(self, label_name: str) -> None:
         """Create a synaptory ID label if it doesn't exist."""

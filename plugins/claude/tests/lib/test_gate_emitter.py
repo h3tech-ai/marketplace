@@ -455,6 +455,97 @@ def test_emit_evaluated_dod_passing_story_is_approved(stub_cli):
     assert _flags(_calls(stub_cli["log"])[0])["--state"] == "approved"
 
 
+# ─── #435 — the wire has to carry what the payload channel used to ───────────
+
+
+@pytest.mark.unit
+def test_a_gap_gets_its_own_token_and_a_typed_result_is_accepted(stub_cli):
+    """`criteria_gap_declared` is not a boolean, so the boolean-only signature
+    could not express it and it shipped as `none` -- the same token as "the
+    tier did not require this check". Two different facts sharing one
+    representation is the rule #521 wrote down, and it mattered here because
+    the payload channel was the only one that could tell them apart, and #435
+    stops crediting the payload channel.
+    """
+    assert ge.emit_evidence_dod_evaluated(
+        "US-44",
+        checks={
+            "tests_pass": "pass",
+            "build_succeeds": "fail",
+            "coverage_no_decrease": "criteria_gap_declared",
+            "code_reviewed": None,
+        },
+        passed=False,
+        tier="mature",
+    ) is True
+    reason = _flags(_calls(stub_cli["log"])[0])["--reason"]
+    assert "tests_pass=true" in reason, "a typed pass ships in the legacy spelling"
+    assert "build_succeeds=false" in reason
+    assert "coverage_no_decrease=gap" in reason
+    assert "code_reviewed=none" in reason
+
+
+@pytest.mark.unit
+def test_the_derived_class_rides_an_additive_token(stub_cli):
+    """Additive on purpose: a control plane that predates `class=` skips the
+    unknown key and still parses every verdict, where fusing the class into
+    the value (`tests_pass=true:replayed`) would have made its parser drop
+    them and blank the Evidence gate mid-upgrade."""
+    assert ge.emit_evidence_dod_evaluated(
+        "US-45",
+        checks={"tests_pass": True, "build_succeeds": True},
+        classes={"tests_pass": "replayed"},
+        passed=True,
+    ) is True
+    reason = _flags(_calls(stub_cli["log"])[0])["--reason"]
+    assert "tests_pass=true" in reason
+    assert "class=tests_pass:replayed" in reason
+    assert "build_succeeds:" not in reason
+
+
+@pytest.mark.unit
+def test_a_class_on_an_unevaluated_or_gapped_check_is_not_shipped(stub_cli):
+    """A class describes evidence that produced a verdict. A check with no
+    verdict has no evidence to classify, so a class attached to one is a
+    contradiction and is dropped rather than forwarded."""
+    assert ge.emit_evidence_dod_evaluated(
+        "US-46",
+        checks={
+            "tests_pass": None,
+            "coverage_no_decrease": "criteria_gap_declared",
+        },
+        classes={"tests_pass": "replayed", "coverage_no_decrease": "attested"},
+        passed=False,
+    ) is True
+    reason = _flags(_calls(stub_cli["log"])[0])["--reason"]
+    assert "class=" not in reason
+
+
+@pytest.mark.unit
+def test_an_unrecognised_verdict_ships_as_no_signal(stub_cli):
+    """Fail-closed at the wire: a value this emitter cannot name is no
+    signal, never a pass."""
+    assert ge.emit_evidence_dod_evaluated(
+        "US-47",
+        checks={"tests_pass": "probably", "build_succeeds": 7},
+        passed=True,
+    ) is True
+    reason = _flags(_calls(stub_cli["log"])[0])["--reason"]
+    assert "tests_pass=none" in reason
+    assert "build_succeeds=none" in reason
+
+
+def test_the_emitters_evidence_classes_equal_the_runtime_vocabulary():
+    """The local literal in `gate_emitter` claims to be kept equal to
+    `runtime_contracts.EVIDENCE_CLASSES`; this is what makes that true rather
+    than aspirational. It is a local literal for the reason every other
+    cross-module reach in that file is lazy: gate emission must not fail to
+    render because a sibling module is missing from a partial install."""
+    from runtime_contracts import EVIDENCE_CLASSES
+
+    assert tuple(ge._EVIDENCE_CLASSES) == tuple(EVIDENCE_CLASSES)
+
+
 # ── the emitter's vocabulary must equal the ORM's (#305) ───────────────────
 
 
@@ -537,33 +628,62 @@ def test_a_dependency_event_can_be_emitted():
     assert 'state="approved"' in src
 
 
-def test_both_publish_paths_report_to_the_control_plane():
-    """Intra-Cycle and cross-Cycle publication each write an event that another
-    clone depends on. Neither was visible to the CP."""
+def test_the_publish_path_reports_to_the_control_plane():
+    """Publication writes an event another clone depends on, and it must be
+    visible to the CP -- otherwise a reader sees every gate around a Cycle and
+    still cannot learn what satisfied a dependency, or when.
+
+    ONE PATH NOW; this was `test_both_publish_paths_...`. The cross-Cycle half
+    lived in `coordination_cycle.py`, which `SPD-194` retires: work that cannot
+    be ordered is co-admitted to ONE Cycle, so there is no second Cycle to
+    publish a dependency to and no `target_type="cycle"` event to emit. The
+    intra-Cycle path in `spq_ledger` is the whole surface, and the module's
+    absence is asserted so the arm cannot stay dropped if it comes back.
+    """
     from pathlib import Path
 
     core = Path(__file__).resolve().parents[3] / "core" / "lib"
-    for module, target in (("spq_ledger.py", 'target_type="work_unit"'),
-                           ("coordination_cycle.py", 'target_type="cycle"')):
-        src = (core / module).read_text(encoding="utf-8")
-        assert "emit_dependency_published" in src, module
-        assert target in src, (module, target)
+    src = (core / "spq_ledger.py").read_text(encoding="utf-8")
+    assert "emit_dependency_published" in src
+    assert 'target_type="work_unit"' in src
+    assert not (core / "coordination_cycle.py").exists(), (
+        "coordination_cycle.py is back, so there is a second publish path "
+        "again -- restore the cross-Cycle arm of this assertion"
+    )
 
 
 def test_emission_never_blocks_a_ceremony():
     """Git is authoritative; the CP observes. A failed emit is a reporting gap,
-    never a delivery one — so every call site swallows its own errors."""
+    never a delivery one — so every call site swallows its own errors.
+
+    `coordination_cycle.py` left the module list with the Coordination Cycle,
+    and the manifest call site MOVED: `spq_state_machine.open_cycle` no longer
+    emits, the `manifest_emitter` sweep does. The manifest half is therefore
+    asserted on the FUNCTIONS that must not raise rather than on a text window
+    around a name -- a window is positional, and the old loop skipped any
+    module whose marker had stopped matching, so three retired markers would
+    have passed while checking nothing.
+    """
+    import inspect
     from pathlib import Path
 
+    import manifest_emitter as me
+
     core = Path(__file__).resolve().parents[3] / "core" / "lib"
-    for module in ("spq_ledger.py", "coordination_cycle.py",
-                   "spq_state_machine.py"):
-        src = (core / module).read_text(encoding="utf-8")
-        for marker in ("emit_dependency_published", "manifest_emitter"):
-            if marker not in src:
-                continue
-            block = src[src.index(marker) - 400 : src.index(marker) + 700]
-            assert "except Exception" in block, (module, marker)
+    src = (core / "spq_ledger.py").read_text(encoding="utf-8")
+    assert "emit_dependency_published" in src, (
+        "spq_ledger no longer emits a dependency event; this test is scanning "
+        "for something that is gone"
+    )
+    at = src.index("emit_dependency_published")
+    assert "except Exception" in src[at - 400 : at + 700]
+
+    # The sweep and the single ship, each swallowing its own failures. The
+    # sweep's contract says so in as many words: "it never raises, for the same
+    # reason the single emission never did".
+    for func in (me.resend_pending, me._ship):
+        body = inspect.getsource(func)
+        assert "except Exception" in body, func.__name__
 
 
 # ─── #320 — which control plane a gate event is addressed to ─────────────────
@@ -711,3 +831,315 @@ def test_manifest_emitter_refuses_an_unstamped_tree(
 
     assert me._resolve_cli() is None
     assert me.emit_cycle_manifest({"manifest_hash": "abc", "cycle_id": "C-1"}) is False
+
+
+# ─── #568 mechanism 3 — a slow probe is not a mismatched binary ──────────────
+#
+# `_resolve_cli` probes each candidate with `synaptory status` to check that the
+# binary and the runtime tree agree on a control plane (#320). That probe used to
+# have a 2.0 s ceiling whose `TimeoutExpired` landed in the same
+# `except (OSError, subprocess.SubprocessError, StopIteration)` arm as every
+# other failure and returned `False` — the value that also means "this binary
+# belongs to the other channel". So a probe that merely ran SLOWLY resolved no
+# CLI, emitted nothing, and said nothing.
+#
+# It was caught by `test_emit_omits_unset_optionals` above, which failed on one
+# full-suite run and passed on the next two: its `stub_cli` deliberately stamps a
+# production cp-url so tree and binary agree on a channel, which FORCES the probe
+# to run against a bash shim on every call. Under full-suite load that exceeded
+# 2.0 s and the test's `_calls(...)[0]` raised IndexError on an empty log.
+#
+# These reproduce it deliberately rather than waiting for load.
+
+import subprocess  # noqa: E402
+
+#: Probe ceiling for the tests that time a real subprocess. Two orders of
+#: magnitude above a warmed shim's ~10 ms spawn, so a pass means the mechanism
+#: worked rather than that the machine was quick.
+TIGHT_CEILING = "0.5"
+
+
+def _warm(path: Path) -> None:
+    """Pay macOS's first-exec cost before anything is timed.
+
+    A freshly written executable is scanned on its first `execve` (Gatekeeper /
+    XProtect): measured on this repo at **473 ms cold against 10 ms warm** for a
+    four-line `/bin/sh` script. Left unpaid, that alone blows a sub-second
+    ceiling and every test below passes for the wrong reason. It is also a neat
+    corroboration of the defect: the probe's budget is spent on process
+    admission, not on the work `status` does.
+    """
+    subprocess.run([str(path), "--warm"], capture_output=True)
+
+
+def _slow_status_shim(path: Path, url: str, *, delay: float, slow_calls: int) -> Path:
+    """A CLI shim whose first `slow_calls` `status` probes sleep past the ceiling.
+
+    `slow_calls=1` is the observed shape: one transient spike, then a machine
+    that answers fine. The counter lives in a sibling file so it survives the
+    separate process each probe spawns.
+
+    `#!/bin/sh` and an explicit absolute PATH, both deliberate: these tests point
+    PATH at a scratch bindir, so `#!/usr/bin/env bash` finds no interpreter and
+    `sleep` is not on PATH either. That failure is silent and mimics the thing
+    under test — the shim exits fast and unreadably instead of timing out.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    counter = path.parent / (path.name + ".probes")
+    path.write_text(
+        "#!/bin/sh\n"
+        "PATH=/usr/bin:/bin\n"
+        'if [ "$1" = status ]; then\n'
+        f"  n=$(cat {counter})\n"
+        f"  echo $((n + 1)) > {counter}\n"
+        f'  if [ "$n" -lt {slow_calls} ]; then sleep {delay}; fi\n'
+        f'  printf "control_plane_url:  {url}\\n"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    _warm(path)
+    counter.write_text("0", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def tight_probe(monkeypatch):
+    """Shrink the probe ceiling so a sleeping shim is deterministically late."""
+    monkeypatch.setenv("SYNAPTORY_CLI_PROBE_TIMEOUT", TIGHT_CEILING)
+    monkeypatch.setattr(ge, "_UNPROBEABLE_WARNED", False)
+    monkeypatch.setattr(ge, "_UNADDRESSED_WARNED", False)
+
+
+@pytest.fixture
+def always_times_out(monkeypatch):
+    """Every probe reports a timeout, without any of them costing wall clock.
+
+    The tests that assert on the *reporting* do not need a real slow subprocess,
+    and paying two real ceilings per emission would put a Layer 1 file into the
+    tens of seconds. The tests that assert on the *mechanism* below use real
+    subprocesses.
+    """
+    calls: list = []
+
+    def _fake(candidate, local, timeout):
+        calls.append((candidate, local, timeout))
+        return ge._TIMEOUT
+
+    monkeypatch.setattr(ge, "_probe_channel_identity", _fake)
+    return calls
+
+
+@pytest.mark.unit
+def test_a_timeout_verdict_is_not_a_mismatch_verdict(tmp_path):
+    """The distinction the fix rests on, asserted on the probe itself.
+
+    A mismatch means *do not emit*. A timeout means *we could not tell*. Folding
+    them together is what made a loaded machine indistinguishable from a wrongly
+    installed CLI.
+    """
+    bindir = tmp_path / "bin"
+    slow = _slow_status_shim(bindir / "slow", PROD_URL, delay=5.0, slow_calls=99)
+    prod = _channel_shim(bindir / "prod", PROD_URL)
+    _warm(prod)
+
+    assert ge._probe_channel_identity(str(slow), False, 0.5) == ge._TIMEOUT
+    assert ge._probe_channel_identity(str(prod), True, 10.0) == ge._MISMATCH
+    assert ge._probe_channel_identity(str(prod), False, 10.0) == ge._MATCH
+    assert len({ge._TIMEOUT, ge._MISMATCH, ge._UNREADABLE, ge._MATCH}) == 4
+
+
+@pytest.mark.unit
+def test_a_probe_that_times_out_once_still_resolves_the_cli(
+    monkeypatch, tmp_path, stamp_runtime, tight_probe
+):
+    """The observed failure, made deterministic.
+
+    One slow probe used to reject the only candidate there was. It now costs a
+    second probe rather than the whole resolution, because a timeout is transient
+    by construction where a mismatch never is.
+    """
+    bindir = tmp_path / "bin"
+    shim = _slow_status_shim(bindir / "synaptory", PROD_URL, delay=5.0, slow_calls=1)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime(PROD_URL)
+
+    assert ge._resolve_cli() == str(shim)
+
+
+@pytest.mark.unit
+def test_a_slow_probe_no_longer_swallows_the_emission(
+    monkeypatch, tmp_path, stamp_runtime, tight_probe
+):
+    """`test_emit_omits_unset_optionals`'s failure, reproduced on purpose.
+
+    Same shape as `stub_cli` — a production stamp so the probe is forced to run —
+    except the shim's first `status` is slow. On the old resolver the log stayed
+    empty and `_calls(...)[0]` raised IndexError with nothing on stderr saying why.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "calls.log"
+    counter = bindir / "probes"
+    shim = bindir / "synaptory"
+    shim.write_text(
+        "#!/bin/bash\n"
+        "PATH=/usr/bin:/bin\n"
+        'if [ "$1" = status ]; then\n'
+        f"  n=$(cat {counter})\n"
+        f"  echo $((n + 1)) > {counter}\n"
+        '  if [ "$n" -lt 1 ]; then sleep 5; fi\n'
+        f'  printf "control_plane_url:  {PROD_URL}\\n"\n'
+        "  exit 0\n"
+        "fi\n"
+        f'printf "%q " "$@" >> {log}\n'
+        f'printf "\\n" >> {log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    _warm(shim)
+    counter.write_text("0", encoding="utf-8")
+    log.unlink(missing_ok=True)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime(PROD_URL)
+
+    ok = ge.emit_gate_event(
+        gate_type="spec_ready", target_type="spec_version",
+        target_id="US-42", state="opened",
+    )
+
+    assert ok is True
+    argv = _calls(log)[0]
+    assert argv[:2] == ["telemetry", "gate-event"]
+
+
+@pytest.mark.unit
+def test_an_unanswerable_probe_is_reported_rather_than_silent(
+    monkeypatch, tmp_path, capsys, stamp_runtime, tight_probe, always_times_out
+):
+    """When we genuinely cannot tell, say so — and say which of the three it is.
+
+    Silence was the expensive part: "the machine was too busy to answer" read
+    exactly like "no CLI is installed" and like "the installed CLI belongs to the
+    other channel", and those have three different operator responses.
+    """
+    bindir = tmp_path / "bin"
+    _channel_shim(bindir / "synaptory", PROD_URL)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime(PROD_URL)
+
+    assert ge._resolve_cli() is None
+
+    err = capsys.readouterr().err
+    assert "did not answer" in err
+    assert "could not tell" in err
+    assert "NOT 'the binary does not match'" in err
+    assert "no control-plane stamp" not in err  # that is a different diagnosis
+
+
+@pytest.mark.unit
+def test_one_retry_is_spent_per_resolution_not_per_candidate(
+    monkeypatch, tmp_path, stamp_runtime, tight_probe, always_times_out
+):
+    """The bound that keeps the retry affordable inside a ceremony.
+
+    A timeout is a statement about the machine, so every later candidate would
+    observe the same thing. Retrying each of them turns a 4 × 2.0 s worst case
+    into 8 × the (now larger) ceiling, inside a loop that runs once per emitted
+    gate event. Two probes total, then give up and say so.
+    """
+    bindir = tmp_path / "bin"
+    _channel_shim(bindir / "synaptory", PROD_URL)
+    _channel_shim(Path(tmp_path) / ".local" / "bin" / "synaptory", PROD_URL)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime(PROD_URL)
+
+    assert ge._resolve_cli() is None
+    assert len(always_times_out) == 2
+
+
+@pytest.mark.unit
+def test_the_unprobeable_warning_is_printed_once_per_process(
+    monkeypatch, tmp_path, capsys, stamp_runtime, tight_probe, always_times_out
+):
+    """Same reason as the unaddressed warning: one gate event per spec."""
+    bindir = tmp_path / "bin"
+    _channel_shim(bindir / "synaptory", PROD_URL)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime(PROD_URL)
+
+    ge.emit_spec_ready_opened(["US-1", "US-2", "US-3"])
+
+    assert capsys.readouterr().err.count("did not answer") == 1
+
+
+@pytest.mark.unit
+def test_a_mismatched_binary_is_rejected_without_paying_for_a_retry(
+    monkeypatch, tmp_path, stamp_runtime, tight_probe
+):
+    """The retry is for timeouts only.
+
+    A mismatch is a permanent property of the installed binary, so re-asking is
+    pure latency inside a ceremony. Counted rather than asserted structurally,
+    because an edit widening the retry to every failure would still pass a shape
+    check.
+    """
+    bindir = tmp_path / "bin"
+    counter = bindir / "synaptory-local.probes"
+    # A LOCAL-stamped tree whose `synaptory-local` answers with the PRODUCTION
+    # URL — a real mismatch, reached and probed rather than skipped.
+    _slow_status_shim(bindir / "synaptory-local", PROD_URL, delay=0.0, slow_calls=0)
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.delenv("SYNAPTORY_CLI_BIN", raising=False)
+    stamp_runtime("http://localhost:8080", local=True)
+
+    assert ge._resolve_cli() is None
+    assert counter.read_text(encoding="utf-8").strip() == "1"
+
+
+@pytest.mark.unit
+def test_an_explicit_cli_bin_keeps_the_benefit_of_the_doubt_when_slow(
+    monkeypatch, tmp_path, stamp_runtime, tight_probe, always_times_out
+):
+    """`SYNAPTORY_CLI_BIN` is the documented CI/e2e hatch.
+
+    It is already accepted when it answers nothing at all, so a slow answer —
+    strictly weaker evidence — must not be the thing that rejects it. Otherwise
+    the fix would break the one path that has no plugin tree to stamp.
+    """
+    shim = _channel_shim(tmp_path / "bin" / "shim", PROD_URL)
+    monkeypatch.setenv("SYNAPTORY_CLI_BIN", str(shim))
+    stamp_runtime(PROD_URL)
+
+    assert ge._resolve_cli() == str(shim)
+
+
+@pytest.mark.unit
+def test_the_probe_ceiling_is_overridable(monkeypatch):
+    """CI on a small runner may need more than the default headroom."""
+    monkeypatch.delenv("SYNAPTORY_CLI_PROBE_TIMEOUT", raising=False)
+    assert ge._probe_timeout() == ge._PROBE_TIMEOUT_DEFAULT
+    monkeypatch.setenv("SYNAPTORY_CLI_PROBE_TIMEOUT", "12")
+    assert ge._probe_timeout() == 12.0
+    for junk in ("", "   ", "nonsense", "0", "-3"):
+        monkeypatch.setenv("SYNAPTORY_CLI_PROBE_TIMEOUT", junk)
+        assert ge._probe_timeout() == ge._PROBE_TIMEOUT_DEFAULT, junk
+
+
+@pytest.mark.unit
+def test_the_ceiling_left_the_value_that_was_measured_too_tight():
+    """2.0 s was reachable on a machine running the suite (#568 mechanism 3).
+
+    Pinned so the headroom is not quietly given back. A bump is the weakest of
+    the three levers on its own — the retry and the distinct verdict are the fix
+    — which is exactly why it needs a test rather than a comment.
+    """
+    assert ge._PROBE_TIMEOUT_DEFAULT > 2.0

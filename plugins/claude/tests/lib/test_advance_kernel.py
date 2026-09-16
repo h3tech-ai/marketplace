@@ -115,7 +115,16 @@ def _receipt(
         "backend": backend,
         "model": "opus",
         "artifacts": ["src/foo.py"],
-        "verification_commands": ["true"],
+        # #403 — an EXECUTED proof object, not the plain string `"true"` this
+        # fixture used to carry. A plain string is a replay instruction, so
+        # tests_pass and build_succeeds scored `None` on every story built
+        # from this helper, which now declares a criteria gap and blocks the
+        # done edge. The receipt a kernel test asserts about should be the
+        # shape a real one has.
+        "verification_commands": [
+            {"command": "pytest -q", "exit_code": 0, "summary": "ok"},
+            {"command": "npm run build", "exit_code": 0, "summary": "ok"},
+        ],
         "metrics": {"n": 1},
         "completed_at": completed_at,
         "token_usage": {
@@ -650,6 +659,65 @@ def test_done_with_red_dod_redirects_to_blocked_under_claude_semantics(tmp_path)
     assert "ui_acceptance" in (story.get("blocked_reason") or "")
 
 
+def test_a_redirect_to_blocked_records_its_verdict_on_the_board(tmp_path):
+    """The verdict that caused the block has to survive it.
+
+    Persistence used to key on where the story LANDED, so a done edge the DoD
+    gate redirected to `blocked` wrote no `dod` at all: the gate evaluated,
+    decided, moved the story and then discarded its own reasoning. The Sync
+    barrier reads `dod_evaluated` off the board, so it had nothing to read on
+    exactly the units the gate had stopped, and a caller could only recover the
+    verdict from the return value of the call that produced it.
+
+    `scrum_state_machine` closed this on its own path in #403. This is the
+    shared kernel every other mode and both MCP hosts advance through, so
+    scrum was the only one that kept the verdict. Asserted alongside the
+    `done` case below so the two cannot drift apart again.
+    """
+    project = _project(tmp_path)
+    payload = _seed(project, state="reviewing")
+    payload["current_stories"][0]["title"] = "View the analytics dashboard screen"
+    payload["current_stories"][0]["ui_bearing"] = True
+    (project / ".synaptory" / ".orchestrator" / "pipeline-state.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    for role, abbrev in (
+        ("software-engineer", "se"),
+        ("quality-engineer", "qe"),
+        ("code-reviewer", "cr"),
+    ):
+        _receipt(project, role=role, abbrev=abbrev)
+
+    decision = ak.execute_advance(
+        str(project),
+        "US-001",
+        "done",
+        policy=_policy(dod_red_behavior="redirect_blocked"),
+    )
+    assert decision.effective_to_state == "blocked"
+
+    story = sp.get_story(sp._read_state(str(project)), "US-001")
+    recorded = story.get("dod") or {}
+    assert recorded.get("evaluated_at"), (
+        "the gate blocked the story and recorded no verdict, so nothing "
+        "downstream can read why: %r" % story.get("dod")
+    )
+    assert recorded.get("passed") is False, recorded
+    # The SAME verdict, not a second evaluation: a re-run could disagree with
+    # the one the block was actually decided on.
+    assert recorded == decision.dod
+
+
+def test_a_story_that_reaches_done_still_records_its_verdict(tmp_path):
+    """The case the redirect fix must not change."""
+    project = _project(tmp_path)
+    _ready_for_done(project)
+    decision = ak.execute_advance(str(project), "US-001", "done", policy=_policy())
+    assert decision.effective_to_state == "done"
+    story = sp.get_story(sp._read_state(str(project)), "US-001")
+    assert (story.get("dod") or {}).get("evaluated_at"), story.get("dod")
+
+
 def test_dod_disabled_policy_skips_the_gate(tmp_path):
     project = _project(tmp_path)
     _ready_for_done(project)
@@ -989,7 +1057,20 @@ def _run_lifecycle_transition_story(
     )
 
 
-@pytest.mark.parametrize("machine,build_mode", [("scrum", "scrum"), ("kanban", "kanban"), ("spq", "spq")])
+#: The lifecycle CLIs that still expose `transition_story`. SPQ dropped every
+#: per-story verb at #644 -- its usage line lists Cycle verbs only -- so there
+#: is no SPQ CLI left to refuse anything.
+#:
+#: That absence is asserted somewhere instead of only removed from here:
+#: `test_adr029_acceptance_edge.py::test_the_spq_cli_names_no_per_unit_acceptance_verb`
+#: pins it in both directions. It is a settled design as of #640 P6 -- SPQ has
+#: no per-Work-Unit acceptance edge to wrap, and acceptance is a named human
+#: recorded at Checkpoint and read by the barrier -- and that test records how
+#: the mismatch it used to describe was resolved.
+_TRANSITION_CLIS = [("scrum", "scrum"), ("kanban", "kanban")]
+
+
+@pytest.mark.parametrize("machine,build_mode", _TRANSITION_CLIS)
 def test_lifecycle_cli_refuses_receipt_gated_edges(tmp_path, machine, build_mode):
     """The public transition_story verbs wrote state with no receipt check.
 
@@ -1005,7 +1086,7 @@ def test_lifecycle_cli_refuses_receipt_gated_edges(tmp_path, machine, build_mode
     assert story["state"] == "testing", "refused transition must not write state"
 
 
-@pytest.mark.parametrize("machine,build_mode", [("scrum", "scrum"), ("kanban", "kanban"), ("spq", "spq")])
+@pytest.mark.parametrize("machine,build_mode", _TRANSITION_CLIS)
 def test_lifecycle_cli_force_recovery_hatch(tmp_path, machine, build_mode):
     project = _project(tmp_path, build_mode=build_mode)
     _seed(project, state="testing", build_mode=build_mode)
@@ -1462,3 +1543,190 @@ def test_qe_dispatch_is_not_dep_gated(tmp_path):
         str(project), "US-001", role="quality-engineer", policy=_policy()
     )
     assert decision.allowed, decision.reason
+
+
+# ─── a refused DoD gate leaves the board something to route on ──────────────
+
+
+def test_the_kernel_records_why_the_gate_refused(tmp_path):
+    """#396. Under a `refuse` policy the unit stays where it was, which is
+    right: red evidence does not advance a board. But the refusal was invisible
+    to `next_action`, which reads the board, so the board kept advertising the
+    promotion the gate had just declined and a compliant orchestrator retried
+    an action that cannot succeed, forever.
+
+    The note is the whole fix: the story's STATE is untouched, so `refuse`
+    still refuses, and the gate's own reason is what routes the unit to the
+    agent that owes the missing result rather than to the SE retry ladder.
+    """
+    import advance_kernel as ak
+    import story_pipeline as sp
+
+    project = tmp_path / "proj"
+    (project / ".synaptory" / ".orchestrator").mkdir(parents=True)
+    (project / ".synaptory.yaml").write_text(
+        "build_mode: scrum\nproject_id: taskflow\n", encoding="utf-8"
+    )
+    (project / ".synaptory" / ".orchestrator" / "pipeline-state.json").write_text(
+        json.dumps({
+            "version": "2.0",
+            "build_mode": "scrum",
+            "lifecycle_state": "SPRINT_EXECUTION",
+            "current_sprint": 1,
+            "sprints_completed": [],
+            "current_stories": [{
+                "id": "US-1",
+                "title": "conditional gate",
+                "state": "reviewing",
+                "pipeline_log": [],
+                "receipts": [],
+                "labels": [],
+                "depends_on": [],
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    reason = "user-facing acceptance (ui_acceptance) has not passed"
+    ak._note_dod_gate_refusal(str(project), "US-1", reason)
+
+    state = sp._read_state(str(project)) if hasattr(sp, "_read_state") else json.loads(
+        (project / ".synaptory" / ".orchestrator" / "pipeline-state.json")
+        .read_text(encoding="utf-8")
+    )
+    story = next(s for s in state["current_stories"] if s["id"] == "US-1")
+
+    # The state did not move. `refuse` still refuses.
+    assert story["state"] == "reviewing", story
+    note = story.get("dod_gate_refusal")
+    assert isinstance(note, dict), story
+    assert reason in note["reason"], note
+    assert note["reason"].startswith("DoD gate:"), (
+        "the note must carry the marker `_gate_remediation` routes on: %r" % note
+    )
+    assert note.get("at"), note
+
+    # And the board now routes to remediation instead of re-offering the
+    # promotion the gate refused.
+    action = sp.next_action(state, receipts_dir=str(tmp_path / "receipts"))
+    assert action["action"] != "promote_story", action
+
+
+def test_a_note_that_cannot_be_written_does_not_replace_the_refusal(tmp_path):
+    """Best effort by design: the gate's answer is what the caller needs, and a
+    note that fails to persist must not turn a typed refusal into a write
+    error."""
+    import advance_kernel as ak
+
+    # No project at all.
+    ak._note_dod_gate_refusal(str(tmp_path / "nope"), "US-1", "whatever")
+    # An empty reason writes nothing rather than an empty marker.
+    ak._note_dod_gate_refusal(str(tmp_path), "US-1", "")
+
+
+def test_the_gate_remediation_action_can_actually_be_dispatched(tmp_path):
+    """#396. The whole sequence, not the action name.
+
+    `next_action` returning `recover_blocked` for a story the gate left in
+    `reviewing` was only half an answer: `execute_dispatch` handled every
+    `recover_blocked` by calling `unblock_story`, which refuses a story that is
+    not blocked. So the very next operation a host performs after reading the
+    board raised `Story ... is not blocked (state: reviewing)` and the dead end
+    had moved rather than closed. My own tests stopped at the action name,
+    which is exactly why they missed it.
+    """
+    import advance_kernel as ak
+    import story_pipeline as sp
+
+    project = tmp_path / "proj"
+    (project / ".synaptory" / ".orchestrator" / "receipts").mkdir(parents=True)
+    (project / ".synaptory.yaml").write_text(
+        "build_mode: scrum\nproject_id: taskflow\n", encoding="utf-8"
+    )
+    (project / ".synaptory" / ".orchestrator" / "pipeline-state.json").write_text(
+        json.dumps({
+            "version": "2.0",
+            "build_mode": "scrum",
+            "lifecycle_state": "SPRINT_EXECUTION",
+            "current_sprint": 1,
+            "sprints_completed": [],
+            "current_stories": [{
+                "id": "US-1",
+                "title": "conditional gate",
+                "state": "reviewing",
+                "pipeline_log": [],
+                "receipts": [],
+                "labels": [],
+                "depends_on": [],
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    # The gate refused, and the board recorded why.
+    ak._note_dod_gate_refusal(
+        str(project), "US-1",
+        "user-facing acceptance (ui_acceptance) has not passed",
+    )
+
+    receipts = str(project / ".synaptory" / ".orchestrator" / "receipts")
+    state = sp._read_state(str(project))
+    action = sp.next_action(state, receipts_dir=receipts)
+    assert action["action"] == "recover_blocked", action
+    role = action["role"]
+
+    # THE NEXT OPERATION A HOST PERFORMS. It must not raise, and it must not
+    # move the story out of `reviewing`: `refuse` means the board did not
+    # advance, and a dispatch is not an advance.
+    decision = ak.execute_dispatch(str(project), "US-1", role=role)
+    assert decision.allowed is True, (decision.code, decision.reason)
+
+    after = sp.get_story(sp._read_state(str(project)), "US-1")
+    assert after["state"] == "reviewing", (
+        "the gate remediation dispatch moved a story the gate deliberately "
+        "left in reviewing: %r" % after
+    )
+
+
+def test_a_genuinely_blocked_story_is_still_unblocked_on_recovery(tmp_path):
+    """And the narrowing must not cost the behaviour it narrowed: a story the
+    board persisted as `blocked` still gets restored before it is dispatched."""
+    import advance_kernel as ak
+    import story_pipeline as sp
+
+    project = tmp_path / "proj"
+    (project / ".synaptory" / ".orchestrator" / "receipts").mkdir(parents=True)
+    (project / ".synaptory.yaml").write_text(
+        "build_mode: scrum\nproject_id: taskflow\n", encoding="utf-8"
+    )
+    (project / ".synaptory" / ".orchestrator" / "pipeline-state.json").write_text(
+        json.dumps({
+            "version": "2.0",
+            "build_mode": "scrum",
+            "lifecycle_state": "SPRINT_EXECUTION",
+            "current_sprint": 1,
+            "sprints_completed": [],
+            "current_stories": [{
+                "id": "US-2",
+                "title": "blocked on a gate",
+                "state": "blocked",
+                "blocked_from": "reviewing",
+                "blocked_reason": (
+                    "DoD gate: user-facing acceptance (ui_acceptance) has not passed"
+                ),
+                "pipeline_log": [],
+                "receipts": [],
+                "labels": [],
+                "depends_on": [],
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    decision = ak.execute_dispatch(str(project), "US-2", role="qe")
+    assert decision.allowed is True, (decision.code, decision.reason)
+    after = sp.get_story(sp._read_state(str(project)), "US-2")
+    assert after["state"] != "blocked", (
+        "a genuinely blocked story was dispatched without being unblocked: %r"
+        % after
+    )

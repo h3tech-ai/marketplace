@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Reserve the source region a Cycle may touch. Fails closed, on purpose.
+
+WHY THIS ONE IS NOT BEST-EFFORT. `manifest_emitter` and `gate_emitter` treat
+the control plane as an observer and swallow every failure, because git holds
+the seal and a lost dashboard row costs nobody a decision. This module is the
+opposite and the difference is not a preference: two clones opening a Cycle
+each hold a declaration the other cannot see until somebody pushes, so the
+registry is the ONLY thing that can refuse the second one in time. A
+reservation that degrades to best-effort answers "no collision" when it means
+"I could not ask", which is the same sentence and a different fact.
+
+`SC-MTH-012` is what rests on it. Concurrent Cycles never declare overlapping
+regions, and that is precisely what lets them run without inspecting each
+other's admissions -- so if nothing enforces it, the thing being skipped is the
+whole basis of concurrency, not a nicety.
+
+## The three answers, and why `none` is one of them
+
+`reserve` returns one of:
+
+- `reserved`   -- the registry granted it. Proceed.
+- `collision`  -- the registry refused, naming the Cycle already holding an
+                  overlapping region. Proceed is not an option.
+- `unavailable`-- the registry did not answer. Also not an option: nothing was
+                  learned.
+- `none`       -- this runtime tree addresses no control plane at all, so there
+                  is no registry to compete for. Proceed, and RECORD it.
+
+`none` is the one that needs defending. An unstamped tree resolves no CLI (#320:
+"no stamp" is not "production"), which means there is no shared registry any
+other clone could be reserving against either -- a single-clone project cannot
+collide with itself. Treating that as a refusal would make SPQ unusable
+offline; treating it as a grant would be a lie. So it is neither: the verdict
+is sealed into the declaration, and a reader can always tell which of the two
+worlds a Cycle was admitted in.
+
+Python 3.9 compatible: this file is projected into every host package.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Sequence
+
+#: Longer than the emitters' 20s. A reservation is on the critical path of a
+#: ceremony that cannot proceed without it, so waiting is strictly better than
+#: guessing -- the opposite trade from telemetry, where the ceremony must not
+#: wait at all.
+_TIMEOUT_S = 45.0
+
+RESERVED = "reserved"
+COLLISION = "collision"
+UNAVAILABLE = "unavailable"
+NONE = "none"
+
+#: Verdicts a Commit may proceed on. Everything else refuses. Written as an
+#: allowlist rather than a list of refusals so a new verdict added later is
+#: refused by default instead of silently permitted.
+PROCEEDS = (RESERVED,)
+
+
+class RegistryError(RuntimeError):
+    """The registry refused, or could not be asked. Both stop a Commit."""
+
+
+#: The registry client, named explicitly. TEST AND CI SEAM.
+#:
+#: `SYNAPTORY_CLI_BIN` is the shipped way to name a CLI for a tree with no
+#: stamp, and it would work here -- but it names the CLI for EVERYTHING, so
+#: doubling the registry with it also redirects `gate_emitter` and
+#: `manifest_emitter` and changes host readiness probes. Measured: pointing it
+#: at a registry double broke three conformance scenarios that have nothing to
+#: do with regions.
+#:
+#: This selects WHICH BINARY answers, never WHAT it answers. A reservation
+#: still has to come back granted, an ungranted one still refuses the Commit,
+#: and a deployment that pointed this at a yes-man would be doing exactly what
+#: `SYNAPTORY_CLI_BIN` already permits and documents. It is not a way to lift
+#: the requirement, and there is none.
+_CLI_ENV = "SYNAPTORY_REGION_REGISTRY_BIN"
+
+
+def _resolve_cli() -> Optional[str]:
+    """The CLI this tree is stamped to address, or None.
+
+    Shared with `gate_emitter` rather than re-derived: the resolution rules
+    (explicit override, channel-matched sibling, no fall-through for an
+    unstamped tree) are exactly the same question, and two copies of it would
+    drift into two different definitions of "which control plane is this".
+    """
+    explicit = os.environ.get(_CLI_ENV)
+    if explicit and os.path.exists(explicit):
+        return explicit
+    try:
+        import gate_emitter
+
+        return gate_emitter._resolve_cli()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+#: The recheck ceiling. Shorter than `_TIMEOUT_S` because a dispatch cannot
+#: proceed until it returns and an outage does not refuse it anyway: waiting
+#: the reservation ceiling would spend 45s per dispatch to learn nothing.
+_RECHECK_TIMEOUT_S = 8.0
+
+
+def _run(
+    cli: str,
+    args: Sequence[str],
+    project_dir: str,
+    *,
+    timeout: float = _TIMEOUT_S,
+) -> "tuple[int, Dict[str, Any], str]":
+    try:
+        done = subprocess.run(
+            [cli, "cycles", "regions", *args],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return 1, {}, str(exc)
+    body: Dict[str, Any] = {}
+    try:
+        body = json.loads(done.stdout or "{}")
+    except (ValueError, TypeError):
+        body = {}
+    tail = (done.stderr or done.stdout or "").strip().splitlines()
+    return done.returncode, body, (tail[-1] if tail else "")
+
+
+def _flags(
+    *,
+    cycle_id: str,
+    repository: str,
+    region: Sequence[str],
+    path_grammar: str,
+    engineering_lead: str,
+    declaration_hash: str,
+    project: str,
+) -> List[str]:
+    args = [
+        "--cycle-id", str(cycle_id),
+        "--repository", str(repository),
+        "--path-grammar", str(path_grammar or "v1"),
+        "--engineering-lead", str(engineering_lead),
+    ]
+    for entry in region:
+        args += ["--region", str(entry)]
+    if declaration_hash:
+        args += ["--declaration-hash", str(declaration_hash)]
+    if project:
+        args += ["--project", str(project)]
+    return args
+
+
+def _verdict(
+    outcome: str, detail: str, *, registry: str, cycle_id: str = ""
+) -> Dict[str, Any]:
+    return {
+        "outcome": outcome,
+        "registry": registry,
+        "detail": detail,
+        "cycle_id": cycle_id,
+    }
+
+
+def reserve(
+    project_dir: str,
+    *,
+    cycle_id: str,
+    repository: str,
+    region: Sequence[str],
+    engineering_lead: str,
+    path_grammar: str = "v1",
+    declaration_hash: str = "",
+    project: str = "",
+) -> Dict[str, Any]:
+    """Claim `region` for `cycle_id`, or say which of the four happened.
+
+    Never raises. The caller decides what a verdict costs, because Commit and
+    a dispatch recheck cost different things: one refuses to seal, the other
+    refuses to dispatch.
+    """
+    cli = _resolve_cli()
+    if cli is None:
+        return _verdict(
+            NONE,
+            "this runtime tree addresses no control plane, so there is no "
+            "shared region registry to reserve against and no other clone "
+            "reserving in it. Run `./synaptory deploy local` or install the "
+            "marketplace plugin to admit Cycles against a registry.",
+            registry="none",
+            cycle_id=cycle_id,
+        )
+    code, body, tail = _run(
+        cli,
+        [
+            "reserve",
+            *_flags(
+                cycle_id=cycle_id,
+                repository=repository,
+                region=region,
+                path_grammar=path_grammar,
+                engineering_lead=engineering_lead,
+                declaration_hash=declaration_hash,
+                project=project,
+            ),
+        ],
+        project_dir,
+    )
+    if code == 0 and body.get("ok"):
+        return _verdict(
+            RESERVED,
+            "the registry granted %s to %s" % (list(region), cycle_id),
+            registry="control-plane",
+            cycle_id=cycle_id,
+        )
+    reason = str(body.get("reason") or "")
+    detail = str(body.get("detail") or tail or "exit %d" % code)
+    if reason == "collision":
+        return _verdict(COLLISION, detail, registry="control-plane", cycle_id=cycle_id)
+    if reason == "no_project_identity":
+        # NOT AN OUTAGE, and this distinction cost an e2e run to find. A
+        # reservation is scoped to a project; a project with no `project_id`
+        # competes for no registry's regions, so there is nothing another
+        # clone could be holding under an identity that does not exist. That
+        # is the same category as a tree addressing no control plane, and
+        # refusing here would have made every unregistered project unable to
+        # open a Cycle -- while telling the operator the registry was down.
+        #
+        # The verdict is still SEALED, so an auditor reading `registry: "none"`
+        # knows separation rested on there being one clone rather than on a
+        # registry having granted anything.
+        return _verdict(NONE, detail, registry="none", cycle_id=cycle_id)
+    return _verdict(UNAVAILABLE, detail, registry="control-plane", cycle_id=cycle_id)
+
+
+def release(
+    project_dir: str,
+    *,
+    cycle_id: str,
+    project: str = "",
+    **_ignored: object,
+) -> Dict[str, Any]:
+    """Give the region back at Checkpoint, so the next Cycle can claim it.
+
+    NAMES A CYCLE AND NOTHING ELSE. `(project, cycle)` identifies the live row
+    -- the live-row uniqueness index guarantees at most one -- and the server
+    reads no region, grammar or Lead. Accepting them here and dropping them
+    would be the same invitation the endpoint's own request model was narrowed
+    to refuse: a caller believing the region it passed was checked. `**_ignored`
+    exists so a caller still passing the reservation's full shape is not a
+    `TypeError` at the Checkpoint, since a release must not be the thing that
+    stops a close.
+
+    A release that fails does NOT stop the close. The Cycle's work is already
+    integrated at that point, and the failure mode of a stuck reservation is a
+    refused future Commit that names the stale holder by id -- recoverable by
+    hand with `synaptory cycles regions release`. Refusing the close instead
+    would strand the trunk integration behind a registry outage, which is
+    strictly worse and is not what the registry is protecting.
+
+    Nor is a 403 a reason to fail the close. Release is restricted to the
+    holder, the Engineering Lead on the declaration, or a project admin, so
+    somebody else closing on their behalf gets refused here and the operator
+    is told which command to hand to whom.
+    """
+    cli = _resolve_cli()
+    if cli is None:
+        return _verdict(
+            NONE, "no registry addressed; nothing to release", registry="none",
+            cycle_id=cycle_id,
+        )
+    args = ["release", "--cycle-id", str(cycle_id)]
+    if project:
+        args += ["--project", str(project)]
+    code, body, tail = _run(cli, args, project_dir)
+    if code == 0 and body.get("ok"):
+        return _verdict(
+            "released", "released %s" % cycle_id, registry="control-plane",
+            cycle_id=cycle_id,
+        )
+    detail = str(body.get("detail") or tail or "exit %d" % code)
+    print(
+        "region_registry: could not release %s (%s). The reservation stays "
+        "live and will refuse the next overlapping Commit by name; release it "
+        "by hand with `synaptory cycles regions release --cycle-id %s` -- as "
+        "the holder, the Engineering Lead on the declaration, or a project "
+        "admin." % (cycle_id, detail, cycle_id),
+        file=sys.stderr,
+    )
+    return _verdict(UNAVAILABLE, detail, registry="control-plane", cycle_id=cycle_id)
+
+
+def holder(
+    project_dir: str, *, repository: str, project: str = ""
+) -> Dict[str, Any]:
+    """Who holds what right now, for a dispatch-time recheck.
+
+    Separate from `reserve` because a recheck must not create a reservation:
+    the question at dispatch is "is MY claim still the live one", and a verb
+    that would answer it by claiming again cannot distinguish a claim that
+    survived from one it just re-made.
+    """
+    cli = _resolve_cli()
+    if cli is None:
+        return {"registry": "none", "available": False, "reservations": []}
+    args = ["list", "--json"]
+    if repository:
+        args += ["--repository", str(repository)]
+    if project:
+        args += ["--project", str(project)]
+    code, body, tail = _run(cli, args, project_dir, timeout=_RECHECK_TIMEOUT_S)
+    if code != 0:
+        return {
+            "registry": "control-plane",
+            "available": False,
+            "detail": tail or "exit %d" % code,
+            "reservations": [],
+        }
+    return {
+        "registry": "control-plane",
+        "available": True,
+        "reservations": list(body.get("reservations") or ()),
+    }
+
+
+def assert_admissible(verdict: Dict[str, Any]) -> None:
+    """Raise unless a Commit may proceed on this verdict."""
+    outcome = str((verdict or {}).get("outcome") or "")
+    if outcome in PROCEEDS:
+        return
+    if outcome == COLLISION:
+        raise RegistryError(
+            "the region registry refused this Cycle's source region: %s"
+            % (verdict.get("detail") or "no detail given")
+        )
+    raise RegistryError(
+        "the region registry could not be asked, so nothing is known about "
+        "collisions with another clone's Cycle: %s. A Commit that seals anyway "
+        "is a Commit whose separation nobody checked (`SC-MTH-012`). Retry, or "
+        "reserve by hand with `synaptory cycles regions reserve`."
+        % (verdict.get("detail") or "no detail given")
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - operator convenience
+    print(json.dumps(holder(os.getcwd(), repository=""), indent=2))

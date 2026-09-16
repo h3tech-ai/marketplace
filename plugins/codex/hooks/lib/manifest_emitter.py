@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Ship sealed SPQ manifests to the control plane. Best-effort, never blocking.
 
-Without this the `cycle_manifests` and `coordination_cycles` tables, their
-ingest endpoints, and the `/cycles` and `/coordination-cycles` pages have no
+Without this the `cycle_manifests` table, its
+ingest endpoints, and the `/cycles` page has no
 producer at all: an operator has to run `synaptory telemetry cycle-manifest` by
 hand, which nothing tells them to do, so in practice the views stay empty
 forever. That is the same defect #303 shipped when it added `cycle_id` columns
@@ -42,6 +42,52 @@ _SHIPPED_RELDIR = os.path.join(
     ".synaptory", ".orchestrator", "spq", ".shipped-manifests"
 )
 
+#: What the WIRE calls the seal digest. Unchanged, deliberately: the ingest
+#: endpoint dedupes on `manifest_hash` and `cli telemetry cycle-manifest`
+#: refuses a payload without it ("manifest has no cycle_id/manifest_hash; is it
+#: sealed?"). Renaming it here would be an API break for a vocabulary change.
+_WIRE_HASH_FIELD = "manifest_hash"
+
+
+def _seal_digest(manifest: Dict[str, Any]) -> str:
+    """The digest of a sealed declaration, whichever key it is stored under.
+
+    `cycle_records` seals under `declaration_hash` since #644; documents sealed
+    before that carry `manifest_hash`. Both are read, newest first, because
+    this module's job is to ship seals ALREADY ON DISK -- including ones an
+    older runtime wrote.
+
+    This is why the sweep shipped nothing after #644: every function here read
+    `manifest_hash` off the document, found none, and skipped it. `_pending`
+    reads a missing digest as "not sealed", so `cycle_manifests` had no
+    producer at all -- the exact silence #334 exists to prevent, reintroduced
+    by a key rename.
+    """
+    import cycle_records
+
+    for field in (cycle_records.HASH_FIELD, _WIRE_HASH_FIELD):
+        value = str((manifest or {}).get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _wire_payload(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """The document as the ingest endpoint expects to read it.
+
+    Projects the digest onto `manifest_hash` when the document carries only
+    `declaration_hash`. A projection here rather than a second key in
+    `cycle_records`: the seal is hashed over its own body, so storing a
+    duplicate digest inside the document would change the document and
+    invalidate the hash it claims.
+    """
+    digest = _seal_digest(manifest)
+    if not digest or manifest.get(_WIRE_HASH_FIELD) == digest:
+        return dict(manifest or {})
+    payload = dict(manifest)
+    payload[_WIRE_HASH_FIELD] = digest
+    return payload
+
 
 def _resolve_cli() -> Optional[str]:
     """The canonical resolver, borrowed rather than re-derived.
@@ -56,6 +102,170 @@ def _resolve_cli() -> Optional[str]:
         return resolve()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _channel_stamp() -> Tuple[str, str]:
+    """`(state, whence)` where state is `stamped`, `unstamped` or `unreadable`.
+
+    Separate from `_resolve_cli` on purpose: the resolver folds "no control
+    plane is named" and "the named one has no usable CLI" into one None, and
+    those are opposite answers to the question this module asks. A tree with no
+    stamp has no record to require; a stamped tree missing its CLI has a record
+    it cannot read.
+
+    AND UNREADABLE IS ITS OWN ANSWER, which the first cut got wrong in the same
+    shape one level earlier. It caught every exception and returned "not
+    stamped", so a damaged install, an import failure, or a cp-url whose
+    permissions deny it all granted the offline downgrade. "The signal could
+    not be read" is unknown authority, not proof that no control plane exists,
+    and only an explicit no-stamp answer may take the offline path.
+    """
+    try:
+        from host_env import control_plane_stamp_state
+
+        state, detail = control_plane_stamp_state()
+    except Exception as exc:  # noqa: BLE001 - an unaskable question is unknown
+        return "unreadable", "the control-plane stamp could not be read (%s)" % exc
+    if state not in ("stamped", "unstamped", "unreadable"):  # pragma: no cover
+        return "unreadable", "the control-plane stamp reported %r" % state
+    return state, str(detail or "")
+
+
+def read_cycle_authority(
+    project_dir: Optional[str], cycle_id: str
+) -> Tuple[Optional[str], str]:
+    """`(manifest_hash, problem)` for the revision the control plane records.
+
+    THE ONLY RECORD OUTSIDE THE WORKING TREE (#507). `revise_manifest` writes
+    revision N+1 to two files in the project and ships an append-only
+    observation to `cycle_manifests`. Delete those files and every remaining
+    local answer is one the graded principal can write, including the marker
+    that says which revision is current. This asks the row instead.
+
+    THREE ANSWERS, NOT TWO. `(hash, "")` is a recorded revision. `(None, "")`
+    is "this project is not connected to a control plane", which is the
+    offline case the gate is required to keep working for (§3.3), and the
+    caller falls back to the local marker with its declared limit. `(None,
+    problem)` is "connected, and the record could not be read", which must
+    fail CLOSED: a connected project whose authority is unreachable has less
+    evidence than an offline one, not more, and treating unreachable as
+    unconfigured is how a connected project would silently get the offline
+    guarantee.
+    """
+    if not cycle_id:
+        return None, ""
+    # WHO DECIDES WHETHER THIS PROJECT IS CONNECTED. Not the project, and this
+    # took two attempts to get right (#507).
+    #
+    # The first cut asked whenever a CLI binary resolved, which sent every
+    # offline checkout on a laptop with `synaptory` installed to the network.
+    # The second read a marker directory the emitter writes inside the project,
+    # which fixed that and handed the graded principal a way to self-declare
+    # offline: delete the directory and the gate stops asking, which is the
+    # same authority-boundary failure #507 rejects one level out.
+    #
+    # So the CLI answers it. `connected` comes from the binary's own stamp and
+    # its session, neither of which is in the project, so deleting project
+    # files cannot fake it. Not connected is an ANSWER (exit zero,
+    # `connected: false`); a failed read is a PROBLEM (non-zero), and the gate
+    # treats those differently.
+    # THE STAMP IS READ DIRECTLY, NOT INFERRED FROM THE RESOLVER (#396).
+    #
+    # `_resolve_cli()` returns None for several DIFFERENT states, and only one
+    # of them is offline: an unstamped tree that addresses nothing, but also a
+    # stamped tree with no candidate installed, one whose candidates all fail
+    # the identity probe, an explicit `SYNAPTORY_CLI_BIN` that is rejected, and
+    # any exception on the way. Reading that single None as "offline" meant
+    # removing, renaming or breaking the matching CLI turned a connected
+    # governed project into the offline authority path and reopened the
+    # revision downgrade. A missing CLI is a reason the record cannot be read;
+    # only a missing STAMP means there is no record.
+    state, whence = _channel_stamp()
+    if state == "unreadable":
+        # An install whose own stamp cannot be read cannot say whether a record
+        # exists, and answering "offline" there is a guess in the graded
+        # party's favour. Actionable, because the remedy is an install repair
+        # rather than anything about the Cycle.
+        return None, (
+            "this install cannot report which control plane it belongs to "
+            "(%s), so whether a recorded manifest revision exists cannot be "
+            "established. Repair the install (reinstall the plugin, or check "
+            "that `hooks/lib/cp-url` is readable)." % (whence or "unknown cause")
+        )
+    cli = _resolve_cli()
+    if cli is None:
+        if state != "stamped":
+            return None, ""
+        return None, (
+            "this tree is stamped for a control plane (%s) and no usable CLI "
+            "resolves, so which manifest revision is in force cannot be "
+            "established. Install or repair the CLI for this channel "
+            "(`synaptory status` reports which one a binary is), or unset "
+            "`SYNAPTORY_CLI_BIN` if it names a binary for a different control "
+            "plane." % (whence or "unknown source")
+        )
+    argv = [cli, "telemetry", "cycle-authority", str(cycle_id)]
+    try:
+        options: Dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "timeout": _TIMEOUT_S,
+        }
+        if project_dir:
+            options["cwd"] = project_dir
+        proc = subprocess.run(argv, **options)
+    except Exception as exc:  # noqa: BLE001 - an unreadable authority is a problem
+        return None, "the recorded revision could not be read (%s)" % exc
+    # THE ANSWER IS SELF-IDENTIFYING, and it has to be. A CLI that predates
+    # this verb prints cobra's help and exits ZERO, so an exit code cannot tell
+    # "this binary cannot answer" from "this binary answered". A parseable
+    # object carrying `connected` is the signal, and the verb prints that shape
+    # on failure too (with a non-zero exit), so a real failure is never
+    # mistaken for an old binary.
+    payload = None
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and "connected" in candidate:
+            payload = candidate
+            break
+    if payload is None:
+        # NO ANSWER FROM A RESOLVED CLI IS A PROBLEM, NOT SILENCE (#396).
+        #
+        # This branch used to return silence, on the argument that blocking
+        # every project until every install was updated is a false refusal.
+        # Review's answer is the one that holds: a stamped tree with an old or
+        # substituted CLI still HAS an out-of-reach `cycle_manifests` row, so
+        # accepting silence there grades the agent-writable local revision on a
+        # connected project. Version skew is a reason the authority cannot be
+        # read; it is not evidence that there is nothing to read.
+        #
+        # The refusal is actionable rather than bare, because the remedy is not
+        # discoverable from a blocked gate: it names the verb, the binary, and
+        # what to do. And it is reachable only from a STAMPED tree, since an
+        # unstamped one resolves no CLI at all and returns silence above, so an
+        # offline project is untouched.
+        return None, (
+            "%s answered nothing to `telemetry cycle-authority`, so which "
+            "manifest revision is in force cannot be established. This plugin "
+            "and the CLI ship as one unit at one version; update the CLI "
+            "(`synaptory update`, or reinstall from the marketplace) so it "
+            "carries that verb." % cli
+        )
+    if payload.get("error") or proc.returncode != 0:
+        detail = str(payload.get("error") or "").strip()
+        if not detail:
+            detail = (proc.stderr or "").strip().splitlines()
+            detail = detail[-1] if detail else "exit %d" % proc.returncode
+        return None, "the recorded revision could not be read: %s" % detail
+    if not payload.get("connected"):
+        return None, ""
+    recorded = str((payload or {}).get("manifest_hash") or "")
+    if not recorded:
+        return None, "the control plane holds no revision for this Cycle"
+    return recorded, ""
 
 
 def _ship(verb: str, manifest: Dict[str, Any], project_dir: Optional[str]) -> bool:
@@ -93,23 +303,9 @@ def emit_cycle_manifest(
     manifest: Dict[str, Any], *, project_dir: Optional[str] = None
 ) -> bool:
     """Record a sealed Cycle manifest (#303). Idempotent on its own hash."""
-    if not manifest or not manifest.get("manifest_hash"):
+    if not manifest or not _seal_digest(manifest):
         return False
     return _ship_and_mark("cycle-manifest", manifest, project_dir)
-
-
-def emit_coordination_manifest(
-    manifest: Dict[str, Any], *, project_dir: Optional[str] = None
-) -> bool:
-    """Record a sealed Coordination Cycle manifest (#305).
-
-    Called on every REVISION too, not just the open: the table is append-only,
-    so dropping a late child inserts a row rather than updating one, and that
-    row is the only record of what the release contained before the drop.
-    """
-    if not manifest or not manifest.get("manifest_hash"):
-        return False
-    return _ship_and_mark("coordination-manifest", manifest, project_dir)
 
 
 # ── retry (#334 G8) ─────────────────────────────────────────────────────────
@@ -128,8 +324,8 @@ def emit_coordination_manifest(
 #      parallel spool would be a second copy of it that can disagree.
 #   2. It catches losses a queue-at-emission never would. `seal_manifest`
 #      returns early on the hydration and already-sealed paths, so a hydrated
-#      workstream never reached the emit call at all -- despite every workstream
-#      being supposed to ship the same seal.
+#      hydrating clone never reached the emit call at all -- despite every
+#      clone being supposed to ship the same seal.
 #   3. It removes the ordering hazard the playbook had to warn about (the
 #      control-plane project must exist BEFORE `open_cycle`). It no longer must:
 #      the next sweep ships what the earlier attempt could not.
@@ -185,10 +381,12 @@ def _ship_and_mark(
 
     Returns True when the manifest is delivered — including when it already was.
     """
-    digest = manifest.get("manifest_hash", "")
+    digest = _seal_digest(manifest)
+    if not digest:
+        return False
     if already_shipped(project_dir, digest):
         return True
-    if _ship(verb, manifest, project_dir):
+    if _ship(verb, _wire_payload(manifest), project_dir):
         _mark_shipped(project_dir, digest)
         return True
     return False
@@ -203,7 +401,9 @@ def _pending(project_dir: str) -> List[Tuple[str, Dict[str, Any]]]:
     out: List[Tuple[str, Dict[str, Any]]] = []
     roots = (
         ("cycle-manifest", os.path.join(spq_paths.spq_root(project_dir), "cycles")),
-        ("coordination-manifest", spq_paths.coordination_root(project_dir)),
+        # The coordination manifest is retired (`SPD-194`): composition
+        # existed only because integration was deferred, and there is no
+        # second manifest to ship.
     )
     for verb, root in roots:
         try:
@@ -217,7 +417,7 @@ def _pending(project_dir: str) -> List[Tuple[str, Dict[str, Any]]]:
                     manifest = json.load(fh)
             except (OSError, ValueError):
                 continue
-            digest = (manifest or {}).get("manifest_hash")
+            digest = _seal_digest(manifest)
             if not digest or already_shipped(project_dir, digest):
                 continue
             out.append((verb, manifest))
@@ -227,7 +427,7 @@ def _pending(project_dir: str) -> List[Tuple[str, Dict[str, Any]]]:
 def resend_pending(project_dir: str) -> Dict[str, int]:
     """Ship every sealed manifest this clone has not yet delivered.
 
-    Cheap and idempotent: with nothing outstanding it lists two directories and
+    Cheap and idempotent: with nothing outstanding it lists one directory and
     returns. Safe to call on any CLI contact -- a ceremony, or the SessionStart
     hook alongside the outbox flush -- and it never raises, for the same reason
     the single emission never did.

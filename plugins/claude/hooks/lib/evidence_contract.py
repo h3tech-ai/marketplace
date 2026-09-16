@@ -17,7 +17,7 @@ receipt_validator._load_policy_schema.
 
 CLI:
     python3 evidence_contract.py envelope --agent-type synaptory:software-engineer \
-        [--active-checks tests_pass,build_succeeds] [--tier growing]
+        [--project-dir /path/to/project] [--story-id US-042]
     python3 evidence_contract.py explain <code>
     python3 evidence_contract.py dump
 """
@@ -33,6 +33,13 @@ import json
 import os
 import sys
 from typing import Any
+
+
+#: The story id `dispatched_receipts.active_dispatch_for` returns when two
+#: stories hold the same role at once. Duplicated rather than imported so the
+#: envelope CLI stays loadable on a partial install; `test_evidence_contract`
+#: asserts the two spellings stay equal.
+AMBIGUOUS_STORY = "?ambiguous"
 
 
 def _host_env():
@@ -285,7 +292,10 @@ EMBEDDED_DEFAULTS: dict[str, Any] = {
             "evidence": {
                 "field": "metrics.findings_critical",
                 "shape": "integer",
-                "predicate": "equals 0 (absent key defaults to 0)",
+                "predicate": (
+                    "equals 0; an absent key is UNEVALUABLE and declares a "
+                    "criteria gap, never a pass (#487)"
+                ),
             },
         },
         "code_reviewed": {
@@ -315,8 +325,9 @@ EMBEDDED_DEFAULTS: dict[str, Any] = {
                 "field": "metrics.coverage_delta",
                 "shape": "number or percent string (e.g. \"+3.2%\")",
                 "predicate": (
-                    "numeric value >= 0; absent or unparseable delta is "
-                    "assumed to pass"
+                    "numeric value >= 0; an absent or unparseable delta is "
+                    "UNEVALUABLE and declares a criteria gap, never a pass "
+                    "(#540)"
                 ),
             },
         },
@@ -349,9 +360,13 @@ EMBEDDED_DEFAULTS: dict[str, Any] = {
                 "field": "metrics.ui_verification",
                 "shape": "{rendered: bool, routes_tested: int, flows_failed: int}",
                 "predicate": (
-                    "rendered true AND flows_failed == 0; legacy shape "
+                    "rendered true AND routes_tested >= 1 AND flows_failed "
+                    "== 0, every count RECORDED; the standard verification "
+                    "tier waives the flow count only; legacy shape "
                     "metrics.routes_tested > 0 with metrics.flows_failed == 0 "
-                    "also accepted; otherwise unverifiable"
+                    "also accepted; an absent, unparseable, non-finite or "
+                    "non-whole count is UNEVALUABLE and declares a criteria "
+                    "gap, never a pass (#540, #396)"
                 ),
             },
         },
@@ -536,7 +551,16 @@ def evidence_spec(check_id: str, contract: dict[str, Any] | None = None) -> dict
 
 
 def tier_checks(tier: str, contract: dict[str, Any] | None = None) -> list[str]:
-    """Active DoD checks for an intensity tier (unknown tier → early)."""
+    """The TIER's static DoD checks (unknown tier → early).
+
+    NOT the checks a given story is graded on. The conditional gates
+    (`ui_acceptance`, `runtime_verified`, `no_critical_findings`,
+    `integration_verified`) are promoted per story and appear in no tier list,
+    so this answer is a floor, never the contract. It backed the `--tier`-only
+    branch of `render_envelope`, which would have shown an agent a shorter
+    check set than the gate uses; use `story_pipeline.dispatch_dod_contract`
+    for anything an agent will read (#501).
+    """
     contract = contract or load_contract()
     tiers = contract.get("dod_tiers", {}).get("tiers", {})
     return list(tiers.get(tier) or tiers.get("early", []))
@@ -665,6 +689,17 @@ _ROLE_OBLIGATIONS: dict[str, list[str]] = {
     "qe": [
         "- **Tests proof (tests_pass)** — record the suite run as an executed object: "
         "`{\"command\": \"pytest tests/ -q\", \"exit_code\": 0, \"summary\": \"42 passed\"}`.",
+        # #406. The SE and CR obligation lists are deliberately untouched: #404
+        # left the SE fixed payload 13 words under its enforced 4,000-word
+        # ceiling, and the authored cases already reach every dispatch through
+        # next_action's per-task `authored_cases` block. QE has no such budget
+        # and is the role that must report per case, so the instruction lands
+        # here only.
+        "- **Authored cases (tests_pass, SPQ)** — when the dispatch carries "
+        "`authored_cases.authored_at_commit: true`, write "
+        "`metrics.authored_test_cases.results` keyed by EVERY authored case id "
+        "(`passed`/`failed`/`blocked`/`not-applicable`). An omitted id is a "
+        "DROPPED case and fails the gate; a green exit code cannot clear it.",
         "- **Runtime proof (runtime_verified)** — when the story requires live verification, "
         "write `metrics.runtime_verification: {\"deployed\": true, \"logs_inspected\": true}`.",
         "- **UI proof (ui_acceptance)** — for user-facing ACs, write "
@@ -678,10 +713,24 @@ _ROLE_OBLIGATIONS: dict[str, list[str]] = {
         "`\"status\": \"complete\"` AND `story_dod: {\"code_reviewed\": true}`. Write both; "
         "omitting `status` scores the review as not done.",
         "- Record findings as `metrics.findings_critical/high/medium/low` integers.",
+        # #487. CE no longer dispatches per Work Unit on SPQ, so the declared
+        # compliance check is owed by the verifying stage. The instruction
+        # lands on CR and not QE because `no_critical_findings` carries
+        # `fallback: review_roles_only`: a security verdict comes from a
+        # review role, and re-pointing it at the test-writing stage would be
+        # a weakening dressed as a re-assignment.
+        "- **Declared compliance (no_critical_findings)** — when the dispatch carries "
+        "`dod.compliance.required: true`, this check is DECLARED on your gate and no "
+        "compliance-engineer will be dispatched to clear it. Run the audit method "
+        "(`synaptory skills get compliance-engineer/guides/security-playbook`, plus "
+        "`compliance-engineer/modes/healthcare` for PHI) and write "
+        "`metrics.findings_critical` as an integer. An ABSENT count is not a clean "
+        "audit: it is a criteria gap and it blocks the story.",
     ],
     "ce": [
         "- **Findings proof (no_critical_findings)** — write `metrics.findings_critical` "
-        "as an integer (0 = clean). The gate reads exactly that key.",
+        "as an integer (0 = clean). The gate reads exactly that key. An absent key is a "
+        "criteria gap, never a pass.",
         "- Structured `findings: [{id, title, severity, file_ref, description}]` recommended.",
     ],
     "pe": [
@@ -690,6 +739,20 @@ _ROLE_OBLIGATIONS: dict[str, list[str]] = {
         "\"summary\": \"images built\"}`.",
     ],
 }
+
+
+def _profile_pair(role: str) -> tuple[str, str] | None:
+    """The `(stage_profile, capability_profile)` pair a role dispatches under.
+
+    Lazy import for the same reason as `_host_env`: a partial install must not
+    break module load, and an envelope must never break a dispatch.
+    """
+    try:
+        from runtime_contracts import profile_pair_for_role
+
+        return profile_pair_for_role(role)
+    except (ImportError, ValueError):
+        return None
 
 
 def _runtime_identity_lines(contract: dict[str, Any] | None = None) -> list[str]:
@@ -701,34 +764,127 @@ def _runtime_identity_lines(contract: dict[str, Any] | None = None) -> list[str]
     is guessing, and a guessed attempt id is worse than an absent one because
     it looks like evidence.
 
-    Stamped as soft-required during the migration window. The kernel enforces
-    on MISMATCH rather than on absence (see advance_kernel), so an agent that
-    omits these still advances on the dispatch binding; what it loses is
-    attempt-scoped evidence, which is exactly what the pilot exists to
-    produce. Requiring presence is a later tightening that belongs with the
-    managed runner.
+    The fields listed here stay soft-required. The kernel enforces them on
+    MISMATCH rather than on absence (see advance_kernel), so an agent that
+    omits them still advances on the dispatch binding; what it loses is
+    attempt-scoped evidence, which is exactly what the pilot exists to produce.
+
+    The `(stage_profile, capability_profile)` pair is NOT in this list, and
+    that is the #473 change. It is named on the role's fixed-literals line
+    instead, where the line now says it is required: a governed dispatch hands
+    the agent a `dispatch_envelope` carrying both values, and a receipt from
+    such a dispatch that omits them is refused by `receipt_validator`. Listing
+    it here as well would say "copy it when you were given it" beside a line
+    saying "you must have it", and the softer sentence is the one an agent
+    under a token budget acts on.
     """
     del contract  # reserved: the field list is contract-independent today
+    # Wording is under the #404 fixed-payload budget, which leaves single-digit
+    # words of headroom (see test_fixed_dispatch_payload_under_4k_words). Every
+    # rule below is still stated; none of them is stated twice.
     return [
-        "- Runtime identity (copy VERBATIM from the dispatch contract you were "
-        "given; never derive or invent these): `attempt_id`, `dispatch_id`",
-        "- When the dispatch contract carries them, also copy: `cycle_id`, "
-        "`manifest_hash`, `workstream_id`, `adapter_profile_id`, `placement`, "
-        "`capability_profile`, `stage_profile`, `runtime_family`, "
-        "`source_revision`, and the exact model id the runtime reported",
+        "- Runtime identity — copy VERBATIM from your dispatch contract, never "
+        "derive or invent: `attempt_id`, `dispatch_id`; and when carried, "
+        "`cycle_id`, `manifest_hash`, `workstream_id`, `adapter_profile_id`, "
+        "`placement`, `runtime_family`, `fencing_token`, `source_revision`, and the exact model "
+        "id the runtime reported",
         "- On a FAILED or cancelled attempt, add `failure_class` from the "
-        "versioned vocabulary. A miss that closes unclassified is the one "
-        "thing the evidence model does not allow.",
+        "versioned vocabulary. Closing unclassified is the one thing the "
+        "evidence model does not allow.",
     ]
+
+
+def resolve_dispatch_dod(project_dir: str, story_id: str) -> dict[str, Any] | None:
+    """The DoD block for the story a dispatch is for, or None (#501).
+
+    The story id is the ONE thing a SubagentStart caller can obtain — via
+    `dispatched_receipts.active_dispatch_for`, which resolves it from the
+    kernel's dispatch binding, or from the board when exactly one story is in
+    flight. Everything else about the gate follows from it, so the envelope
+    takes the handle and does the resolution itself rather than asking the
+    hook for a check list it has no way to compute.
+
+    Returns None when the story cannot be resolved. The caller must SAY so —
+    see `render_envelope`; a silently missing DoD stanza reads as "no extra
+    checks apply", which is the reading this whole change exists to prevent.
+    """
+    if not project_dir or not story_id:
+        return None
+    try:
+        import story_pipeline as sp
+
+        return sp.dispatch_dod_contract(str(project_dir), str(story_id))
+    except Exception:  # noqa: BLE001 - an envelope must never break a dispatch
+        return None
+
+
+def _dod_lines(dod: dict[str, Any] | None, unresolved_reason: str) -> list[str]:
+    """The `### Definition of Done for this story` stanza.
+
+    Always emits something once a synaptory role is dispatched. Either the
+    resolved contract, or a named reason it could not be resolved — never
+    silence, because silence and "the base tier only" are indistinguishable
+    to the agent reading it, and one of them is a much heavier contract than
+    the other.
+    """
+    lines = ["", "### Definition of Done for this story"]
+    if not dod:
+        lines.append(
+            "- NOT RESOLVED (%s). Unmeasured, NOT empty: ask the orchestrator "
+            "for `next_action`'s `dod` block before choosing evidence."
+            % (unresolved_reason or "reason unrecorded")
+        )
+        return lines
+    tier = str(dod.get("tier") or "")
+    source = str(dod.get("tier_source") or "")
+    active = [str(c) for c in (dod.get("active_checks") or [])]
+    lines.append(
+        "- Tier `%s`%s. Graded on: %s"
+        % (
+            tier,
+            " (%s)" % source if source else "",
+            ", ".join("`%s`" % c for c in active) if active else "(none)",
+        )
+    )
+    # Grouped by reason: the PHI pair shares one, and the budget cannot afford
+    # to print the same clause twice.
+    grouped: dict[str, list[str]] = {}
+    for entry in dod.get("undetermined_checks") or []:
+        if not isinstance(entry, dict):
+            continue
+        grouped.setdefault(str(entry.get("why") or ""), []).append(
+            "`%s`" % entry.get("check")
+        )
+    if grouped:
+        lines.append(
+            "- Unmeasured, NOT inactive — promoted by evidence you have yet "
+            "to write: %s"
+            % "; ".join(
+                "%s %s" % (", ".join(checks), why) if why else ", ".join(checks)
+                for why, checks in grouped.items()
+            )
+        )
+    return lines
 
 
 def render_envelope(
     agent_type: str,
-    active_checks: list[str] | None = None,
-    tier: str | None = None,
+    dod: dict[str, Any] | None = None,
+    dod_unresolved_reason: str = "",
     contract: dict[str, Any] | None = None,
 ) -> str:
     """Render the role-scoped Execution Envelope markdown block.
+
+    `dod` is the block from `story_pipeline.dispatch_dod_contract` (via
+    `resolve_dispatch_dod`) for the story this dispatch is for. Absent, the
+    envelope says the checks were not resolved and why.
+
+    #501: this used to take `active_checks` and `tier` directly, and no
+    caller ever passed either, so the stanza had never appeared in a real
+    dispatch. Those parameters asked a SubagentStart hook for a per-story
+    computation it could not perform: the host tells it the ROLE, not the
+    story, and the promotions depend on config, the story record and the
+    receipts so far. The handle a caller can actually supply is the story id.
 
     Returns "" for non-synaptory agent types and roles without a receipt
     abbreviation (nothing to enforce). Never raises.
@@ -763,6 +919,19 @@ def render_envelope(
         )
         lines.append(f"- Required fields: {required}")
         role_literals = f"- Fixed literals for this role: `\"role\": \"{role}\"`"
+        # #402: the advance gate keys the stage on this pair, and refuses a
+        # receipt naming another, so the two values are literals to copy
+        # exactly rather than fields to derive. #473: on a governed dispatch
+        # they are also REQUIRED, and the envelope is where they come from --
+        # said in the line the agent reads, so the instruction matches what
+        # `receipt_validator` enforces.
+        pair = _profile_pair(role)
+        if pair:
+            role_literals += (
+                f"; `\"stage_profile\": \"{pair[0]}\"`; "
+                f"`\"capability_profile\": \"{pair[1]}\"` (REQUIRED; copy from "
+                "your `dispatch_envelope`; the gate refuses another)"
+            )
         if stage:
             role_literals += f"; `\"token_usage.stage\": \"{stage}\"`"
         elif multi:
@@ -776,49 +945,46 @@ def render_envelope(
         )
         lines.extend(_runtime_identity_lines(contract))
         lines.append("")
+        # The two forms are stated once each, with their example inline. The
+        # separate GOOD/BAD example block that used to follow restated both in
+        # full; under the #404 budget (single-digit words of headroom) the
+        # duplicate is what pays for the DoD stanza below.
         lines.append("### verification_commands — two forms, only one is proof")
         lines.append(
-            "1. Executed object `{\"command\", \"exit_code\", \"summary\"}` — **proof**: "
-            "the command was run and its exit code recorded. ONLY this form scores "
-            "tests_pass / build_succeeds."
+            "1. Executed object — **proof** (the command ran, its exit code is "
+            "recorded) and the ONLY form that scores tests_pass / "
+            'build_succeeds: `{"command": "pytest tests/ -q", "exit_code": 0, '
+            '"summary": "42 passed"}`'
         )
         lines.append(
-            "2. Plain string — a replay instruction: the SubagentStop hook re-runs it. "
-            "NOT proof; it scores nothing by itself."
+            "2. Plain string — a replay instruction the SubagentStop hook "
+            're-runs. NOT proof, scores nothing: `"npm run build 2>&1 | tail '
+            '-5"` — and its pipe is rejected on replay too.'
         )
-        lines.append("")
-        lines.append("GOOD (proof, scores the gate):")
-        lines.append('```json')
-        lines.append('{"command": "pytest tests/ -q", "exit_code": 0, "summary": "42 passed"}')
-        lines.append('```')
-        lines.append('BAD (pipe → rejected on replay AND scores nothing):')
-        lines.append('```json')
-        lines.append('"npm run build 2>&1 | tail -5"')
-        lines.append('```')
         lines.append("")
         lines.append("### Replay rules (the hook re-runs every command, shell=False)")
         lines.append(f"- Allowed programs: {programs}")
+        # The "commit multi-step logic as a repo script" rule closes this
+        # bullet instead of repeating as its own trailing bullet: it is the
+        # remedy for the payloads this line forbids, so it belongs here.
         lines.append(
             f"- Forbidden: bare shell tokens ({tokens}), command substitution "
             "`$(...)`/backticks, env-var prefixes, inline interpreter payloads "
-            "(`bash -c`/`sh -c`/`python3 -c`/`node -e`/`-p`/stdin `-`) — commit "
-            "the logic as a repo script and run `python3 scripts/x.py` "
-            "(or `python3 -m <module>`), find flags that execute/mutate "
-            f"({', '.join(replay.get('find_flag_denylist', []))})"
+            "(`bash -c`/`sh -c`/`python3 -c`/`node -e`/`-p`/stdin `-`), find "
+            "flags that execute/mutate "
+            f"({', '.join(replay.get('find_flag_denylist', []))}). "
+            "Commit multi-step logic as a repo script and invoke it directly: "
+            "`python3 scripts/x.py`, `python3 -m <module>`, `bash scripts/verify.sh`."
         )
         lines.append(
-            "- Env vars: export them separately when YOU run the command, then record "
-            "`{\"command\": \"pnpm build\", \"exit_code\": 0}` without the prefix."
+            "- Env vars: export them before running, and record the command "
+            "without the prefix."
         )
         must_be = "; ".join(replay.get("must_be", []))
         lines.append(
             f"- Commands must be: {must_be}. Timeouts: "
             f"{replay.get('per_command_timeout_s', 60)}s per command, "
             f"{replay.get('total_timeout_s', 300)}s total."
-        )
-        lines.append(
-            "- Multi-step logic belongs in committed repo scripts invoked directly "
-            "(e.g. `bash scripts/verify.sh`)."
         )
 
         obligations = _ROLE_OBLIGATIONS.get(abbrev)
@@ -827,18 +993,7 @@ def render_envelope(
             lines.append("### Your evidence obligations")
             lines.extend(obligations)
 
-        if active_checks:
-            lines.append("")
-            lines.append(
-                "This story's active DoD checks: " + ", ".join(active_checks)
-                + (f" (tier: {tier})" if tier else "")
-            )
-        elif tier:
-            checks = tier_checks(tier, contract)
-            lines.append("")
-            lines.append(
-                f"This story's active DoD checks (tier: {tier}): " + ", ".join(checks)
-            )
+        lines.extend(_dod_lines(dod, dod_unresolved_reason))
 
         return "\n".join(lines)
     except Exception:
@@ -858,8 +1013,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_env = sub.add_parser("envelope", help="Render the Execution Envelope for a role")
     p_env.add_argument("--agent-type", required=True)
-    p_env.add_argument("--active-checks", default=None, help="Comma-separated check ids")
-    p_env.add_argument("--tier", default=None)
+    # #501: the caller supplies the story HANDLE, not a precomputed check
+    # list. `--story-id` accepts the literal `?ambiguous` that
+    # `dispatched_receipts.active_dispatch_for` emits when two stories hold
+    # the same role, so the hook can pass the resolver's answer straight
+    # through and the envelope reports the ambiguity rather than guessing.
+    p_env.add_argument("--project-dir", default=None)
+    p_env.add_argument("--story-id", default=None)
 
     p_explain = sub.add_parser("explain", help="Explain a rejection code")
     p_explain.add_argument("code")
@@ -869,10 +1029,28 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "envelope":
-        checks = None
-        if args.active_checks:
-            checks = [c.strip() for c in args.active_checks.split(",") if c.strip()]
-        print(render_envelope(args.agent_type, active_checks=checks, tier=args.tier))
+        story = (args.story_id or "").strip()
+        project_dir = (args.project_dir or "").strip()
+        dod = None
+        reason = ""
+        if story == AMBIGUOUS_STORY:
+            reason = (
+                "two stories hold this role at once, so the role alone cannot "
+                "say which one this dispatch is"
+            )
+        elif not story:
+            reason = "no dispatch binding and no single story in flight"
+        elif not project_dir:
+            reason = "no project directory available to this hook"
+        else:
+            dod = resolve_dispatch_dod(project_dir, story)
+            if dod is None:
+                reason = "story %s did not resolve to a board entry" % story
+        print(
+            render_envelope(
+                args.agent_type, dod=dod, dod_unresolved_reason=reason
+            )
+        )
         return 0
     if args.cmd == "explain":
         print(explain_rejection(args.code))

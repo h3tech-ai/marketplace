@@ -1,0 +1,18 @@
+{
+  "project_id": "taskflow",
+  "vcs": {
+    "repo_url": "https://github.com/h3tech-ai/taskflow.git",
+    "default_ref": "main",
+    "auth_ref": "cred://runner/github-vcs-read"
+  },
+  "tracker": {
+    "provider": "github",
+    "auth_ref": "cred://runner/github-tracker-write"
+  },
+  "ci": {},
+  "config_sources": [
+    "repo://.synaptory.yaml"
+  ],
+  "updated_at": "2026-09-01T12:00:00Z",
+  "updated_by": "operator@h3t.co"
+}

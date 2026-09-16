@@ -199,6 +199,72 @@ class TestNoSilentDegradation:
         assert len(result.denial.detail) > 20
 
 
+class TestARuntimeThatCannotNameItsModelIsNotSelectable:
+    """#689 -- selection refuses, and for the reason doctor gave.
+
+    The CLI probe reports a runtime that states no exact model id as
+    unavailable, because every kernel-minted envelope leaves the model to
+    policy and the receipt would then name none. Selection reads that report
+    out of the availability snapshot, so no rule about models lives here: what
+    is pinned is that an unavailable profile is refused and the probe's own
+    sentence survives into the explanation an operator reads.
+
+    Without this the #357 pilot's shape repeats: selected, ten minutes of work,
+    then refused for evidence the runtime could never have produced.
+    """
+
+    #: Verbatim from `runtimeSpec.modelIdentityGap` plus the doctor sentence
+    #: around it, shortened. The point of copying it is that the selector must
+    #: carry the probe's words rather than inventing its own.
+    PROBE_REASON = (
+        "codex is installed and within the pin, but codex states no exact "
+        "model id anywhere in its stream. Route this capability profile to a "
+        "runtime that states its model, such as claude-local-v1 (#689)"
+    )
+
+    def _availability(self, profiles):
+        return [
+            rs.Availability(
+                profile_id=p["profile_id"],
+                available=p["profile_id"] != "codex-local-v1",
+                detail=(
+                    self.PROBE_REASON
+                    if p["profile_id"] == "codex-local-v1"
+                    else ""
+                ),
+            )
+            for p in profiles
+        ]
+
+    def test_auto_never_lands_on_it(self, policy, profiles):
+        result = rs.select_runtime(
+            build_mode="spq",
+            policy=policy,
+            request=_request("se"),
+            profiles=profiles,
+            availability=self._availability(profiles),
+        )
+        assert result.selected != "codex-local-v1", result.explain()
+
+    def test_a_pin_is_refused_with_the_probes_own_reason(self, policy, profiles):
+        result = rs.select_runtime(
+            build_mode="spq",
+            policy=policy,
+            request=_request("se", mode="pin", pinned_profile="codex-local-v1"),
+            profiles=profiles,
+            availability=self._availability(profiles),
+        )
+        assert result.denied, result.explain()
+        rejections = dict(result.rejected)["codex-local-v1"]
+        codes = [r.code for r in rejections]
+        assert rs.REJECT_UNAVAILABLE in codes, codes
+        detail = " ".join(r.detail for r in rejections)
+        assert "no exact model id" in detail, detail
+        assert "#689" in detail, detail
+        # And the explanation an operator actually reads carries it too.
+        assert "no exact model id" in result.explain()
+
+
 class TestCapabilityProfileIsThePolicyKey:
     def test_a_prover_only_runtime_never_wins_a_producer_dispatch(
         self, policy, profiles

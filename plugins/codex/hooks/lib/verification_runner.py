@@ -478,6 +478,15 @@ def _resolve_workspace_cwd(workspace_ref: Any, project_dir: str) -> str | None:
 # ─── Result type ──────────────────────────────────────────────────────────────
 
 
+#: This runner IS the `replayed` class (capability-profile-pilot.md 3.3,
+#: #403): a machine re-executed the command and got the same answer. The tag
+#: is a label on semantics that do not change — nothing about which commands
+#: are allowed, how they are validated, cached, or judged moves because the
+#: output now says which integrity discipline produced it. It is here so a
+#: reader crediting depth does not have to infer the class from the caller.
+EVIDENCE_CLASS = "replayed"
+
+
 class VerificationResult:
     """Result of running verification commands."""
 
@@ -494,6 +503,7 @@ class VerificationResult:
             "total": len(self.results),
             "failures": self.failures,
             "results": self.results,
+            "evidence_class": EVIDENCE_CLASS,
         }
 
 

@@ -94,7 +94,10 @@
         "next cycle",
         "run a cycle",
         "cycle execution",
-        "spq lifecycle"
+        "spq lifecycle",
+        "acceptance",
+        "release readiness",
+        "go live"
       ],
       "trigger_patterns": [
         "(?:open|start|run|next)\\s+cycle(?:\\s+\\d+)?",
@@ -114,33 +117,30 @@
       "lifecycle": "spq",
       "pipeline": [],
       "skip_conditions": [],
-      "notes": "Routes to the SPQ lifecycle: DISCOVERY -> COMMIT -> CYCLE_EXECUTION -> SYNC -> CHECKPOINT -> (loop or ACCEPTANCE). Requires build_mode: spq. The distinguishing feature vs scrum is SYNC, the cross-workstream integration barrier."
+      "notes": "Routes to the SPQ lifecycle: DISCOVERY -> CYCLE -> ACCEPTANCE -> COMPLETE, with ACCEPTANCE -> CYCLE for a non-final go-live. Requires build_mode: spq. Commit, Sync and Checkpoint are recorded method events inside the CYCLE stage, never stages and never gates. See modes/spq.md."
     },
     {
       "mode": "Sync",
       "trigger_signals": [
         "sync",
-        "sync workstreams", "coordination cycle", "cycle of cycles", "release readiness", "pin the release", "drop from the release",
-        "sync crews",
-        "integrate workstreams",
-        "run the barrier",
-        "declare ready"
+        "record a sync",
+        "cross-cycle dependency",
+        "waiting on another cycle",
+        "dependency status"
       ],
       "trigger_patterns": [
-        "sync\\s+(?:workstreams?|crews?|cycle)",
-        "(?:run|clear|evaluate)\\s+the\\s+barrier",
-        "declare\\s+(?:sync\\s+)?ready"
+        "record\\s+(?:a\\s+)?sync",
+        "(?:cross[-\\s]?cycle|another\\s+cycle)\\s+dependen(?:cy|cies)",
+        "waiting\\s+on\\s+(?:another\\s+)?cycle"
       ],
       "skills_involved": [
-        "quality-engineer",
         "software-engineer",
-        "solution-architect",
-        "compliance-engineer"
+        "solution-architect"
       ],
       "lifecycle": "spq",
       "pipeline": [],
       "skip_conditions": [],
-      "notes": "The cross-workstream integration barrier (SYNC). Ordered procedure, and steps 2 and 5 are human by design: agents must not commit or push to shared branches. See spq/sync.md."
+      "notes": "Records that one Cycle's wait on another cleared: which Work Unit waited, from which Cycle, and how it resolved. Sync authorizes nothing and blocks nothing -- a real unresolved dependency blocks the affected Work Unit, and a Cycle with zero Sync events is the normal case. The integration barrier is at Checkpoint, not here. See spq/sync.md."
     },
     {
       "mode": "Checkpoint",
@@ -148,20 +148,23 @@
         "checkpoint",
         "close cycle",
         "demo the cycle",
-        "cycle review"
+        "cycle review",
+        "run the barrier"
       ],
       "trigger_patterns": [
         "checkpoint(?:\\s+\\d+)?",
-        "(?:close|demo)\\s+(?:the\\s+)?cycle"
+        "(?:close|demo)\\s+(?:the\\s+)?cycle",
+        "(?:run|evaluate)\\s+the\\s+barrier"
       ],
       "skills_involved": [
         "technical-writer",
-        "project-owner"
+        "project-owner",
+        "quality-engineer"
       ],
       "lifecycle": "spq",
       "pipeline": [],
       "skip_conditions": [],
-      "notes": "Closes the Cycle with a customer demonstration from an integrated dev, then harvests MethodSignals. Always runs AFTER SYNC \u2014 integration precedes demonstration."
+      "notes": "Closes a Cycle: demonstrate the admitted result, record the per-Work-Unit human acceptance, then run the all-or-nothing barrier over the set admitted at Commit, which integrates the candidate to the shared trunk. The barrier is the transition condition; the Checkpoint event is the record. See spq/checkpoint.md."
     },
     {
       "mode": "Test",

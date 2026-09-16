@@ -107,7 +107,8 @@ Based on the analysis, propose **concrete, actionable** improvements. Each sugge
 
 ### Adjust Model Tier
 - If strategic role (PM/SA/CE/RA) is producing shallow output → "Confirm the role is routed to Opus (see model-pins.json)"
-- If executor role (SE/QE/PE/TW/CR) is slow and stories are simple → "Stay on Sonnet; consider tightening prompt scope"
+- If executor role (SE/QE/PE/TW) is slow and stories are simple → "Stay on Sonnet; consider tightening prompt scope"
+- CR runs on Opus by design (#434) so the prover does not share the producer's exact weights. Never propose moving it back to the SE tier as a speed or cost retro action; propose narrowing CR scope instead.
 
 ### Adjust Sprint Capacity
 - If carry-over > 20% → "Reduce Sprint {N+1} capacity from {X} to {X * 0.8} stories"

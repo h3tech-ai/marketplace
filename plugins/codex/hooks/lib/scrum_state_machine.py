@@ -60,6 +60,7 @@ from story_pipeline import (
     reject_story as _sp_reject_story,
     request_acceptance as _sp_request_acceptance,
     next_action as _sp_next_action,
+    attach_dispatch_dod_contract,
     dep_context,
     dependency_gate_mode,
     parallelism_config,
@@ -384,6 +385,7 @@ def start_sprint(
             labels=s.get("labels"),
             depends_on=s.get("depends_on"),
             file_scope=s.get("file_scope"),
+            project_dir=project_dir,
         )
         for s in stories
     ]
@@ -590,7 +592,11 @@ def add_story(
     """Add a story to current_stories."""
     state = read_state(project_dir)
     story = create_story(
-        story_id, title, backends, acceptance_criteria=acceptance_criteria
+        story_id,
+        title,
+        backends,
+        acceptance_criteria=acceptance_criteria,
+        project_dir=project_dir,
     )
     state.setdefault("current_stories", []).append(story)
     _write_state(project_dir, state)
@@ -642,9 +648,28 @@ def transition_story(
         to_state, reason, _pre_dod = resolve_done_edge(
             project_dir, state, story_id, to_state, reason, mode="scrum"
         )
+    else:
+        _pre_dod = None
 
     state = _sp_transition_story(state, story_id, to_state, reason, project_dir)
     _write_state(project_dir, state)
+
+    # #403 — a story the gate REDIRECTED to blocked used to record no DoD
+    # verdict at all and emit nothing, because both blocks below key on
+    # `done`. So the strongest signal the pipeline produces (why the story
+    # stopped) was the one signal that never left the machine, and the
+    # control plane saw a story that simply went quiet. `resolve_done_edge`
+    # already computed the verdict; persist and ship it.
+    #
+    # This predates #403 for the conditional gates, but #403 makes the redirect
+    # reachable for a declared criteria gap, which is a far more common shape
+    # than a PHI compliance miss, so leaving the hole open was not an option.
+    if to_state == "blocked" and _pre_dod is not None:
+        story = get_story(state, story_id)
+        if story:
+            story["dod"] = _pre_dod
+            _write_state(project_dir, state)
+            _sp_ship_evaluated_dod(story_id, _pre_dod, project_dir=project_dir)
 
     if to_state in ("done", "awaiting_acceptance"):
         sprint_num = state.get("current_sprint", 1)
@@ -710,7 +735,12 @@ def accept_story(project_dir: str, story_id: str,
     state = read_state(project_dir)
     state = _sp_accept_story(state, story_id, accepted_by, project_dir)
     _write_state(project_dir, state)
-    # Best-effort gate emission — never raises (see gate_emitter docstring).
+    # Only a CREDITED acceptance reaches this line. `accept_story` refuses an
+    # uncreditable one before it writes anything (#592), so the `returned`
+    # emission that #599 added here became unreachable and was removed rather
+    # than left looking live. Scrum and SPQ stay identical because they
+    # delegate to the same `story_pipeline.accept_story` (#486).
+    # Best-effort gate emission, never raises (see gate_emitter docstring).
     try:
         from gate_emitter import emit_evidence_dod_accepted
         emit_evidence_dod_accepted(
@@ -819,6 +849,16 @@ def next_action(project_dir: str) -> dict[str, Any]:
         parallelism=parallelism_config(project_dir),
         dep_context=dep_context(project_dir, state),
         dependency_gate=dependency_gate_mode(project_dir),
+        verify_only=verify_only_units(project_dir, state),
+    )
+    # #501 follow-up — swap the tier-only `dod` block for the per-story
+    # contract the gate will actually enforce. Lives here, not in
+    # `story_pipeline.next_action`, which has no project_dir and stays pure.
+    attach_dispatch_dod_contract(
+        result,
+        project_dir,
+        state=state,
+        receipts_dir=_resolve_receipts_dir(project_dir),
     )
     result.update(base)
     return result
@@ -987,7 +1027,12 @@ def main() -> None:
                 (get_story(read_state(project_dir), story_id) or {}).get("state") or ""
             )
             refused = _cli_receipt_gated_refusal(
-                from_state, to_state, story_id, forced=forced, reason=reason
+                from_state,
+                to_state,
+                story_id,
+                forced=forced,
+                reason=reason,
+                project_dir=project_dir,
             )
             if refused:
                 _die(refused)
@@ -1107,6 +1152,61 @@ def _consume_spec_flag(args: list[str]) -> tuple[list[str], str | None]:
 def _die(msg: str) -> None:
     print(msg, file=sys.stderr)
     sys.exit(1)
+
+def verify_only_units(project_dir: str, state: dict) -> "frozenset[str]":
+    """Queued Work Units whose deliverable came from outside and binds (#495 P2).
+
+    HERE RATHER THAN IN `story_pipeline.next_action`, which has no project_dir
+    and stays pure: recognising a verify-only unit means reading its intake
+    record off disk, and this module is where the other project reads live.
+
+    CHEAP PROBE FIRST, and deliberately. `next_action` runs on every ceremony
+    turn, so a full intake read per candidate would put a file parse plus a
+    possible control-plane round trip on the path that answers "what next". The
+    record's absence is the common case and `os.path.exists` settles it.
+
+    QUEUED ONLY. A unit past `queued` has a producing stage behind it whatever
+    its intake record says, and re-selecting a verifier for it would contradict
+    the board.
+
+    NOT `admitted` ALONE, and not `binds` alone either. A unit whose admission
+    no longer yields a candidate (substituted artifact, rewritten record, a
+    producing receipt in the way) is not a verify-only job with a problem, it
+    is a unit whose subject cannot be established: selecting a verifier there
+    would invite a check against bytes the platform has already refused to
+    name, so it falls back to `dispatch_se` and stays unbacked with intake's
+    own reason. But `binds` alone deadlocks, because it requires the very
+    verifying receipt this dispatch exists to produce. So the predicate is
+    "binds, or is intact and simply unverified".
+    """
+    import os
+
+    try:
+        import external_intake as _ei
+    except Exception:  # noqa: BLE001 - no intake module is no verify-only unit
+        return frozenset()
+    found = []
+    for story in (state.get("current_stories") or []):
+        if not isinstance(story, dict):
+            continue
+        if str(story.get("state") or story.get("status") or "") != "queued":
+            continue
+        unit_id = str(story.get("id") or "")
+        if not unit_id:
+            continue
+        try:
+            if not os.path.exists(_ei.record_path(str(project_dir), unit_id)):
+                continue
+            read = _ei.read_intake(str(project_dir), unit_id)
+            # `binds` OR `awaiting_verification`. Requiring `binds` alone was a
+            # deadlock: `binds` needs a verifying receipt, and the dispatch this
+            # selection authorizes is what produces one, so the verifier could
+            # never be dispatched precisely because it had not run yet.
+            if read.binds or read.awaiting_verification:
+                found.append(unit_id)
+        except Exception:  # noqa: BLE001 - an unreadable intake is not verify-only
+            continue
+    return frozenset(found)
 
 
 if __name__ == "__main__":

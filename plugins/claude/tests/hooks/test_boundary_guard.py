@@ -8,8 +8,13 @@ under-blocks, so the allow cases are as load-bearing as the deny cases.
 Guards under test:
   G1 — write-tool access to `.synaptory/tracker/` (story ops → tracker_cli.py)
   G2 — direct writes to `pipeline-state.json` (transitions → story_pipeline.py)
-  G3 — write-tool access to `.synaptory/sync/` (readiness records are derived
-       by `sync_barrier.py declare-ready <N>`, never hand-authored)
+  G4 — write-tool access to the SPQ Cycle store, on both roots
+
+G3 is absent because it is retired with `.synaptory/sync/` (ADR-035). Its cases
+are deleted rather than relaxed: a test that asserted a write to that directory
+is *allowed* would pin the absence of a guard on a path nothing creates, which
+is coverage of nothing. What replaced the readiness record it protected — the
+sealed declaration, the cut record, the dependency events — is under G4.
 
 Note the guard always exits 0; the decision lives in stdout, not the return
 code. Empty stdout is "allow".
@@ -65,85 +70,6 @@ def _deny_reason(stdout: str) -> str | None:
     return hso.get("permissionDecisionReason") or ""
 
 
-# ─── G3: .synaptory/sync/ readiness records ───────────────────────────────────
-
-
-@pytest.mark.hook
-@pytest.mark.parametrize("tool", ["Write", "Edit"])
-def test_g3_denies_write_tools_on_sync_record(guard_hook, guard_env, run_hook, tool):
-    """A Write/Edit at `.synaptory/sync/cycle-3/exec.json` is denied.
-
-    The deny message must name the verb to use instead, or the agent has no
-    recovery path from the block.
-    """
-    result = run_hook(
-        guard_hook,
-        env=guard_env,
-        stdin=_tool_call(tool, file_path=".synaptory/sync/cycle-3/exec.json"),
-    )
-    assert result.returncode == 0
-    reason = _deny_reason(result.stdout)
-    assert reason is not None, f"expected deny, got stdout: {result.stdout!r}"
-    assert ".synaptory/sync/" in reason
-    assert "declare-ready" in reason
-
-
-@pytest.mark.hook
-def test_g3_denies_absolute_path_into_sync(guard_hook, guard_env, run_hook):
-    """Absolute paths resolve against the project dir just like relative ones."""
-    project = Path(guard_env["CLAUDE_PROJECT_DIR"])
-    target = project / ".synaptory" / "sync" / "cycle-3" / "exec.json"
-    result = run_hook(
-        guard_hook, env=guard_env, stdin=_tool_call("Write", file_path=str(target))
-    )
-    reason = _deny_reason(result.stdout)
-    assert reason is not None, f"expected deny, got stdout: {result.stdout!r}"
-    assert "declare-ready" in reason
-
-
-@pytest.mark.hook
-def test_g3_denies_bash_redirect_into_sync(guard_hook, guard_env, run_hook):
-    """Shelling out around the write tools is blocked too."""
-    result = run_hook(
-        guard_hook,
-        env=guard_env,
-        stdin=_tool_call(
-            "Bash", command="echo '{}' > .synaptory/sync/cycle-3/exec.json"
-        ),
-    )
-    reason = _deny_reason(result.stdout)
-    assert reason is not None, f"expected deny, got stdout: {result.stdout!r}"
-    assert "declare-ready" in reason
-
-
-@pytest.mark.hook
-def test_g3_allows_declare_ready_invocation(guard_hook, guard_env, run_hook):
-    """The sanctioned producer of the record must not be blocked by its own guard."""
-    result = run_hook(
-        guard_hook,
-        env=guard_env,
-        stdin=_tool_call(
-            "Bash",
-            command="python3 .synaptory/scripts/sync_barrier.py declare-ready 3",
-        ),
-    )
-    assert result.returncode == 0
-    assert result.stdout.strip() == "", (
-        f"declare-ready must be allowed, got: {result.stdout!r}"
-    )
-
-
-@pytest.mark.hook
-def test_g3_allows_reading_a_sync_record(guard_hook, guard_env, run_hook):
-    """G3 is a write boundary; Read is not a write tool."""
-    result = run_hook(
-        guard_hook,
-        env=guard_env,
-        stdin=_tool_call("Read", file_path=".synaptory/sync/cycle-3/exec.json"),
-    )
-    assert result.stdout.strip() == ""
-
-
 # ─── Allow path: the guard must not over-block ────────────────────────────────
 
 
@@ -181,12 +107,18 @@ def test_allows_unrelated_bash_command(guard_hook, guard_env, run_hook):
 
 @pytest.mark.hook
 def test_guardrails_zero_disables_the_guard(guard_hook, guard_env, run_hook):
-    """`SYNAPTORY_GUARDRAILS=0` is a full off switch — G3 is defence in depth."""
+    """`SYNAPTORY_GUARDRAILS=0` is a full off switch — every guard here is
+    defence in depth, not a security boundary.
+
+    The probe path is one G1 actually denies. It used to be a
+    `.synaptory/sync/` write, which after ADR-035 no guard denies at all: the
+    test would then have passed whether the off switch worked or not.
+    """
     env = {**guard_env, "SYNAPTORY_GUARDRAILS": "0"}
     result = run_hook(
         guard_hook,
         env=env,
-        stdin=_tool_call("Write", file_path=".synaptory/sync/cycle-3/exec.json"),
+        stdin=_tool_call("Write", file_path=".synaptory/tracker/stories/US-042.md"),
     )
     assert result.returncode == 0
     assert result.stdout.strip() == ""
@@ -194,11 +126,15 @@ def test_guardrails_zero_disables_the_guard(guard_hook, guard_env, run_hook):
 
 @pytest.mark.hook
 def test_silent_exit_when_no_workspace(guard_hook, hook_env, run_hook):
-    """No `.synaptory/` → not a synaptory project → guard is inert."""
+    """No `.synaptory/` → not a synaptory project → guard is inert.
+
+    Same reasoning as the off-switch test above for why the probe is a path a
+    guard would otherwise deny.
+    """
     result = run_hook(
         guard_hook,
         env={**hook_env, "SYNAPTORY_GUARDRAILS": "1"},
-        stdin=_tool_call("Write", file_path=".synaptory/sync/cycle-3/exec.json"),
+        stdin=_tool_call("Write", file_path=".synaptory/tracker/stories/US-042.md"),
     )
     assert result.returncode == 0
     assert result.stdout.strip() == ""
@@ -264,7 +200,7 @@ def test_g2_still_denies_pipeline_state_bash_redirect(guard_hook, guard_env, run
     assert "advance_kernel.py" in reason
 
 
-# ── G4: the SPQ store and the committed Cycle transport (#303) ─────────────
+# ── G4: the SPQ Cycle store, on both of its roots ───────────────────────────
 
 
 @pytest.mark.hook
@@ -272,12 +208,12 @@ def test_g2_still_denies_pipeline_state_bash_redirect(guard_hook, guard_env, run
 @pytest.mark.parametrize(
     "target",
     [
-        ".synaptory/.orchestrator/spq/cycles/7-abc12345/manifest.json",
+        ".synaptory/.orchestrator/spq/index.json",
+        ".synaptory/.orchestrator/spq/cycles/7-abc12345/execution-state.json",
         ".synaptory/.orchestrator/spq/cycles/7-abc12345/dependency-ledger.json",
-        ".synaptory/.orchestrator/spq/cycles/7-abc12345/workstreams/spine/execution-state.json",
-        ".synaptory/.orchestrator/spq/workstream",
         ".synaptory/cycles/7-abc12345/manifest.json",
-        ".synaptory/cycles/7-abc12345/events/spine/0001-integrated-WU-1.json",
+        ".synaptory/cycles/7-abc12345/cuts.json",
+        ".synaptory/cycles/7-abc12345/events/0001-integrated-WU-1.json",
     ],
 )
 def test_g4_denies_write_tools_on_the_spq_store(
@@ -285,10 +221,15 @@ def test_g4_denies_write_tools_on_the_spq_store(
 ):
     """Before G4 the entire SPQ store was unguarded.
 
-    G2 matches only the literal string `pipeline-state.json`, and G3 covers
-    only `.synaptory/sync/`, so nothing stopped an agent hand-writing a Cycle
-    manifest or a dependency event -- and a hand-written event would unblock a
-    Work Unit on a claim nothing verified.
+    G2 matches only the literal string `pipeline-state.json`, so nothing
+    stopped an agent hand-writing a Cycle declaration, a dependency event, or a
+    cut. A hand-written event unblocks a Work Unit on a claim nothing verified;
+    a hand-written cut shrinks the set the Checkpoint barrier has to clear.
+
+    Both roots are exercised, because they are two different exposures and a
+    fix to one has repeatedly not been a fix to the other: the local store
+    holds the board this clone acts on, the committed one holds what every
+    other clone reads.
     """
     result = run_hook(
         guard_hook, env=guard_env, stdin=_tool_call(tool, file_path=target)
@@ -355,82 +296,50 @@ def test_g4_is_suppressed_by_the_guardrails_override(guard_hook, guard_env, run_
     assert _deny_reason(result.stdout) is None
 
 
-# ── G4 extended: the committed Coordination-Cycle transport (#305) ──────────
+# ── G4: the two roots stay independently matched ────────────────────────────
 
 
 @pytest.mark.hook
-@pytest.mark.parametrize("tool", ["Write", "Edit"])
-@pytest.mark.parametrize(
-    "target",
-    [
-        ".synaptory/coordination-cycles/cc-1-abc12345/manifest.json",
-        ".synaptory/coordination-cycles/cc-1-abc12345/events/3-aabbccdd/0001-contract_published-WU-1.json",
-        ".synaptory/.orchestrator/spq/coordination-cycles/cc-1-abc12345/manifest.json",
-    ],
-)
-def test_g4_denies_write_tools_on_the_coordination_store(
-    guard_hook, guard_env, run_hook, tool, target
-):
-    """A hand-written coordination manifest is the highest-value forgery here.
-
-    Its `selected_sha` list decides which child increments ship. Everything else
-    G4 guards can, at worst, unblock one Work Unit on an unverified claim; this
-    one can put a child increment nobody integrated into a release.
-    """
-    result = run_hook(
-        guard_hook, env=guard_env, stdin=_tool_call(tool, file_path=target)
-    )
-    assert result.returncode == 0
-    reason = _deny_reason(result.stdout)
-    assert reason is not None, f"expected deny for {target}, got: {result.stdout!r}"
-    assert "spq_state_machine.py" in reason
-
-
-@pytest.mark.hook
-def test_g4_denies_a_bash_redirect_into_the_coordination_store(
+def test_g4_matches_both_roots_on_both_ingress_paths(
     guard_hook, guard_env, run_hook
 ):
-    result = run_hook(
-        guard_hook,
-        env=guard_env,
-        stdin=_tool_call(
-            "Bash",
-            command="echo '{}' > .synaptory/coordination-cycles/cc-1-abc12345/manifest.json",
-        ),
-    )
-    assert _deny_reason(result.stdout) is not None
+    """Regression pin, now that the third root is gone.
 
-
-@pytest.mark.hook
-def test_g4_still_denies_the_303_roots_after_the_305_widening(
-    guard_hook, guard_env, run_hook
-):
-    """Regression pin: widening the alternation must not shadow the old arms.
-
-    `coordination-cycles` contains `cycles` as a substring, so the two roots and
-    the two regex alternatives have to stay independently matched.
+    `coordination-cycles` used to be an alternative in the same regex and
+    contains `cycles` as a substring, so removing it is exactly the kind of
+    edit that can collapse the remaining alternation or drop an arm. Both roots
+    have to be denied through the file-path ingress and through the Bash
+    redirect ingress -- four cases, because a guard fixed on one ingress and
+    not the other is a hole on the path nobody tested.
     """
-    for target in (".synaptory/cycles/7-abc12345/manifest.json",
-                   ".synaptory/.orchestrator/spq/index.json"):
+    for target in (
+        ".synaptory/cycles/7-abc12345/manifest.json",
+        ".synaptory/.orchestrator/spq/index.json",
+    ):
         result = run_hook(
             guard_hook, env=guard_env, stdin=_tool_call("Write", file_path=target)
         )
         assert _deny_reason(result.stdout) is not None, target
-    result = run_hook(
-        guard_hook,
-        env=guard_env,
-        stdin=_tool_call(
-            "Bash", command="echo x > .synaptory/cycles/7-abc12345/manifest.json"
-        ),
-    )
-    assert _deny_reason(result.stdout) is not None
+        result = run_hook(
+            guard_hook,
+            env=guard_env,
+            stdin=_tool_call("Bash", command="echo x > " + target),
+        )
+        assert _deny_reason(result.stdout) is not None, target
 
 
 @pytest.mark.hook
 def test_g4_roots_and_the_bash_regex_name_the_same_trees(guard_hook):
     """Two spellings of one rule; a fix applied to one and not the other is a
-    hole that only shows up on the path nobody tested."""
+    hole that only shows up on the path nobody tested.
+
+    Asserted in both directions: the retired third root must be absent from
+    both spellings, or the guard would still advertise a tree the product does
+    not create.
+    """
     text = Path(guard_hook).read_text(encoding="utf-8")
-    for tree in (".orchestrator', 'spq'", "'cycles'", "'coordination-cycles'"):
+    for tree in (".orchestrator', 'spq'", "'cycles'"):
         assert tree in text, tree
-    assert r"(\.orchestrator/spq|cycles|coordination-cycles)/" in text
+    assert r"(\.orchestrator/spq|cycles)/" in text
+    assert "coordination-cycles" not in text
+    assert "'.synaptory', 'sync'" not in text

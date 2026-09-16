@@ -80,6 +80,10 @@ def test_the_stanza_names_no_field_the_contract_module_rejects():
     receipt = {
         "attempt_id": "att_01J6ABCDEF",
         "dispatch_id": "a" * 32,
+        "adapter_profile_id": "claude-local-v1",
+        "placement": "local",
+        "fencing_token": "b" * 32,
+        "source_revision": "c" * 40,
         "failure_class": "deterministic-check",
     }
     assert rc.validate_receipt_attempt_binding(receipt) == []

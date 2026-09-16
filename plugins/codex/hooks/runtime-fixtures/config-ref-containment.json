@@ -1,0 +1,52 @@
+{
+  "_comment": "The containment cases every `config_refs` reader must agree on, shared by the Python contract tests and the Go bridge tests so a rule added on one side and not the other fails immediately (#396). `layout` is built under a temp checkout root; `outside` entries are built beside it, outside the tree. `contained` is whether the reader may open `ref`.",
+  "cases": [
+    {
+      "name": "a plain file in the tree",
+      "layout": [{"kind": "file", "path": ".synaptory.yaml", "content": "project_id: taskflow\n"}],
+      "ref": "repo://.synaptory.yaml",
+      "contained": true
+    },
+    {
+      "name": "a nested file in the tree",
+      "layout": [{"kind": "file", "path": "config/synaptory.yaml", "content": "project_id: taskflow\n"}],
+      "ref": "repo://config/synaptory.yaml",
+      "contained": true
+    },
+    {
+      "name": "the config itself is a symlink to host state",
+      "outside": [{"kind": "file", "path": "vendor-state.yaml", "content": "project_id: leaked\n"}],
+      "layout": [{"kind": "symlink", "path": ".synaptory.yaml", "outside_target": "vendor-state.yaml"}],
+      "ref": "repo://.synaptory.yaml",
+      "contained": false
+    },
+    {
+      "name": "an intermediate directory is a symlink out of the tree",
+      "outside": [{"kind": "file", "path": "vendor/synaptory.yaml", "content": "project_id: leaked\n"}],
+      "layout": [{"kind": "symlink", "path": "config", "outside_target": "vendor"}],
+      "ref": "repo://config/synaptory.yaml",
+      "contained": false
+    },
+    {
+      "name": "a symlink that stays inside the tree is still refused",
+      "layout": [
+        {"kind": "file", "path": "real/synaptory.yaml", "content": "project_id: taskflow\n"},
+        {"kind": "symlink", "path": ".synaptory.yaml", "inside_target": "real/synaptory.yaml"}
+      ],
+      "ref": "repo://.synaptory.yaml",
+      "contained": false
+    },
+    {
+      "name": "a directory is not a config file",
+      "layout": [{"kind": "dir", "path": ".synaptory.yaml"}],
+      "ref": "repo://.synaptory.yaml",
+      "contained": false
+    },
+    {
+      "name": "an absent file is refused rather than assumed",
+      "layout": [],
+      "ref": "repo://.synaptory.yaml",
+      "contained": false
+    }
+  ]
+}

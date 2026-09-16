@@ -225,9 +225,41 @@ test -f .husky/pre-commit && test -x .husky/pre-commit \
   || test -f lefthook.yml \
   || (echo "ERROR: pre-commit hook not installed" && exit 1)
 
-# Run a dry-run to confirm it executes without errors
-git stash -u --quiet && git stash pop --quiet 2>/dev/null || true
+# Confirm the hook is runnable, WITHOUT mutating the working tree.
+# Run it against a scratch index: git reads a missing index file as an empty
+# one, so the Step 4 staged-file lists come back empty, each hook step becomes
+# a no-op, and neither the real index nor the working tree is written.
+# This is why every staged-file list must keep `--diff-filter=ACM`: against an
+# empty index an unfiltered `git diff --cached --name-only` reports the tracked
+# files as deletions instead of reporting nothing.
+scratch_index="$(mktemp -u "${TMPDIR:-/tmp}/precommit-check.XXXXXX")"
+if [ -x .husky/pre-commit ]; then
+  bash -n .husky/pre-commit \
+    || { echo "ERROR: .husky/pre-commit has a syntax error"; exit 1; }
+  GIT_INDEX_FILE="$scratch_index" .husky/pre-commit \
+    || { echo "ERROR: .husky/pre-commit exited non-zero on an empty run"; exit 1; }
+else
+  GIT_INDEX_FILE="$scratch_index" lefthook run pre-commit \
+    || { echo "ERROR: lefthook pre-commit exited non-zero on an empty run"; exit 1; }
+fi
+rm -f "$scratch_index"
 ```
+
+What that check proves and what it does not: it proves the installed hook is
+syntactically valid and exits 0 when invoked, which is what this step claims. It
+does not prove the lint, type-check or test steps pass on real staged content:
+the next real commit is what proves that. Report it that way; do not describe an
+empty run as a full hook run.
+
+**Never verify a hook by moving the user's work out of the way.** Do not stash,
+do not create a throwaway commit, do not `checkout` over a dirty path, and never
+suppress a failure with `2>/dev/null || true`. The stash stack in particular is
+**repository-global**: one stack per repository, `stash pop` always takes
+`stash@{0}`, and it is the single piece of git state a `worktree` does **not**
+isolate. A Synaptory story pipeline runs concurrent agents in per-story
+worktrees of one repository (`.synaptory/.worktrees/`), so a stash-and-pop pair
+can carry off uncommitted work belonging to another agent, and a suppressed
+`pop` failure leaves that work in the stash while the step reports success.
 
 ### Feature Flag Testing (if feature flags detected)
 

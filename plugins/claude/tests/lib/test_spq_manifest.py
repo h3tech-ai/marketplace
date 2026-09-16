@@ -570,18 +570,48 @@ def test_cross_ref_keys_of_two_cycles_never_collide():
     assert a != b
 
 
-# ── coordination_cycle_id is hashed, so it must be shape-checked ───────────
+# ── coordination_cycle_id: hashed, and no longer shape-checked ─────────────
+#
+# `test_a_malformed_coordination_cycle_id_is_refused` and its well-formed twin
+# lived here. Their subject was the shape validator: `coordination_cycle_id`
+# became a PATH SEGMENT the moment a parent resolved it, so #303's unchecked
+# hashed field was a traversal waiting to happen and `validate` delegated to
+# `spq_paths.valid_coordination_cycle_id`.
+#
+# `SPD-194` retires the Coordination Cycle (#644), and `spq_paths` no longer
+# offers that validator. Nothing resolves the field into a path any more, so
+# the traversal is unreachable and refusing `../../etc/passwd` is a guarantee
+# about a concept that does not exist. Deleted rather than relaxed.
+#
+# What is NOT deleted is the field: `build` still accepts it and
+# `canonical_bytes` still hashes it, which the two tests below pin. The
+# in-between state -- an inert `validate` branch that reads as a shape check --
+# is pinned explicitly, because a validator that silently validates nothing is
+# worse than one that is gone, and prose in a docstring rots where an assertion
+# does not.
 
 
-def test_a_malformed_coordination_cycle_id_is_refused():
-    m = _manifest(coordination_cycle_id="../../etc/passwd")
-    problems = mf.validate(m, require_baseline=False)
-    assert any("coordination_cycle_id" in p for p in problems), problems
+def test_the_coordination_cycle_id_shape_check_is_inert_and_says_so():
+    """`validate`'s `coordination_cycle_id` branch checks nothing now.
 
+    It calls `spq_paths.valid_coordination_cycle_id` inside
+    `except (ImportError, AttributeError): pass`, and `SPD-194` removed that
+    function -- so the branch swallows the `AttributeError` and every value
+    passes, including a traversal. Asserted rather than described so the next
+    reader of that branch learns it is dead from a failing test if anyone
+    "fixes" the field back into service without restoring the validator.
+    """
+    import spq_paths
 
-def test_a_well_formed_coordination_cycle_id_validates():
-    m = _manifest(coordination_cycle_id="cc-1-9f2c1ab3")
-    assert mf.validate(m, require_baseline=False) == []
+    assert not hasattr(spq_paths, "valid_coordination_cycle_id")
+    problems = mf.validate(
+        _manifest(coordination_cycle_id="../../etc/passwd"),
+        require_baseline=False,
+    )
+    assert problems == [], (
+        "a shape check came back to life; re-assert the refusal above rather "
+        "than this absence"
+    )
 
 
 def test_absent_coordination_cycle_id_is_not_a_problem():

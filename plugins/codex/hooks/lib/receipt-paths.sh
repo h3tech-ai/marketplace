@@ -18,14 +18,20 @@
 #     Five independent derivations of one path (add the three shell hooks) is
 #     how that happens
 #
-# Three layouts, and the SPQ line covers all three of ITS homes at once because
-# each ends in `receipts/` under `spq/` (see spq_paths.py):
+# Three layouts, and SPQ now has exactly ONE receipt home (ADR-035): `receipts/`
+# sits directly under the Cycle (`spq_paths.receipts_dir`), where three homes at
+# two different depths used to answer to the retired ownership objects.
 #
-#   receipts/                                          flat
-#   specs/<active>/receipts/                           multi-spec (scrum/kanban)
-#   spq/cycles/<cycle-id>/workstreams/<ws>/receipts/   SPQ Work Units
-#   spq/cycles/<cycle-id>/receipts/                    SPQ cycle-level
-#   spq/coordination-cycles/<cc-id>/receipts/          SPQ RELEASE-{seq} (#305)
+#   receipts/                        flat
+#   specs/<active>/receipts/         multi-spec (scrum/kanban)
+#   spq/cycles/<cycle-id>/receipts/  SPQ
+#
+# The SPQ line stays a `*/receipts/*.json` sweep under `spq/` rather than
+# tightening to that one depth, and deliberately: receipts written before the
+# layout change are immutable evidence a hook still has to count and ship, and
+# `find` reaching them costs nothing. Widening the one pattern is how a single
+# definition serves both depths; adding a second line for the old one is exactly
+# how six copies came to exist.
 
 # Every receipt JSON in the project. One path per line, unordered.
 # $1 = the .orchestrator directory.

@@ -80,17 +80,41 @@ def validate_pipeline_state(state: dict[str, Any]) -> list[str]:
     # this validator.
     if build_mode == "spq" and (state.get("version") == "3.0" or isinstance(specs, dict)):
         problems.append(
-            "pipeline-state.json is on the retired v3.0 Multi-Spec layout but "
-            "build_mode is spq. Run migrate_spq_native.py: SPQ state moved to "
-            ".synaptory/.orchestrator/spq/ with native cycle/workstream identity"
+            "pipeline-state.json is on the retired v3.0 Multi-Spec layout "
+            "while build_mode is spq. There is no migrator: `ADR-035` refuses "
+            "the old layout by name rather than converting it, because pilot "
+            "state carried no audit value. Open a Cycle -- `open_cycle` writes "
+            "the board at .synaptory/.orchestrator/spq/cycles/<cycle-id>/"
+            "execution-state.json and leaves this file a mode+identity pointer"
         )
         return problems
 
-    # An SPQ pointer carries its identity under `spq`; validate what it names.
-    if build_mode == "spq" and isinstance(state.get("spq"), dict):
-        spq = state["spq"]
-        cycle_id = spq.get("cycle_id")
-        seq = spq.get("cycle_seq")
+    # An SPQ project's `pipeline-state.json` is a mode + native identity
+    # POINTER, and it is one from `initialize` onward -- not only once a Cycle
+    # exists. Lifecycle fields and Work Units live in the Cycle's own
+    # execution-state.json and are validated by the SPQ state machine;
+    # applying the legacy flat-state validator here makes a correct project
+    # look corrupt.
+    #
+    # THE `cycle_id is not None` GUARD USED TO OWN THE RETURN, and that made a
+    # project between `initialize` and `open_cycle` fall through to that
+    # validator, which reported `state: missing lifecycle_state` about a
+    # pointer not supposed to carry one. The consequence was not a cosmetic
+    # warning: `doctor` folds this verdict into `structured_execution_ready`,
+    # so every mutating MCP tool on Cursor and Codex refused -- including
+    # `approve_baseline`, the one verb that gets a project out of DISCOVERY. A
+    # fresh SPQ project could not be driven at all on either non-Claude host,
+    # and the refusal named a corrupt state file.
+    #
+    # So the branch returns for the MODE, and validates the identity only when
+    # there is one to validate.
+    if build_mode == "spq":
+        spq = state.get("spq")
+        if spq is not None and not isinstance(spq, dict):
+            problems.append("spq pointer is not an object")
+            return problems
+        cycle_id = (spq or {}).get("cycle_id")
+        seq = (spq or {}).get("cycle_seq")
         if cycle_id is not None:
             try:
                 import spq_paths
@@ -106,12 +130,7 @@ def validate_pipeline_state(state: dict[str, Any]) -> list[str]:
             except Exception as exc:  # noqa: BLE001
                 problems.append("spq.cycle_id %r is invalid: %s" % (cycle_id, exc))
 
-            # Once a Cycle exists, `pipeline-state.json` is intentionally only
-            # a mode + native identity pointer. Lifecycle fields and stories
-            # live in the selected execution-state.json and are validated by
-            # the SPQ state machine. Applying the legacy flat-state validator
-            # here makes every correctly hydrated Cycle look corrupt.
-            return problems
+        return problems
 
     if isinstance(specs, dict):
         # v3 multi-spec: active_spec must resolve to an existing slot.

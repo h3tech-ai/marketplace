@@ -184,7 +184,13 @@ def test_an_spq_project_on_the_v3_layout_is_reported_as_drift():
         }
     )
     assert problems
-    assert any("migrate_spq_native.py" in p for p in problems)
+    assert any("retired v3.0" in p for p in problems), problems
+    assert any("ADR-035" in p for p in problems), (
+        "the warning has to name the decision now that there is no migrator to "
+        "name instead: `ADR-035` refuses the old layout rather than converting "
+        "it, so the operator's next step is `open_cycle` and not a script. "
+        "Got %r" % (problems,)
+    )
 
 
 def test_a_scrum_project_on_the_v3_layout_is_still_clean():

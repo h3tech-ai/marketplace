@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Synaptory Getting Started</title>
-  <meta name="synaptory-version" content="v1.2.1">
-  <meta name="synaptory-built-at" content="2026-09-02T05:18:43Z">
+  <meta name="synaptory-version" content="v1.3.0">
+  <meta name="synaptory-built-at" content="2026-09-16T09:46:26Z">
   
   <style>
     :root {
@@ -381,7 +381,7 @@
             <p>Install a host, configure SPQ, and start your first governed Cycle.</p>
             <div class="hero-meta">
               <div class="hero-chip">2 chapters</div>
-              <div class="hero-chip" data-stamp="version">v1.2.1</div><div class="hero-chip" data-stamp="built-at">built 2026-09-02T05:18:43Z</div>
+              <div class="hero-chip" data-stamp="version">v1.3.0</div><div class="hero-chip" data-stamp="built-at">built 2026-09-16T09:46:26Z</div>
             </div>
           </div>
         </div>
@@ -451,28 +451,23 @@ tracker:
 <pre class="code-block" data-lang="text"><code>Initialize this project for governed SPQ delivery.</code></pre>
 <p>Review the proposed file before approving it. In particular, confirm <code>project_id</code>, <code>build_mode: spq</code>, repository paths, and tracker configuration.</p>
 <blockquote><p><strong>Why explicit?</strong> SPQ is the recommended lifecycle, but the current compatibility default for an omitted <code>build_mode</code> is still Scrum. Explicit configuration prevents a new project from entering the legacy lifecycle.</p></blockquote>
-<h2 id="getting-started-cursor-cli-or-ci">5. Define durable workstreams</h2>
-<p>Workstreams are product or code areas, not people or temporary crews. A minimal starting shape might be:</p>
+<h2 id="getting-started-cursor-cli-or-ci">5. Declare the source region and the trunk</h2>
+<p>A Cycle declares the repository paths it may address and the one shared branch it integrates into. There are no lanes to define and no parallelism to switch on -- concurrency is a consequence of the path scope each Work Unit declares.</p>
 <pre class="code-block" data-lang="yaml"><code>spq:
-  workstreams:
-    - id: &quot;product&quot;
-      shared_owner: true
-    - id: &quot;integration&quot;
-      integration: true
-  sync:
-    promote_to: &quot;dev&quot;
-    mode: &quot;all_or_nothing&quot;
-    integration_mode: &quot;at_sync&quot;
-    accept_unverified_events: false</code></pre>
-<p>Larger projects can add durable lanes such as <code>identity</code>, <code>billing</code>, or <code>platform</code>. Do not name workstreams after the current engineer or runtime.</p>
+  source_region:
+    - &quot;api/&quot;
+    - &quot;web/&quot;
+  trunk_ref: &quot;refs/heads/dev&quot;</code></pre>
+<p>Overlapping source regions are refused at declaration. That refusal is what lets two Cycles run concurrently without either one inspecting what the other admits.</p>
 <h2 id="getting-started-4-bind-the-repository-to-a-project">6. Start the first Cycle</h2>
 <p>Give Synaptory an outcome, not an instruction to mutate lifecycle files:</p>
 <pre class="code-block" data-lang="text"><code>Use SPQ to deliver account sign-in with audit logging. Start Discovery and
 show me the baseline before Commit.</code></pre>
 <p>The normal path is:</p>
 <ol>
-<li><strong>Discovery</strong> frames the outcome, constraints, workstreams, and evidence expectations.</li><li><strong>Baseline approval</strong> is a human gate. Review and explicitly approve or request changes.</li><li><strong>Commit</strong> admits a non-empty set of ready Work Units and seals the Cycle manifest.</li><li><strong>Cycle Execution</strong> dispatches the exact next role for each Work Unit, applies its stage/capability routing overlay, and validates its receipt.</li><li><strong>Sync entry</strong> waits for the human confirmation that workstream heads and readiness records are committed and pushed.</li><li><strong>Sync</strong> integrates the selected heads and runs the configured regression, journey, and shared-digest checks.</li><li><strong>Clear Sync</strong> is a human gate and is allowed only on a green integration verdict.</li><li><strong>Checkpoint</strong> records the increment and asks whether to open another Cycle or proceed to Acceptance.</li><li><strong>Acceptance</strong> runs the release roles and stops for the final human release decision.</li>
+<li><strong>Discovery</strong> frames the outcome, the constraints, the source region and the evidence expectations.</li><li><strong>Baseline approval</strong> is a human gate. It needs a measured calibration sample, not just a sha -- review and explicitly approve or request changes.</li><li><strong>Commit</strong> admits a non-empty set of ready Work Units, each declaring its path scope, and seals the declaration. Nothing joins the Cycle afterwards.</li><li>The Cycle dispatches the exact next role for each Work Unit and validates its receipt. Disjoint units run concurrently with nothing to enable; intersecting ones run in the order they declared.</li><li><strong>A cut</strong>, if the Cycle cannot finish its admitted set. Explicit reason, backlog return, and a key a later Commit can name. It never moves the baseline.</li><li><strong>The barrier</strong> evaluates the admitted set minus the recorded cuts -- all of it or none -- and integrates the result to the shared trunk.</li><li><strong>Checkpoint</strong> records the demonstration, the verdict, the integrated trunk revision and the cut list, and asks whether to open another Cycle or proceed to Acceptance.</li><li><strong>Acceptance</strong> runs the release roles and stops for the human release decision. Only the final one closes the engagement.</li>
 </ol>
+<p><strong>There is no Sync to wait for.</strong> Sync records that one Cycle waited on another&#x27;s published result and how it cleared; it has zero or more occurrences and blocks nothing. What blocks a Work Unit is an unsatisfied dependency, and <code>/synaptory status</code> says which one.</p>
 <p>At any boundary, ask:</p>
 <pre class="code-block" data-lang="text"><code>/synaptory status</code></pre>
 <p>On Codex, use <code>$synaptory</code> and ask for status in the same request. Do not run the lifecycle Python modules directly and never edit <code>.synaptory/.orchestrator/pipeline-state.json</code>.</p>
@@ -482,15 +477,20 @@ show me the baseline before Commit.</code></pre>
 synaptory runtimes doctor</code></pre>
 <p>Runtime selection remains inert until an enabled <code>runtimes:</code> policy is present in an SPQ project. The selected delivery role maps to one of four capability profiles, and policy cannot select anything outside <code>allowed_profiles</code>. Capability profiles do not grant authority; the dispatch envelope does.</p>
 <p>Read <a href="user-guide.html#concepts-hosts-and-runtimes">Hosts and Runtimes</a> before enabling it.</p>
-<h2 id="getting-started-5-define-durable-workstreams">8. Know which release layer you need</h2>
+<h2 id="getting-started-5-declare-the-source-region-and-the-trunk">8. One shape, and when to open a second Cycle</h2>
+<p>There is one delivery shape: a Cycle. Open a <strong>second concurrent Cycle</strong> when the work has its own cadence and a <strong>source region that does not overlap</strong> the first -- that is the whole condition, and no layer above them composes anything.</p>
 <ul>
-<li>Several workstreams sharing one Cycle and one Sync barrier: continue with</li>
+<li>Work that belongs to one increment: one Cycle. Continue with</li>
 </ul>
 <p><a href="user-guide.html#guides-spq-delivery">SPQ Delivery</a>.</p>
 <ul>
-<li>Several independent child Cycles running at different cadences but shipping</li>
+<li>Work with its own cadence and a disjoint region: a second Cycle, with its own</li>
 </ul>
-<p>together: use a <a href="user-guide.html#guides-coordination-cycles">Coordination Cycle</a>.</p>
+<p>Lead, Crew and Checkpoint. Neither waits for the other.</p>
+<ul>
+<li>Work that <strong>cannot be ordered</strong> -- a mutually dependent pair -- goes in <strong>one</strong></li>
+</ul>
+<p>Cycle. It cannot be split across two, and the declaration refuses the split and names the route.</p>
 <ul>
 <li>Existing Scrum, Kanban, or Multi-Spec project: follow</li>
 </ul>

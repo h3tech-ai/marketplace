@@ -1,0 +1,5 @@
+{
+  "check_id": "coverage-no-decrease",
+  "result": "criteria_gap_declared",
+  "detail": "no coverage baseline exists for workstream api; the missing evidence shape is a replayed coverage report at the prior revision to compare this run against"
+}

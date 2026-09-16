@@ -171,57 +171,31 @@ if [ -f "$SUITE_DIR/.orchestrator/settings.md" ]; then
   PROJECT_NAME=$(grep -m1 "^Project:" "$SUITE_DIR/.orchestrator/settings.md" 2>/dev/null | sed 's/^Project: *//')
 fi
 
-# Read sprint state from pipeline-state.json
+# Restore the board — whichever lifecycle owns it.
+#
+# This used to branch on `mode == "scrum"` and `mode == "kanban"` inline and
+# stop there, so an SPQ session restored NO pipeline context at all: no Cycle,
+# no admitted Work Units, no progress (#514). That is not merely a missing
+# summary — the SPQ design's own resume rule is that a resumed session runs
+# `next_action` first and never replans from memory, and an orchestrator handed
+# no context is exactly what invites replanning from memory.
+#
+# The rendering moved to `hooks/lib/pipeline_board.py` so all three hosts read
+# the board through one resolver and render the same restore block, and so a
+# board that could not be READ says so instead of looking like an empty board.
+# One python spawn now covers both the context block and the session title.
 SPRINT_CONTEXT=""
+SESSION_TITLE_SUFFIX=""
 STATE_FILE="$SUITE_DIR/.orchestrator/pipeline-state.json"
 
+# `restore` prints the one-line session-title suffix first, then the context
+# block from line 2 on — so bash splits it with head/tail and no second
+# interpreter spawn is needed to parse JSON back out.
 if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
-  SPRINT_CONTEXT=$("$_py" -c "
-import json, sys
-def render_substate(mode, sub, prefix=''):
-    lines = []
-    lifecycle = sub.get('lifecycle_state', 'INCEPTION')
-    lines.append(f'{prefix}Lifecycle State: {lifecycle}')
-    if mode == 'scrum':
-        current = sub.get('current_sprint', 0)
-        goal = sub.get('sprint_goal', '')
-        completed = len(sub.get('sprints_completed', []))
-        stories = sub.get('current_stories', [])
-        done = sum(1 for s in stories if s.get('state') == 'done')
-        lines.append(f'{prefix}Current Sprint: {current}')
-        if goal: lines.append(f'{prefix}Sprint Goal: {goal}')
-        lines.append(f'{prefix}Completed Sprints: {completed}')
-        if stories: lines.append(f'{prefix}Stories: {done}/{len(stories)} done')
-    elif mode == 'kanban':
-        total = sub.get('cumulative_ticket_number', 0)
-        current = len(sub.get('current_stories', []))
-        completed = len(sub.get('tickets_completed', []))
-        lines.append(f'{prefix}Cumulative Tickets: {total}')
-        lines.append(f'{prefix}On Board: {current}')
-        lines.append(f'{prefix}Completed: {completed}')
-    return lines
-
-try:
-    state = json.load(open('$STATE_FILE'))
-    version = state.get('version')
-    mode = state.get('build_mode', 'scrum')
-    out = []
-    if version == '3.0' and isinstance(state.get('specs'), dict):
-        # Multi-spec rollup (design §5.2 / docs/multi-spec-design.md)
-        out.append(f'Build Mode: {mode}')
-        active = state.get('active_spec', '')
-        out.append(f'Active Spec: {active or \"<none>\"}')
-        for sid, sub in state['specs'].items():
-            out.append('')
-            out.append(f'### Spec: {sid}' + ('  (active)' if sid == active else ''))
-            out.extend(render_substate(mode, sub, prefix='  '))
-    elif version == '2.0' and 'lifecycle_state' in state:
-        out.append(f'Build Mode: {mode}')
-        out.extend(render_substate(mode, state))
-    print('\n'.join(out))
-except Exception:
-    pass
-" 2>/dev/null || echo "")
+  _restore=$("$_py" "${_HOOK_ROOT}/hooks/lib/pipeline_board.py" \
+    "$CLAUDE_PROJECT_DIR" restore 2>/dev/null || printf '\n')
+  SESSION_TITLE_SUFFIX=$(printf '%s\n' "$_restore" | head -1)
+  SPRINT_CONTEXT=$(printf '%s\n' "$_restore" | tail -n +2)
 fi
 
 # Build context message
@@ -263,7 +237,7 @@ Workspace: ${SUITE_DIR}/
 Receipts: ${RECEIPT_COUNT} agent completions recorded
 ${OUTBOX_WARNING}
 
-${SPRINT_CONTEXT:+Sprint State:
+${SPRINT_CONTEXT:+Pipeline State:
 ${SPRINT_CONTEXT}
 }
 **IMPORTANT — Before starting work, ask the user how they'd like to proceed using AskUserQuestion:**
@@ -338,32 +312,9 @@ ${RULE_CONTENT}"
   fi
 done
 
-# Derive a session title from project + sprint/kanban state.
-SESSION_TITLE_SUFFIX=""
-if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
-  SESSION_TITLE_SUFFIX=$("$_py" -c "
-import json, sys
-try:
-    state = json.load(open('$STATE_FILE'))
-    mode = state.get('build_mode', 'scrum')
-    version = state.get('version', '2.0')
-    def sprint_label(sub):
-        lc = sub.get('lifecycle_state', 'INCEPTION')
-        if mode == 'scrum':
-            n = sub.get('current_sprint', 0)
-            return f'Sprint {n}' if n else lc.title()
-        return lc.replace('_', ' ').title()
-    if version == '3.0' and isinstance(state.get('specs'), dict):
-        active = state.get('active_spec', '')
-        sub = state['specs'].get(active, {}) if active else {}
-        lbl = sprint_label(sub) if sub else ''
-        print((' · ' + active + (' · ' + lbl if lbl else '')) if active else '')
-    else:
-        print(' · ' + sprint_label(state))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-fi
+# The session title suffix came from the same `pipeline_board.py restore` call
+# as the context block above (line 1 of its output), so it is Cycle-aware on
+# SPQ instead of falling back to a sprint label the lifecycle does not have.
 SESSION_TITLE="Synaptory · ${PROJECT_NAME:-$(basename "${CLAUDE_PROJECT_DIR}")}${SESSION_TITLE_SUFFIX}"
 
 # watchPaths: react when the project config or pipeline state is edited out-of-band.

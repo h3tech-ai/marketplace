@@ -202,6 +202,32 @@ def test_cursor_composer_backend_accepted(tmp_path: Path):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "model",
+    ["claude-sonnet-4-6", "gpt-5.6", "gemini-2.5-pro"],
+)
+def test_cursor_router_accepts_provider_model_identity(tmp_path: Path, model: str):
+    """#681: the backend is the router; the model names its routed provider."""
+    receipt = _good_receipt()
+    receipt.update(
+        {
+            "backend": "cursor",
+            "model": model,
+            "attempt_id": "att_7110131d21adfe29155a",
+            "dispatch_id": "6b66edf399537fbb3c43a3ed0b3c227e",
+            "adapter_profile_id": "cursor-local-readonly-v1",
+            "placement": "local",
+        }
+    )
+    p = _write(tmp_path, receipt)
+    r = validate_receipt(str(p), str(tmp_path))
+    assert r.valid, f"unexpected errors: {r.errors}"
+    persisted = json.loads(p.read_text(encoding="utf-8"))
+    assert persisted["backend"] == "cursor"
+    assert persisted["model"] == model
+
+
+@pytest.mark.unit
 def test_grok_model_with_claude_backend_fails(tmp_path: Path):
     receipt = _good_receipt()
     receipt["backend"] = "claude"

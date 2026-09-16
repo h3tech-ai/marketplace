@@ -50,8 +50,63 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 # dots, no leading dash.
 WORK_UNIT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
+# An authored acceptance-case id is the KEY a verifying receipt reports its
+# per-case outcome under, so it is matched literally across the manifest/receipt
+# boundary. Same containment argument as the unit id, one character wider: `.`
+# is allowed because tracker case keys carry it (`STAR-27492.1`).
+ACCEPTANCE_CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
+
 SCHEMA_VERSION = "1.0"
 KIND = "spq.cycle.manifest"
+
+# ── the test-first prove path (#406, proposal 3.3, ADR-032 section 4) ────────
+#
+# `SP-WRK-007` requires a verifying stage to verify against criteria declared
+# BEFORE any producing stage ran. V1 did the reverse: QE authored tests after
+# reading SE's diff, so the test encoded the implementation rather than the
+# requirement. Making that structural rather than a review habit needs the
+# authored set to live in an artifact that (a) exists at COMMIT and (b) cannot
+# be edited afterwards without leaving a trace.
+#
+# The Cycle manifest is already both of those things. It is authored at COMMIT,
+# it is hash-sealed, and `revise` demands an explicit supersede. So the authored
+# cases go on the Work Unit record here rather than into a side file: a side
+# file would have needed its own integrity story, and a second definition of
+# "the authored set" is how the two come to disagree.
+#
+# Three admission classifications, because migration and enforcement need
+# different answers and a single boolean would have collapsed them:
+#
+#   TEST_FIRST_AUTHORED -- the unit carries a non-empty `acceptance_cases` list.
+#                         The full contract: producer gets them as its target,
+#                         prover executes them, `tests_pass` is evaluated
+#                         against them first.
+#   TEST_FIRST_GAP      -- the unit carries `criteria_gap_declared`. Admitted,
+#                         and RECORDED as admitted without authored cases. The
+#                         declared-gap vocabulary is #403's, reused rather than
+#                         reinvented: a thin gate must render thin.
+#   TEST_FIRST_ABSENT   -- the unit record has no `acceptance_cases` KEY at all,
+#                         i.e. it predates this field. Admitted with an
+#                         implicit gap recorded on its behalf, so an in-flight
+#                         Cycle sealed before #406 is not bricked by a
+#                         requirement its manifest could not have met.
+#
+# Key ABSENCE is what separates the last two from a refusal, and that is
+# deliberate: `_normalize_unit` writes the key on every unit it touches, so any
+# manifest built by this module states its position. An empty list is therefore
+# a unit that WAS asked and authored nothing, which is refused. See the
+# forgeability note on `admission_problems`.
+TEST_FIRST_AUTHORED = "authored"
+TEST_FIRST_GAP = "criteria_gap_declared"
+TEST_FIRST_ABSENT = "absent"
+
+#: Reason stamped on the implicit gap for a pre-#406 unit record.
+LEGACY_GAP_REASON = (
+    "this Work Unit record carries no `acceptance_cases` field, so it was "
+    "admitted before the test-first prove path existed (#406). tests_pass for "
+    "it is evaluated on the pre-#406 rules and is NOT traced to criteria "
+    "declared before the producing stage ran."
+)
 
 # Conditions a dependency edge may declare, mirroring
 # `story_pipeline.DEP_CONDITIONS`. Kept as a literal here rather than imported
@@ -127,6 +182,274 @@ def verify_hash(manifest: Dict[str, Any]) -> bool:
     return bool(recorded) and recorded == compute_hash(manifest)
 
 
+# ── reading a sealed document of EITHER generation ──────────────────────────
+#
+# `open_cycle` now writes a `cycle_records` declaration: keyed on
+# `declaration_hash`, units under `admitted_units`, hashed by that module's own
+# `canonical_bytes`. This module's `manifest_hash` / `work_units` / `verify_hash`
+# describe the retired `spq.cycle.manifest`.
+#
+# The three accessors below decide, per DOCUMENT, which generation it is and
+# answer in that generation's terms. That is NOT the alias pair
+# `cycle_records.HASH_FIELD` warns against: the warning is about ONE document
+# answering to two names, and no document written by either sealer does. A
+# reader that hardcoded the retired spelling did not fail loudly -- it read a
+# missing hash as "unverifiable" and a missing unit list as "empty" -- which is
+# how the DoD gate came to report `untrusted_manifest` for every Cycle the
+# replacement state machine opens.
+
+
+def sealed_hash(document: Dict[str, Any]) -> str:
+    """The hash this sealed document claims, in the key it names it with."""
+    import cycle_records
+
+    for key in (cycle_records.HASH_FIELD, "manifest_hash"):
+        value = str(document.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def verify_sealed(document: Dict[str, Any]) -> bool:
+    """Does this sealed document still hash to what it claims?
+
+    Dispatches on the key it carries, because the two generations hash
+    different bodies with different canonical bytes: verifying a declaration
+    with this module's `verify_hash` reads `manifest_hash` as absent and
+    answers False, which is "tampered" rather than "not mine".
+    """
+    import cycle_records
+
+    if str(document.get(cycle_records.HASH_FIELD) or "").strip():
+        return cycle_records.verify_hash(document)
+    return verify_hash(document)
+
+
+def sealed_units(document: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The admitted Work Unit records, from whichever key holds them."""
+    import cycle_records
+
+    for key in (cycle_records.UNITS_FIELD, "work_units"):
+        units = document.get(key)
+        if isinstance(units, (list, tuple)):
+            return [u for u in units if isinstance(u, dict)]
+    return []
+
+
+# ── where the seal can be read from (#507) ──────────────────────────────────
+#
+# A sealed manifest is written to TWO places by `_seal_manifest`: the local
+# store under the gitignored orchestrator tree, and the committed
+# cross-clone transport under `.synaptory/cycles/`. Every reader that
+# consulted only the first one treated the loss of ONE COPY as the loss of
+# the seal -- which is how `rm` of a single file downgraded #406's gate to
+# the pre-#406 rules while an identical copy sat on disk beside it (#507).
+#
+# So "read the seal" is defined here, once, with its provenance reported,
+# rather than spelled per-caller. Two spellings of where the seal lives is a
+# seal that quietly stops being one -- the same argument the hash rule at the
+# top of this module makes about two spellings of the hash.
+
+#: The local sealed copy, `.synaptory/.orchestrator/spq/cycles/<id>/manifest.json`.
+#: Written 0444 and authoritative for THIS clone.
+SEAL_LOCAL = "local"
+
+#: The committed transport, `.synaptory/cycles/<id>/manifest.json`. A different
+#: file with a different lifetime, git-TRACKABLE (the documented narrow
+#: un-ignore), and the only copy that reaches another clone.
+SEAL_COMMITTED = "committed"
+
+#: The committed transport as `HEAD` holds it. Outside the working tree
+#: entirely: removing the file does not remove the blob, so this rung answers
+#: after both on-disk copies are gone.
+SEAL_GIT = "git"
+
+#: Ordered most-local first. The local copy wins so a clone that has both
+#: keeps answering from the document its own verbs maintain, and so tampering
+#: with the local copy still reads as tampering rather than being papered over
+#: by a pristine sibling.
+#: A copy was found and it is not the revision the board is executing. A
+#: DIFFERENT answer from "no seal": the operator action is to commit or
+#: restore the CURRENT revision, not to restore a deleted one, and consuming
+#: the older document would let a superseded, easier authored set finish the
+#: unit (#396).
+#:
+#: Named for the condition rather than the rung, because it is not the git
+#: rung's alone: the first cut of this compared only there, so restoring an
+#: old revision into either on-disk path walked straight past the check.
+SEAL_STALE = "stale"
+
+SEAL_ORIGINS = (SEAL_LOCAL, SEAL_COMMITTED, SEAL_GIT, SEAL_STALE)
+
+_GIT_TIMEOUT_S = 20
+
+
+def _git(project_dir: str, *args: str) -> Tuple[int, str]:
+    """`(returncode, stdout)`. Never raises: no git is not a verdict."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 - no git, no repo, or a hang
+        return 1, ""
+    return result.returncode, result.stdout
+
+
+def committed_relpath(project_dir: str, cycle_id: str) -> str:
+    """The committed manifest's repo-relative path, in git's own spelling."""
+    import os
+
+    import spq_paths
+
+    absolute = spq_paths.committed_manifest_path(project_dir, cycle_id)
+    return os.path.relpath(absolute, str(project_dir)).replace(os.sep, "/")
+
+
+def seal_paths(project_dir: str, cycle_id: str) -> List[Tuple[str, str]]:
+    """`[(origin, path)]` for the on-disk copies, most-local first.
+
+    Empty for an identity `spq_paths` refuses. The Cycle id reaching here comes
+    from the agent-writable board pointer, so a malformed one has to answer
+    "there is no such seal" rather than raise an `IdentityError` inside a gate
+    evaluation.
+    """
+    import spq_paths
+
+    try:
+        return [
+            (SEAL_LOCAL, spq_paths.manifest_path(project_dir, cycle_id)),
+            (SEAL_COMMITTED,
+             spq_paths.committed_manifest_path(project_dir, cycle_id)),
+        ]
+    except Exception:  # noqa: BLE001 - IdentityError and friends
+        return []
+
+
+def read_sealed(
+    project_dir: str,
+    cycle_id: str,
+    *,
+    allow_git: bool = True,
+    expect_hash: str = "",
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """`(manifest, origin)` for `cycle_id`, or `(None, "")` if no copy reads.
+
+    The hash is NOT checked here: `verify_hash` is the caller's decision,
+    because a document that fails its own hash is a different answer from no
+    document at all and this function must not collapse the two.
+
+    `allow_git=False` for a caller that must stay free of subprocesses. The
+    git rung is reached only when both on-disk copies are unreadable, which on
+    a healthy project is never.
+
+    `expect_hash` IS THE REVISION THE BOARD IS EXECUTING, and the git rung is
+    the only one that needs it (#396). `revise_manifest` writes revision N+1
+    to both working-tree copies without committing it, so `HEAD` still holds
+    N. Recovering N there and verifying only that it hashes to itself made
+    deleting the current revision cheaper than honouring it: the unit finishes
+    under the superseded, easier authored set and the case the revision added
+    is silently gone. Self-consistency answers "is this a real document", not
+    "is this the document in force".
+
+    Given a hash, a document from ANY rung that is not that revision is
+    reported as `SEAL_STALE` with no document, so a caller blocks on a stale
+    seal rather than consuming an older one. Without a hash every rung behaves
+    as before, because a caller that knows of no current revision has nothing
+    to be stale against.
+
+    WHAT `expect_hash` IS WORTH, stated exactly. It comes from the board, which
+    the graded principal can write, so it raises the cost of the bypass without
+    closing it: rewriting `sealed_manifest_hash` to a superseded revision and
+    then restoring that revision defeats this comparison. Between a revision
+    and the commit that carries it there is NO record of the current revision
+    outside the working tree, so nothing offline can do better.
+
+    A PERMANENT DESIGN LIMIT FOR AN OFFLINE PROJECT, not a gap awaiting an
+    owner (proposal §12.17, "a decision rather than an oversight"). The two
+    closures that exist -- a signature by a key the graded principal does not
+    hold, or the control plane's append-only `cycle_manifests` row -- both
+    require connectivity AT THE MOMENT OF REVISION, and requiring either would
+    make the Definition of Done gate depend on the control plane, which §3.3
+    refuses: local delivery state is canonical and an offline project must
+    still be able to evaluate its own DoD. So the residual is a property of
+    the situation rather than of this implementation, and closing it is a
+    methodology decision about §3.3, not a defect to fix here.
+
+    For a CONNECTED project the same finding IS closed, and elsewhere:
+    `manifest_emitter.read_cycle_authority` asks the recorded row, the
+    connected/offline answer comes from the CLI's own stamp and session --
+    neither of which is in the project, so deleting project files cannot fake
+    offline -- and unreachable fails closed. #507 recorded both halves and is
+    closed for what it delivered; the offline half was declared, not deferred.
+    The tripwire is
+    `test_seal_absence.py::test_an_offline_project_keeps_the_local_marker_and_its_limit`.
+    """
+    # EVERY RUNG COMPARES, not just the last one. The first cut checked only
+    # the git rung, so restoring an old revision into either on-disk path was
+    # a shorter route to the same resurrection: the loop returned before any
+    # comparison ran. A stale copy is skipped rather than returned, so a
+    # current copy further down the order still answers.
+    stale = False
+    for origin, path in seal_paths(project_dir, cycle_id):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                found = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(found, dict) and found:
+            if expect_hash and sealed_hash(found) != str(expect_hash):
+                stale = True
+                continue
+            return found, origin
+    if not allow_git:
+        return None, SEAL_STALE if stale else ""
+    relpath = ""
+    try:
+        relpath = committed_relpath(project_dir, cycle_id)
+    except Exception:  # noqa: BLE001 - an invalid id has no committed path
+        return None, SEAL_STALE if stale else ""
+    # `HEAD:./<path>` and not `HEAD:<path>`: the second form is relative to the
+    # REPOSITORY ROOT, so it would read the wrong file (or nothing) whenever the
+    # project directory is not the root -- a nested SPQ project inside a larger
+    # repository, which is a shape the worktree flow produces routinely.
+    code, out = _git(project_dir, "show", "HEAD:./%s" % relpath)
+    if code != 0 or not out.strip():
+        return None, SEAL_STALE if stale else ""
+    try:
+        found = json.loads(out)
+    except ValueError:
+        return None, SEAL_STALE if stale else ""
+    if isinstance(found, dict) and found:
+        if expect_hash and sealed_hash(found) != str(expect_hash):
+            return None, SEAL_STALE
+        return found, SEAL_GIT
+    return None, SEAL_STALE if stale else ""
+
+
+def sealed_in_history(project_dir: str, cycle_id: str) -> bool:
+    """Did any commit ever carry this Cycle's committed manifest?
+
+    The one record of a seal that the subject of the gate cannot reach by
+    writing files: removing the path from `HEAD` takes a commit, and the commit
+    that removed it is itself the evidence. Consulted only after `read_sealed`
+    has come back empty, so the cost lands on the anomalous path.
+    """
+    try:
+        relpath = committed_relpath(project_dir, cycle_id)
+    except Exception:  # noqa: BLE001
+        return False
+    code, out = _git(
+        project_dir, "rev-list", "--max-count=1", "HEAD", "--", relpath
+    )
+    return code == 0 and bool(out.strip())
+
+
 # ── construction ────────────────────────────────────────────────────────────
 
 
@@ -186,8 +509,60 @@ def normalize_dep(entry: Any) -> Dict[str, Any]:
     return {"unit_id": str(entry), "condition": "done", "external": None}
 
 
-def _normalize_unit(raw: Dict[str, Any], owner_default: str = "") -> Dict[str, Any]:
+def normalize_case(entry: Any, index: int) -> Dict[str, Any]:
+    """One authored acceptance case, normalized (#406).
+
+    Accepts a dict (`{id, statement, criterion_ref}`) or a bare string, which
+    becomes the statement with a positional id. Positional ids are stable
+    precisely because the manifest is immutable once sealed: a `revise` that
+    reorders the list produces a new hash and a recorded supersede, so a
+    receipt reporting `AC-2` can always be resolved against the revision it
+    was dispatched under. Lowering the authoring bar matters here -- a PO who
+    must invent ids for five cases authors fewer cases.
+    """
+    if not isinstance(entry, dict):
+        return {
+            "id": "AC-%d" % (index + 1),
+            "statement": str(entry or "").strip(),
+            "criterion_ref": "",
+        }
     return {
+        "id": str(entry.get("id") or "AC-%d" % (index + 1)).strip(),
+        "statement": str(entry.get("statement") or entry.get("text") or "").strip(),
+        # Which declared acceptance criterion this case proves. Traceability
+        # only: nothing selects a path or a command from it.
+        "criterion_ref": str(entry.get("criterion_ref") or "").strip(),
+    }
+
+
+def normalize_cases(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [normalize_case(entry, i) for i, entry in enumerate(raw)]
+
+
+def normalize_case_gap(raw: Any) -> Optional[Dict[str, Any]]:
+    """A `criteria_gap_declared` block on a Work Unit, normalized (#406).
+
+    A gap is only a gap when someone declared it: an empty dict, or one with
+    no reason, is not a declaration and normalizes to None so admission
+    refuses it. "Absence of a reason" being accepted as a reason is exactly
+    the silent-nothing this ticket exists to remove.
+    """
+    if not isinstance(raw, dict):
+        return None
+    reason = str(raw.get("reason") or "").strip()
+    if not reason:
+        return None
+    return {
+        "reason": reason,
+        "declared_by": str(raw.get("declared_by") or "").strip(),
+        "declared_at": str(raw.get("declared_at") or "").strip(),
+    }
+
+
+def _normalize_unit(raw: Dict[str, Any], owner_default: str = "") -> Dict[str, Any]:
+    unit = {
         "id": str(raw.get("id") or ""),
         "title": str(raw.get("title") or ""),
         "owner_workstream": str(raw.get("owner_workstream") or owner_default or ""),
@@ -200,6 +575,157 @@ def _normalize_unit(raw: Dict[str, Any], owner_default: str = "") -> Dict[str, A
         "outputs": [dict(o) for o in (raw.get("outputs") or []) if isinstance(o, dict)],
         "depends_on": [normalize_dep(d) for d in (raw.get("depends_on") or [])],
     }
+    # #406. Written only when the input STATES a position, because key absence
+    # is the migration signal `classify_unit` reads: normalizing an absent key
+    # into `[]` here would turn every pre-#406 unit into "asked and authored
+    # nothing", which admission refuses -- bricking exactly the in-flight
+    # Cycles the declared-gap path exists to carry.
+    if "acceptance_cases" in raw:
+        unit["acceptance_cases"] = normalize_cases(raw.get("acceptance_cases"))
+    gap = normalize_case_gap(raw.get("criteria_gap_declared"))
+    if gap is not None:
+        unit["criteria_gap_declared"] = gap
+    return unit
+
+
+def classify_unit(unit: Dict[str, Any]) -> str:
+    """This unit's test-first admission class (#406).
+
+    Reads the RAW record, so `acceptance_cases` key absence still means
+    "predates the requirement" rather than "authored nothing". Authored cases
+    win over a declared gap: a unit that carries both has the artifact, and
+    the gap declaration is then stale rather than load-bearing.
+    """
+    cases = unit.get("acceptance_cases")
+    if isinstance(cases, (list, tuple)) and normalize_cases(cases):
+        return TEST_FIRST_AUTHORED
+    if normalize_case_gap(unit.get("criteria_gap_declared")) is not None:
+        return TEST_FIRST_GAP
+    if "acceptance_cases" not in unit:
+        return TEST_FIRST_ABSENT
+    return ""  # asked, authored nothing, declared no gap -- refused
+
+
+def authored_case_ids(unit: Dict[str, Any]) -> List[str]:
+    """The authored case ids for one Work Unit, deduplicated in order."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for case in normalize_cases(unit.get("acceptance_cases")):
+        cid = case["id"]
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def unit_case_problems(unit: Dict[str, Any]) -> List[str]:
+    """Shape problems in one unit's authored-case artifact (#406).
+
+    Shape is checked on every manifest, whether or not admission requires the
+    artifact to be present: a malformed case list is a defect in a document
+    that IS trying to declare something, and letting it through would put an
+    unmatchable id in a hash-sealed manifest.
+    """
+    uid = unit.get("id") or "<unnamed>"
+    problems: List[str] = []
+    raw = unit.get("acceptance_cases", None)
+    if raw is not None and not isinstance(raw, (list, tuple)):
+        problems.append(
+            "work unit %r has acceptance_cases of type %s; it must be a list"
+            % (uid, type(raw).__name__)
+        )
+        return problems
+    seen: Set[str] = set()
+    for case in normalize_cases(raw):
+        cid = case["id"]
+        if not ACCEPTANCE_CASE_ID_RE.match(cid):
+            problems.append(
+                "work unit %r declares acceptance case id %r, which must match "
+                "%s: a verifying receipt reports its per-case outcome under "
+                "this exact key, so an id the two sides cannot spell "
+                "identically is a case nothing can prove"
+                % (uid, cid, ACCEPTANCE_CASE_ID_RE.pattern)
+            )
+        if cid in seen:
+            problems.append(
+                "work unit %r declares acceptance case id %r twice; per-case "
+                "outcomes are keyed by id, so a duplicate makes one of the two "
+                "unprovable" % (uid, cid)
+            )
+        seen.add(cid)
+        if not case["statement"]:
+            problems.append(
+                "work unit %r acceptance case %r has no statement: an id with "
+                "no criterion behind it is a case a producer cannot target and "
+                "a prover can trivially mark passed" % (uid, cid)
+            )
+    gap_raw = unit.get("criteria_gap_declared")
+    if gap_raw is not None and normalize_case_gap(gap_raw) is None:
+        problems.append(
+            "work unit %r declares criteria_gap_declared with no `reason`. A "
+            "gap is a statement about what is missing; without one it is "
+            "indistinguishable from having skipped the question" % uid
+        )
+    return problems
+
+
+def admission_problems(units: Sequence[Dict[str, Any]]) -> List[str]:
+    """Why these Work Units may not be admitted at COMMIT (#406).
+
+    The admission requirement of proposal 3.3: a Work Unit reaches
+    CYCLE_EXECUTION either with authored acceptance cases or with an explicit
+    declared gap. Called on the RAW caller-supplied records, before
+    `_normalize_unit` states a position on their behalf.
+
+    FORGEABILITY, stated plainly. The caller-supplied unit list is untrusted
+    input and this function is not a wall against a determined author:
+
+    - An author who omits the `acceptance_cases` key entirely lands on
+      `TEST_FIRST_ABSENT` and is admitted with an implicit gap. That is not
+      closable while migration is a requirement, because "no opinion" is
+      exactly the shape a pre-#406 sealed manifest has and refusing it bricks
+      in-flight Cycles. What is closed is SILENCE: the gap is recorded on the
+      unit, on the Cycle state, on every dispatch payload, and on the DoD
+      result, so a Cycle running without test-first is visibly running without
+      it rather than indistinguishable from one that is not.
+    - An author can declare five trivially-true cases and clear its own gate
+      later. Nothing structural stops that either, and the statement
+      requirement above only makes it cost a sentence. What the sealed
+      manifest DOES buy is that the trivial cases are the ones on the record
+      at COMMIT, before the producer ran, so a reviewer reads them against the
+      acceptance criteria rather than against the diff that satisfied them.
+      Adversarial case authorship is #408's subject, not this function's.
+
+    What IS refused here is the case a review cannot catch by reading: a unit
+    that states a position (`acceptance_cases: []`) and declares nothing.
+    """
+    problems: List[str] = []
+    for index, unit in enumerate(units or []):
+        if not isinstance(unit, dict):
+            # A problem string, not a `continue`. Skipping let a non-dict entry
+            # escape the case requirement entirely and then raise
+            # `AttributeError` deeper in `_normalize_unit`, which is a worse
+            # message from a worse place -- in a function whose entire contract
+            # is "say why these units may not be admitted".
+            problems.append(
+                "work unit at position %d is a %s, not an object; it can "
+                "declare neither an id nor acceptance cases"
+                % (index, type(unit).__name__)
+            )
+            continue
+        problems.extend(unit_case_problems(unit))
+        if classify_unit(unit):
+            continue
+        problems.append(
+            "work unit %r declares `acceptance_cases: []` and no "
+            "`criteria_gap_declared`. SP-WRK-007 requires the verifying stage "
+            "to verify against criteria declared BEFORE any producing stage "
+            "ran, so the authored set is admitted at COMMIT or its absence is "
+            "declared. Author the cases, or record why they do not exist with "
+            "`criteria_gap_declared: {\"reason\": \"...\"}`."
+            % (unit.get("id") or "<unnamed>")
+        )
+    return problems
 
 
 def build(
@@ -559,6 +1085,12 @@ def validate(
         if uid in unit_ids:
             problems.append("duplicate work unit id %r" % uid)
         unit_ids.add(uid)
+        # #406 -- SHAPE only. Whether the artifact must be PRESENT is an
+        # admission question (`admission_problems`), asked once at COMMIT
+        # against the caller's raw records; asking it here would re-ask it of
+        # every already-sealed manifest on every hydration and refuse the ones
+        # sealed before the field existed.
+        problems.extend(unit_case_problems(unit))
         owner = unit.get("owner_workstream")
         if not owner:
             problems.append("work unit %r has no owner_workstream" % uid)

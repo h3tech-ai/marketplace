@@ -1,0 +1,56 @@
+[
+  {
+    "role": "se",
+    "agent": "software-engineer",
+    "stage_profile": "producing",
+    "capability_profile": "producer"
+  },
+  {
+    "role": "qe",
+    "agent": "quality-engineer",
+    "stage_profile": "verifying",
+    "capability_profile": "prover"
+  },
+  {
+    "role": "cr",
+    "agent": "code-reviewer",
+    "stage_profile": "verifying",
+    "capability_profile": "prover"
+  },
+  {
+    "role": "ce",
+    "agent": "compliance-engineer",
+    "stage_profile": "verifying",
+    "capability_profile": "prover"
+  },
+  {
+    "role": "pe",
+    "agent": "platform-engineer",
+    "stage_profile": "producing",
+    "capability_profile": "producer"
+  },
+  {
+    "role": "tw",
+    "agent": "technical-writer",
+    "stage_profile": "producing",
+    "capability_profile": "producer"
+  },
+  {
+    "role": "po",
+    "agent": "project-owner",
+    "stage_profile": "planning",
+    "capability_profile": "planner"
+  },
+  {
+    "role": "sa",
+    "agent": "solution-architect",
+    "stage_profile": "planning",
+    "capability_profile": "planner"
+  },
+  {
+    "role": "ra",
+    "agent": "research-advisor",
+    "stage_profile": "analysing",
+    "capability_profile": "analyst"
+  }
+]

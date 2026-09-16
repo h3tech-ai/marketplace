@@ -13,6 +13,7 @@ def emit(
     event_name,
     *,
     additional_context=None,
+    protected_context=None,
     decision=None,
     reason=None,
     system_message=None,
@@ -26,7 +27,44 @@ def emit(
     permission_decision_reason=None,
     updated_tool_output=None,
 ):
-    """Emit hook JSON to stdout per the Claude Code hook output contract."""
+    """Emit hook JSON to stdout per the Claude Code hook output contract.
+
+    `protected_context` is appended after `additional_context` and is the LAST
+    thing trimmed. The cap is a blind head-truncation, so whatever a caller
+    appends last is what silently disappears — and the SubagentStart hook
+    appended the Execution Envelope last (#501). That is the machine-checked
+    contract SubagentStop enforces, so losing its tail means grading an agent
+    on text it was never shown; the compacted protocol index it displaced is
+    a reference that names where the full versions live. Whichever side is
+    trimmed, the trim is ANNOUNCED in place, because a silently shorter
+    contract reads as a lighter one.
+    """
+    if protected_context:
+        joined = (additional_context or "") + protected_context
+        protected_raw = protected_context.encode("utf-8")
+        if len(protected_raw) >= _CAP_BYTES:
+            # The protected part alone overflows, so no budget can be
+            # reserved. Drop the unprotected head entirely and let the ordinary
+            # truncation below cut the protected part: keeping the head would
+            # spend the whole cap on the reference material and deliver the
+            # contract's first lines only, which is the worse half of each.
+            additional_context = protected_context
+        elif len(joined.encode("utf-8")) > _CAP_BYTES:
+            marker = (
+                "\n[synaptory: protocol index truncated to fit the 10 KB "
+                "additionalContext cap; the Execution Envelope below is "
+                "complete. Full protocols: .synaptory/.protocols/]\n"
+            )
+            budget = _CAP_BYTES - len(protected_raw) - len(marker.encode("utf-8"))
+            head = (additional_context or "").encode("utf-8")
+            additional_context = (
+                head[: max(0, budget)].decode("utf-8", errors="ignore")
+                + marker
+                + protected_context
+            )
+        else:
+            additional_context = joined
+
     if additional_context is not None:
         raw = additional_context.encode("utf-8")
         if len(raw) > _CAP_BYTES:

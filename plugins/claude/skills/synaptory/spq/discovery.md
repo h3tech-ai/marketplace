@@ -1,525 +1,381 @@
-# Discovery State (SPQ)
+# Discovery (SPQ)
 
-> **Lifecycle state:** `DISCOVERY`
-> **Clone:** integration clone (the delivery lead's). Workstream clones do not exist yet; this state creates them.
-> **Participants:** RA (conditional), PO, SA, PE, QE, Orchestrator
-> **Output:** an **approved baseline**: problem framed, first Work Units drafted, foundation architecture, CI/CD, test framework, the three barrier proof scripts, and N provisioned workstreams
+> **Stage:** `DISCOVERY` -- runs once, and opens the engagement
+> **Participants:** Engagement Lead and Business Analyst (the problem), Solution Architect (the solution), DevSecOps Engineer, Quality Assurance, Orchestrator
+> **Output:** an **approved baseline** -- scope, non-scope, timeline, cost, a measured calibration sample, the current-system assessment, the initial source regions, and the first Cycle's candidate Work Units
+> **Human gate:** YES. The baseline is the line the engagement is held to, and only a named human approves it.
 
-Discovery is SPQ's Request + Analyze + first Plan. It is the nearest analogue to Scrum's Inception, and it carries one obligation Inception does not: **the cross-workstream barrier's inputs must exist before the first Cycle opens.** A team that reaches `SYNC` and discovers `scripts/sync-regression.sh` was never written has already spent the integration slot.
+Discovery converts an unknown into a **commitment**. It ends when the baseline exists and not before: nothing opens a Cycle until `approve_baseline` has recorded one, because the baseline is the line a cut must not move, and without it there is nothing for a cut to be measured against.
 
-## Discovery Depth
-
-Read from `.synaptory.yaml` → `sprint.inception`. That is the existing key; SPQ adds no new depth setting.
-
-| Depth | When to Use | Scope |
-|------|-------------|-------|
-| **foundation** (default) | Most projects. Direction is clear, details will emerge. | Mini-BRD, 3-5 epics, Cycle 1 Work Units with ACs, foundation ADRs, lightweight SAD (1-2 pages), API skeleton, ERD, CI/CD + Docker, test framework, barrier proof scripts. |
-| **blueprint** | Complex domains, regulatory, fixed-scope contracts needing a comprehensive plan. | Full BRD with NFRs, all epics decomposed, Cycle 1-2 Work Units, complete SAD + API contracts + ERD, full infra bootstrap, detailed test spec. |
-
-```
-CONFIG=$(cat .synaptory.yaml 2>/dev/null)
-DISCOVERY_DEPTH=<extract sprint.inception from CONFIG, default "foundation">
-```
+**Discovery is sized to the uncertainty it must remove** -- short where the problem is well understood, longer where the system is complex or the legacy estate is unknown. No configuration key sets that depth and no timer bounds it. What is fixed is the exit condition below.
 
 ---
 
-## Entry Points
+## Two lines of work, in parallel
 
-| Project Type | Path |
-|--------------|------|
-| **Greenfield** | Full Discovery (foundation or blueprint) → Baseline Gate → Commit |
-| **Brownfield** | Discover (`modes/reverse.md`) → Adaptive Discovery (fill gaps only) → Baseline Gate → Commit |
+**The problem.** The Engagement Lead -- with the Business Analyst where the domain is complex or the stakeholders and subject-matter experts many -- resolves the problem and the business case: what is needed, where the boundaries sit, what success means, and the order value should be delivered in.
+
+**The solution.** The Solution Architect resolves the architecture and the decisions that shape it and, where a system already exists, an assessment of its state and the constraints it imposes.
+
+**Whether current-system context was reconstructed, or there was none to reconstruct, is recorded either way.** "We did not look" and "there was nothing to look at" are different facts, and only one of them is a risk carried into the first Cycle.
+
+The two converge on a baseline precise enough to stand behind, expressed as the specification the Cycles will execute.
 
 ---
 
-## Adaptive Brownfield Detection
+## Pre-step: workspace bootstrap
 
-For brownfield projects (after Discover has run), detect what already exists and skip those steps. **`pe` and `qe` are skipped outright when CI/CD and a test framework are already present** but their SPQ-specific deliverables (the barrier proof scripts) are **not** covered by that detection and still have to be produced. Check for them separately.
-
-| Signal | Detection Method | If Present | If Missing |
-|--------|-----------------|------------|------------|
-| **CI/CD pipeline** | `.github/workflows/*`, `.gitlab-ci.yml`, `Jenkinsfile` | Skip PE bootstrap | Run PE bootstrap |
-| **Test framework** | `jest.config.*`, `pytest.ini`, `*_test.go`, `conftest.py` | Skip QE setup | Initialize test framework |
-| **Barrier proof scripts** | `scripts/sync-regression.sh`, `sync-journey.sh`, `shared-digest.sh` | Skip Step 3b | **Run Step 3b regardless of the two rows above** |
-| **Architecture docs** | `docs/architecture/`, `**/adr-*.md` | Skip SA foundation | Run foundation ADRs |
-| **Context packages** | `.synaptory/.orchestrator/context-packages/*.md` | Skip Discover | Already ran |
-| **Project config** | `.synaptory.yaml` with `build_mode: spq` | Skip config gen | Run Init mode |
-| **Tracker data** | `tracker_cli.py health-check` returns OK | Skip tracker init | Initialize tracker |
-| **Business requirements** | `docs/requirements/*BRD*.md` (or `paths.brd`) exists | Skip business interview (Step 1 floor) | Run business-discovery floor |
-| **Tech stack documented** | `docs/architecture/tech-stack.md` or ADRs document the stack | Skip technical recommend-then-confirm | Run technical interview |
-| **UI mockups** | `.synaptory/design/mockups/index.html` exists and is approved | Skip mockup generation (Step 2.5) | Generate mockup baseline (UI projects only) |
-| **Workstream provisioning** | `spq.workstreams[]` non-empty **and** each branch exists on the remote | Skip Step 5 | Run Step 5 |
+Idempotent, safe to re-run.
 
 ```bash
-TRACKER_CLI="python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir $(pwd)"
+mkdir -p .synaptory/.protocols/ docs/requirements/validation
 
-DETECTED=()
-MISSING=()
-
-# CI/CD
-ls .github/workflows/*.yml .gitlab-ci.yml Jenkinsfile 2>/dev/null | head -1 && DETECTED+=(cicd) || MISSING+=(cicd)
-
-# Test framework
-ls jest.config.* pytest.ini conftest.py 2>/dev/null | head -1 && DETECTED+=(tests) || MISSING+=(tests)
-find . -name "*_test.go" -maxdepth 3 2>/dev/null | head -1 && DETECTED+=(tests)
-
-# Barrier proof scripts (SPQ-specific, no scrum analogue, so nothing else checks for them)
-ls scripts/sync-regression.sh scripts/sync-journey.sh scripts/shared-digest.sh 2>/dev/null | wc -l
-
-# Architecture
-ls docs/architecture/*.md 2>/dev/null | head -1 && DETECTED+=(architecture) || MISSING+=(architecture)
-
-# Tracker
-${TRACKER_CLI} health-check 2>/dev/null && DETECTED+=(tracker) || MISSING+=(tracker)
-```
-
-### Adaptive Paths
-
-**ALL detected (including the proof scripts and workstream provisioning)** → skip Discovery → start at Commit:
-```
-Print: "Brownfield ready, existing infrastructure and barrier scripts detected. Skipping Discovery."
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" transition "$(pwd)" COMMIT
-→ Read spq/commit.md
-```
-
-**SOME detected** → targeted Discovery, running only the missing steps:
-```
-Print: "Partial setup detected. Running targeted Discovery for: {MISSING list}"
-```
-
-**NONE detected** → full Discovery, same as greenfield.
-
----
-
-## Pre-Step: Workspace Bootstrap
-
-Before dispatching any agent, verify the workspace is initialised. Idempotent, safe to re-run.
-
-```bash
-mkdir -p .synaptory/.protocols/ .synaptory/.orchestrator/receipts docs/requirements/validation
-
-# Initialise SPQ pipeline state only if missing or empty
 if [ ! -s .synaptory/.orchestrator/pipeline-state.json ]; then
   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" init "$(pwd)"
 else
-  echo "  ✓ Workspace already initialised, skipping bootstrap"
+  echo "  workspace already initialised, skipping bootstrap"
 fi
 ```
 
-(The deployed plugin ships `.pyc`; source dev runs use `.py`. Try `.py` first and fall back to `.pyc` if it is missing.)
+**Verify the state is SPQ, not Scrum.** `init` writes `build_mode: spq` and `lifecycle_state: DISCOVERY`. If `read` reports anything else, stop -- a Scrum state file driven by these prompts fails open rather than closed, because the Stop-hook loop engine resolves its state machine from `build_mode` and would drive the other one.
 
-**Verify the state is SPQ, not scrum.** `init` writes `build_mode: spq` and `lifecycle_state: DISCOVERY`. If `read` reports anything else, stop. A scrum state file driven by SPQ prompts fails open rather than closed: the Stop-hook loop engine would drive the *scrum* state machine and the barrier would never be reached.
+**Un-ignore the committed transport now, not at Commit.** `open_cycle` refuses a Cycle whose declaration would be gitignored, and discovering that at Commit wastes the sizing session:
 
-**If bootstrap fails** (missing module, permission error): create `pipeline-state.json` manually with `{"version": "2.0", "build_mode": "spq", "lifecycle_state": "DISCOVERY", "discovery": {"completed_at": null, "baseline_approved": false}, "current_cycle": 0, "current_stories": []}` and continue.
+```bash
+git check-ignore -q .synaptory/cycles/ \
+  && echo "GITIGNORED -- add '!.synaptory/cycles/' after '.synaptory/*'" \
+  || echo "committed transport is visible to git"
+```
 
-**Generate `CLAUDE.md` (idempotent).** It is the session-persistent anchor Claude Code reads at the start of every session, and under SPQ it carries one extra obligation: it must name the lifecycle as `spq` and it must carry the git safety rules, because those rules are what make `SYNC` a human gate.
+**Generate `CLAUDE.md` (idempotent).** It is the session-persistent anchor read at the start of every session. Under SPQ it must name the lifecycle as `spq`, list the declared source regions, and carry the git safety rules verbatim -- those rules are what keep the trunk promotion a human act.
 
 ```python
 if not Read("CLAUDE.md") or "synaptory-state" not in Read("CLAUDE.md"):
     # Same section shape as ceremonies/inception.md, with:
     #   - Build mode: spq
-    #   - a Workstreams table (id, branch, shared_owner) from .synaptory.yaml
-    #   - the six git safety rules VERBATIM, plus:
-    #     7. NEVER hand-author a readiness record under .synaptory/sync/.
-    #   - a <!-- synaptory-state --> comment carrying phase: DISCOVERY and cycle: 0
+    #   - the declared source regions, and the paths outside every region
+    #   - the seven git safety rules VERBATIM from modes/spq.md
+    #   - a <!-- synaptory-state --> comment carrying stage: DISCOVERY
     Bash('printf "%s" "$SECTION" | python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/update_claude_md.py" "${CLAUDE_PROJECT_DIR}"')
 ```
 
-`update_claude_md` is idempotent: it inserts or updates the `synaptory` section without overwriting other content.
-
 ---
 
-## Receipts for this state
+## Receipts for this stage
 
-Every agent dispatched here writes its receipt under the pseudo Work Unit id **`DISCOVERY-0`**, because Discovery has no Work Units yet and receipt `story_id` must match `^[A-Z][A-Z0-9]*-\d+$`:
+Every step writes its receipt under the pseudo Work Unit id **`DISCOVERY-0`**, because Discovery has no Work Units yet and a receipt's `story_id` must match `^[A-Z][A-Z0-9]*-\d+$`. **No Discovery step is on a receipt-gated edge**: nothing in `DISCOVERY -> CYCLE` reads any of these files, so all but one are skill invocations the orchestrator runs in its own context. The full rule is in `modes/spq.md` under "Dispatch identities versus skill invocations".
 
-| Agent | Receipt path | `token_usage.stage` |
-|---|---|---|
-| `ra` (conditional) | `.synaptory/.orchestrator/receipts/DISCOVERY-0-ra.json` | *(resolved from role)* |
-| `po` | `.synaptory/.orchestrator/receipts/DISCOVERY-0-po.json` | **`pro-discovery`: must be stated explicitly** |
-| `sa` | `.synaptory/.orchestrator/receipts/DISCOVERY-0-sa.json` | *(resolved from role)* |
-| `pe` | `.synaptory/.orchestrator/receipts/DISCOVERY-0-pe.json` | *(resolved from role)* |
-| `qe` | `.synaptory/.orchestrator/receipts/DISCOVERY-0-qe.json` | *(resolved from role)* |
+Resolve every path rather than spelling it:
 
-**Why `po` is special.** `project-owner` is deliberately absent from the receipt validator's role→stage fallback map, because it spans three stages (`pro-discovery`, `pro-brd`, `pro-ux-spec`) and the validator cannot pick one for you. The prefix fallback does not rescue it either, it omits `pro-` for the same reason. Every PO dispatch prompt in this file **must name the stage**, or the PO's cost attribution is lost silently: the work runs, the receipt validates, and `/cost` shows nothing for it. The other eight roles resolve through the fallback map and are safe to omit.
-
----
-
-## Step 0. RA: Frame the Problem (Conditional)
-
-**Dispatch the Research Advisor only when the problem is genuinely unframed**: the user is describing a situation rather than a product, the domain is unfamiliar, or there are competing approaches nobody has weighed. If the request already names what to build and why, **skip this step**: an RA pass over an already-framed problem is a pure cost with no artifact anybody reads.
-
-```
-RA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "research-advisor")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the research inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="RA problem framing", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${RA_BACKEND}.md` for the full prompt template. The RA writes its receipt to `.synaptory/.orchestrator/receipts/DISCOVERY-0-ra.json` as its last action.
-
-**RA prompt context:**
-- The user's description of the situation
-- What is already known vs assumed
-- Any constraints already stated (regulatory, budget, existing systems)
-
-**RA output:**
-- Problem statement, context, options with trade-offs, risks
-- Written to `.synaptory/.orchestrator/discovery-research.md`
-
-**Record a MethodSignal** if this step was skipped, or if it was needed but the framing still did not converge. The whole point of running SPQ on V1's nine agents is to learn where the mapping chafes:
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" record_method_signal "$(pwd)" \
-  profile_straddle --summary "ra acted as Analyst; po then re-derived the same framing at Step 1"
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/advance_kernel.py" bind_receipt "$(pwd)" DISCOVERY-0 qe
 ```
+
+| Step | How it runs | Receipt suffix | `role` / `accountable_role` | `token_usage.stage` |
+|---|---|---|---|---|
+| Problem framing (conditional) | skill invocation | `-research.json` | `orchestrator` / `research-advisor` | `orchestrator` |
+| Baseline, BRD, first Work Units | skill invocation | `-baseline.json` | `orchestrator` / `project-owner` | **`pro-discovery`: state it explicitly** |
+| Design mockups (UI surfaces) | orchestrator | `-design.json` | `orchestrator` | `orchestrator` |
+| Architecture and current-system assessment | skill invocation | `-architecture.json` | `orchestrator` / `solution-architect` | `sa-architecture` |
+| Pipeline and environments bootstrap | skill invocation | `-infra.json` | `orchestrator` / `platform-engineer` | `pe-infra` |
+| Test framework and the calibration sample | **dispatch** | `-qe.json` | `quality-engineer` | *(resolved from role)* |
+
+**Why the PO stage is special.** `project-owner` is deliberately absent from the receipt validator's role-to-stage fallback, because it spans three stages and the validator cannot pick one for you; the prefix fallback omits `pro-` for the same reason. Omit the stage and the receipt still validates while the cost attribution silently disappears.
 
 ---
 
-## Step 1. PO: Baseline Problem, BRD, First Work Units
+## Step 0. Frame the problem (conditional, research skill)
 
-Dispatch the Project Owner agent.
+Run this **only when the problem is genuinely unframed** -- the request names a technology rather than an outcome, or the stakeholders disagree about what success is. A framed problem needs no research pass, and running one anyway spends a session restating what the client already said.
+
+> **SKILL INVOCATION, not a dispatch.** No gate reads a `research-advisor` receipt on any SPQ flow, so spawning an isolated subagent buys nothing. Retrieve the contract, do the work here, and write ONE orchestrator receipt for the step (`modes/spq.md`, "Dispatch identities versus skill invocations").
 
 ```
-PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
+synaptory skills get research-advisor
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the BRD/backlog work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO discovery, baseline and first Work Units", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `.synaptory/.orchestrator/receipts/DISCOVERY-0-po.json` as its last action, and **the prompt MUST instruct it to set `token_usage.stage` to `pro-discovery`**, because this stage is not derivable from the role.
-
-> **MANDATORY business-discovery floor, every engagement mode, including autonomous.**
-> Instruct the PO to run the business-discovery floor (problem & who, core workflow with
-> writable AC, explicit out-of-scope, success metric, hard constraints/compliance) via
-> `AskUserQuestion` before authoring the BRD. Autonomous mode does **not** skip this; it
-> only drops the *extended* rounds. Every BRD/epic claim must trace to an interview answer
-> or a source doc, never to an unstated guess. The PO writes the answers to
-> `.synaptory/.orchestrator/business-interview-answers.md`. See
-> `plugin-claude/agents/project-owner/phases/01-understand-input.md`.
-
-**PO prompt context:**
-- The user's project description / build request
-- Discovery depth (foundation or blueprint)
-- RA framing from Step 0, if it ran
-- Existing context packages (if brownfield)
-- Engagement mode (from `.synaptory.yaml`). note the floor runs regardless
-- **The workstream list** (`spq.workstreams[]`). Work Units must be draftable against product areas that map onto it, or the first Commit cannot distribute them
-
-**PO output:**
-- Mini-BRD (foundation) or full BRD with NFRs (blueprint): vision, problem, target users, key features
-- 3-5 epics with rough breakdowns
-- Cycle 1 Work Units fully decomposed with acceptance criteria (Given/When/Then), each carrying `kind`, `labels`, `depends_on` and (optionally) `file_scope`
-- **A proposed workstream assignment per epic**, naming which product area owns it
-
-The PO receipt looks like this (`stage` is the load-bearing field; `model` and `token_usage` come from the agent's own run):
-
-```json
-{
-  "story_id": "DISCOVERY-0",
-  "role": "project-owner",
-  "backend": "claude",
-  "model": "claude-opus-4-8",
-  "artifacts": ["docs/requirements/BRD.md", ".synaptory/.orchestrator/business-interview-answers.md"],
-  "metrics": {"epics": 4, "work_units_drafted": 9, "interview_answers": 6},
-  "verification_commands": ["test -s docs/requirements/BRD.md"],
-  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "pro-discovery"},
-  "completed_at": "2026-08-03T00:00:00Z"
-}
-```
-
-**Skip if:** brownfield with an existing BRD and a populated backlog (adaptive detection).
+Output: the problem statement, the users, the business case, what is explicitly **not** in scope, and the open questions Discovery must still answer.
 
 ---
 
-## Step 2. SA: Foundation Architecture and the Shared Surface
+## Step 1. The baseline: scope, non-scope, timeline, cost (project-owner skill)
 
-Dispatch the Solution Architect agent.
+> **SKILL INVOCATION, not a dispatch.** Nothing in `DISCOVERY -> CYCLE` reads a `project-owner` receipt, so the orchestrator retrieves the contract and does the work in its own context. The receipt it writes MUST name `token_usage.stage: "pro-discovery"`.
 
 ```
-SA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "solution-architect")
+synaptory skills get project-owner
+synaptory skills get project-owner/guides/discovery
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="SA foundation architecture", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/DISCOVERY-0-sa.json` as its last action.
+Produce, in the repository:
 
-> **MANDATORY technical recommend-then-confirm, every engagement mode, including
-> autonomous.** Instruct the SA to present a **Technical Recommendation Summary**
-> (language, framework, datastore(s), architecture pattern, key trade-offs) via
-> `AskUserQuestion` and get user confirmation or override **before** finalizing ADRs/SAD.
-> Autonomous mode auto-derives the *proposal* from the BRD but still surfaces this single
-> confirmation gate, it must not silently pick the stack. The SA records the confirmed
-> decision to `.synaptory/.orchestrator/tech-interview-answers.md`.
+- **Scope and non-scope.** Both. A baseline listing only what is in it cannot refuse a change that was never excluded.
+- **The specification**, structured and machine-readable, with **individually addressable, testable acceptance criteria**. A criterion nothing can point at is a criterion nothing can verify.
+- **Timeline and cost**, against the scope above.
+- **The first Cycle's candidate Work Units**, each with acceptance criteria and a **declared path scope**. They are candidates: what a Cycle admits is decided at its own Commit.
+- **The specification revision id.** Lead time is measured from the approved specification timestamp, so an unversioned specification makes the measurement unreproducible.
 
-**Foundation output:**
-- 3-5 foundation ADRs (architecture pattern, tech stack, data strategy, API approach) reflecting the CONFIRMED stack
-- Lightweight SAD (1-2 pages): system overview, layer separation, key flows (auth, multi-tenancy, data access)
-- API skeleton (OpenAPI or gRPC proto)
-- ERD for core entities
-
-**Blueprint output:** complete SAD, all ADRs, full API contracts, comprehensive ERD, sequence diagrams for key flows.
-
-**SPQ-specific obligation: name the shared surface.** With N workstreams building in parallel, whatever they share is where drift accumulates. Instruct the SA to produce, as an explicit deliverable:
-
-1. **The shared paths.** Which directories hold cross-workstream contracts and the design system (typically `contracts/`, an OpenAPI directory, a shared types package, a design-token package). These become `spq.sync.shared_digest_paths`, which barrier criterion 4 compares.
-2. **A recommendation for which workstream should own them** (`shared_owner: true`). One workstream, not a committee, the owner publishes a pinned version at each Commit and the rest build against it.
-3. **The workstream seams.** Where the product decomposes with the fewest shared touchpoints. A decomposition that gives every workstream a stake in `contracts/` produces a barrier that blocks every Cycle.
-
-Record all three in the SAD and reflect (1) and (2) into `.synaptory.yaml` at Step 5.
-
-**Skip if:** brownfield with existing `docs/architecture/`. Still get the shared-surface decision, because nothing in a scrum-era repo will have recorded it.
+Each specification declares a **kind** -- `feature`, `story`, `bugfix`, `task`, `release` -- and the kind decides which fields are required. An unrecognised kind is rejected at Commit rather than defaulted, so settle it here.
 
 ---
 
-## Step 2.5. Design: UI/UX Mockup Baseline (UI-surface projects)
+## Step 2. The solution: architecture and the existing system (architecture skill)
 
-**Trigger:** `.synaptory.yaml` → `features.frontend: true`, OR `project.framework` is a web/mobile framework. `features.frontend` is authoritative.
+> **SKILL INVOCATION, not a dispatch.** `solution-architect` is on no receipt-gated edge in this lifecycle, so no SPQ ceremony dispatches it at all.
 
-**Skip the entire step for:** CLI tools, libraries, backend-only APIs, infrastructure projects.
+```
+synaptory skills get solution-architect
+```
 
-Follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`. For UI-surface projects the in-repo mockup baseline is **MANDATORY** and the Baseline Gate blocks on it; `design.enabled: false` disables only the optional Claude Design path, not the baseline.
+Output: the foundation ADRs, a lightweight SAD, the data model, the API surface, and -- where a system already exists -- **its assessed state and the constraints it imposes**.
 
-Generate self-contained HTML/CSS mockups for the key screens using the design system
-reference as the token source. Those bodies are control-plane delivered, not packaged
-(ADR-016) -- fetch them first:
+**Record the current-system finding either way.** One of these two sentences belongs in the baseline:
+
+- "Current-system context was reconstructed from {sources}; the constraints it imposes are {list}."
+- "There is no existing system; this is greenfield."
+
+A baseline silent on this point has not answered the question, and the first Cycle pays for it.
+
+---
+
+## Step 3. Pipeline and environments (platform skill)
+
+> **SKILL INVOCATION, not a dispatch.** No Discovery gate reads a `platform-engineer` receipt; the Acceptance one does, and that stays a dispatch.
+
+```
+synaptory skills get platform-engineer
+```
+
+Early Cycles establish the deployment environments and the CI/CD pipeline because later ones build on them, so Discovery leaves the first version behind: build, test and deploy running end to end on one trivial change.
+
+**Leave a runnable regression behind, and name it in the baseline.** At Checkpoint the barrier's `regression_green` criterion is satisfied by a supplied proof, and **a skipped or absent proof counts as unmet, never as met**. So the baseline records the exact command that produces it -- `make regression`, `npm run test:ci`, whatever this repository uses. No configuration key reads that command: it is named in the specification and cited by the Checkpoint, which is why it belongs in a document a human reads rather than in a setting nothing enforces.
+
+---
+
+## Step 4. The measured calibration sample (QE dispatch)
+
+**This is the step Discovery cannot end without, and the one most often skipped.** `approve_baseline` refuses a baseline with no calibration, because the commitment must be calibrated against a real, measured sample of the work before it binds -- and a baseline approved without one is an estimate with a signature on it.
+
+**A git revision and a boolean do not satisfy it.** A `baseline_sha` is a starting revision, not a commitment.
+
+Dispatch the Quality Engineer to build the test framework **and to take the sample**: carry one or two representative Work Units all the way through -- implement, verify, review -- and measure what it cost.
+
+> **MANDATORY: spawn this agent via the `Agent()` tool.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. Resolve the receipt path with `bind_receipt` above and pass the resolved absolute path into the prompt; do not pass a literal variable.
+
+What the sample must carry, because these are the fields a later capacity plan cites:
+
+| Field | Why |
+|---|---|
+| the Work Unit ids measured | a plan citing a sample nobody recorded is fabricated history |
+| how many units | sample size, stated rather than implied |
+| elapsed time, with its unit | a bare number is how a per-day rate gets read as a per-Cycle one |
+| the observation window | `{start}..{end}`, so the measurement can be placed in time |
+| the verification depth applied | a sample proven shallowly does not size deeply-proven work |
+| the method | one sentence on how it was measured, so it can be repeated |
+
+The first-ever Cycle plans against **this sample plus an explicit bootstrap assumption**. It may not plan against invented Cycle history, and once real Cycles have closed it may not fall back to a bootstrap: `cycle_measurement.assert_plan_supported` refuses both directions.
+
+---
+
+## Step 4b. The UI/UX mockup baseline (UI-surface projects only)
+
+**Trigger:** `.synaptory.yaml` -> `features.frontend: true`, or a web/mobile framework in `preferences`. `features.frontend` is authoritative. **Skip the whole step** for CLI tools, libraries, backend-only APIs and infrastructure projects.
+
+Follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`. For a UI-surface project the in-repo mockup baseline is **MANDATORY** and the Baseline Gate blocks on it; `design.enabled: false` disables only the optional Claude Design path, not the baseline.
+
+Generate self-contained HTML/CSS mockups for the key screens, using the design-system reference as the token source. Those bodies are control-plane delivered rather than packaged (ADR-016), so fetch them first:
 
 Bash("synaptory skills get design-assets/component-patterns")
 Bash("synaptory skills get design-assets/color-palettes")
 Bash("synaptory skills get design-assets/typography")
 Bash("synaptory skills get design-assets/spacing-layout")
- Each page inlines its CSS (no external CDN/font/script fetches). Cover the landing screen, the primary user flow, and the core action at minimum. Write to `${design.mockups_dir}` (default `.synaptory/design/mockups/`): one `{screen}.html` per screen plus an `index.html` gallery.
 
-**Under SPQ the mockup baseline has a second job:** it is the first draft of the design system the `shared_owner` workstream will publish and pin at each Commit. Note in `.synaptory/design/mockups/README.md` which tokens are shared (and therefore governed by the barrier) versus workstream-local.
+Each page inlines its CSS -- no external CDN, font or script fetches. Cover the landing screen, the primary user flow and the core action at minimum. Write to `${design.mockups_dir}` (default `.synaptory/design/mockups/`): one `{screen}.html` per screen plus an `index.html` gallery.
 
-The orchestrator generates this baseline itself, so its receipt is orchestrator-authored: `role: "orchestrator"`, `token_usage.stage: "orchestrator"`, and a **descriptive filename suffix** rather than a role abbreviation (`orchestrator` has no entry in the contract's role-abbreviation map). Because `SessionEnd` ships inline orchestrator receipts through the receipt validator, it MUST carry every required field:
-
-```json
-{
-  "story_id": "DISCOVERY-0",
-  "role": "orchestrator",
-  "backend": "claude",
-  "model": "claude-opus-4-8",
-  "artifacts": [".synaptory/design/mockups/index.html", ".synaptory/design/mockups/landing.html"],
-  "metrics": {"screens": 3, "mockups_generated": 3},
-  "verification_commands": ["test -s .synaptory/design/mockups/index.html"],
-  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "orchestrator"},
-  "completed_at": "2026-08-03T00:00:00Z"
-}
-```
-
-Written to `.synaptory/.orchestrator/receipts/DISCOVERY-0-design.json`. (`model` and `token_usage` come from the orchestrator's own run; the zeros are placeholders. `metrics` must be non-empty, at least one concrete count.)
+**Under SPQ the baseline has a second job:** design tokens usually live *outside* every source region, which makes them a shared path with exactly one owning Work Unit per Cycle. Note in `.synaptory/design/mockups/README.md` which tokens are shared -- those are the ones the barrier's `shared_paths_owned` criterion will range over -- and which belong inside one region.
 
 ---
 
-## Step 3a. PE: CI/CD Bootstrap
+## Step 5. Declare the source regions
 
-Dispatch the Platform Engineer agent.
+**This is what replaced provisioning.** There are no lanes to provision -- no per-lane clone, no per-lane branch, no ownership table. What Discovery draws instead is the set of **source regions**, because they decide how many Cycles can run at once.
 
-```
-PE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "platform-engineer")
-```
+A **source region** is a declaration *on a Cycle*: the part of the source that Cycle may address. It is not a team and not an object of its own, so nothing is created here. What Discovery produces is the map each Cycle's Commit will declare from.
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the infra work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PE CI/CD bootstrap and barrier proof scripts", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `.synaptory/.orchestrator/receipts/DISCOVERY-0-pe.json` as its last action.
+Three rules govern the map, and all three are checked later by code:
 
-**PE output:**
-- CI/CD pipeline (GitHub Actions / GitLab CI / etc.)
-- Dockerfile + docker-compose.dev.yml
-- Dev environment setup
-- Basic monitoring configuration
-- **A CI job that runs on `sync/cycle-*` branches.** The integration branch is where the barrier is evaluated, so it must be a first-class CI target rather than an unmatched glob
+1. **Two concurrent Cycles never declare overlapping regions.** That is the only cross-Cycle check in the system, and it runs at declaration -- which is exactly what lets concurrent Cycles stay independent, because no Cycle has to inspect what another is admitting.
+2. **A path outside every region is a shared path** -- contracts, schemas, shared libraries, the build configuration. Exactly one Work Unit is declared its owner at Commit: never none, never two. Two owners is the same unrecoverable merge as none, because whoever merges last decides what the file says.
+3. **A change that must land together with its consumer cannot be ordered, so it cannot be split.** It is admitted to **one** Cycle rather than spread across concurrent ones.
 
-**Blueprint adds:** staging environment setup.
-
-**Skip if:** brownfield with an existing CI/CD pipeline. This does **not** cover Step 3b.
-
----
-
-## Step 3b. PE: The Three Barrier Proof Scripts (SPQ-only, never skipped)
-
-Fold this into the same PE dispatch as Step 3a. It has no scrum analogue, so no adaptive-detection row above will notice it is missing, and it is the single most commonly forgotten Discovery deliverable, because it is project code rather than plugin code.
-
-The barrier executes these three scripts directly, outside the hook path. Their paths come from `spq.sync`:
-
-| Script | Barrier criterion | What it must do |
-|---|---|---|
-| `scripts/sync-regression.sh` | 3, regression green on the integrated tree | Run the **full cross-workstream** suite. Non-interactive, no watch mode, no dev server. Exit 0 only on a clean pass. |
-| `scripts/sync-journey.sh` | 5, the increment's end-to-end journey passes | Drive the current increment's primary user journey end to end on the integrated branch. **A skipped journey is UNPROVEN, not passed**, since the barrier treats a skip as a block, so do not stub it with `exit 0`. |
-| `scripts/shared-digest.sh` | 4, shared digests match | Given repo-relative paths as arguments, emit one `<path> <sha256>` line per path. Tracked files only, `LC_ALL=C` sort, content bytes only, no modes, no mtimes. |
-
-**Four constraints the PE prompt must state, because a script that violates them fails at the barrier and not before:**
-
-1. **Repo-relative and committed.** Invoked as `bash scripts/<name>.sh`. Absolute interpreter script paths are rejected by the Evidence Contract.
-2. **No pipes, redirects, `&&`, `;`, or command substitution in any recorded verification command.** Compose inside the script, never in the command string.
-3. **`git` is not an allowlisted program.** Any `git` use must live *inside* the script; it can never appear in a receipt's `verification_commands`.
-4. **`shared-digest.sh` is ONE script invoked TWICE**: once by `declare-ready` in each workstream clone, once by `evaluate` in the integration clone. Two implementations, or any locale/ordering/metadata dependence, produce a barrier that fails for reasons nobody can reproduce. Determinism is the requirement; brevity is not.
-
-Verify they exist and are executable before leaving Discovery:
-```bash
-bash scripts/shared-digest.sh contracts/
-test -x scripts/sync-regression.sh
-test -x scripts/sync-journey.sh
-```
-
----
-
-## Step 4. QE: Test Framework and the Journey
-
-Dispatch the Quality Engineer agent.
+Write the map into the baseline. Each entry is one region and the paths it covers, in the declared path grammar:
 
 ```
-QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
+region             paths                                   intended concurrent Cycles
+─────────────────  ──────────────────────────────────────  ──────────────────────────
+ingest             src/ingest/, src/api/routers/ingest.py  1
+dashboard          web/src/, web/public/                   1
+shared (no region) contracts/, db/migrations/              n/a -- owned per Work Unit
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the test-framework setup inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE test framework and increment journey", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/DISCOVERY-0-qe.json` as its last action.
+**The grammar is small on purpose, and unsupported forms are refused rather than guessed.** Every accepted form has exactly one reading, so two people declaring the same intent produce the same declaration:
 
-**QE output:**
-- Test framework configuration (jest/pytest/go-test based on the confirmed stack)
-- Cycle 1 test specification
-- **The journey definition that `scripts/sync-journey.sh` executes.** QE owns *what* the journey asserts; PE owns the script plumbing that runs it. Say so in both prompts, or each will assume the other did it.
-- **A regression-scope statement**: which suites belong in `sync-regression.sh` (everything cross-workstream) versus a workstream's own pre-declare run. Getting this wrong in the expensive direction, the full suite per Work Unit, is the measured cause of slow cycles.
-
-**Blueprint adds:** contract test stubs, detailed test spec.
-
-**Skip if:** brownfield with an existing test framework. Still get the journey definition and the regression scope.
-
----
-
-## Step 5. Workstream Provisioning
-
-The barrier cannot form a quorum from an empty list, and these ids are **permanent**: they land in control-plane history on the first receipt and every historical rollup keys on them.
-
-**Three inputs this state cannot infer.** They are delivery-planning decisions, not design questions. Ask the user:
-
-| Input | Why it blocks |
+| Accepted | Means |
 |---|---|
-| **N and the workstream ids** | Every clone, manifest branch and native `spq/workstream` pin derives from them |
-| **Which workstream is `shared_owner: true`** | Decides who publishes contracts and the design system at each Commit |
-| **The tracker discriminator**, a label or a Linear project | Commit filters each workstream's admitted set by it; Linear permits only these two |
+| `api/` | this directory and everything under it |
+| `api/**` | the same thing, spelled the way a reader expects |
+| `api/routers/auth.py` | one exact file |
 
-**Name product areas, not people.** A workstream named after whoever currently staffs it is wrong the moment they move, and the name is already permanent by then. A Crew is the *assignment* of people to a workstream; reassigning a Crew must not rename a workstream, invalidate a rollup, or move a branch.
+| Refused | Because |
+|---|---|
+| `*.py` | it matches in every directory, so it declares no region at all |
+| `**/fixtures` | the same problem, one level down |
+| `api/*/routers` | "one segment" is a guess about how deep the tree is |
+| `../shared`, `/etc/passwd` | a scope that leaves the repository is not a scope in it |
+| `api\routers` | one separator, so two spellings cannot disagree about one path |
+| `""` | an empty scope declares nothing, and reads as "addresses nothing" -- which is how a unit becomes concurrent-safe with the whole repository |
+| `/**` | the whole repository, which no unit may declare |
 
-Write the config block:
+Check the map before writing it down. This refuses exactly what Commit will refuse:
 
-```yaml
-build_mode: "spq"
-
-tracker:
-  backend: "linear"
-  linear:
-    manage_cycles: true          # REQUIRED, a Cycle IS a Cycle; defaults to false
-
-spq:
-  workstreams:
-    - id: "<product-area-1>"
-      shared_owner: true         # exactly one
-    - id: "<product-area-2>"
-    - id: "integration"
-      integration: true          # the barrier seat; excluded from the readiness quorum
-  sync:
-    remote: "origin"
-    branch_pattern: "cycle/{cycle_id}/ws/{id}"
-    integration_branch_pattern: "cycle/{cycle_id}/integration"
-    promote_to: "dev"
-    mode: "all_or_nothing"
-    readiness_dir: ".synaptory/sync"
-    require_regression: true
-    require_journey: true
-    shared_digest_paths: ["contracts/"]        # from Step 2
-    regression_script: "scripts/sync-regression.sh"
-    journey_script: "scripts/sync-journey.sh"
-    digest_script: "scripts/shared-digest.sh"
-    verdict_cache: true
-  cycle:
-    scope_defined: true
-    number_owner: "integration_state"
-```
-
-Then, per workstream:
-
-1. **Create its working clone** from `dev`. Do not guess the Cycle branch yet: Commit allocates the collision-safe `cycle_id` and seals the exact branch into the Cycle manifest.
-2. **After Commit seals the manifest, check out the manifest-declared branch** in that clone. The default is `cycle/{cycle_id}/ws/{id}`; an explicit workstream `branch:` override is sealed the same way. `collect` treats the sealed manifest as authority and only falls back to config for a pre-manifest legacy Cycle.
-3. **Hydrate and pin the workstream** in that clone: `hydrate_cycle --workstream {workstream-id}` validates the manifest projection and writes `.synaptory/.orchestrator/spq/workstream`. The pin is a FILE, so it survives the shell — you do not have to re-export anything. (`SYNAPTORY_WORKSTREAM` overrides it for a one-off command; `SYNAPTORY_ACTIVE_SPEC` is the Scrum/Kanban Multi-Spec variable and SPQ ignores it entirely.)
-4. **Un-ignore the two committed subtrees** in the project `.gitignore`. `.synaptory/` is gitignored as a whole; these are the narrow exceptions, because git is SPQ's only channel between clones:
-   ```
-   .synaptory/*
-   !.synaptory/sync/
-   !.synaptory/cycles/
-!.synaptory/coordination-cycles/
-   ```
-   `sync/` carries readiness records; `cycles/<cycle-id>/` carries the sealed Cycle manifest and the dependency events. Per-workstream filenames and per-workstream event directories mean no merge conflicts. Nothing else under `.synaptory/` gets committed.
-
-   Note the trailing `/*` on the first line. Git cannot re-include a path whose parent directory is excluded, so `.synaptory/` followed by a negation silently does nothing and the records stay uncommittable.
-5. **Create the tracker discriminator**: the label or Linear project each workstream's admitted set is filtered by.
-
-Verify the config resolves before the gate:
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" config "$(pwd)"
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import path_scope
+
+regions = {
+    "ingest": ["src/ingest/", "src/api/routers/ingest.py"],
+    "dashboard": ["web/src/", "web/public/"],
+}
+for name, paths in sorted(regions.items()):
+    print(name, "->", path_scope.normalize_all(paths))
+names = sorted(regions)
+for i, left in enumerate(names):
+    for right in names[i + 1:]:
+        if path_scope.intersects(regions[left], regions[right]):
+            print("OVERLAP:", left, right, "-- two concurrent Cycles cannot declare both")
+PY
 ```
-Check: `workstreams[]` matches what you just wrote, exactly one `shared_owner`, the `integration: true` entry is excluded from the quorum, and every script path exists.
+
+Case is deliberately **not** folded: `Api/` and `api/` are one path on macOS and two in CI, so folding would make a declaration mean different things on different machines. A collision that exists only on macOS is reported everywhere, which is the safe direction.
+
+**Regions are drawn from the architecture, not from the org chart.** A region that maps to a team rather than to the source is the retired lane arriving under a new name, and it will overlap with something.
 
 ---
 
-## Baseline Gate
+## The Baseline Gate
 
-After all Discovery steps complete, present the Baseline Gate for human approval:
+Present it for human approval:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  BASELINE GATE                          Discovery
+  BASELINE GATE                              Discovery
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Problem        {✓ framed | ○ not framed}
-  Vision         {✓ if BRD/Mini-BRD exists | ○ if not}
-  Epics          {N} identified
-  Cycle 1        {N} Work Units ready (with ACs)
-  Architecture   {N} ADRs · SAD {✓ lightweight | ✓ full} · ERD {N} entities
-  Shared surface {paths} owned by {shared_owner}
-  API            {✓ skeleton | ✓ full contracts}
-  CI/CD          {✓ if pipeline exists | ○ if not}
-  Tests          {✓ if framework configured | ○ if not}
-  Barrier        {✓ regression · journey · digest scripts committed | ⏳ MISSING (BLOCKING)}
-  Workstreams    {N} provisioned · branches {✓ on remote | ⏳ pending}
-  Design         {✓ mockups approved | ⏳ pending approval (BLOCKING) | ○ skipped (no UI surface)}
+  Problem          {framed | not framed}
+  Scope            {N} epics in scope · {N} exclusions recorded
+  Timeline / cost  {stated | MISSING (BLOCKING)}
+  Calibration      {N} units measured over {window} · {hours}h {| MISSING (BLOCKING)}
+  Current system   {reconstructed from {sources} | none -- greenfield | NOT RECORDED (BLOCKING)}
+  Specification    revision {id} · {N} addressable criteria
+  Cycle 1 units    {N} candidates, each with a declared path scope
+  Architecture     {N} ADRs · SAD · data model
+  Pipeline         {build/test/deploy green | MISSING}
+  Regression       {command named in the baseline | NOT NAMED (BLOCKING)}
+  Source regions   {N} declared · no overlaps · shared paths {N}
+  Transport        {.synaptory/cycles/ visible to git | GITIGNORED (BLOCKING)}
+  Design           {mockups approved | pending (BLOCKING) | skipped -- no UI surface}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Options:
-  1. Approve and open Cycle 1 (Recommended)
+  1. Approve the baseline (Recommended)
   2. Show details
   3. I have concerns
   4. Chat about this
 ```
 
-**Two HARD gates.** Approve is not available until both clear:
+**The blocking lines are blocking.** Approve is unavailable until each clears, and each is a failure that gets more expensive later rather than one that resolves itself:
 
-- **Barrier readiness.** All three proof scripts committed and executable, `spq.workstreams[]` non-empty with exactly one `shared_owner`, and every workstream branch present on the remote. Approving without these defers a guaranteed failure to the first `SYNC`, where it costs the whole integration slot.
-- **Design** (UI-surface projects only). The in-repo mockup baseline must exist and the user must confirm it represents the vision. Non-UI projects show `○ skipped (no UI surface)` and are not blocked.
+| Blocked on | Because |
+|---|---|
+| Timeline / cost | the baseline is the scope, timeline and cost the engagement is held to. Two of three is not a baseline |
+| Calibration | `approve_baseline` refuses without it, and the refusal is the point: the first Cycle would be sized against nothing |
+| Current-system record | an unrecorded assessment cannot be told apart from an unperformed one |
+| Regression command | `regression_green` is unmet without a proof, and the Cycle would discover that at its close |
+| Committed transport | `open_cycle` refuses a gitignored declaration, so Commit cannot proceed |
+| Design (UI surfaces only) | non-UI projects show `skipped` and are not blocked |
 
-**On approval, these steps are MANDATORY and must run in order. Do not paraphrase them, do not skip, do not describe them as if they had run.** Gate transitions have been observed to silently fail when the orchestrator describes work instead of executing it. Run these as actual tool calls:
+**On approval, run these as actual tool calls, in order. Do not paraphrase them and do not describe them as if they had run.**
 
-1. **Record the approval and transition, in one command** via the Bash tool:
+1. **Record the baseline.**
+
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" approve_baseline "$(pwd)" --approved-by "<user email>"
+   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" approve_baseline "$(pwd)" \
+     --approved-by "<the approving human's identity>" \
+     --baseline-ref "<the specification revision the Cycles execute, e.g. BRD-1.0>" \
+     --calibration '{"sample": ["WU-001", "WU-002"], "measured_units": 2, "elapsed_hours": 11.5, "window": "2026-09-01..2026-09-05", "verification_depth": "unit + integration + review", "method": "two representative units carried end to end during Discovery"}'
    ```
-   This sets `discovery.baseline_approved`, `discovery.completed_at` and
-   `discovery.approved_by`, and transitions to `COMMIT`, in a single write.
 
-   **Do NOT try to Edit `pipeline-state.json` yourself.** Boundary guard G2
-   denies write-tool access to it, so the edit fails; and because a bare
-   `transition COMMIT` succeeds on its own, the old two-step version could land
-   in `COMMIT` with `baseline_approved` still false. An approval gate that
-   records nothing is not a gate.
-2. **Verify** the command's output reads `lifecycle_state: COMMIT` and
-   `discovery.baseline_approved: true`. If either is wrong, do NOT proceed;
-   surface the error to the user.
-3. Print one line: `✓ Baseline Gate approved. State transitioned to COMMIT at <timestamp>.`
-4. Load `${CLAUDE_PLUGIN_ROOT}/skills/synaptory/spq/commit.md` and open Cycle 1.
+   It refuses an empty approver, an empty `--baseline-ref` and an empty `--calibration` -- three separate refusals, because the predecessor recorded a boolean and an approver string and nothing could be held to it.
 
-If you do not have permission to run any of these tool calls, **stop** and tell the user. Do not pretend the gate passed.
+   **Do not try to edit `pipeline-state.json` yourself.** The boundary guard denies write-tool access to it, and an approval that records nothing is not a gate.
 
-**On concerns:** present the specific concern areas, re-run targeted steps, then re-present the gate.
+2. **This verb does not change the stage, and that is deliberate.** It writes the engagement's baseline. There is no `COMMIT` stage to move to: Commit is an **event**, and the stage change `DISCOVERY -> CYCLE` happens when `open_cycle` seals the first declaration. Confirm with `read` that `discovery.baseline_approved` is `true` while `lifecycle_state` is still `DISCOVERY`, then ask the lifecycle what it wants next:
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" next_action "$(pwd)"
+   ```
+
+   It answers `open_cycle` once the baseline is approved, and `approve_baseline` until then. If it still says `approve_baseline`, the write did not land: surface the error rather than proceeding.
+
+3. Print one line: `Baseline approved by <human> at <timestamp>. Ready to open Cycle 1.`
+
+4. Load `${CLAUDE_PLUGIN_ROOT}/skills/synaptory/spq/commit.md` and open the first Cycle.
+
+If you do not have permission to run any of these calls, **stop** and tell the user. Do not pretend the gate passed.
+
+**On concerns:** name the specific areas, re-run those steps, re-present the gate.
 
 ---
 
-## What Discovery Does NOT Do
+## Receipt ledger for this stage
+
+One receipt per step, all under `DISCOVERY-0`. The QE dispatch's is written by the agent; the rest are written by the orchestrator inline, and an unwritten one is work that never reaches `/cost` or `/audit`.
+
+```json
+{
+  "story_id": "DISCOVERY-0",
+  "role": "orchestrator",
+  "accountable_role": "platform-engineer",
+  "backend": "claude",
+  "model": "{model_id_used}",
+  "artifacts": [".github/workflows/ci.yml", "Makefile"],
+  "metrics": {"pipelines_created": 1, "environments_bootstrapped": 1},
+  "verification_commands": [
+    {"command": "make regression", "exit_code": 0, "summary": "412 passed, 0 failed"},
+    "test -s .github/workflows/ci.yml"
+  ],
+  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "pe-infra"},
+  "completed_at": "{iso8601_utc_timestamp}"
+}
+```
+
+Two forms, and they mean different things. An **executed object** (`command` + `exit_code` + `summary`) is proof: the command ran and its exit code was recorded, and only this form scores `tests_pass` or `build_succeeds`. A **plain string** is a replay instruction the SubagentStop hook re-runs, and is not proof. Both must be replayable, so no command substitution, no shell pipelines, no `python3 -c` payload -- a command the hook cannot re-run is a claim.
+
+`{model_id_used}` and `{iso8601_utc_timestamp}` are placeholders to substitute with real values. Never copy a literal model id out of a prompt: `/cost` would price the step at a rate nothing ran at.
+
+---
+
+## What Discovery does not do
 
 | Activity | Discovery |
 |---|---|
-| Decompose ALL Work Units | No. Cycle 1 only (foundation), Cycle 1-2 (blueprint) |
-| Fix the Cycle roadmap | No, the PO admits units per Cycle at Commit |
-| Complete architecture design | No, lightweight SAD + foundation ADRs; the rest emerges per Cycle via SA triggers |
-| Lock architecture | No, architecture evolves per Cycle |
-| Open a Cycle | No. `open_cycle` is Commit's act, and it owns the Cycle number |
-| Run a barrier | No, but it must leave behind everything the barrier needs |
+| Decompose every Work Unit | No. The first Cycle's candidates, and enough of the shape to size the rest |
+| Fix a Cycle roadmap | No. What a Cycle admits is decided at its own Commit |
+| Complete the architecture | No. Foundation decisions; the rest emerges per Cycle |
+| Open a Cycle | No. `open_cycle` is the Commit event's act, and it is what changes the stage |
+| Create a lane, a branch per team, or a durable ownership table | No. Those belonged to the retired noun `SPD-194` removed. Discovery declares **regions**, which are a property of a Cycle rather than objects of their own |
+| Run a barrier | No -- but it must leave behind the regression the barrier will cite |
+| Bound its own length | No. It is sized to the uncertainty it removes, and no timer forces its end |

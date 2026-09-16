@@ -27,6 +27,42 @@ if _synaptory_cp_url_is_local "${_cp_url:-}" || [[ "$PLUGIN_ROOT" == */plugins/l
   _local_plugin=1
 fi
 
+# An explicit override that cannot be used is a configuration error, not a
+# reason to go looking elsewhere (#396). The unstamped guard below treats any
+# non-empty SYNAPTORY_CLI_BIN as the escape hatch, while the override branch
+# further down only fires when the path is `-x`. A missing, stale or
+# non-executable value therefore satisfied the guard, skipped the override,
+# and fell through to the ordinary production candidate search: an unstamped
+# tree with a typo'd override resolved the production CLI and shipped
+# telemetry to prod for a project prod has never heard of, which is exactly
+# the #320 egress #424 closed for the no-override case.
+#
+# Refusing here rather than silently searching also matches what the variable
+# means: naming a binary is an instruction about WHICH CLI to use, so an
+# unusable one is a stop, never a hint.
+if [[ -n "${SYNAPTORY_CLI_BIN:-}" ]] && [[ ! -x "${SYNAPTORY_CLI_BIN}" ]]; then
+  echo "synaptory: SYNAPTORY_CLI_BIN is set to '${SYNAPTORY_CLI_BIN}' but that is not an executable file; resolving no CLI. Fix the path or unset it." >&2
+  exit 1
+fi
+
+# An unstamped tree addresses nothing (issue #320). `gate_emitter._resolve_cli`
+# already fails closed when no signal names a channel; this resolver did not,
+# so a source-tree sideload (`claude --plugin-dir ./plugin-claude`, which the
+# multi-runtime demo playbook prescribes) fell through to the production
+# `synaptory` on PATH and ran SessionStart's `outbox flush` and
+# `telemetry session-start` against prod for a project prod has never heard
+# of. "No stamp" is not "production": that fall-through is what stranded 76
+# project directories in the outbox over two months.
+#
+# SYNAPTORY_CLI_BIN remains the explicit escape hatch for CI and e2e runs
+# (checked below), and a ~/.cursor/plugins/local sideload keeps its
+# local-channel behaviour because it sets _local_plugin above.
+if [[ -z "${_cp_url:-}" ]] && [[ "$_local_plugin" == "0" ]] \
+   && [[ -z "${SYNAPTORY_CLI_BIN:-}" ]]; then
+  echo "synaptory: no control-plane stamp in this plugin tree; resolving no CLI (telemetry skipped, #320). Run ./synaptory deploy local, or set SYNAPTORY_CLI_BIN for CI and e2e runs." >&2
+  exit 1
+fi
+
 _candidate_url() {
   local candidate="$1" line
   line=$("$candidate" status 2>&1 | sed -n 's/^control_plane_url:[[:space:]]*//p' | head -n1 || true)

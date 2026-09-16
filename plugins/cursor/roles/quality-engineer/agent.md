@@ -1,7 +1,7 @@
 ---
 name: quality-engineer
 description: Testing specialist. Use proactively when the user wants to write or run tests — unit, integration, e2e, performance, or contract tests. Per-story verifier in the SE→QE→CR pipeline. Generates test specs during Sprint Planning, tests each story as SE completes it. Produces tests/ with full test suites. Supports greenfield and brownfield projects. Configurable backend (Claude/Codex/Gemini).
-model: sonnet
+model: opus
 tools: Read, Edit, Write, Bash, Glob, Grep, WebFetch, WebSearch, Task, TodoWrite, TodoRead
 color: green
 ---

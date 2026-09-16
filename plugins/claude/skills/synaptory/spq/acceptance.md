@@ -1,451 +1,377 @@
-# Acceptance. Release and Operate Handover
+# Acceptance (SPQ)
 
-> **Lifecycle state:** `ACCEPTANCE`
-> **Participants:** Orchestrator (integration clone), QE, CE, PE, TW, CR, delivery owner (human)
-> **Output:** full verification at release depth, production infrastructure, complete documentation, operate handover
-> **Human gate:** YES. Ship / do not ship.
-> **Adapted from:** `modes/release.md`
+> **Stage:** `ACCEPTANCE` -- one go-live, and it **repeats**
+> **Participants:** Quality Assurance (the readiness decision), Engagement Lead (the commitment), QE, CE, PE, TW, CR, the client
+> **Output:** one audit-ready evidence package, one release-readiness decision bound to it, and -- on the final Acceptance only -- the recorded handover
+> **Human gate:** YES. Ship / do not ship, decided by a named human.
+> **Next stage:** `CYCLE` for a non-final release, `COMPLETE` for the final one
 
-Acceptance is SPQ's Release. It runs when the delivery owner decides to ship, not
-automatically after the last Cycle. Every agent runs at **maximum depth**
-(release-tier DoD intensity).
+Acceptance validates delivered software against the commitment. The client confirms it meets the agreed requirements; outstanding feedback, security remediation and performance tuning are closed out against the baseline.
 
-What SPQ adds over `modes/release.md` is that the thing being released was built
-by N workstreams and integrated Cycle by Cycle at Sync. So Acceptance has two
-extra obligations before any activity starts: **every Cycle's barrier must have
-cleared green**, and **nothing may be in flight on a workstream branch**. A
-release cut from a `dev` that is missing one workstream's last Cycle is exactly
-the failure Sync exists to prevent, arriving one state later.
+**A long engagement ships several times, so Acceptance repeats.** Each go-live carries its own evidence package and its own readiness decision. Only the **final** Acceptance additionally ends the engagement, by handing over the codebase, the technical and operational documentation, and the knowledge the client's team needs to run what was built.
 
----
+**Delivery does not stop for it.** Other Cycles may keep running: a release does not wait for an unrelated open Cycle. What it evaluates is a **pinned integrated release candidate**, not "whatever the trunk is".
 
-## Entry
-
-`ACCEPTANCE` is reached from `CHECKPOINT` only:
-
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" close_cycle "$(pwd)" --proceed-to ACCEPTANCE
-```
-
-`CYCLE_EXECUTION → ACCEPTANCE` and `SYNC → ACCEPTANCE` are illegal. There is one
-path to a release and it runs through a demonstrated, integrated Cycle.
-
-**Trigger signals:** "release", "ship it", "prepare for production", "deploy to
-production", "go live", "production ready". Suggest it at Checkpoint when the
-backlog for the current increment is empty, but never auto-enter it.
+**The package is compiled, not assembled.** Every record in it was produced by the work as it ran. An evidence record dated *after* this Acceptance opened is refused as retrospective -- a proof written afterwards proves the release, not the work.
 
 ---
 
 ## Prerequisites
 
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" read "$(pwd)"
-# require: lifecycle_state == "ACCEPTANCE";  N = current_cycle (the last closed Cycle)
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" summary "$(pwd)"
-```
-
-### Release integrity check, before any agent is dispatched
-
-Walk `cycles_completed` from `summary` and assert three things. Each failure is
-blocking, and each is cheap to check now and expensive to discover after a cut.
-
-| Check | Where to look | Failure means |
-|---|---|---|
-| Every closed Cycle recorded a **green** barrier verdict | `cycles_completed[].sync.verdict` | a Cycle was force-transitioned past Sync; its increment was never proved integrated |
-| Every closed Cycle's cleared sha is an ancestor of `dev` | `cycles_completed[].sync.head_sha` | a Cycle cleared but its promotion PR never landed, so `dev` is missing it |
-| No workstream has undeclared work for a Cycle after the last closed one | `sync_barrier.py status "$(pwd)" {N}` per Cycle; workstream branches ahead of `dev` | work exists that no barrier has seen. It ships unverified or it does not ship |
-
-Work that is in flight has exactly two honest outcomes: it goes through one more
-`COMMIT → CYCLE_EXECUTION → SYNC → CHECKPOINT` loop, or it is cut and stays out
-of the release. There is no third option where it is included on the strength of
-its own workstream's tests.
+Acceptance is reached from a closed Cycle:
 
 ```bash
-# per-Cycle barrier status, read-only, runs no proof scripts
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" status "$(pwd)" {N}
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" transition "$(pwd)" ACCEPTANCE
 ```
+
+That transition refuses while any admitted Work Unit is neither `done` nor cut, naming each one. A Cycle that cannot finish cuts work; it does not carry it forward into a release.
+
+Then read what this Acceptance still owes:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" acceptance_status "$(pwd)"
+```
+
+```json
+{"ready": false,
+ "present": ["quality-engineer"],
+ "missing": ["code-reviewer", "compliance-engineer", "platform-engineer", "technical-writer"],
+ "final": false,
+ "next_stage": "CYCLE"}
+```
+
+**Record the moment this Acceptance opened.** The package is keyed on it, and it is what separates a record the work produced from one written for the release. Take it from the board's `lifecycle_history` entry for `ACCEPTANCE`.
+
+`{N}` in every receipt id below is the Cycle sequence this Acceptance releases -- the `current_cycle` on the board, which `close_cycle` leaves at the last closed Cycle.
 
 ---
 
-## Release activities
+## The five evidence dispatches
 
-All five run at release depth. Each carries a dispatch block, and every dispatch
-must go through the `Agent()` tool.
+All five are **release depth** -- the deepest DoD tier -- and all five are **gate-required**: `acceptance_status` reports `ready: false` until each receipt exists at its exact path. No skill invocation substitutes for any of them.
 
-> **Why this is not documentation polish.** Inline execution skips the
-> `SubagentStop` hook, so **no receipt is written and the work never reaches
-> `/cost` or `/quality`**. At Acceptance that is the worst place to lose a
-> receipt: the release audit trail is exactly the set of receipts, and a release
-> whose security audit produced no receipt cannot be shown to have had one.
+Resolve each path rather than spelling it:
 
-| Activity | Agent | Receipt |
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/advance_kernel.py" bind_receipt "$(pwd)" ACCEPTANCE-{N} qe
+```
+
+`next_action` names the next missing one for you:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" next_action "$(pwd)"
+```
+
+| Role | Receipt | What it must prove |
 |---|---|---|
-| 1 | `qe` full regression across every workstream | `ACCEPTANCE-{N}-qe.json` |
-| 2 | `ce` full security audit | `ACCEPTANCE-{N}-ce.json` |
-| 3 | `pe` production infrastructure | `ACCEPTANCE-{N}-pe.json` |
-| 4 | `tw` complete documentation | `ACCEPTANCE-{N}-tw.json` |
-| 5 | `cr` final code review | `ACCEPTANCE-{N}-cr.json` |
-| 6 | orchestrator: skill extraction | no subagent receipt |
+| `qe` | `ACCEPTANCE-{N}-qe.json` | the full regression on the pinned candidate, at release depth, with a per-case outcome for every authored case in the release |
+| `ce` | `ACCEPTANCE-{N}-ce.json` | the security, privacy and compliance review of the integrated surface, against the versioned threat model |
+| `pe` | `ACCEPTANCE-{N}-pe.json` | production infrastructure and operational readiness, with the environment checks **executed** rather than described |
+| `tw` | `ACCEPTANCE-{N}-tw.json` | the complete documentation set: what was built, how it is operated, what is known to be missing |
+| `cr` | `ACCEPTANCE-{N}-cr.json` | the final read-only review of the release candidate |
 
-Model tiers are unchanged: Opus for `ce`, Sonnet for `qe` / `pe` / `tw` / `cr`,
-resolved to pinned ids through `backends/model-pins.json`.
+> **MANDATORY: Spawn this agent via the `Agent()` tool**, for every one of the five. Inline execution skips the SubagentStop hook, so no receipt is written, `acceptance_status` stays `ready: false`, and the work never reaches `/cost` or `/quality`. Each dispatch names its installed role, for example `Agent(subagent_type="synaptory:quality-engineer", description="QE release regression", prompt=<self-contained prompt per the wrapper>)` -- see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md` and its siblings. Pass the resolved absolute path from `bind_receipt` into each prompt; do not pass the literal variable.
 
-Activities 1 through 5 have no ordering dependency on each other and may be
-dispatched in parallel. Activity 6 reads their output, so it runs last.
-
-### Activity 1. Full regression testing (QE)
+Resolve each role's backend before writing its prompt. A dispatch prompt that does not state the backend is a dispatch that assumes one:
 
 ```bash
 QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
-# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
-# workstream path, not `.orchestrator/receipts/`, and the readiness gate
-# resolves the same way, so a hardcoded path is a receipt no gate sees.
-RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the release regression inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE release regression", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-qe.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
-
-**QE prompt context:**
-- Every Work Unit across every Cycle and every workstream, not one workstream's set
-- Full suite: unit, integration, contract, e2e, performance
-- The Sync journey script is the per-Cycle increment journey. Release depth means
-  the **cross-Cycle** journeys as well: a user path that spans two Cycles was
-  never exercised by any single barrier
-- DoD intensity: `release`, all checks at maximum depth
-- Coverage baseline to compare against
-
-The run happens on `dev` (or the release branch cut from it) in the integration
-clone, under the delivery owner's principal. As at Sync, it must not run under any
-workstream's `se` chain.
-
-```json
-{
-  "story_id": "ACCEPTANCE-7",
-  "role": "quality-engineer",
-  "backend": "claude",
-  "model": "claude-sonnet-4-6",
-  "artifacts": [
-    "reports/release-qa.md",
-    "reports/release-coverage.md",
-    "reports/release-performance.md"
-  ],
-  "metrics": {
-    "tests_passed": 4188,
-    "tests_failed": 0,
-    "coverage_pct": 84,
-    "cycles_covered": 7,
-    "workstreams": 3
-  },
-  "verification_commands": [
-    {"command": "bash scripts/sync-regression.sh", "exit_code": 0, "summary": "4188 passed, 0 failed"},
-    {"command": "bash scripts/release-journeys.sh", "exit_code": 0, "summary": "11 cross-Cycle journeys green"},
-    "test -s reports/release-coverage.md"
-  ],
-  "verification_summary": "Release regression green across 7 Cycles and 3 workstreams",
-  "story_dod": {
-    "tests_pass": true,
-    "build_succeeds": true,
-    "no_critical_findings": true,
-    "code_reviewed": true,
-    "coverage_no_decrease": true
-  },
-  "token_usage": {
-    "input": 68400,
-    "output": 12900,
-    "cache_read": 41200,
-    "cache_write": 5100,
-    "stage": "qe-verification"
-  },
-  "completed_at": "2026-10-02T09:20:00Z"
-}
-```
-
-Report all five canonical DoD keys explicitly, including any that are `false`.
-An omitted key scores as unevaluated on `/quality`, not as passing. At release
-depth these should be genuinely populated rather than inherited: `code_reviewed`
-is true here because Activity 5 ran, not because per-Work-Unit reviews happened
-months ago.
-
-The long suites will be flagged by the `SubagentStop` replay for the same reason
-they are at Sync (30s hook budget, 60s per-command replay cap). That is expected.
-See the replay section in `spq/sync.md`; do not shorten a release suite to
-quiet a hook.
-
-### Activity 2. Full security audit (CE)
-
-```bash
 CE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "compliance-engineer")
-# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
-# workstream path, not `.orchestrator/receipts/`, and the readiness gate
-# resolves the same way, so a hardcoded path is a receipt no gate sees.
-RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the security audit inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="CE release security audit", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${CE_BACKEND}.md`. The CE writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-ce.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
-
-**CE prompt context:**
-- Complete STRIDE threat model over the integrated system
-- OWASP Top 10 assessment, full scope
-- Dependency audit against known vulnerabilities
-- Every `SYNC-{N}-ce.json` from the Cycles that had one: the composed auth and
-  data surface was reviewed incrementally, and this pass owns the whole
-- `healthcare.baa_enforced` and the PHI-bearing paths, when the project is
-  subject to HIPAA or equivalent
-
-**CE output:** threat model document, findings report with severities, dependency
-audit results.
-
-```json
-{
-  "story_id": "ACCEPTANCE-7",
-  "role": "compliance-engineer",
-  "backend": "claude",
-  "model": "claude-opus-4-8",
-  "artifacts": [
-    "docs/security/threat-model.md",
-    "reports/release-security-findings.md"
-  ],
-  "metrics": {
-    "findings_critical": 0,
-    "findings_high": 2,
-    "findings_medium": 9,
-    "findings_low": 14,
-    "dependencies_audited": 412
-  },
-  "verification_commands": [
-    {"command": "npm audit --omit=dev", "exit_code": 0, "summary": "0 critical, 0 high in production deps"},
-    {"command": "test -s docs/security/threat-model.md", "exit_code": 0, "summary": "threat model present"}
-  ],
-  "verification_summary": "Release security audit complete, 0 critical findings",
-  "token_usage": {
-    "input": 74100,
-    "output": 15300,
-    "cache_read": 38900,
-    "cache_write": 4400,
-    "stage": "ce-compliance"
-  },
-  "completed_at": "2026-10-02T10:05:00Z"
-}
-```
-
-### Activity 3. Production infrastructure (PE)
-
-```bash
 PE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "platform-engineer")
-# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
-# workstream path, not `.orchestrator/receipts/`, and the readiness gate
-# resolves the same way, so a hardcoded path is a receipt no gate sees.
-RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not do the infrastructure work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PE production infrastructure", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-pe.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
-
-**PE prompt context:**
-- IaC modules for the production environment
-- Production CI/CD pipeline, not only the dev pipeline
-- Monitoring dashboards, alert rules, and SLOs
-- Rollback scripts and the procedure for using them
-- Runbooks for the operational scenarios the system actually has
-
-**PE prompt context specific to SPQ:** the workstream is the durable unit, so the
-operational ownership map is keyed on **workstreams, not Crews**. A Crew is a
-temporary assignment of people; naming a runbook, an alert route, or an on-call
-rotation after one means the document is wrong the first time somebody moves.
-Name the product area.
-
-**PE output:** production IaC, production CI/CD workflow, monitoring and alerting
-configuration, rollback scripts, operational runbooks.
-
-### Activity 4. Complete documentation (TW)
-
-```bash
 TW_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "technical-writer")
-# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
-# workstream path, not `.orchestrator/receipts/`, and the readiness gate
-# resolves the same way, so a hardcoded path is a receipt no gate sees.
-RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not write the release documentation inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="TW release documentation", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${TW_BACKEND}.md`. The TW writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-tw.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
-
-**TW prompt context:**
-- Every completed Work Unit across every Cycle, for documentation scope
-- Existing architecture docs (ADRs, API contracts) and the shared contracts the
-  `shared_owner` published per Cycle
-- Every `reports/cycle-{N}-*.md` from the Checkpoints, which is the narrative
-  spine of the release notes
-- The harvested MethodSignals, for the internal delivery retrospective section.
-  These are the pilot's method evidence and belong in a durable document rather
-  than only in `signals.jsonl`
-- Existing README and guides
-
-**TW output:** API reference, developer guides, operational guide, architecture
-guide, updated README, release notes.
-
-### Activity 5. Final code review (CR)
-
-```bash
 CR_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "code-reviewer")
-# Resolve the receipts dir; never spell it. Inside a Cycle this is the SPQ
-# workstream path, not `.orchestrator/receipts/`, and the readiness gate
-# resolves the same way, so a hardcoded path is a receipt no gate sees.
-RECEIPTS_DIR=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" receipts_dir "$(pwd)")
 ```
 
-> **MANDATORY: Spawn this agent via the `Agent()` tool, do not run the final review inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="CR release review", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${CR_BACKEND}.md`. The CR writes its receipt to `${RECEIPTS_DIR}/ACCEPTANCE-{N}-cr.json` as its last action. Pass the resolved absolute path into the prompt; do not pass the literal `${RECEIPTS_DIR}`.
-
-**CR prompt context:**
-- The full codebase, not a per-Work-Unit scope
-- Architecture conformance across workstream boundaries. This is the review that
-  can see what no per-Work-Unit review could: three workstreams solving the same
-  problem three ways, a shared contract worked around rather than changed, and
-  duplicated logic that only looks duplicated when you hold all N together
-- Performance anti-pattern scan
-- The `SYNC-{N}-sa.json` adjudications, which name every shared component that
-  drifted and how it was resolved
-
-The CR receipt must carry top-level `"status": "complete"` on an approve verdict.
-The `code_reviewed` DoD gate reads it. A needs-work or blocked review must not
-set `"complete"`.
-
-### Activity 6. Skill extraction (Orchestrator)
-
-The orchestrator extracts recurring patterns into reusable Claude Code skills:
-recurring implementation patterns across Work Units, project-specific
-conventions worth codifying, and any place a workstream repeatedly reinvented
-something. Run this last, after Activities 1 through 5 have produced their
-reports.
+**Depth is not deferred to this gate.** Every one of these checks ran per Work Unit as the work finished; what happens here is the release-depth pass over the *integrated* result. Regulated depth in particular may never be saved up for a final ceremonial gate -- if a project's supported depth cannot cover a requirement, that **reduces the supported scope** rather than passing silently.
 
 ---
 
-## Release readiness
+## Step 1. Compile the evidence package
+
+```bash
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - acceptance-facts.json <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import acceptance_record as acceptance, spq_state_machine as spq
+
+facts = json.load(open(sys.argv[1], encoding="utf-8"))
+board = spq.read_state(os.getcwd())
+closes = [c for c in board.get("cycles_completed") or []
+          if str(c.get("cycle_id")) in set(facts["cycle_ids"])]
+package = acceptance.compile_evidence(
+    acceptance_id=facts["acceptance_id"],
+    trunk_digest=facts["trunk_digest"],
+    opened_at=facts["opened_at"],
+    cycle_closes=closes,
+    integrated_shas_on_trunk=facts["integrated_shas_on_trunk"],
+    evidence=facts["evidence"],
+)
+json.dump(package, open("acceptance-package.json", "w", encoding="utf-8"), indent=2)
+print(json.dumps({"acceptance_id": package["acceptance_id"],
+                  "trunk_digest": package["trunk_digest"],
+                  "cycles": [c["cycle_id"] for c in package["cycles"]],
+                  "evidence": len(package["evidence"]),
+                  "package_digest": package["package_digest"]}, indent=2))
+PY
+```
+
+`acceptance-facts.json`:
+
+```json
+{
+  "acceptance_id": "REL-2026-09-1",
+  "trunk_digest": "<the pinned trunk revision this release is about>",
+  "opened_at": "<when this Acceptance entered ACCEPTANCE, from lifecycle_history>",
+  "cycle_ids": ["3-a91f0c2e", "4-77b1de03"],
+  "integrated_shas_on_trunk": ["<every revision observed on the trunk>"],
+  "evidence": [
+    {"id": "ACCEPTANCE-4-qe", "kind": "verification", "digest": "sha256:…",
+     "recorded_at": "2026-09-07T14:02:11Z"}
+  ]
+}
+```
+
+Get the observed revisions from git rather than from a claim:
+
+```bash
+git fetch origin main
+git rev-parse origin/main                      # trunk_digest
+git log --format=%H origin/main -n 200         # integrated_shas_on_trunk
+```
+
+Three refusals, and each is one the method names:
+
+| Refused | Because |
+|---|---|
+| a Cycle close with no integrated revision | it is an **unintegrated candidate**, and a release compiled from one demonstrates a staging branch as the final result |
+| a close whose integrated revision is not observed on this trunk | either that work is not in this candidate or this candidate is not the trunk. Both make the package a claim about something else |
+| evidence recorded after `opened_at` | a retrospective proof. Every entry needs a `recorded_at`, because evidence that cannot be dated is indistinguishable from evidence written for the release |
+
+**A release may compile several closed Cycles**, and nothing requires a particular count or that no other Cycle is open. The `package_digest` covers the Acceptance identity and the trunk digest together, so a package cannot be re-presented for a different go-live.
+
+---
+
+## Step 2. The release-readiness decision
+
+```bash
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - "<principal>" "<outcome>" "<rationale>" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import acceptance_record as acceptance
+
+package = json.load(open("acceptance-package.json", encoding="utf-8"))
+decision = acceptance.readiness_decision(
+    package=package, principal=sys.argv[1], outcome=sys.argv[2], rationale=sys.argv[3])
+acceptance.assert_decision_binds(decision, package=package)
+json.dump(decision, open("acceptance-decision.json", "w", encoding="utf-8"), indent=2)
+print(json.dumps({k: decision.get(k) for k in
+                  ("action", "role", "principal", "outcome", "risk",
+                   "subject", "subject_digest", "rationale")}, indent=2))
+PY
+```
+
+The outcome is one of a closed set -- `continue`, `escalate`, `ask-client`, `block`, `rework` -- and **there is deliberately no `pass` and no `approve`**: `continue` is a decision somebody is named for, and the absence of a decision is not one of the five.
+
+Release readiness is **Quality Assurance's** action and the role is derived from the action, never chosen by the caller. `decide-release-readiness` is high risk, so it never continues automatically and it refuses the automated principal outright: a machine cannot be the accountable human here.
+
+**`assert_decision_binds` is not optional.** It refuses an approval reused for another digest or another go-live, which is a natural failure rather than an exotic one: a release slips, the candidate is rebuilt, and last week's approval is still sitting there looking like an approval. It approved a different revision. If it refuses, rebuild the candidate and decide again.
+
+---
+
+## Step 3. Is this the final Acceptance?
+
+**"Final" is not a flag anyone sets.** It is a property of the engagement's state: no outstanding commitments, and a recorded handover. A caller-set flag would let a mid-engagement release end the engagement.
+
+```bash
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import acceptance_record as acceptance, spq_state_machine as spq
+
+board = spq.read_state(os.getcwd())
+outstanding = list(board.get("outstanding_commitments") or [])
+handover = board.get("handover") or {}
+target = acceptance.acceptance_target(outstanding_commitments=outstanding, handover=handover)
+print(json.dumps({
+    "outstanding_commitments": outstanding,
+    "handover_recorded": acceptance.handover_recorded(handover),
+    "handover_items_required": list(acceptance.HANDOVER_ITEMS),
+    "next_stage": target,
+}, indent=2))
+PY
+```
+
+The handover is an **AND of three items**, not a count -- `codebase`, `documentation`, `operating_knowledge`. An engagement closed without the operating knowledge has handed over a codebase nobody can run.
+
+> **There is no verb that records the handover or the outstanding commitments.** Both live on the engagement, and only `approve_baseline` writes there today, so `acceptance_status` reports `final: false` on every Acceptance and `next_stage: CYCLE`. That makes the check above a **prompt-level** guard: `transition COMPLETE` is a legal edge and does not consult it. So run `assert_close_permitted` yourself before taking that edge, and do not tell the user the lifecycle refused a premature close -- it would not have.
+
+```bash
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import acceptance_record as acceptance, spq_state_machine as spq
+
+board = spq.read_state(os.getcwd())
+try:
+    acceptance.assert_close_permitted(
+        requested_target="COMPLETE",
+        outstanding_commitments=list(board.get("outstanding_commitments") or []),
+        handover=board.get("handover") or {},
+    )
+    print("this Acceptance may close the engagement")
+except acceptance.AcceptanceError as exc:
+    print("REFUSED:", exc)
+PY
+```
+
+---
+
+## Step 4. The release gate
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  RELEASE READINESS                        v{version}
+  ACCEPTANCE                          {ACCEPTANCE_ID}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Cycles          {closed} closed, {green}/{closed} barrier green
-  Workstreams     {n} integrated, 0 branches ahead of dev
-  Work Units      {done} done, {cut} cut across all Cycles
-  Tests           {passed}/{total} passing ({coverage}% coverage)
-  Security        {critical} Critical, {high} High remaining
-  Infrastructure  ✓ IaC validates, production CI/CD configured
-  Documentation   ✓ API docs, guides, runbooks, release notes
-  Rollback        ✓ Scripts exist and tested
-  Method evidence {signals} MethodSignals harvested over {closed} Cycles
+  Candidate      {trunk_ref} @ {short trunk_digest}, pinned
+  Cycles         {ids} · {N} accepted Work Units
+  Evidence       {N}/5 role receipts · {N} compiled records
+  Package        {package_digest}
+  Quality        regression {…} · security {…} · infra {…} · docs {…} · review {…}
+  Open items     {N} outstanding commitments
+  Handover       {codebase | -} {documentation | -} {operating_knowledge | -}
+  This release   {FINAL -- closes the engagement | non-final -- delivery continues}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Options:
   1. Ship it
-  2. Show full report
-  3. Fix remaining issues
+  2. Do not ship -- {escalate | ask-client | block | rework}
+  3. Show the evidence package
   4. Chat about this
 ```
 
-**Blocking conditions** (must be resolved before shipping):
-- Any Cycle without a green barrier verdict
-- Any Cycle whose cleared sha is not an ancestor of `dev`
-- Any workstream branch carrying work no barrier has seen
-- Critical security findings > 0
-- Tests failing
-- Infrastructure validation failed
-- Any of Activities 1 through 5 with no receipt on disk
+**Print `{N}/5` from `acceptance_status`, not from memory.** Its `present` and `missing` lists are the readiness answer, and they are read from the files on disk.
 
-The last one is not bureaucracy. A missing receipt means the activity either did
-not run or ran inline, and in both cases the release has no evidence it happened.
+---
 
-**Warning conditions** (can ship with explicit acknowledgement):
-- High security findings > 0
-- Coverage below target
-- Documentation gaps
-- Cut Work Units that the delivery owner expected in this release
+## Step 5. On "ship it"
 
-### On "Ship it"
+1. **Record the decision** (Step 2) with `outcome: continue` and a named principal. Everything below depends on it existing.
+
+2. **Deploy**, by the mechanism the project uses. **Ask before pushing, tagging or deploying anything.** Integration to the trunk already happened at each Cycle's Checkpoint; this is the release of an already-integrated revision.
+
+3. **Move the stage.** Two edges, and which one is legal is decided in Step 3:
+
+   ```bash
+   # a non-final go-live: delivery continues
+   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" transition "$(pwd)" CYCLE
+   ```
+
+   ```bash
+   # the FINAL go-live: the engagement is handed over and closed
+   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" transition "$(pwd)" COMPLETE
+   ```
+
+   `ACCEPTANCE -> CYCLE` is what makes Acceptance repeatable, and it is the normal edge. `COMPLETE` is terminal in both directions: nothing transitions out of it, and `open_cycle` refuses on it too, because the final Acceptance ended the engagement and there is nothing to return to.
+
+4. **On a non-final release**, load `${CLAUDE_PLUGIN_ROOT}/skills/synaptory/spq/commit.md` and open the next Cycle. Delivery continues from the same trunk.
+
+---
+
+## Step 6. On "do not ship"
+
+Record the decision with the outcome that is true -- `escalate`, `ask-client`, `block` or `rework` -- and its rationale. **A refusal is a recorded decision, not an absence of one**, and the difference is what an auditor reads later.
+
+Then name each blocking item's kind, exactly as at Checkpoint. The Engagement Lead owns the naming:
+
+| Kind | Where the work goes |
+|---|---|
+| **Correction** | an upcoming Cycle. A critical failure -- production down, a security or compliance breach -- interrupts rather than queueing |
+| **Absorb** | a coming Cycle, inside the agreed intent |
+| **Swap** | exchanged for committed work of equal or smaller size, with the sizing basis recorded |
+| **Re-baseline** | a new scope, timeline and cost agreed with the client **before that work begins**. Work already authorized continues while the new line is set |
+
+Write the disposition's own fields to `change.json` and name it:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" transition "$(pwd)" COMPLETE
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - change.json <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import acceptance_record as acceptance
+
+record = acceptance.name_change(**json.load(open(sys.argv[1], encoding="utf-8")))
+print(json.dumps(record, indent=2))
+PY
 ```
 
-`COMPLETE` is terminal: `spq_state_machine.transition` refuses every transition
-out of it. Do not enter it to tidy the board.
+Each disposition asserts what it promises, so each needs its own fields -- a label that does not check its effect on the commitment is not a naming:
 
-`ACCEPTANCE → COMPLETE` now validates all five release receipts and every
-closed Cycle's green Sync verdict before persisting the release approver and
-emitting `release_approved`. Missing or failed evidence is a state-machine
-refusal, not a prompt-level warning.
+| Disposition | `change.json` carries |
+|---|---|
+| `correction` | `severity`: one of `production-down`, `security-breach`, `compliance-breach` (interrupting) or `defect`, `regression`, `usability`, `documentation` (routine). Guessing here decides whether a production outage waits for a Cycle |
+| `absorb` | `baseline_digest_before` and `baseline_digest_after`, asserted equal -- the commitment holds |
+| `swap` | `scope_added` and `scope_removed`, each a list of `{unit_id, size}` with a positive size, plus a `sizing_basis` and the unchanged baseline digests. Removed size must be **equal or larger** than added -- an unsized side makes "equal or smaller" unfalsifiable |
+| `re-baseline` | `client_agreed_at` before `work_started_at`, plus `new_scope_unit_ids` and `authorized_unit_ids`. New scope may not begin before the client agreed; already-authorized work continues |
 
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✓ RELEASED                               v{version}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The four are a closed set and **a cut is not one of them**: a cut removes unfinished Work Units *inside* the baseline, and a re-baseline moves the baseline.
 
-  {closed} Cycles, {n} workstreams, all barriers green.
-  Documentation, infrastructure, and security artifacts are
-  ready for production deployment.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-### On "Fix remaining issues"
-
-Present the specific blocking and warning items. Route each to the owning
-workstream, not to whoever is nearest. A fix that touches code must go through a
-Cycle and its barrier; a fix confined to docs, IaC or runbooks is re-dispatched
-here as the relevant Activity.
-
-### On "Show full report"
-
-```
-Read("${CLAUDE_PLUGIN_ROOT}/agents/technical-writer/modes/report.md")
-```
+Then return to delivery with `transition CYCLE` and admit the resulting work at the next Commit. Do not admit it here: the admitted set of a closed Cycle is closed.
 
 ---
 
-## Operate handover
+## Step 7. The handover (final Acceptance only)
 
-This state covers v1's DEPLOY **and** OPERATE phases. Releasing without the
-handover leaves a system nobody is set up to run.
+Three items, all required. Compile them from what the work produced:
 
-Hand over, in writing:
+| Item | What it is |
+|---|---|
+| `codebase` | the repository, the trunk revision released, and the access the client's team needs |
+| `documentation` | the technical and operational documentation -- the `tw` receipts across every Cycle are its provenance |
+| `operating_knowledge` | how to run, monitor, deploy and recover what was built |
 
-| Item | Produced by | Keyed on |
-|---|---|---|
-| Runbooks per operational scenario | Activity 3 | the scenario |
-| Alert routes and on-call ownership | Activity 3 | the **workstream** (product area), never a Crew |
-| SLOs and their dashboards | Activity 3 | the user-facing journey |
-| Rollback procedure, tested | Activity 3 | the deploy unit |
-| Architecture guide and ADR index | Activity 4 | the system |
-| Known findings accepted at ship time | Activity 2 | each finding, with who accepted it |
-
-**Post-launch mode.** Maintenance work does not need a cross-workstream barrier,
-because maintenance is not N parallel workstreams converging on one increment.
-Switch to Kanban:
-
-```yaml
-build_mode: kanban    # in .synaptory.yaml
-```
-
-Keep `spq` only if the post-launch team really is N workstreams shipping one
-integrated increment on a cadence. Running the barrier for a single stream is
-pure overhead: it costs a merge, an evaluate, and a human gate to prove
-something a single working copy already proved.
+Record all three against the engagement, then take the `COMPLETE` edge. Print one line naming the released revision, the accepted Work Unit count and the handover items, so the last thing in the log is what was actually handed over.
 
 ---
 
-## Receipt ledger for this state
+## Receipt ledger for this stage
 
-| Receipt | Author | `story_id` | `stage` |
-|---|---|---|---|
-| `ACCEPTANCE-{N}-qe.json` | QE subagent | `ACCEPTANCE-{N}` | `qe-verification` |
-| `ACCEPTANCE-{N}-ce.json` | CE subagent | `ACCEPTANCE-{N}` | `ce-compliance` |
-| `ACCEPTANCE-{N}-pe.json` | PE subagent | `ACCEPTANCE-{N}` | `pe-infra` |
-| `ACCEPTANCE-{N}-tw.json` | TW subagent | `ACCEPTANCE-{N}` | `tw-docs` |
-| `ACCEPTANCE-{N}-cr.json` | CR subagent | `ACCEPTANCE-{N}` | `cr-review` |
+Five dispatches, five receipts, all under the pseudo Work Unit id `ACCEPTANCE-{N}` where `{N}` is the Cycle sequence this release is compiled from. Every one is gate-required: `acceptance_status` reads the files on disk and reports `ready: false` until all five exist.
 
-`{N}` is `current_cycle`, which `close_cycle` leaves at the last closed Cycle
-number, so the release receipts are attributable to the increment they cut.
-`ACCEPTANCE-{N}` satisfies the required `^[A-Z][A-Z0-9]*-\d+$` story-id pattern.
-All five roles resolve their stage through `ROLE_STAGE_FALLBACK`, so the stage
-may be omitted, but write it: a receipt that names its own stage cannot be
-mis-attributed by a future change to the fallback map.
+```json
+{
+  "story_id": "ACCEPTANCE-4",
+  "role": "quality-engineer",
+  "backend": "claude",
+  "model": "{model_id_used}",
+  "artifacts": ["docs/release/REL-2026-09-1-regression.md"],
+  "metrics": {"cases_executed": 214, "cases_failed": 0, "coverage_pct": 87},
+  "verification_commands": [
+    {"command": "make regression", "exit_code": 0, "summary": "214 passed, 0 failed at release depth"},
+    {"command": "npm run test:e2e", "exit_code": 0, "summary": "18 journeys green"},
+    "test -s docs/release/REL-2026-09-1-regression.md"
+  ],
+  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "qe-verification"},
+  "completed_at": "{iso8601_utc_timestamp}"
+}
+```
+
+An **executed object** (`command` + `exit_code` + `summary`) is proof: the command ran and its exit code was recorded, and only this form scores `tests_pass` or `build_succeeds`. A **plain string** is a replay instruction the SubagentStop hook re-runs, and is not proof. Both must be replayable -- no command substitution, no shell pipeline, no `python3 -c` payload -- because a command the hook cannot re-run is a claim.
+
+`{model_id_used}` and `{iso8601_utc_timestamp}` are placeholders to substitute with real values. Never copy a literal model id out of a prompt: `/cost` would price the step at a rate nothing ran at.
+
+**Every one of these receipts must predate this Acceptance's `opened_at`** to enter the evidence package. That is not a technicality: a proof recorded after the release opened proves the release, not the work. Run the five dispatches first, then compile.
+
+---
+
+## What Acceptance does not do
+
+| Activity | Acceptance |
+|---|---|
+| Integrate to the trunk | No. That happened at each Cycle's Checkpoint. Acceptance releases an already-integrated revision |
+| Wait for every open Cycle | No. It evaluates a pinned candidate; unrelated Cycles keep running |
+| Produce the evidence | No. It **compiles** records the work already produced. A record created here for the release is refused |
+| Close the engagement, by default | No. Only the final one does, and "final" is a property of the engagement's state |
+| Admit new work | No. Feedback becomes work at the next Commit |
+| Approve on behalf of a machine | No. Release readiness is high risk and refuses the automated principal |
+| Deepen a check that was skipped earlier | No. Regulated depth cannot be deferred to a final gate; unsupported depth reduces the supported scope |

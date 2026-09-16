@@ -1,0 +1,31 @@
+{
+  "task": "Accept WU-142 against the acceptance cases authored at COMMIT",
+  "role": "project-owner",
+  "accountable_role": "project-owner",
+  "backend": "claude",
+  "model": "claude-runtime-reported-id",
+  "attempt_id": "att_01J6EVID03",
+  "dispatch_id": "3c4d5e6f708192a3b4c5d6e7f8091a2b",
+  "adapter_profile_id": "claude-local-v1",
+  "placement": "local",
+  "capability_profile": "planner",
+  "stage_profile": "planning",
+  "cycle_id": "003-9f2c41ab",
+  "manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workstream_id": "api",
+  "source_revision": "cccccccccccccccccccccccccccccccccccccccc",
+  "fencing_token": "fixture-lease-generation-1",
+  "artifacts": [],
+  "verification_commands": [],
+  "evidence": [
+    {
+      "evidence_class": "judged",
+      "principal": "alice@h3t.co",
+      "candidate_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "verdict": "accepted",
+      "recorded_at": "2026-09-02T10:15:00Z",
+      "independent_of_producer": true
+    }
+  ],
+  "completed_at": "2026-09-02T10:15:00Z"
+}

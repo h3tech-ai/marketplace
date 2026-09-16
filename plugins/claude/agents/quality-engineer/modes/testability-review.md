@@ -75,7 +75,7 @@ Write receipt to `.synaptory/.orchestrator/receipts/T5a-testability-review.json`
   "story_id": "{story_id}",
   "role": "quality-engineer",
   "backend": "claude",
-  "model": "",
+  "model": "{model_id_used}",
   "verdict": "PROCEED | PROCEED WITH WARNINGS | HOLD — FIX REQUIRED",
   "block_count": 0,
   "warn_count": 0,

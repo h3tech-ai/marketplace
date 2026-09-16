@@ -1,444 +1,463 @@
-# Commit State (SPQ)
+# Commit (SPQ)
 
-> **Lifecycle state:** `COMMIT`
-> **Clone:** integration clone (the delivery lead's), which owns the Cycle number
-> **Participants:** PO, QE, SA (if triggered), Orchestrator
-> **Output:** an open Cycle: admitted Work Units in `queued`, distributed across workstreams, shared components published and pinned, QE Cycle test spec, DoD tier announced
+> **Event:** Commit -- it **opens** a Cycle, and it is not a stage
+> **Stage change:** `DISCOVERY -> CYCLE`, or `CYCLE -> CYCLE`, or `ACCEPTANCE -> CYCLE`
+> **Participants:** Engagement Lead (the goal), Engineering Lead (the breakdown, and the one accountable owner of this Cycle), Quality Assurance, Solution Architect (conditional), Orchestrator
+> **Output:** one **sealed declaration** -- the admitted set, closed; each unit's path scope; the source region; the trunk; the barrier criteria, published in advance
+> **Human gate:** YES. The Engineering Lead approves the breakdown and every admitted unit clears readiness before build begins.
 
-Commit opens a Cycle by **admitting** Work Units. Each admitted unit must clear readiness (Definition of Ready) before any workstream starts Build.
+Commit is where a Cycle's set is **fixed**. Nothing joins after it: the admitted set is a property of a hash-sealed document, not of an event anybody could omit, and there is no verb that appends a unit to an open Cycle.
 
-**Sizing at Commit carries more weight than Sprint Planning does.** A sprint ends when the clock runs out; a Cycle ends when its admitted Work Units are done, and a workstream that cannot make the barrier **cuts scope** rather than merging late. Over-admitting here does not produce a late Cycle; it produces a Cycle that reaches `SYNC` with units cut, or N-1 workstreams waiting on one. Mis-sizing surfaces at the barrier, where it is expensive; it is cheap to fix here.
+**Sizing here carries more weight than a sprint plan does.** A sprint ends when the clock runs out; a Cycle ends when its admitted Work Units are done, and a Cycle that cannot finish **cuts work** rather than running long. Over-admitting does not produce a late Cycle -- it produces a Cycle that reaches its barrier with work cut. Mis-sizing surfaces at the barrier, where it is expensive; it is cheap to fix here.
+
+**The Commit event does not cause any of this.** `open_cycle` seals the declaration and records a `commit` event as a consequence. Delete the event record and the Cycle is still open; delete the seal and there is no Cycle.
 
 ---
 
-## Step 0: Allocate N, and Read What the Last Checkpoint Learned
+## Step 0. Read what the last Cycle measured
 
-**The Cycle number has exactly one owner: this clone's state.** It is monotonic. The tracker's cycle is a mirror bound to it, never the source: a cycle renamed or renumbered in Linear cannot silently repoint a Cycle.
-
-```bash
-STATE=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" read "$(pwd)")
-# CYCLE_N = current_cycle + 1
-# CYCLES_COMPLETED = len(cycles_completed)
-```
-
-Fix `CYCLE_N` **now**, before any dispatch: every receipt written during this state is keyed `CYCLE-{N}`, and Step 8 passes the same number to `open_cycle` explicitly rather than letting it default. Pass it explicitly so the receipts written earlier in this state cannot disagree with the number that was ultimately allocated.
-
-**Read the MethodSignals harvested at the previous Checkpoint.** SPQ has no retro event, so process learning is recorded as signals at Checkpoint and read *here*. This is the loop that makes the exercise worth running:
+A Cycle is sized against **recorded history**, not against what the team believes it can hold. Read the closed Cycles off the board and measure them:
 
 ```bash
-# MethodSignals: where the SPQ mapping chafed last Cycle. A state that had to be
-# skipped, a barrier criterion routinely waived, vocabulary that confused agents,
-# an agent straddling two execution profiles.
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list method_signal
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import cycle_measurement as measure, spq_state_machine as spq
 
-# Cross-loop signals: recurring failure classes, DoD gate hotspots, blocked units,
-# evidence-replay mismatches.
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/signals.py" "$(pwd)" list
+board = spq.read_state(os.getcwd())
+history = measure.history_report(board.get("cycles_completed") or [])
+print(json.dumps(history, indent=2)[:4000])
+PY
 ```
 
-**Feed the hits into this Cycle's plan, do not just log them.** A signal that is read and ignored every Cycle is worse than no signal, because it makes the store look maintained. Concretely:
+Read the answer literally. **`available: false` is a real answer and never a zero.** A first Cycle has no history and says so, with `problems` naming why; a Cycle whose archive is incomplete says that instead of reporting a rate nobody can reproduce. Neither is permission to invent a number.
 
-| Signal | What it should change in THIS Cycle |
+| What history says | What this Commit may cite |
 |---|---|
-| A barrier criterion waived twice | Admit a Work Unit that fixes the proof script, or change the config deliberately and say why |
-| A shared path edited by a non-owner workstream | Either move it out of `shared_digest_paths` or admit a unit in the `shared_owner`'s set that makes the change properly |
-| A recurring gate failure (e.g. `ui_acceptance`) | An AC-clarity or test-infrastructure unit, not another retry |
-| One workstream cutting scope every Cycle | Admit fewer units to it. This is the mis-sizing a scope-defined Cycle predicts |
-| A profile straddle (`po` as Analyst *and* Planner in the same state) | Nothing this Cycle; it is v2 feedback. Leave it recorded. |
+| `available: true` | the measured throughput and cut-rate, the Cycle ids, the sample size and the observation window |
+| `available: false`, no Cycle has closed | the Discovery calibration sample plus **an explicit bootstrap assumption**, named as such |
+| `available: false`, Cycles have closed | neither. Fix the archive, or state that the plan is unsupported by data -- a bootstrap while real Cycles exist is ignoring what was measured, and `assert_plan_supported` refuses it |
+
+Then read the last Checkpoint's report for where the method chafed: a criterion routinely close to failing, a unit class that keeps getting cut, an admitted set that was consistently too large. That is process signal, and Commit is where it changes behaviour.
 
 ---
 
-## Adaptive Intensity
+## Adaptive intensity
 
-**Lightweight** (stable backlog, no new feedback from the prior Checkpoint):
-- PO confirms pre-refined Work Units
-- Skip SA (unless triggers found)
-- Orchestrator presents the Cycle for approval
-- QE generates the test spec
+The DoD tier deepens as the system matures, and `next_action` reports the resolved tier on every dispatch:
 
-**Full** (new customer feedback, scope changes, MethodSignals demanding action, units cut at the last barrier):
-- PO performs deep refinement
-- SA architecture review if triggers found
-- New units created from Checkpoint feedback and from cut units returning to the backlog
-- Full Cycle scope negotiation
+| Cycles closed | Tier | Checks |
+|---|---|---|
+| 0-1 | `early` | tests pass, build succeeds |
+| 2-3 | `growing` | + no critical findings, code reviewed |
+| 4+ | `mature` | + coverage does not decrease |
+| an Acceptance is in view | `release` | maximum depth |
 
-**How to decide:**
-- Cycle 1: always **Full**
-- Cycle 2+: **Full** if the prior Cycle had customer feedback captured, MethodSignals requiring action, units cut at `SYNC`, or a blocked barrier. Otherwise **Lightweight**.
+`quality.dod_tier` in `.synaptory.yaml` overrides the computed tier. Announce the tier here so agents know the gate expectations up front:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/story_pipeline.py" set_dod_tier "$(pwd)" {TIER} \
+  --decided-by "<the deciding human>" --reason "<why this tier for this Cycle>"
+```
+
+A project may **add** a check or raise a threshold. It may not remove one the method declares.
 
 ---
 
-## Step 1: Read Context
+## Step 1. The goal, and one Engineering Lead
+
+The Engagement Lead sets the Cycle goal from the specification. The Engineering Lead owns the Cycle and the Crew executing it.
+
+**Exactly one Engineering Lead per Cycle.** N Leads means N concurrent Cycles, each on its own cadence, each closing with its own demonstration. If two people would own this one, that is two Cycles with two declarations and two non-overlapping regions -- not one Cycle with two owners.
+
+**The Crew grants nothing.** It is a list of names: who is executing this Cycle now, re-seatable between Cycles. It is not an authorization boundary, it is not an identity anything is keyed on, and re-seating one changes no barrier admission. `crew` is a list on the declaration and the seal refuses anything else, because a table with permissions in it is the thing the separation exists to prevent.
+
+---
+
+## Step 2. Refine and admit the Work Units (project-owner skill)
+
+> **SKILL INVOCATION, not a dispatch.** No gate reads a `project-owner` receipt at Commit, so the orchestrator retrieves the contract and refines in its own context. The receipt it writes MUST name `token_usage.stage: "pro-brd"`.
+
+```
+synaptory skills get project-owner
+synaptory skills get project-owner/guides/refinement
+```
+
+Pull the candidates -- from the baseline for a first Cycle, from the tracker and the previous Cycle's cuts afterwards. **Units cut from an earlier Cycle returned to the backlog and are re-admitted here**, which is what a cut is for.
 
 ```bash
 TRACKER_CLI="python3 ${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/tracker/tracker_cli.py --project-dir $(pwd)"
-
-# Current backlog, including units cut from the previous Cycle (they returned here)
-${TRACKER_CLI} get-backlog
-${TRACKER_CLI} query --status TO_DO
+${TRACKER_CLI} get-backlog --status ready
 ```
 
-Also read:
-- Prior Checkpoint's customer feedback (`.synaptory/.orchestrator/cycle-feedback.md`, if it exists)
-- The previous Cycle's barrier verdict: which criterion blocked, and how long it took
-  ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" status "$(pwd)" {CYCLE_N minus 1}
-  ```
-- The workstream list and the shared surface:
-  ```bash
-  python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/sync_barrier.py" config "$(pwd)"
-  ```
+**Admission is the readiness moment.** Each admitted Work Unit clears readiness before build begins, which is what stops a Cycle opening on work nobody has sized. The declaration is validated as a whole and **every problem is reported at once** -- an author fixing six problems in six round trips stops reading the messages by the sixth.
 
----
+### What the sealed declaration requires
 
-## Step 2: PO Refines and Admits Work Units
-
-Dispatch the Project Owner agent.
-
-```
-PO_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the refinement inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="PO cycle admission", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md` for the full prompt template. The PO writes its receipt to `.synaptory/.orchestrator/receipts/CYCLE-{N}-po.json` as its last action, and **the prompt MUST instruct it to set `token_usage.stage` to `pro-brd`**, because this stage is not derivable from the role.
-
-**Why the stage must be stated.** `project-owner` is deliberately absent from the receipt validator's role→stage fallback map, because it spans three stages (`pro-discovery`, `pro-brd`, `pro-ux-spec`) and the validator cannot pick one. The prefix fallback omits `pro-` for the same reason. Omit the stage and the receipt still validates, the work still runs, and the PO's cost attribution for this Cycle is lost silently. Discovery uses `pro-discovery`; Commit uses **`pro-brd`**.
-
-**PO prompt context:**
-- Cycle number `{CYCLE_N}` and the goal under consideration
-- Prior Checkpoint feedback, and which units were cut at the last barrier (they are backlog again, not automatically re-admitted)
-- MethodSignals and cross-loop signals from Step 0
-- Current backlog
-- **The workstream list, and which workstream owns the shared paths**
-- Throughput from closed Cycles (`cycles_completed[].work_units_done`) for capacity
-
-**PO output:**
-- Refined Work Units with detailed acceptance criteria (Given/When/Then)
-- Priority ordering and a proposed **Cycle Goal**
-- **A workstream assignment per unit.** Every admitted unit belongs to exactly one workstream
-- Capacity recommendation **per workstream**, not for the Cycle as a whole. A Cycle of 12 units means nothing if 9 land on one workstream; that workstream sets the barrier date for everybody.
-- Per-unit `kind`, `labels`, `depends_on`, `file_scope`
-
-**Work Unit classification.** Every admitted unit carries three fields that feed the pipeline:
-
-- **`kind`**: one of `enabler | infra | backend | api | ui | mixed`. **Seed it from tracker labels** (the PO sees them in the backlog); the keyword regex over titles/ACs is a last-resort fallback for unlabelled units. A non-UI kind (`enabler`, `infra`, `backend`) suppresses the `ui_bearing` heuristic, so an enabler like "define color tokens" is never mis-routed into full browser QA just because an AC says a component *renders* them. `kind` also keys the `quality.verification.by_kind` tier overrides.
-
-  | Tracker label(s) | → `kind` |
-  |---|---|
-  | `enabler`, `tech-debt`, `spike`, `chore`, `refactor` | `enabler` |
-  | `infra`, `infrastructure`, `ci`, `cd`, `devops`, `platform` | `infra` |
-  | `backend`, `service`, `db`, `database`, `migration` | `backend` |
-  | `api`, `endpoint`, `contract`, `integration` | `api` |
-  | `ui`, `frontend`, `design`, `ux`, `screen`, `page` | `ui` |
-  | UI label **and** a backend/api label (or no label matches) | `mixed` |
-
-- **`depends_on`**: unit ids that must satisfy their declared condition before this one can be dispatched **at all** — a hard gate on both the serial and the parallel path (#304), not a parallel-batch filter. An edge naming a unit that is not on this workstream's board fails closed until the Cycle manifest and dependency ledger resolve it (#303). Record real sequencing constraints only. A cross-workstream edge MUST name a verifiable condition (`contract_published`, `artifact_published`, or `integrated`) and the producer's declared output; a bare `done` claim is local-board state and does not safely unblock another clone unless the project explicitly opts into unverified events. For `integrated`, configure `spq.sync.integration_mode: incremental`; for contract/artifact publication, configure the shared digest script. The producer publishes an event and the consumer refreshes its ledger during Cycle Execution — the dependency does not wait silently until the final barrier.
-- **`file_scope`**: the glob/dir list the unit is expected to touch. Optional under worktree isolation; **required** for every batch member under `parallelism.isolation: shared`.
-
-**Definition of Ready (admission criteria).** A unit is **admitted** only when all of these hold. Present anything failing as "not ready" and leave it in the backlog rather than admitting it and hoping:
-
-| # | Ready when |
-|---|---|
-| 1 | Acceptance criteria are written and **testable** (a QE can derive an assertion without asking a question) |
-| 2 | `kind`, `labels`, `depends_on` recorded; `file_scope` recorded when required |
-| 3 | Exactly one workstream owns it |
-| 4 | **Shared-path impact is declared**: either the unit does not touch `shared_digest_paths`, or it belongs to the `shared_owner` workstream |
-| 5 | No `[DESIGN-PENDING]` tag outstanding (see below) |
-| 6 | It fits inside this Cycle for its workstream. A unit that plainly cannot finish is not admitted, a scope-defined Cycle has no "carry-over" concept to absorb it |
-
-**Design-PENDING resolution (signal-gated).** For each proposed unit tagged `[DESIGN-PENDING]`, follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`:
-
-1. If a Cycle design preview exists in `.synaptory/design/`, generate a scoped handoff bundle from the relevant prototype section
-2. Otherwise prompt the team to create a targeted prototype using the unit's ACs as the brief
-3. Store the bundle at `.synaptory/design/{unit-id}-design.md`
-4. Record `design_ref: .synaptory/design/{unit-id}-design.md` against the unit. `tracker_cli.py` has **no field-update verb**, so set it in the tracker UI, and carry it into the Cycle orientation pack (Step 9) so every dispatch sees it
-5. Remove the `[DESIGN-PENDING]` tag
-6. **Guard:** a unit still tagged `[DESIGN-PENDING]` must NOT be admitted (criterion 5 above).
-
-**Skip for:** backend-only, enabler and infra units. They must not carry the tag; strip it without generating a bundle.
-
-The PO receipt looks like this (`model` and `token_usage` come from the agent's own run):
-
-```json
-{
-  "story_id": "CYCLE-3",
-  "role": "project-owner",
-  "backend": "claude",
-  "model": "claude-opus-4-8",
-  "artifacts": [".synaptory/.orchestrator/cycle-3-admission.md"],
-  "metrics": {"work_units_admitted": 11, "work_units_deferred": 4, "workstreams": 3},
-  "verification_commands": ["test -s .synaptory/.orchestrator/cycle-3-admission.md"],
-  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "pro-brd"},
-  "completed_at": "2026-08-10T00:00:00Z"
-}
-```
-
----
-
-## Step 3: SA Architecture Review (Conditional)
-
-Follow the SA Auto-Detect Protocol at `.synaptory/.protocols/sa-triggers.md`.
-
-For each proposed Work Unit:
-1. Scan the unit text for architecture trigger signals
-2. If ANY triggers found → dispatch the SA
-3. If NO triggers found → skip the SA entirely
-
-Also run the periodic health check:
-```
-Read .synaptory.yaml → architecture.health_check_interval (default: 3)
-If CYCLE_N % health_check_interval == 0:
-  Dispatch the SA for an architecture health check regardless of triggers
-```
-
-**Two SPQ-specific triggers, in addition to the protocol's list.** Both are about the shared surface, which is where parallel workstreams collide:
-
-- **Any change to `shared_digest_paths` this Cycle.** A contract or design-system change is by definition N-workstream-visible, so it gets architectural review before it is published, not after the barrier reports a digest delta.
-- **The previous Cycle's barrier blocked on criterion 4** (digests did not match). Something outside the intended ownership model moved a shared path; the SA decides whether the shared surface is drawn in the wrong place, which is a design question rather than a discipline problem.
-
-```
-SA_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "solution-architect")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="SA cycle architecture review", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/CYCLE-{N}-sa.json` as its last action.
-
----
-
-## Step 4: Publish and Pin the Shared Components
-
-Two needs pull in opposite directions: branch integration is inherently *after* the workstreams build, but shared components have to be settled *before* they build, or drift surfaces at merge time, the expensive moment. Commit resolves it:
-
-1. **Here at Commit**, the workstream flagged `shared_owner: true` publishes the contract and design-system version for this Cycle.
-2. **At `SYNC`**, barrier criterion 4 catches drift by digest comparison.
-3. Anything a workstream *needed* to change in a shared component becomes an input to the shared owner's **next** Commit, never a mid-Cycle edit.
-
-**Publish, then pin:**
+Read the requirements from the code rather than from this table, and read them *before* you write the JSON. This prints every problem the seal would refuse, without writing anything:
 
 ```bash
-# The shared owner lands the Cycle's contract + design-system version on its branch
-# FIRST (a normal Work Unit with a normal SE/QE cycle, admitted in Step 2: the
-# publish is work, not an announcement).
-#
-# Then record the pinned digest every other workstream builds against. ONE script,
-# the same one the barrier runs on both sides:
-bash scripts/shared-digest.sh contracts/
+SPQ_LIB="${CLAUDE_PLUGIN_ROOT}/hooks/lib" python3 - <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SPQ_LIB"])
+import cycle_records as records
+
+declaration = json.load(open("cycle-declaration.draft.json", encoding="utf-8"))
+problems = records.problems(declaration)
+print("\n".join("  - " + p for p in problems) if problems
+      else "this declaration would seal; barrier criteria: "
+           + ", ".join(records.BARRIER_CRITERIA))
+PY
 ```
 
-Record the emitted digests in the Cycle orientation pack (Step 9) as the pinned baseline for this Cycle, one line per shared path. A digest reading `error:no-tracked-files` means a `shared_digest_paths` entry is typo'd or its content was deleted, fix it now. It is a silent barrier bypass: both sides then agree on "nothing", and criterion 4 passes vacuously on a shared component that dropped out of governance.
+Draft it as `cycle-declaration.draft.json` and iterate against that command until it is clean. The Cycle-level fields:
 
-### The protection here is prompt-level, and you must not overstate it
+| Field | Required because |
+|---|---|
+| `cycle_id` | omit it and `open_cycle` allocates one; supply one only to reproduce an id |
+| `repository` | a Cycle addresses **one** repository, and a declaration naming none cannot be refused for spanning two |
+| `trunk_ref` | closing integrates to one shared trunk; without a named trunk there is nothing to integrate into |
+| `baseline_ref` | filled from the approved baseline. A cut must not move it, which needs it named |
+| `goal` | a Cycle is demonstrated against its goal |
+| `engineering_lead` | exactly one, and it is an accountability rather than a permission |
+| `source_region` | two concurrent Cycles are kept apart by declaration rather than by coordination, so a Cycle declaring no region cannot be checked against another's |
+| `admitted_units` | non-empty. The barrier ranges over the set Commit fixed, and an empty set makes every barrier vacuous |
+| `shared_path_owners` | present even when empty. An omitted map cannot be told apart from a forgotten one, and `shared_paths_owned` would then be evaluating a field it cannot distinguish from a gap |
+| `barrier_criteria` | published here so the Cycle sizes against them now instead of discovering them at close |
 
-**State `shared_digest_paths` as ask-first in every `se` dispatch prompt** for this Cycle. Exact wording to include:
+#### The region is reserved before the declaration is sealed
 
-> The paths `{shared_digest_paths}` are owned by the `{shared_owner}` workstream for Cycle `{N}` and are pinned at digest `{digest}`. Do **not** edit them. If this Work Unit needs a change there, stop and report it. It becomes an input to the next Commit, not a change you make now.
+A declared region separates nothing on its own. Two clones each hold a sealed
+declaration the other cannot see until somebody pushes, so `open_cycle` claims
+the region from the control plane's registry **before** sealing, and there is
+exactly one answer it proceeds on:
 
-**No code enforces this.** The `sprint.protected_modules` config key is read in exactly one place (`modes/story-buddy.md`) and is not on the execution path, it does not gate any SE dispatch. The deterministic boundary guard covers `.synaptory/tracker/`, `pipeline-state.json` and `.synaptory/sync/` only. So:
+| The registry says | Commit |
+|---|---|
+| granted | seals, recording `region_reservation: {registry: "control-plane"}` |
+| a live Cycle already holds an overlapping region | **refused**, naming that Cycle |
+| nothing -- unreachable, unauthenticated, timed out | **refused.** "I could not ask" is not "no collision" |
+| this project has no `project_id` | **refused.** A claim cannot be scoped without one |
 
-- Do **not** tell the user that `protected_modules` protects the shared surface. It does not.
-- The real detection is after the fact, at `SYNC` criterion 4.
-- If the first Cycle shows drift, that is the signal to escalate to a deterministic guard rather than a stronger prompt. Record it as a MethodSignal at Checkpoint.
+**So a Cycle cannot be opened offline, or from a project the control plane does
+not know.** That is deliberate. The registry is the only party that sees two
+clones in time, and a mode where the requirement does not apply is a mode where
+concurrency has no basis -- two clones of the same unregistered repository both
+lack a `project_id`, both get the same answer, and would both seal the same
+region. Missing identity is an inability to *address* the registry, never
+evidence that no peer exists.
+
+If the Commit refuses with `registry_unavailable`, run `synaptory whoami`
+before re-running it; `synaptory cycles regions list` shows what is held.
+
+**A Commit that refuses after reserving gives the region back.** Re-admission
+links and other post-seal checks can still fail, and a stray reservation would
+have the next Commit refused for a collision with a Cycle that does not exist.
+
+The claim is rechecked when work is **dispatched**, because a reservation can
+be released afterwards and a second Cycle can then legally claim the region
+this one is still working in. A dispatch is refused when the registry names
+another holder, when this Cycle's grant is gone, and when the registry cannot
+be reached at all -- an unanswerable recheck is not a confirmation. A Cycle
+whose declaration records no grant is refused for the same reason: its
+separation was never established.
+
+The region goes back at Checkpoint. See `checkpoint.md` §6.6.
+
+Per Work Unit:
+
+| Field | Required because |
+|---|---|
+| `id` | unique in the set, and a **safe path segment** (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`). Ids become event and receipt filenames, so an id carrying `/` or `..` would place a Cycle's records outside its own directory |
+| `kind` | one of `feature`, `story`, `bugfix`, `task`, `release`. An unrecognised kind is rejected rather than defaulted, because the kind decides which fields are required |
+| `title` | what it is |
+| `acceptance_criteria` | non-empty, no blank entries. Nothing can judge a unit without them, and the barrier would have nothing to evaluate |
+| `path_scope` | **non-empty.** See below |
+| `acceptance_cases` | the authored cases, written **before** any code exists |
+| `depends_on` | only where a real edge exists |
+| `execution_order` | only for an intersecting pair. See below |
+
+### `path_scope` is not optional, and an absent one is not "no files"
+
+Every admitted unit declares the part of the source it may address, in the grammar `spq/discovery.md` documents. An absent scope is **refused at admission** rather than treated as disjoint: compared against anything it would read as "addresses nothing", which is how a unit becomes concurrent-safe with the whole repository.
+
+**Disjointness is evaluated separately from dependency satisfaction and never inferred from it.** Two Work Units with no edge between them may still address one file, and a dependency check cannot see it -- and the failure that prevents, two changes silently diverging on one file and reconciled by whoever merges last, is not recoverable from evidence afterwards.
+
+**An intersecting pair is legal, sequentially.** The refusal is admission to a *concurrent* execution set, so two units whose scopes intersect need a distinct `execution_order` each:
+
+```json
+{"id": "WU-201", "path_scope": ["src/api/"], "execution_order": 1}
+{"id": "WU-202", "path_scope": ["src/api/routers/"], "execution_order": 2}
+```
+
+Without distinct orders the seal refuses the pair by name. With them the pair is admitted and the **dispatch** gate keeps it sequential: a concurrent dispatch onto an intersecting scope is refused with `scope_collision`, and it compares the sealed declaration rather than the board.
+
+Those are two refusals at two moments and neither substitutes for the other. Commit cannot know when a unit is actually running; dispatch cannot see the whole admitted set's shape.
+
+### A shared path has exactly one owner
+
+A path outside every declared region -- a contract, a schema, a shared library, the build configuration -- is declared with its one owning unit:
+
+```json
+"shared_path_owners": [
+  {"path": "contracts/ingest.openapi.yaml", "owning_unit_id": "WU-201"}
+]
+```
+
+The seal refuses a shared path with no owner, an owner whose own `path_scope` does not cover it, and a path covered by two units. **Two owners is the same unrecoverable merge as none.** State the map even when it is empty -- an empty list is a position, a missing key is not.
+
+### Dependencies: what an edge may wait for
+
+An edge names a **verifiable condition** rather than merely "done", because `done` is the producer's own claim about itself while the others are facts another unit can check.
+
+```json
+"depends_on": ["WU-201"]
+"depends_on": [{"unit_id": "WU-201", "condition": "contract_published"}]
+```
+
+A bare id waits for `done`, the weakest condition. The conditions are `done`, `contract_published`, `artifact_published`, `integrated`, `environment_ready`, and anything else is refused as unverifiable. `cycle_integrated` is gone: it was the cross-Cycle condition, and there is no parent Cycle to wait on now that unorderable work is co-admitted to one.
+
+**An edge naming a unit this Cycle did not admit is refused.** Work that cannot be ordered cannot be split: co-admit the pair to one Cycle, or consume a *published, versioned* artifact of it at this Cycle's own Commit.
+
+**A mutual pair is not a loop to reject.** Two units that depend on each other inside one declaration are the atomic case, already co-admitted -- which is exactly what the method asks for.
+
+**A condition stronger than `done` needs a verifier sealed with it.** `done` resolves off the board. `contract_published` and `artifact_published` are proven by a ledger event whose declared digest the resolver **recomputes**, so the declaration must name the script that computes it:
+
+```bash
+python3 core/lib/spq_state_machine.py open_cycle \
+  --goal "..." --units units.json \
+  --verification '{"digest_script": "scripts/digest.sh"}'
+```
+
+The script takes the output `id` as its one argument and prints the digest on stdout. It is sealed **inside the declaration hash**, so the digest that admits an edge cannot be recomputed later by a different script. A declaration carrying a digest-verified edge and no `verification.digest_script` is **refused at Commit**, as is a script path escaping the project -- because a verifier nobody can run is the same silent pass as no verifier, which is what this cost the predecessor.
+
+Publishing a digest that does not match what the script recomputes is refused outright; the event never lands. After it does land, the consumer clears in two more steps that are deliberately human: **commit and push** `.synaptory/cycles/` (until then `dep_status` says `dep_event_local_only`, not "nothing published"), then `refresh_ledger` in the reading clone (until then it says `dep_ledger_stale`). Three distinguishable codes rather than one "blocked", because the operator's next action differs in each.
+
+### A design-pending unit is not admitted
+
+For each candidate tagged `[DESIGN-PENDING]`, follow the Design Grooming Protocol at `.synaptory/.protocols/design-grooming.md`:
+
+1. If a design preview exists under `.synaptory/design/`, generate a scoped handoff bundle from the relevant prototype section.
+2. Otherwise create a targeted prototype using the unit's acceptance criteria as the brief.
+3. Store the bundle at `.synaptory/design/{unit-id}-design.md` and carry that path into the orientation pack (Step 8) so every dispatch sees it. `tracker_cli.py` has **no field-update verb**, so if the reference belongs on the ticket, set it in the tracker UI.
+4. Remove the tag.
+5. **A unit still tagged `[DESIGN-PENDING]` is not admitted.** A unit whose screen nobody has designed cannot have testable acceptance cases, and admitting it moves the design decision inside the barrier.
+
+### Authored acceptance cases, before any code exists
+
+Each admitted unit declares the cases the verifying stage will execute:
+
+```json
+"acceptance_cases": [
+  {"id": "AC-1", "statement": "POST /ingest with a valid signature returns 202", "criterion_ref": "AC-1"},
+  {"id": "AC-2", "statement": "POST /ingest with no signature returns 401", "criterion_ref": "AC-2"}
+]
+```
+
+A case id must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$` and every case needs a statement: a verifying receipt reports its per-case outcome under that exact key, so an id the two sides cannot spell identically is a case nothing can prove, and an id with no statement behind it is one a prover can trivially mark passed.
+
+**Where cases genuinely cannot be authored yet, declare the gap.** A unit that states a position (`"acceptance_cases": []`) and declares nothing is refused: `open_cycle` refuses admission with `authored_cases_absent` before it allocates an identity or writes anything, because a Cycle that admits a unit with no criteria has already lost the test-first ordering and no later check can restore it.
+
+```json
+"criteria_gap_declared": {"reason": "the third-party contract is unpublished; QE authors the cases at verification",
+                          "declared_by": "<who declared it>", "declared_at": "<iso8601>"}
+```
+
+A gap with no `reason` is not a declaration. The Cycle then records the gap on the board, on every dispatch payload and on the DoD result, so a Cycle running without test-first is *visibly* running without it rather than indistinguishable from one that is not.
 
 ---
 
-## Step 5: Team Approves the Cycle Scope
+## Step 3. Architecture review (conditional, architecture skill)
 
-Present the admitted set for confirmation. **Show it per workstream**, because a Cycle-level total hides the imbalance that decides the barrier date:
+Run this when an admitted unit trips an architecture trigger -- a new entity, a new service, a new integration, a security requirement, a performance requirement -- or on the periodic health check.
+
+> **SKILL INVOCATION, not a dispatch.** `solution-architect` is on no receipt-gated edge in this lifecycle, so no SPQ ceremony dispatches it.
+
+```
+synaptory skills get solution-architect
+```
+
+Output: the ADRs this Cycle needs, and any contract change that has to be **owned by one admitted unit** rather than edited by several.
+
+---
+
+## Step 4. Approve the scope (human gate)
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  CYCLE {N}, COMMIT
+  COMMIT                                     Cycle {N}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Cycle Goal:  {PO_PROPOSED_GOAL}
-  Throughput:  {AVG} units/cycle over {M} closed Cycles
-  Shared:      contracts/ @ {digest[:12]}, owned by {shared_owner}
-
-  Admitted Work Units:
-  ┌────────────┬──────────┬────────────────────────────┬──────┬────────┐
-  │ Workstream │ Unit     │ Title                      │ Kind │ Design │
-  ├────────────┼──────────┼────────────────────────────┼──────┼────────┤
-  │ {ws-1}     │ US-042   │ User login with MFA        │ ui   │ 🎨     │
-  │ {ws-1}     │ US-043   │ Password reset             │ mixed│        │
-  │ {ws-2}     │ US-051   │ Publish auth contract v3   │ api  │        │
-  │ {ws-3}     │ INFRA-05 │ Add Redis cache            │ infra│        │
-  └────────────┴──────────┴────────────────────────────┴──────┴────────┘
-  {ws-1}: 5 units · {ws-2}: 4 units · {ws-3}: 2 units
-  {SA_NOTE: "Architecture signals detected. SA reviewed: new entity, shared contract change"}
-  {🎨 = design handoff bundle at .synaptory/design/{unit-id}-design.md}
-
-  Deferred (not ready): US-044 (ACs not testable), US-047 (touches contracts/,
-  not owned by this workstream)
+  Goal             {CYCLE_GOAL}
+  Engineering Lead {LEAD}
+  Crew             {names} -- grants nothing
+  Repository       {REPO}   Trunk {TRUNK_REF}
+  Source region    {paths}  · no overlap with {other open Cycles}
+  Admitted         {N} Work Units, all with a declared path scope
+  Intersecting     {N} pairs, each with a distinct execution_order
+  Shared paths     {N}, each with exactly one owner
+  Authored cases   {N}/{N} units · {N} declared gaps
+  DoD tier         {tier}
+  Barrier criteria {read from cycle_records.BARRIER_CRITERIA -- printed, not restated}
+  Sized against    {measured history: cycles {ids}, throughput {v}, cut-rate {v}, window {w}}
+                   {or: bootstrap from the Discovery calibration sample -- no Cycle has closed}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   Options:
-  1. Approve the Cycle (Recommended)
-  2. Add Work Units
-  3. Remove Work Units
-  4. Rebalance across workstreams
-  5. Adjust the Cycle Goal
-  6. Chat about this
+  1. Commit this scope (Recommended)
+  2. Show the declaration
+  3. Reduce the admitted set
+  4. Chat about this
 ```
 
-**Call out an imbalance explicitly** when the busiest workstream carries more than roughly twice the lightest one's load: under `all_or_nothing`, the Cycle clears when the *last* workstream is ready, so the others will idle at the barrier. Offer option 4 rather than waiting for `SYNC` to reveal it.
+**Print the barrier criteria; do not type them.** They come from one constant, and restating a list in prose is how three different criteria counts came to ship in one product -- eight documented, nine printed, five emitted by two hosts. The check in Step 2 prints them, and after Commit the sealed declaration carries them.
 
-**The user has final authority over Cycle scope.** They may admit something you flagged as not ready, record the override in the admission notes so the next Commit's signals show where it came from.
+**The Cycle sizes against those criteria here.** Every one has to be met at the close, together, over the whole admitted set. If the Cycle cannot plausibly clear all of them with this set, the set is too large -- and reducing it now costs a conversation, while discovering it at the barrier costs the close.
 
 ---
 
-## Step 5.5: Announce the DoD Tier
+## Step 5. Bind the tracker
 
-The DoD tier must be an **announced decision**, not a silent promotion the team discovers at gate time.
-
-1. **Resolve it:**
-   ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/story_pipeline.py" dod_tier "$(pwd)"
-   ```
-   Prints `{tier, tier_source, active_base_checks}`. `tier_source: "computed"` means it was never announced, exactly what this step fixes.
-
-2. **Present it:**
-   ```
-   ━━━ Cycle {N} DoD Tier ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-     This Cycle's DoD tier is {TIER}, requiring:
-       {active_base_checks, one per line}
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   ```
-   Call out step-ups: `growing` adds `code_reviewed` → **every unit now gets a CR dispatch** (expect a cost/latency bump per unit). `mature` adds `coverage_no_decrease` → coverage is measured and must not regress.
-
-   **Under SPQ the tier also reaches the barrier.** Each workstream's readiness record carries a derived `dod` block (`{tier, tier_source, checks_failed, units_evaluated, units_passed}`), and that record is the **only** channel by which any quality evidence crosses the clone boundary: replay mismatches go to a local event log that nothing ships, and the signals store never leaves the clone. A tier left at `computed` therefore shows up as an unannounced tier in N readiness records at the barrier.
-
-3. **Let the human confirm or override, then persist it:**
-   ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/story_pipeline.py" set_dod_tier "$(pwd)" {tier} \
-     --decided-by "{PO_EMAIL_OR_ROLE}" [--reason "{why}"]
-   ```
-   From here on every `next_action` output carries the tier with `tier_source: "planned"`.
-
----
-
-## Step 6: QE Cycle Test Specification
-
-Dispatch the Quality Engineer agent for this Cycle's units only.
-
-```
-QE_BACKEND=$(python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
-```
-
-> **MANDATORY: Spawn this agent via the `Agent()` tool. Do not execute the test-spec work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Agent(subagent_type="general-purpose", description="QE cycle test specification", prompt=<self-contained prompt per the wrapper>)`: see `${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/CYCLE-{N}-qe.json` as its last action.
-
-**QE prompt context:**
-- The admitted units (ids, titles, ACs) **grouped by workstream**
-- Existing test infrastructure and the framework from `.synaptory.yaml`
-- The pinned shared digest, contract tests assert against the pinned version, not against whatever is on a workstream branch
-
-**QE output:**
-- A test specification per unit AC, written to `.synaptory/.orchestrator/test-specification-cycle-{N}.md`
-- **The layer split, stated per workstream:** which assertions run in the workstream's own pre-declare regression versus which belong in `scripts/sync-regression.sh` at the barrier. Cross-workstream assertions are only *runnable* on the integrated tree, so putting them in a workstream suite means they either fail there permanently or get skipped, and a skipped cross-workstream assertion is exactly the class of defect the barrier exists to catch.
-- **This Cycle's journey**, if the increment changes the primary user path. `scripts/sync-journey.sh` executes it at criterion 5, and a journey that still asserts the previous Cycle's flow passes while proving nothing.
-
----
-
-## Step 7: Bind the Tracker Cycle
-
-A Cycle **is** a tracker cycle (a Linear Cycle / Jira sprint / GitHub milestone). Requires `tracker.linear.manage_cycles: true`: it defaults to `false`, and without it the cycle is never created and each workstream's `get-sprint-backlog` returns nothing.
+The tracker mirrors the Cycle; it is never its source. A cycle renamed or renumbered in the tracker cannot repoint a Cycle, because identity lives in the sealed declaration.
 
 ```bash
 ${TRACKER_CLI} health-check
-
-# The tracker's cycle/sprint verbs are the SAME ones scrum uses. A Cycle maps onto
-# the existing sprint interface, and SPQ adds no adapter surface.
 ${TRACKER_CLI} list-sprints
-echo '{"number":{CYCLE_N},"goal":"{CYCLE_GOAL}"}' | ${TRACKER_CLI} create-sprint
+echo '{"number":{CYCLE_SEQ},"goal":"{CYCLE_GOAL}"}' | ${TRACKER_CLI} create-sprint
 ```
 
-Then write the admitted units into that cycle, each tagged with its workstream's discriminator (label or Linear project) so every clone can filter its own subset out of the shared cycle.
+SPQ adds no tracker adapter surface: a Cycle maps onto the existing sprint interface, and `get-sprint-backlog {CYCLE_SEQ}` is how a clone reads it back.
 
-The binding is recorded in this clone's state by `open_cycle --tracker-cycle` in Step 8. Record it even when the cycle number happens to equal `N`: the point is that a cycle renamed or renumbered later cannot silently repoint the Cycle, and the tracker stays a **mirror, never the source of truth**.
+**There is no verb that assigns a unit to a cycle.** `tracker_cli.py` exposes no field-update verb at all, and the remote adapters restrict `update_story()` to a fixed field allow-list that would silently drop the rest -- so moving tickets into the cycle is a tracker-UI action. Do not invent a verb for it; the Cycle's own authority is the sealed declaration, and the tracker is a mirror of it.
 
 ---
 
-## Step 8: Open the Cycle
+## Step 6. Open the Cycle
+
+One command seals the declaration, projects the board, and records the Commit event.
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" open_cycle "$(pwd)" {CYCLE_N} \
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" open_cycle "$(pwd)" \
   --goal "{CYCLE_GOAL}" \
-  --tracker-cycle {CYCLE_NUMBER} \
-  --work-units '[
-    {"id":"US-042","title":"User login with MFA",
-     "acceptance_criteria":["User can open the login screen and enter credentials","On success the dashboard renders"],
-     "kind":"ui","labels":["ui","auth","ws:frame"],"depends_on":[],"file_scope":["frontend/auth/","services/auth/"]},
-    {"id":"US-051","title":"Publish auth contract v3",
-     "acceptance_criteria":["The v3 auth contract is published and version-tagged","Consumers resolve it from the pinned digest"],
-     "kind":"api","labels":["api","ws:spine"],"depends_on":[],"file_scope":["contracts/auth/"]},
-    {"id":"INFRA-005","title":"Add Redis cache",
-     "acceptance_criteria":["Session reads hit Redis","A cold cache degrades to the datastore without error"],
-     "kind":"infra","labels":["infra","ws:exec"],"depends_on":[],"file_scope":["infra/"]}]'
+  --repository "{OWNER/REPO}" \
+  --trunk-ref "{TRUNK_REF}" \
+  --engineering-lead "{LEAD}" \
+  --crew '["se", "qe", "cr"]' \
+  --source-region '["src/ingest/", "src/api/routers/ingest.py"]' \
+  --shared-path-owners '[{"path": "contracts/ingest.openapi.yaml", "owning_unit_id": "WU-201"}]' \
+  --units '[{"id": "WU-201", "kind": "feature", "title": "Ingest accepts a signed envelope", "acceptance_criteria": ["AC-1 a signed envelope is accepted", "AC-2 an unsigned envelope is refused with 401"], "path_scope": ["src/ingest/", "contracts/ingest.openapi.yaml"], "acceptance_cases": [{"id": "AC-1", "statement": "POST /ingest with a valid signature returns 202", "criterion_ref": "AC-1"}, {"id": "AC-2", "statement": "POST /ingest with no signature returns 401", "criterion_ref": "AC-2"}]}]'
 ```
 
-Notes that cost quality if skipped:
+`--units` and `--source-region` are JSON. `--goal`, `--repository`, `--trunk-ref` and `--engineering-lead` are strings. `barrier_criteria` and `baseline_ref` are **not** arguments: the criteria come from the one constant, and the baseline comes from the approved Discovery record -- neither is a value a Commit may choose.
 
-- **Pass `{CYCLE_N}` explicitly.** `open_cycle` defaults to `current_cycle + 1`, which is normally the same number, but the receipts written in Steps 2, 3 and 6 already committed to `CYCLE-{N}`. An explicit argument makes a mismatch an error instead of a silent split across two ids. `open_cycle` refuses a non-monotonic number outright.
-- **Always include `acceptance_criteria`.** They are snapshotted onto the unit record and drive the `ui_acceptance` DoD gate: a unit whose ACs describe a user-facing screen is auto-routed to SE `frontend` + QE `browser-qa` and cannot reach `done` without UI verification. Omitting the ACs disables that protection for the unit.
-- **Carry `kind`, `labels`, `depends_on`, `file_scope`.** Snapshotted at intake: `kind` suppresses the ui_bearing heuristic for `enabler`/`infra`/`backend` and selects the verification tier; `depends_on` gates dispatch outright on both paths (#304) and, with `file_scope`, parallel-batch membership.
-- **Put the workstream discriminator in `labels`** (e.g. `ws:frame`). It is how each clone filters its own admitted subset out of the shared cycle, and how per-workstream reporting reconciles against the tracker.
+The result names what was sealed:
 
-`open_cycle` creates the unit records in `queued`, records the tracker binding, clears any previous barrier verdict, and transitions the lifecycle to **`CYCLE_EXECUTION`**.
+```json
+{"ok": true, "cycle_id": "3-a91f0c2e", "cycle_seq": 3,
+ "declaration_hash": "sha256:…", "admitted_unit_ids": ["WU-201", "WU-202"]}
+```
+
+**Record the `cycle_id` and the `declaration_hash`.** Every later mutation names them, and a mutation whose declared identity is not the current one is refused rather than applied to whichever Cycle happens to be open.
+
+### What `open_cycle` refuses, and what each refusal means
+
+| Refusal | Meaning |
+|---|---|
+| a baseline is not approved | Discovery has not ended. The baseline is the line a cut must not move |
+| `DISCOVERY -> CYCLE` is not legal from here | the engagement is `COMPLETE`. The final Acceptance handed it over, and there is nothing to reopen |
+| `authored_cases_absent` | a unit stated `acceptance_cases: []` and declared no gap. Author the cases or declare the gap with a reason |
+| the declaration cannot be sealed, with a list | every problem at once. Fix them together and re-run |
+| `transport_ignored` | `.synaptory/cycles/` is gitignored, so this declaration would be invisible to every other clone while writing cleanly here |
+
+**A refusal leaves nothing on disk.** Admission is checked before the identity is allocated and before anything is written, so a refused Commit is re-runnable rather than a half-opened Cycle to recover.
 
 ---
 
-## Step 9: Generate the Cycle Orientation Pack
+## Step 7. Commit and push the transport
 
-Write `.synaptory/.orchestrator/cycle-context.md`: the **single onboarding digest every dispatched agent reads FIRST, instead of re-reading the BRD/ADRs/mockups from scratch**. The Orchestrator writes it inline (no agent dispatch), regenerated at **every** Commit so it never goes stale. Target ~2-4k tokens.
+The sealed declaration reaches other clones through git, and nothing else does:
+
+```bash
+git add .synaptory/cycles/{CYCLE_ID}/manifest.json
+git commit -m "spq: commit Cycle {CYCLE_ID} -- {N} Work Units admitted"
+```
+
+**Ask before committing and before pushing.** Then every other clone joins the Cycle by hydrating onto it, which verifies the seal before adopting anything:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" hydrate_cycle "$(pwd)" --cycle-id {CYCLE_ID}
+```
+
+---
+
+## Step 8. The orientation pack
+
+Write one file the Crew reads instead of re-deriving the Cycle:
 
 ```markdown
-<!-- generated_at: {ISO-8601} | cycle: {N} | git: {HEAD short SHA} -->
-# Cycle {N} Orientation
+# Cycle {CYCLE_ID}
 
-## Cycle Goal & Work Units
-{goal, then a table: id | title | workstream | kind | depends_on | verification tier}
+## Goal
+{CYCLE_GOAL}   Engineering Lead: {LEAD}   Trunk: {TRUNK_REF}
 
-## Workstreams & Ownership
-{table: workstream id | manifest branch | native workstream pin | shared_owner? |
- tracker discriminator}
+## Admitted Work Units
+| id | kind | path scope | depends on | order | authored cases |
 
-## Shared Components (PINNED for this Cycle)
-{one line per shared_digest_paths entry: path | pinned digest | owning workstream}
-{followed VERBATIM by: "Do not edit these paths. A needed change is an input to
- the next Commit, reported, not made."}
+## Source region
+{paths}. Outside it: shared paths and their one owner each.
 
-## Barrier Expectations
-{the five criteria, the proof script paths, and the one-line statement that
- declare_sync_ready runs the workstream regression and DERIVES the dod/replay
- blocks, an agent cannot assert readiness by writing a file}
-
-## Product & Architecture Digest
-{the decisions and constraints that bind THIS Cycle's units; cite the source doc
- path next to each item so an agent can open it when the digest flags a gap}
+## The barrier this Cycle sized against
+{the criteria, printed from the sealed declaration}
 
 ## Commands
-{EXACT install / build / test / dev-server commands for this repo, copied from
- package.json / Makefile / README, verified against the tree, not guessed}
-
-## Module & File Map
-{where things live, annotated with which units touch which area}
+next_action · begin_dispatch · advance · bind_receipt · dep_status · cut_work_unit
 
 ## Conventions
-{naming, error handling, test framework/patterns, styling}
-
-## What Already Exists
-{features/endpoints/screens delivered in prior Cycles, so agents extend instead
- of re-implementing}
+{test command, lint command, the regression named in the baseline}
 ```
 
-Dispatch prompts list this file right after `.synaptory.yaml` (see `skills/_shared/backends/claude.md`); agents open a full source doc only when the digest flags a gap or their unit cites it. Keep it honest, a wrong command, a stale file map, or a stale pinned digest costs every dispatch in the Cycle.
+**State the shared paths as ask-first in every `se` dispatch prompt**: *"`{paths}` are owned by `{unit}` for this Cycle. Do not edit them. If your Work Unit needs a change there, stop and report it as an input to the next Commit."*
 
-Print:
-```
-✓ Cycle {N} opened, {M} Work Units admitted across {K} workstreams
-  Goal: {CYCLE_GOAL}
-  DoD tier: {TIER} ({active checks})
-  Shared: {path} @ {digest[:12]} (owner: {shared_owner})
-  Orientation pack: .synaptory/.orchestrator/cycle-context.md
-  Proceeding to Cycle Execution, each workstream drives its own clone.
+**That protection is prompt-level, and you must not overstate it.** No boundary guard enforces it during execution. What *is* enforced is the barrier's `shared_paths_owned` criterion at the close, and the dispatch gate's `scope_collision` refusal when two units' declared scopes intersect -- both of which are cheaper than a merge and more expensive than asking.
+
+---
+
+## Receipt ledger for this event
+
+The QE Cycle test specification is a dispatch and writes its own receipt; the refinement and architecture steps are skill invocations whose receipt the orchestrator writes inline. Resolve every path with `bind_receipt` under the pseudo Work Unit id `CYCLE-{CYCLE_SEQ}`.
+
+```json
+{
+  "story_id": "CYCLE-3",
+  "role": "orchestrator",
+  "accountable_role": "project-owner",
+  "backend": "claude",
+  "model": "{model_id_used}",
+  "artifacts": [".synaptory/cycles/3-a91f0c2e/manifest.json", "docs/cycles/cycle-3.md"],
+  "metrics": {"units_admitted": 5, "units_readmitted": 1, "authored_cases": 14},
+  "verification_commands": [
+    {"command": "python3 -m json.tool .synaptory/cycles/3-a91f0c2e/manifest.json", "exit_code": 0, "summary": "sealed declaration parses"},
+    "test -s .synaptory/cycles/3-a91f0c2e/manifest.json"
+  ],
+  "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "stage": "pro-brd"},
+  "completed_at": "{iso8601_utc_timestamp}"
+}
 ```
 
-Then hand off: each workstream clone loads `modes/spq.md` → `CYCLE_EXECUTION` and drives its own `next_action` loop until it returns `await_sync`. The integration clone waits at the barrier; it does not dispatch Work Units.
+An **executed object** (`command` + `exit_code` + `summary`) is proof; a **plain string** is a replay instruction the SubagentStop hook re-runs, and is not proof. Both must be replayable -- no command substitution, no shell pipeline, no `python3 -c` payload -- because a command the hook cannot re-run is a claim.
+
+`{model_id_used}` and `{iso8601_utc_timestamp}` are placeholders to substitute with real values. Never copy a literal model id out of a prompt: `/cost` would price the step at a rate nothing ran at.
+
+---
+
+## What Commit does not do
+
+| Activity | Commit |
+|---|---|
+| Add a unit to an open Cycle | No. The set is closed at Commit, and there is no verb that appends one |
+| Grow the set by revising the declaration | No. A revision may narrow, correct a scope or record a cut; a revision that admitted a unit would be late admission with a reason attached |
+| Assign units to a lane | No. There are no lanes. A unit belongs to the Cycle that admitted it |
+| Enable parallelism | No. Concurrency is a consequence of the declared scopes, not a switch |
+| Choose the barrier criteria | No. They come from one constant. A project may add one or raise a threshold; removing one the method declares is refused at the seal |
+| Move the baseline | No. That is a re-baseline, an accountable action the client agrees to first |

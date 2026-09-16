@@ -1,47 +1,26 @@
 """Layer 2 — `synaptory-inject-protocols.sh` contract tests.
 
-Phase 1 modernisation: the hook now emits the compact protocol index
-(plugin-claude/hooks/data/compacted-protocols.md) as the additionalContext payload
-instead of the full 92 KB body of all 17 protocols.  The individual
-protocol fetch loop still runs so that full bodies land in
-.synaptory/.protocols/ for SKILL.md !cat usage, but those bodies are NOT
-what appears in additionalContext.
+The hook emits the compact protocol index
+(plugin-claude/hooks/data/compacted-protocols.md) as the additionalContext
+payload. It is the ONLY protocol body the hook fetches (#400 removed the
+dead 17-protocol fan-out whose output was discarded) — full per-protocol
+bodies land in .synaptory/.protocols/ via the SessionStart skills-fetch,
+not per dispatch.
 
 Tests pin:
   - The compact file content lands in additionalContext (CP path and disk fallback).
-  - The fetch loop still runs and populates .synaptory/.protocols/ on disk.
+  - The compact payload is the only `skills get` the hook issues.
+  - The assembled payload is byte-identical to compact + risk checklist.
   - The depth-guard blocks at MAX_AGENT_DEPTH+1 with a BLOCKED payload.
   - Silent skip when neither the CLI nor the compact file is available.
 """
 
 from __future__ import annotations
 
-import os
+import hashlib
 from pathlib import Path
 
 import pytest
-
-# The 17 protocol names hardcoded in plugin-claude/hooks/synaptory-inject-protocols.sh.
-# Order matters — they shape the system prompt every subagent sees.
-PROTOCOL_NAMES = [
-    "receipt-protocol",
-    "input-validation",
-    "tool-efficiency",
-    "freshness-protocol",
-    "iron-laws",
-    "verification-discipline",
-    "socratic-gate",
-    "anti-safe-harbor",
-    "script-output-handling",
-    "clean-code-self-check",
-    "scope-challenge",
-    "finding-memory",
-    "tdd-discipline",
-    "code-review-response",
-    "subagent-isolation",
-    "source-attribution",
-    "open-decision-registry",
-]
 
 
 @pytest.fixture
@@ -49,23 +28,11 @@ def inject_hook(plugin_root: Path) -> Path:
     return plugin_root / "hooks" / "synaptory-inject-protocols.sh"
 
 
-def _seed_all_protocols(stub_cli, prefix: str = "BODY:") -> dict[str, str]:
-    """Write a distinct canned body for every protocol; return name→body map."""
-    bodies: dict[str, str] = {}
-    for name in PROTOCOL_NAMES:
-        body = f"# {prefix} protocols/{name}\n\nbody-marker-{name}\n"
-        stub_cli.add_body(f"protocols/{name}", body)
-        bodies[name] = body
-    return bodies
-
-
 @pytest.mark.hook
 def test_cp_path_emits_compact_file(
     inject_hook, hook_env, stub_cli, subagent_stdin, run_hook, parse_output, plugin_root: Path
 ):
-    """Stub CLI returns every protocol → additionalContext is the compact index file."""
-    _seed_all_protocols(stub_cli)
-
+    """additionalContext is the compact index file."""
     result = run_hook(inject_hook, env=hook_env, stdin=subagent_stdin)
     assert result.returncode == 0, f"hook failed: {result.stderr}"
 
@@ -85,10 +52,9 @@ def test_risk_checklist_survives_into_additional_context(
     inject_hook, hook_env, stub_cli, subagent_stdin, run_hook, parse_output
 ):
     """Regression (PR #83 re-review): a project `risk_checklist:` must reach
-    subagents. The compact-protocol load resets CONTEXT, so an earlier bug
-    dropped the appended checklist entirely — healthcare/security review
-    patterns never made it into additionalContext."""
-    _seed_all_protocols(stub_cli)
+    subagents, appended AFTER the compact protocol payload — an earlier bug
+    dropped the checklist entirely and healthcare/security review patterns
+    never made it into additionalContext."""
     project_dir = Path(hook_env["CLAUDE_PROJECT_DIR"])
     (project_dir / ".synaptory").mkdir(parents=True, exist_ok=True)
     (project_dir / ".synaptory" / "risk.md").write_text(
@@ -117,8 +83,6 @@ def test_compact_payload_under_10kb(
     inject_hook, hook_env, stub_cli, subagent_stdin, run_hook, parse_output
 ):
     """The compact additionalContext must be under the 10 KB cap."""
-    _seed_all_protocols(stub_cli)
-
     result = run_hook(inject_hook, env=hook_env, stdin=subagent_stdin)
     assert result.returncode == 0, f"hook failed: {result.stderr}"
 
@@ -221,11 +185,70 @@ def test_empty_when_neither_path_works(
 
 
 @pytest.mark.hook
+def test_only_compact_payload_is_fetched(
+    inject_hook, hook_env, stub_cli, subagent_stdin, run_hook
+):
+    """Dead-fetch regression (#400): the compact payload is the ONLY
+    `skills get` the hook issues. The 17 per-protocol fetches whose
+    concatenated output was discarded before emission must stay gone."""
+    skills_log = stub_cli.bodies_dir.parent / "skills-get.log"
+    env = {**hook_env, "SYNAPTORY_STUB_SKILLS_LOG": str(skills_log)}
+
+    result = run_hook(inject_hook, env=env, stdin=subagent_stdin)
+    assert result.returncode == 0, f"hook failed: {result.stderr}"
+
+    fetched = skills_log.read_text(encoding="utf-8").splitlines() if skills_log.exists() else []
+    assert fetched == ["get hooks/data/compacted-protocols"], (
+        f"hook must fetch only the compact payload it injects, got: {fetched}"
+    )
+
+
+@pytest.mark.hook
+def test_assembled_payload_byte_identical(
+    inject_hook, hook_env, stub_cli, subagent_stdin, run_hook, parse_output
+):
+    """The emitted additionalContext is byte-for-byte the CP-fetched compact
+    body followed by the project risk-checklist block — nothing dropped,
+    nothing reordered, nothing inserted (non-synaptory agent → no envelope)."""
+    compact_body = "# CANARY Synaptory Protocols\n\ncompact-marker\n"
+    stub_cli.add_body("hooks/data/compacted-protocols", compact_body)
+    project_dir = Path(hook_env["CLAUDE_PROJECT_DIR"])
+    (project_dir / ".synaptory").mkdir(parents=True, exist_ok=True)
+    rc_body = "# PHI Review Patterns\n- CANARY_RISK_PATTERN\n"
+    (project_dir / ".synaptory" / "risk.md").write_text(rc_body, encoding="utf-8")
+    (project_dir / ".synaptory.yaml").write_text(
+        "project_id: test\nrisk_checklist: .synaptory/risk.md\n", encoding="utf-8"
+    )
+
+    result = run_hook(inject_hook, env=hook_env, stdin=subagent_stdin)
+    assert result.returncode == 0, f"hook failed: {result.stderr}"
+    parsed = parse_output(result.stdout)
+    assert parsed is not None
+    ctx: str = parsed["additional_context"]
+
+    # The stub prepends its deterministic watermark line; $(...) strips the
+    # body's trailing newlines. The risk-checklist block is appended verbatim.
+    wm = hashlib.sha256(b"stub|hooks/data/compacted-protocols").hexdigest()[:16]
+    expected = (
+        f"<!-- synaptory-id: {wm} -->\n{compact_body}".rstrip("\n")
+        + "\n# Project Risk Checklist (.synaptory/risk.md)\n\n"
+        + "Project-supplied review checklist — MANDATORY context. Apply every applicable\n"
+        + "item to the code you produce or verify in this story; treat an unaddressed\n"
+        + "applicable item as a blocking finding.\n\n"
+        + rc_body
+        + "\n---\n"
+    )
+    assert ctx == expected, (
+        f"additionalContext is not byte-identical to compact + risk checklist:\n"
+        f"got:      {ctx!r}\nexpected: {expected!r}"
+    )
+
+
+@pytest.mark.hook
 def test_depth_guard_blocks_at_4(
     inject_hook, hook_env, stub_cli, subagent_stdin, run_hook
 ):
     """Depth counter at MAX_AGENT_DEPTH+1 → hook emits BLOCKED payload + exit 1."""
-    _seed_all_protocols(stub_cli)
     project_dir = Path(hook_env["CLAUDE_PROJECT_DIR"])
     # Pre-populate the depth counter so this invocation will be at depth 4.
     # synaptory_logger.py stores it at .synaptory/.orchestrator/active-depth.

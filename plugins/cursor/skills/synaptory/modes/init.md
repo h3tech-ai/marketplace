@@ -76,9 +76,55 @@ and "Chat about this" is always last. Never write a field the user has not seen.
 - **`project.type`** — greenfield | brownfield | evolved_brownfield | mixed (default from health classification).
 
 ### Round 2 — Lifecycle (ALWAYS)
-- **`build_mode`** — scrum | kanban | spq (kanban is brownfield-only; warn if chosen for greenfield. spq adds a cross-workstream integration barrier and needs the `spq:` block plus one clone per workstream — see docs/spq-lifecycle-design.md §5.3).
+- **`build_mode`** -- scrum | kanban | spq (kanban is brownfield-only; warn if chosen for greenfield).
+  **If the answer is `spq`, run Round 2b before moving on.** It is a different lifecycle, not a
+  setting to flip later: four stages (`DISCOVERY → CYCLE → ACCEPTANCE → COMPLETE`), three recorded
+  method events (Commit, Sync, Checkpoint) that gate nothing, and an all-or-nothing barrier at each
+  Cycle's close that integrates to one shared trunk. See `modes/spq.md`.
 - **`engagement_mode`** — structured | interactive.
-- **`sprint.inception`** — foundation | blueprint (foundation for most; blueprint for regulated/fixed-scope).
+- **`sprint.inception`** -- foundation | blueprint (foundation for most; blueprint for regulated/fixed-scope). **Scrum only**: SPQ sizes Discovery to the uncertainty it must remove and reads no depth key.
+
+### Round 2b -- SPQ (only when `build_mode: spq`)
+
+Three things, and they are small on purpose. **Most of what an SPQ Cycle needs is declared per
+Cycle at its Commit, not configured once here**: the admitted set, each Work Unit's `path_scope`,
+the source region, the Engineering Lead, the Crew and the barrier criteria all live in the sealed
+declaration `open_cycle` writes. A configuration key for any of them would be a second, staler
+copy of a hash-sealed document.
+
+- **`spq.source_region`** -- the default region a Cycle declares when its Commit does not name one,
+  as a list in the declared path grammar (`api/`, `api/**`, or `api/routers/auth.py`; suffix
+  patterns, leading globstars, interior wildcards, traversal and absolute paths are refused rather
+  than guessed). Offer the top-level source directories as candidates and let the user pick. Two
+  concurrent Cycles never declare overlapping regions, so this is a default for a single-Cycle
+  project and a starting point for a concurrent one.
+- **`spq.trunk_ref`** -- the one shared trunk every Cycle integrates to at its Checkpoint. Default
+  from `git symbolic-ref refs/remotes/origin/HEAD` (usually `main`); confirm it. It is the
+  `--trunk-ref` a Commit declares, and a Cycle that integrates into a different ref is the
+  deferred integration the retired composition layer existed to gather.
+- **`parallelism.max_concurrent`** -- a **resource ceiling**, not a concurrency switch. Under SPQ
+  there is no `story_parallelism` and no `isolation` mode: concurrency is a consequence of the
+  declared path scopes, and this only limits how much runs at once. Say that when you ask, because
+  a user who read the Scrum block will expect a switch. A ceiling can never make colliding work
+  legal.
+
+Then check the one thing that is not a setting and blocks the first Commit if it is wrong:
+
+```bash
+git check-ignore -q .synaptory/cycles/ \
+  && echo "BLOCKING: add '!.synaptory/cycles/' after '.synaptory/*' in .gitignore" \
+  || echo "committed transport is visible to git"
+```
+
+A Cycle's sealed declaration, its cut record and its dependency events travel to other clones
+through that directory. `open_cycle` refuses a gitignored declaration (`transport_ignored`), so fix
+it during init rather than during the first sizing session.
+
+**Do not write a barrier-criteria list, a threshold list, a lane list or a sync block.** The
+criteria come from one constant in the runtime and are published into each sealed declaration; a
+project may add a criterion or raise a threshold, but not by editing `.synaptory.yaml`, and there
+is no key that reads one. Restating the list in configuration is how three different criteria
+counts came to ship in one product.
 
 ### Round 3 — Tracker
 - **`tracker.backend`** — local | github | jira | teamwork | linear.

@@ -1,0 +1,273 @@
+# Platform Engineer Playbook
+
+Everything the Platform Engineer intent contract used to carry inline.
+Fetched on demand (`synaptory skills get
+platform-engineer/guides/platform-playbook`) so the dispatch payload stays a
+task frame rather than a manual.
+
+## Overview
+
+Infrastructure, reliability, and deployment pipeline: from infrastructure design through production-ready deployment with monitoring, SLOs, chaos engineering, runbooks, and security. Generates infrastructure artifacts at the project root (`infra/`, `.github/workflows/`, Dockerfiles) with planning notes in `.synaptory/platform-engineer/`.
+
+## Engagement Mode
+
+Read `.synaptory/.orchestrator/settings.md` at startup; with no settings, assume Autonomous.
+
+| Mode | Behavior |
+|------|----------|
+| **Autonomous** | Full auto-execution. Use architecture's cloud choice. Sensible defaults for all infra decisions. Surface only genuinely irreversible choices (1-2 max). Report decisions in output. |
+| **Controlled** | Surface all major decisions. Show Dockerfile strategy, CI pipeline design, monitoring architecture before implementing. Walk through each Terraform module. User approves deployment strategy and alert thresholds. |
+
+## Progress Output
+
+Follow the visual-identity protocol. Print structured progress throughout execution.
+
+**Skill header** (print on start):
+```
+━━━ Platform Engineer ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**Phase progress** (print during execution):
+```
+  [1/6] Containerization
+    ✓ {N} Dockerfiles, 1 docker-compose
+    ⧖ building multi-stage images...
+    ○ CI/CD pipelines
+    ○ infrastructure as code
+    ○ monitoring
+    ○ security
+
+  [2/6] CI/CD Pipelines
+    ✓ {N} workflows ({provider})
+    ⧖ configuring deployment strategies...
+    ○ infrastructure as code
+    ○ monitoring
+    ○ security
+
+  [3/6] Infrastructure as Code
+    ✓ {N} Terraform modules, {M} resources
+    ⧖ provisioning cloud resources...
+    ○ monitoring
+    ○ security
+
+  [4/6] Monitoring & Observability
+    ✓ dashboards, alerting configured
+    ○ security
+
+  [5/6] Security
+    ⧖ scanning, secrets, IAM...
+
+  [6/6] Complete
+    ✓ {N} Dockerfiles, {M} CI workflows, {K} Terraform modules
+```
+
+**Completion summary** (print on finish — MUST include concrete numbers):
+```
+✓ Platform Engineer    {N} infra modules, {M} CI workflows, {K} Dockerfiles    ⏱ Xm Ys
+```
+
+## Brownfield Awareness
+
+If `.synaptory/.orchestrator/codebase-context.md` exists and mode is `brownfield`:
+- **READ existing infrastructure first** — check for Dockerfiles, CI configs, Terraform, K8s manifests
+- **EXTEND, don't replace** — add new services to existing docker-compose, add jobs to existing CI
+- **NEVER overwrite** — existing Dockerfile, workflows, Terraform state, or alerting configs
+- **Match existing patterns** — if they use GitHub Actions, don't create GitLab CI. If they use Pulumi, don't create Terraform. If they use Datadog, don't replace with Prometheus
+- **Preserve existing alerting** — add new alerts, don't reorganize existing ones
+
+## Config Paths
+
+Read `.synaptory.yaml` at startup. Use these overrides if defined:
+- `preferences.iac_tool` — default: `opentofu` (options: `opentofu`, `terraform`, `pulumi`)
+- `paths.iac` — default: derived from `iac_tool` (`infra/opentofu/`, `infra/terraform/`, or `infra/pulumi/`)
+  - Backward compat: if `paths.terraform` is set but `paths.iac` is not, use `paths.terraform` and treat as `iac_tool: terraform`
+- `paths.kubernetes` — default: `infra/kubernetes/`
+- `paths.ci_cd` — default: `.github/workflows/`
+- `paths.monitoring` — default: `infra/monitoring/`
+
+### IaC Tool Resolution
+
+Resolve the IaC tool and path at startup:
+```python
+iac_tool = config.preferences.iac_tool or "opentofu"
+iac_path = config.paths.iac or config.paths.terraform or f"infra/{iac_tool}/"
+iac_cli  = {"opentofu": "tofu", "terraform": "terraform", "pulumi": "pulumi"}[iac_tool]
+```
+Use `iac_tool`, `iac_path`, and `iac_cli` throughout all phases instead of hardcoded values.
+
+## Phase Index
+
+| Phase | Catalog name | Purpose |
+|-------|--------------|---------|
+| 1. Infrastructure Assessment | `platform-engineer/phases/01-assessment` | Evaluate current state, application profile, scale requirements, environments, budget, team capabilities |
+| 2. Infrastructure as Code | `platform-engineer/phases/02-infrastructure-as-code` | Terraform modules, environments, multi-cloud provider configs |
+| 3. CI/CD Pipelines | `platform-engineer/phases/03-cicd-pipelines` | Build/test/deploy workflows, deployment strategies (blue-green, canary, rolling) |
+| 4. Container Orchestration | `platform-engineer/phases/04-container-orchestration` | Dockerfiles, docker-compose, Kubernetes manifests, Helm charts |
+| 5. Monitoring & Observability | `platform-engineer/phases/05-monitoring` | Prometheus, Grafana, logging, tracing, alerting — Four Golden Signals |
+| 6. Security | `platform-engineer/phases/06-security` | Scanning, secrets management, IAM, compliance, incident response |
+
+The reliability phases (`platform-engineer/reliability-phases/01-readiness-review` through `05-capacity-planning`) cover readiness review, SLO definition, chaos engineering, incident management, and capacity planning. Fetch them when the task is reliability work rather than build-out.
+
+## Dispatch Protocol
+
+For all phases: fetch the relevant phase guide before starting that phase. Never fetch all phases at once — each is loaded on demand to minimize token usage. Execute phases sequentially. Each phase builds on the previous.
+
+## Parallel Execution
+
+After Phase 1 (Assessment), Phases 2-4 and Phases 5-6 can run as two parallel groups:
+
+**Group 1 (infrastructure artifacts — independent):**
+```python
+Agent(prompt=f"Generate {iac_tool} IaC following Phase 2. Write to {iac_path}.", ...)
+Agent(prompt="Generate CI/CD pipelines following Phase 3. Write to .github/workflows/ and scripts/.", ...)
+Agent(prompt="Generate container orchestration following Phase 4. Write Dockerfiles and K8s manifests.", ...)
+```
+
+Wait for all Group 1 agents to complete, then write the checkpoint file and verify before proceeding:
+
+```python
+# Group 1 completion — write checkpoint
+Write(".synaptory/platform-engineer/infra-complete.json",
+      json.dumps({"completed_at": "<ISO-8601>",
+                  "artifacts": [iac_path, ".github/workflows/", "services/*/Dockerfile"]}))
+
+# Checkpoint check — REQUIRED before spawning Group 2
+checkpoint_path = ".synaptory/platform-engineer/infra-complete.json"
+if not exists(checkpoint_path):
+    STOP("infra-complete.json not found. Group 1 (IaC + CI/CD + Containers) has not "
+         "finished. Do NOT spawn Monitoring + Security agents until Group 1 completes.")
+checkpoint = json.load(checkpoint_path)
+if not checkpoint.get("completed_at"):
+    STOP("Group 1 not yet complete — infrastructure not ready. "
+         "Wait for Group 1 to finish before proceeding to Group 2.")
+```
+
+**Group 2 (after Group 1 — needs infrastructure context):**
+```python
+Agent(prompt="Generate monitoring + observability following Phase 5. Write to infra/monitoring/.", ...)
+Agent(prompt="Generate security infrastructure following Phase 6. Write to infra/security/.", ...)
+```
+
+**Full execution order:**
+1. Phase 1: Assessment (sequential)
+2. Phases 2-4: IaC + CI/CD + Containers (PARALLEL)
+3. Phases 5-6: Monitoring + Security (PARALLEL, after Group 1)
+
+## Output Structure
+
+### Project Root Output (Deliverables)
+
+```
+infra/
+├── terraform/
+│   ├── modules/
+│   │   ├── networking/
+│   │   ├── compute/
+│   │   ├── database/
+│   │   ├── messaging/
+│   │   ├── storage/
+│   │   ├── monitoring/
+│   │   ├── security/
+│   │   └── dns/
+│   ├── environments/
+│   │   ├── dev/
+│   │   ├── staging/
+│   │   └── prod/
+│   └── global/
+├── kubernetes/
+│   ├── base/
+│   └── overlays/
+├── helm/               # (optional)
+├── monitoring/
+│   ├── prometheus/
+│   ├── grafana/
+│   ├── logging/
+│   ├── tracing/
+│   └── alerting/
+└── security/
+    ├── scanning/
+    ├── secrets/
+    ├── network/
+    ├── iam/
+    ├── compliance/
+    └── incident-response/
+
+.github/workflows/
+├── ci.yml
+├── cd-staging.yml
+├── cd-production.yml
+├── pr-checks.yml
+└── scheduled.yml
+
+scripts/
+├── build.sh
+├── deploy.sh
+├── rollback.sh
+└── smoke-test.sh
+
+services/<service-name>/
+└── Dockerfile              # Per-service Dockerfiles co-located with service code
+
+docker-compose.yml          # Project root
+docker-compose.test.yml     # Project root
+
+```
+
+### Workspace Output (Planning, Assessment & Analysis)
+
+```
+.synaptory/platform-engineer/
+├── deployment-plan.md          # Deployment planning notes
+├── infrastructure-assessment.md # Infrastructure assessment documents
+└── decisions.md                # Platform engineering decision log
+```
+
+## Red Flags — Rationalization Prevention
+
+If you catch yourself thinking any of these, STOP. You are about to compromise infrastructure quality.
+
+| Forbidden Thought | Why It's Dangerous | What to Do Instead |
+|---|---|---|
+| "We'll add monitoring later" | Unmonitored systems fail silently. You can't fix what you can't see | Monitoring, alerting, and logging are DAY ONE requirements, not afterthoughts |
+| "This works in dev, it'll work in production" | Dev ≠ prod. Different networks, scale, security contexts, and failure modes | Test in a production-like environment. Document every known dev/prod divergence |
+| "We don't need runbooks for this service" | When it breaks at 3am, runbooks are the difference between 5-minute fix and 4-hour outage | Every service gets a runbook. Cover: how to restart, how to diagnose, how to rollback |
+| "Manual deployment is fine for now" | Manual deployment is how wrong artifacts reach production | Automate deployment from day one. CI/CD is infrastructure, not a luxury |
+| "This secret can go in the config file" | Config files get committed. Secrets in config = secrets in git history forever | Secrets go in vault/SSM/env vars. Never in files that could be committed |
+| "The container image doesn't need to be pinned" | Unpinned images pull different code on different deploys. Irreproducible builds | Pin every image to a specific SHA or version tag |
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Same Terraform state for all envs | Separate state per environment, shared modules |
+| Secrets in environment variables | Use cloud Secrets Manager + External Secrets Operator |
+| No rollback strategy | Blue-green or canary with automated rollback triggers |
+| Monitoring without alerting | Every dashboard metric needs an alert threshold and runbook link |
+| Over-permissive IAM | Start with zero permissions, add as needed, review quarterly |
+| Skipping staging | Staging must mirror prod topology, use same IaC modules |
+| Docker images as root | Always `USER nonroot`, read-only filesystem where possible |
+| Alert fatigue | SLO-based alerting, aggregate similar alerts, escalation tiers |
+
+## Verification Checklist
+
+- [ ] Every service has Dockerfiles, CI/CD pipelines, and Terraform modules
+- [ ] Every environment has separate Terraform state
+- [ ] All containers run as non-root with resource limits
+- [ ] Monitoring covers the Four Golden Signals
+- [ ] Every alert has a threshold and documented escalation path
+- [ ] Secrets managed via vault/SSM — never in config files or environment variables
+
+## Handoff
+
+| Consumer | What They Get |
+|----------|---------------|
+| Technical Writer | Infrastructure docs, deployment guides, architecture diagrams |
+| Development teams | Dockerfiles, CI/CD pipelines, deployment scripts |
+| Reliability Engineer | `{iac_path}`, `.github/workflows/`, `infra/kubernetes/`, `infra/monitoring/` — consumed as inputs (resolve `iac_path` from config) |
+
+## Pre-Receipt Checklist
+
+- [ ] Dockerfiles exist for all services
+- [ ] CI/CD config is valid (GitHub Actions workflows or equivalent)
+- [ ] Infrastructure-as-Code validates without errors
+- [ ] Monitoring and alerting configured

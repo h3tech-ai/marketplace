@@ -19,7 +19,7 @@ The `agents.default_backend` / `agents.roles` keys in `.synaptory.yaml` from v2.
 
 ## Dispatch Procedure
 
-See [claude.md](claude.md) for the full dispatch procedure: prompt composition, tier → model-ID resolution via [model-pins.json](model-pins.json), `Agent()` invocation, receipt verification, and the H3-F1 recovery ladder.
+See [claude.md](claude.md) for the full dispatch procedure: prompt composition, per-role tier selection, `Agent()` invocation with the tier ALIAS, receipt verification, and the H3-F1 recovery ladder. The dispatch path never reads [model-pins.json](model-pins.json); see Model Tier Routing below for what that file is and is not.
 
 ## Receipt Contract
 
@@ -28,7 +28,7 @@ Every receipt written by a role dispatched from plugin-claude MUST set:
 ```json
 {
   "backend": "claude",
-  "model": "<exact model ID, e.g. claude-sonnet-4-6>",
+  "model": "<the exact model ID you actually ran under>",
   ...
 }
 ```
@@ -37,7 +37,7 @@ The `receipt_validator.py` module enforces `backend == "claude"`.
 
 ## Model Tier Routing
 
-Model tier is resolved per role via the mapping in [claude.md](claude.md) → Step 2. Aliases (`opus`, `sonnet`, `haiku`) are pinned to exact model IDs via [model-pins.json](model-pins.json) so regulated customers (HC0-F2) can reproduce behavior audit-to-audit.
+Model tier is resolved per role via the mapping in [claude.md](claude.md) → Step 2. Aliases (`opus`, `sonnet`, `haiku`) are recorded against exact model IDs in [model-pins.json](model-pins.json). That record is a statement of INTENT and a reviewable diff, and nothing more. This line used to promise regulated customers an audit-to-audit reproduction guarantee, which was false: nothing on the dispatch path reads the file, `Agent()` takes only the alias, and the model on a receipt is written by the dispatched agent about itself. HC0-F2 is recorded NOT DELIVERABLE IN V1 (#596, brd-plugin FR-PLUGIN-071).
 
 ## Concurrency & Depth Guard
 

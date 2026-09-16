@@ -1,0 +1,55 @@
+{
+  "provenance": {
+    "source_repo": "h3tech-ai/synaptory-spec",
+    "source_path": "spec/spq-methodology.md",
+    "source_section": "10.2 If you hear an old word",
+    "spec_revision": "SPD-194",
+    "source_table_sha256": "3de3e17aadf567b9bf15dc9db0c338cb8fd82253d7d7e77860c95717790d729e",
+    "table_sha256": "74cc10c45cc05097c05764f02f542848fab8b637f104229c22a2fc7474094757",
+    "derived_at": "2026-09-09",
+    "derived_by": "scripts/check-retired-vocabulary-table --write",
+    "note": "A copy, with provenance. Re-derive and compare with `scripts/check-retired-vocabulary-table`; that check needs both repositories present and is not part of the pytest suite, because a guard that skips when its source is absent reads exactly like one that passed. Running it by hand is the decision rather than a gap waiting on automation (#684): automating it needs a standing credential for one private repository to read another, which is a permanent grant bought against a rare event in a codebase with a finite life. Re-run it when §10.2 changes; it exits 2, not 0, when it cannot read the spec."
+  },
+  "revisions": {
+    "this-revision": "SPD-194, `h3tech-ai/synaptory-spec` 2026-09-07. The revision that ships section 10.2 in its current form. Section 10.2 writes this cell as \"**This revision**\", relative to itself, so it is named here instead. When the spec ships a later revision these rows become \"Earlier revision\" and the drift check fires.",
+    "earlier-revision": "A revision before SPD-194; section 10.2 names it only as \"Earlier revision\". In this repository the same rename is recorded by docs/adrs/ADR-028-spq-cycle-vocabulary.md, which cites `SPD-173` for Slice -> Cycle, superseding `SPD-120`'s Increment."
+  },
+  "words": [
+    {
+      "id": "slice",
+      "heard": "Slice",
+      "read_instead": "Cycle",
+      "retired_in": "earlier-revision"
+    },
+    {
+      "id": "increment",
+      "heard": "Increment",
+      "read_instead": "Cycle",
+      "retired_in": "earlier-revision"
+    },
+    {
+      "id": "the_implementation_phase",
+      "heard": "The Implementation phase",
+      "read_instead": "Cycles",
+      "retired_in": "earlier-revision"
+    },
+    {
+      "id": "workstream",
+      "heard": "Workstream",
+      "read_instead": "Cycle",
+      "retired_in": "this-revision"
+    },
+    {
+      "id": "cycle_of_cycles",
+      "heard": "Cycle of Cycles",
+      "read_instead": "Nothing",
+      "retired_in": "this-revision"
+    },
+    {
+      "id": "coordination_cycle",
+      "heard": "Coordination Cycle",
+      "read_instead": "Nothing between the Cycles",
+      "retired_in": "this-revision"
+    }
+  ]
+}

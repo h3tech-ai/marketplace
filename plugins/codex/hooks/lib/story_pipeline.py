@@ -20,7 +20,9 @@ CLI:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -38,11 +40,66 @@ def _host_env():
     return host_env
 
 
+def _profile_pair_for_role(role: Any) -> dict[str, str] | None:
+    """The `(stage_profile, capability_profile)` pair a dispatch role runs
+    under, as a dict, or None when the role does not project onto one (#402).
+
+    Lazy import for the same reason as `_host_env`: a partial install must not
+    break module load, and a dispatcher that crashed because the profile
+    vocabulary was absent would be strictly worse than one that says nothing
+    about profiles.
+    """
+    if not role:
+        return None
+    try:
+        from runtime_contracts import profile_pair_for_role
+
+        stage_profile, capability_profile = profile_pair_for_role(role)
+    except (ImportError, ValueError):
+        return None
+    return {
+        "stage_profile": stage_profile,
+        "capability_profile": capability_profile,
+        "role": str(role),
+    }
+
+
 try:
     from synaptory_logger import emit as _log_emit
 except ImportError:  # synaptory_logger may not be on sys.path in some invocations
     def _log_emit(event: str, project_dir: str | None = None, **payload: Any) -> None:
         return None
+
+
+def _emit_project_event(
+    event: str, project_dir: str | os.PathLike[str] | None, **payload: Any
+) -> None:
+    """Log a project event, or drop it when the project is not known.
+
+    ONE PLACE DECIDES, and it never falls back to the working directory.
+    Handed `project_dir=None`, `synaptory_logger.emit` addresses
+    `host_env.project_dir()`, which ends at `os.getcwd()` -- so an unaddressed
+    event is written into whatever directory the process happened to be in.
+    Most call sites in this module pass the project; `story_create` and the
+    `forced_transition` override did not, and `transition_story` takes it
+    OPTIONALLY, so any caller that omits it silently redirects the write.
+
+    What that cost: running `./synaptory test` grew a
+    `.synaptory/.orchestrator/{events.jsonl,chain-id}` in the checkout under
+    test, worktree or not (#380). `.synaptory/*` is gitignored, so `git status`
+    stayed clean and nothing showed -- the same invisibility that made #502 and
+    #568 read as mysterious corruption instead of as a test leak.
+
+    Dropping rather than redirecting is not a new best-effort: `emit`'s own
+    contract already drops events it cannot write ("missing workspace,
+    permission denied") so hooks stay non-blocking, and an event with no
+    project is exactly that. Dropping is also the only remedy that reaches
+    callers this module does not own -- the host adapters and the tests that
+    build a record without naming a project.
+    """
+    if project_dir is None:
+        return
+    _log_emit(event, project_dir=project_dir, **payload)
 
 
 def is_per_story_acceptance_enabled(project_dir: str | os.PathLike) -> bool:
@@ -286,6 +343,46 @@ def parallelism_config(project_dir: str | os.PathLike) -> dict[str, Any]:
     return out
 
 
+def concurrency_policy(project_dir: str | os.PathLike) -> dict[str, Any]:
+    """THE effective concurrency policy, which is not the same block on every
+    lifecycle.
+
+    Scrum and Kanban keep `parallelism_config` unchanged -- `story_parallelism`
+    and `isolation` are theirs, they are in supported scope, and removing them
+    would be a capability regression for every project running several
+    label-filtered boards.
+
+    SPQ HAS NO SWITCH, and that is `C-07` / `SC-MTH-010`: concurrency is a
+    CONSEQUENCE of declared path scope, not an enablement a project sets. The
+    predecessor made it a switch twice over -- `story_parallelism` defaulted to
+    False so a project that never edited its config got no concurrency at all,
+    and `isolation: worktree` permitted file overlap BY DESIGN, so declared
+    scopes were compared only under `shared`. Two Work Units addressing one
+    path were both authorized, and the risk looked absent rather than
+    unguarded.
+
+    What survives for SPQ is `max_concurrent`, a resource ceiling. The
+    distinction is worth stating because it is the one this function exists to
+    keep: a ceiling limits how much runs at once and can never make colliding
+    work legal, while a switch decided whether the collision was looked for.
+    `advance_kernel._scope_collision` is what decides, and it consults the
+    sealed declaration rather than anything here.
+    """
+    block = parallelism_config(project_dir)
+    # `_project_build_mode` rather than a local read: it already mirrors
+    # `advance_kernel.build_mode`'s two lookups and returns "" rather than
+    # raising on an unreadable board, and one more copy of that logic is how
+    # the two would drift.
+    if _project_build_mode(project_dir) != "spq":
+        return block
+    return {
+        "max_concurrent": block["max_concurrent"],
+        # Named rather than merely absent, so a reader learns WHAT governs
+        # concurrency instead of only that a key they expected is gone.
+        "governed_by": "declared path scope (C-07)",
+    }
+
+
 def _config_dod_tier(project_dir: str | os.PathLike) -> str | None:
     """Read an explicit `quality.dod_tier` override from `.synaptory.yaml`."""
     in_quality = False
@@ -364,6 +461,38 @@ def story_touches_phi(
     return any(sig.lower() in blob for sig in signals if sig)
 
 
+#: The compliance obligations the compliance-engineer used to discharge by
+#: being dispatched per story (#31). #487 makes them DECLARED CHECKS on the
+#: gate instead (proposal 3.1, the `SP-WRK-019` shape): the gate names them
+#: before the verifying stage runs, refuses the transition until each has
+#: returned a result, and reads an absent, unfinished or errored result as a
+#: failure rather than as a pass.
+#:
+#: One id today, and the tuple rather than its length is the point: the
+#: promotion in `active_dod_checks` iterates this declaration instead of
+#: naming a check, so a second compliance obligation joins by being added
+#: here. Adding one is deliberately NOT done in this ticket, because a new
+#: check id is also a new key in `receipt_validator.KNOWN_STORY_DOD_KEYS`, a
+#: new entry in `receipt-schema/evidence-contract.json`, and a new column on
+#: the control plane's Evidence gate — surfaces owned by other tickets in this
+#: epic (#407 landed the ingest, #408 holds `conformance/contract.json` as a
+#: single writer). The mechanism lands here; widening the set is a separate,
+#: cross-surface change.
+COMPLIANCE_CHECKS: tuple[str, ...] = ("no_critical_findings",)
+
+#: Receipt abbreviation to full role name, for the gate messages that have to
+#: name a stage a human can dispatch. Deliberately a local literal rather than
+#: an import of `runtime_contracts.ROLE_NAMES`: every other cross-module reach
+#: in this file is lazy for the same reason (a partial host install must not
+#: break module load), and a block reason must never fail to render.
+_ROLE_ABBREV_TO_NAME: dict[str, str] = {
+    "se": "software-engineer",
+    "qe": "quality-engineer",
+    "cr": "code-reviewer",
+    "ce": "compliance-engineer",
+}
+
+
 def active_dod_checks(
     intensity: str,
     *,
@@ -381,10 +510,24 @@ def active_dod_checks(
     service proven live, #44 phase 5). Promotion is what makes those gates
     satisfiable — the orchestrator dispatches the matching agent/mode only when
     the gate is active, so the two stay in lockstep.
+
+    #487 changes WHO satisfies the compliance half, not whether it is
+    promoted. On SPQ the promotion no longer implies a compliance-engineer
+    dispatch (there never was one on the Work Unit path); it declares the
+    obligation on the gate, and `compliance_accountable_role` names the
+    verifying stage that owes the result. Scrum and Kanban are unchanged.
     """
     checks = list(DOD_TIER_CHECKS.get(intensity, DOD_TIER_CHECKS["early"]))
-    if compliance_required and "no_critical_findings" not in checks:
-        checks.append("no_critical_findings")
+    if compliance_required:
+        # #487 — promote the DECLARED compliance set rather than one named
+        # check. The behaviour is identical while `COMPLIANCE_CHECKS` holds a
+        # single id; what changes is that the obligation now has one place to
+        # be read from, which is what lets `next_action` state it to a
+        # dispatch and what makes a second obligation a one-line addition
+        # instead of a hunt through four call sites.
+        for compliance_check in COMPLIANCE_CHECKS:
+            if compliance_check not in checks:
+                checks.append(compliance_check)
     if runtime_required and "runtime_verified" not in checks:
         checks.append("runtime_verified")
     if ui_required and "ui_acceptance" not in checks:
@@ -404,6 +547,170 @@ _EVIDENCE_GATE_KEYS = (
     "code_reviewed", "coverage_no_decrease",
 )
 
+# ─── Typed DoD check results (#403, capability-profile-pilot.md 3.3) ─────────
+
+#: The three results a required check can land on. `criteria_gap_declared` is
+#: its own state: never a pass, never a fail, and never folded into either.
+#: Mirrors runtime_contracts.DOD_CHECK_RESULTS (imported lazily below, in the
+#: `_host_env` idiom, so a partial install cannot break module load).
+DOD_RESULT_PASS = "pass"
+DOD_RESULT_FAIL = "fail"
+CRITERIA_GAP_DECLARED = "criteria_gap_declared"
+
+#: Payload key for the typed results this module SHIPS, and the key a receipt
+#: may carry a SELF-REPORTED result under. Same key on both sides because the
+#: control plane reads exactly one (`analytics.DOD_CHECK_RESULTS_KEY`, the
+#: seam #407 named for this ticket) and mirrors it, not two.
+DOD_CHECK_RESULTS_KEY = "dod_check_results"
+
+#: Per check, the evidence shape whose ABSENCE makes the check unevaluable.
+#: This is the text a `criteria_gap_declared` result carries, and the reason
+#: the result exists: a gate that cannot be evaluated must say what is missing
+#: so the orchestrator's retry prompt can teach the agent, instead of
+#: resolving to a silent nothing that renders like a pass (the 13.3 shape).
+#: Extends the self-explaining `detail` idiom #134 GAP-1 established for
+#: tests_pass / build_succeeds to every check that can be required.
+_MISSING_EVIDENCE_SHAPE: dict[str, str] = {
+    "tests_pass": (
+        "`verification_commands` contains no executed proof objects. "
+        "Plain-string commands are replay instructions, not evidence — "
+        'record each command you actually ran as {"command": "...", '
+        '"exit_code": 0, "summary": "..."}.'
+    ),
+    "build_succeeds": (
+        "`verification_commands` contains no executed proof objects. "
+        "Plain-string commands are replay instructions, not evidence — "
+        'record each command you actually ran as {"command": "...", '
+        '"exit_code": 0, "summary": "..."}.'
+    ),
+    "no_critical_findings": (
+        "no review receipt records a critical-findings count. A "
+        "compliance-engineer or code-reviewer receipt must carry "
+        "`metrics.findings_critical` as an explicit number; a security "
+        "verdict cannot be inferred from its absence."
+    ),
+    "code_reviewed": (
+        "no code-reviewer receipt exists for this story. A review is the "
+        'CR\'s own act: it must carry top-level `"status": "complete"` (or '
+        "`story_dod.code_reviewed: true`), and no other role's receipt can "
+        "stand in for it."
+    ),
+    "coverage_no_decrease": (
+        "no receipt records `metrics.coverage_delta`, so there is nothing to "
+        "compare against the prior revision. Record the delta as a signed "
+        'percentage (e.g. "+3.2%") or a number.'
+    ),
+    "runtime_verified": (
+        "no receipt carries a structured `metrics.runtime_verification` "
+        "object. A note saying the stack was checked is intent; the object "
+        "recording {deployed, logs_inspected} is the evidence."
+    ),
+    "ui_acceptance": (
+        "no receipt carries a structured `metrics.ui_verification` object. A "
+        "green API or unit suite is not evidence a screen renders — QE "
+        "browser-qa (or e2e) must record {rendered, routes_tested, "
+        "flows_failed}."
+    ),
+    "integration_verified": (
+        "no receipt declares an `integrations[]` entry with a backing "
+        "executed smoke command, so the story's claim that an external "
+        "service is wired has no live proof."
+    ),
+}
+
+
+def criteria_gap_detail(check_id: str, *, source: str | None = None) -> str:
+    """The missing-evidence description a `criteria_gap_declared` carries.
+
+    Names the check, then the evidence shape that is absent, then whether any
+    receipt was even found for it — the last distinction matters because "the
+    receipt is the wrong shape" and "there is no receipt" need different
+    fixes, and a reader who cannot tell them apart re-dispatches the wrong
+    role.
+    """
+    shape = _MISSING_EVIDENCE_SHAPE.get(
+        check_id, "no receipt carries evidence this check can be evaluated from."
+    )
+    where = (
+        "a receipt was found but carries no evaluable evidence"
+        if source
+        else "no receipt was found that could source it"
+    )
+    return "%s is unverified: %s. Missing evidence: %s" % (check_id, where, shape)
+
+
+# ─── the compliance obligation, declared rather than dispatched (#487) ───────
+
+
+def compliance_accountable_role(build_mode: str | None) -> str:
+    """The receipt abbreviation that OWES the declared compliance result.
+
+    SPQ dispatches no compliance-engineer on the Work Unit path any more
+    (#487), so the obligation lands on the stage that verifies the unit:
+    `cr`, the prover that already owns the `reviewing -> done` edge, is
+    already excluded from sourcing its own build evidence, and already
+    records `metrics.findings_critical/high/medium/low` per its evidence
+    obligations. `qe` is deliberately NOT the answer: `no_critical_findings`
+    carries `fallback: review_roles_only` precisely so a security verdict
+    comes from a review role, and widening that to the test-writing stage
+    would be a weakening dressed as a re-assignment.
+
+    Scrum and Kanban are out of scope for this pilot (proposal 7). They keep
+    the compliance-engineer dispatch they have, so this returns `ce` for them
+    and nothing about those two lifecycles changes.
+
+    CE is NOT dissolved as a dispatch identity everywhere, and that is a
+    finding rather than an omission: `spq_state_machine.ACCEPTANCE_ROLES`
+    binds `ACCEPTANCE -> COMPLETE` to a real `ACCEPTANCE-{N}-ce.json`, so CE
+    keeps dispatching at the SPQ Acceptance gate and in `modes/secure.md`.
+    What this ticket removes is the per-Work-Unit dispatch nobody schedules.
+    """
+    return "cr" if str(build_mode or "").lower() == "spq" else "ce"
+
+
+def compliance_declaration(
+    *,
+    baa_enforced: bool,
+    required: bool,
+    build_mode: str | None = None,
+) -> dict[str, Any]:
+    """The compliance check set declared on the gate, in dispatch-readable form.
+
+    This is the surface the `SP-WRK-019` shape needs and the pipeline did not
+    have: before #487, `no_critical_findings` was promoted at GATE time and
+    announced to nobody at DISPATCH time. `next_action`'s `dod` block carried
+    only the static tier list (`DOD_TIER_CHECKS`), and the SubagentStart
+    envelope is rendered with neither `--active-checks` nor `--tier`, so the
+    conditional compliance obligation reached no agent before it blocked one.
+    A check a dispatch was never told about is a check the dispatch cannot
+    have produced evidence for.
+
+    `required` is the verdict computed from the receipts that exist SO FAR,
+    so it can flip from false to true as a unit's diff grows. `provisional`
+    says exactly that, and it is why a BAA project's dispatch is told about
+    the obligation even while `required` is still false: the alternative is
+    telling the verifying stage only once it is too late to have produced
+    the evidence.
+    """
+    return {
+        "checks": list(COMPLIANCE_CHECKS),
+        "baa_enforced": bool(baa_enforced),
+        "required": bool(required),
+        # True when the project is BAA-enforced and the PHI signal has not
+        # (yet) tripped. Not "false": a later receipt can still trip it.
+        "provisional": bool(baa_enforced) and not bool(required),
+        "accountable_role": compliance_accountable_role(build_mode),
+        "evidence": {
+            cid: _MISSING_EVIDENCE_SHAPE.get(
+                cid, "no receipt carries evidence this check can be evaluated from."
+            )
+            for cid in COMPLIANCE_CHECKS
+        },
+        # Stated rather than implied: an absent result is not a pass. It is
+        # this, and `dod_gate_block_reason` refuses the done edge on it.
+        "absent_result": CRITERIA_GAP_DECLARED,
+    }
+
 
 def ship_evaluated_dod(
     story_id: str,
@@ -418,6 +725,16 @@ def ship_evaluated_dod(
     probe) deliberately do not emit. Without this the computed verdict lives
     only in local pipeline state and `/quality` is left scoring agent
     self-assessment, which in practice reports one of the five checks.
+
+    #435 widens WHAT this ships, not when. The control plane stopped
+    crediting `payload.dod_check_results` because a receipt payload is
+    member-supplied and its subject writes it, which left this — the
+    pipeline's own evaluation — as the only channel a verdict is credited
+    from. Two facts the payload could carry and this could not therefore move
+    here, or they would have been deleted along with the channel that carried
+    them: the typed `result` (so `criteria_gap_declared` stays its own state,
+    #407) and the DERIVED `evidence_class` (`backing_evidence_class`, never a
+    class a payload named for itself, #432).
     """
     if not isinstance(dod_result, dict):
         return
@@ -427,12 +744,23 @@ def ship_evaluated_dod(
     try:
         from gate_emitter import emit_evidence_dod_evaluated
 
+        entries = {
+            k: (checks.get(k) or {}) for k in _EVIDENCE_GATE_KEYS if k in checks
+        }
         emit_evidence_dod_evaluated(
             story_id,
+            # The typed result where the evaluation produced one, else the
+            # boolean. A gap has `passed is None`, so shipping `passed` alone
+            # made a declared gap indistinguishable from a check the tier
+            # never required.
             checks={
-                k: (checks.get(k) or {}).get("passed")
-                for k in _EVIDENCE_GATE_KEYS
-                if k in checks
+                k: (e["result"] if isinstance(e.get("result"), str) else e.get("passed"))
+                for k, e in entries.items()
+            },
+            classes={
+                k: e["evidence_class"]
+                for k, e in entries.items()
+                if isinstance(e.get("evidence_class"), str)
             },
             passed=bool(dod_result.get("passed")),
             tier=dod_result.get("intensity") or dod_result.get("verification_tier"),
@@ -453,23 +781,110 @@ def dod_gate_block_reason(dod_result: dict[str, Any] | None) -> str | None:
     agent/mode (compliance-engineer, runtime verification, browser-qa) or get
     PO acceptance, then unblock.
 
-    Four conditional gates block here:
+    The blocking set is OPEN, not closed (#494 question 3). It began as four
+    conditional gates, #403 added a fifth entry deliberately, and #494 adds a
+    sixth. The rule that governs additions is the one all six satisfy: a
+    condition blocks here when the gate can establish, from evidence the
+    subject of the gate did not author, that a required check is not answered.
+    What does NOT belong here is a check resting on the receipt's own claim
+    about itself.
+
       - `no_critical_findings`  — PHI-touching healthcare story (#31)
       - `runtime_verified`      — live-deployment verification (#30)
       - `ui_acceptance`         — user-facing AC verified through the UI (#44)
       - `integration_verified`  — external service proven live (#44 phase 5)
+      - any required check whose `result` is `criteria_gap_declared` (#403)
+      - a static check that passed on attested evidence but failed DoD-time
+        evidence replay (#179 E1): an exit code that does not reproduce is not
+        proof
+      - a required check that FAILED against the hash-sealed authored set
+        (#494): the verdict is derived from a document its subject cannot edit
 
-    The static tier checks (tests_pass/build_succeeds/…) keep their existing
-    handling so this never changes behaviour for backend-only, non-healthcare,
-    non-opt-in projects — EXCEPT when a static check that passed on attested
-    evidence fails DoD-time evidence replay (#179 E1): a receipt whose passing
-    exit code does not reproduce is not proof, so it blocks here rather than
-    completing silently. Routed to the producing role by `_gate_remediation`.
+    The remaining static tier checks (build_succeeds, coverage, …) keep their
+    existing handling, so this never changes behaviour for backend-only,
+    non-healthcare, non-opt-in projects, nor for any project whose Cycle
+    carries no sealed authored set. Routed to the producing role by
+    `_gate_remediation`.
     """
     if not dod_result:
         return None
     checks = dod_result.get("checks", {})
     problems: list[str] = []
+    # #403 — a required check that declared a criteria gap blocks. This was the
+    # first STATIC-check addition to this gate, and it is deliberate: a gap is
+    # not a fail, it is the absence of anything to evaluate, and the failure
+    # mode it replaces was a required gate resolving to a silent nothing that
+    # rendered indistinguishably from a pass (proposal 3.3, the 13.3 fix at
+    # the contract level: thin gates must look thin).
+    #
+    # Blocking is recoverable and self-explaining: `detail` names the missing
+    # evidence shape, and `_gate_remediation` routes the block to the role
+    # that can produce it. A caller cannot use this to dodge a required check
+    # either, because a gap never clears one: `passed` stays None, so the DoD
+    # verdict is still not-passed, AND the done edge now stops.
+    for cid, c in checks.items():
+        if c.get("required") and c.get("result") == CRITERIA_GAP_DECLARED:
+            problems.append(
+                "%s declared a criteria gap: %s"
+                % (cid, c.get("detail") or criteria_gap_detail(cid))
+            )
+    # #494 — a required check whose FAIL was derived from the hash-sealed
+    # authored set blocks, exactly as a declared gap does.
+    #
+    # This exists because the gate had an INVERTED incentive, which is worse
+    # than a hole. `criteria_gap_declared` blocks, so a prover that honestly
+    # reports a case it could not evaluate is stopped; a `fail` did not block,
+    # so a prover that silently omits the same case from
+    # `metrics.authored_test_cases.results` was not. Dropping a case was
+    # strictly cheaper than declaring a gap, and it needed no forgery at all,
+    # only a missing key. A gate that pays better for silence than for honesty
+    # is not measuring what it claims to measure.
+    #
+    # The condition is narrow on purpose, and the narrowness is what makes it
+    # safe. It fires only where `_authoritative_story` resolved the authored
+    # set from a manifest that passed `spq_manifest.verify_hash`, so the
+    # verdict is derived from a document the subject of the gate cannot edit
+    # without breaking the seal. That is why the standing rationale for
+    # letting static checks through ("static checks are self-attested and are
+    # covered by receipt replay instead", `HostPolicy.dod_requires_pass`)
+    # does not reach it: the authored-case verdict is not self-attested, and
+    # replay does not cover it either, because replay re-runs
+    # `verification_commands` and a suite that never ran the dropped case
+    # exits 0. Where there is no seal (`authored_source` `board` or absent:
+    # Scrum, Kanban, every pre-#406 Cycle) nothing changes.
+    #
+    # `missing_manifest` (#507) deliberately does NOT reach this clause. A
+    # deleted seal makes the authored set unknowable rather than disproven, so
+    # it blocks through #403's criteria-gap route with a remedy about restoring
+    # a document — which is a different instruction from "report every case",
+    # and handing an operator the wrong one of the two is how a block becomes
+    # a stall.
+    #
+    # A legitimately not-applicable case is NOT caught by this. It is settled
+    # by `_case_result_is_settled` when it carries a reason, so the verdict is
+    # True and there is no fail to block on. Turning every absence into a hard
+    # failure would have broken honest flows, which is a different failure
+    # rather than a safer one; what this closes is the case reported as
+    # nothing at all.
+    for cid, c in checks.items():
+        if not c.get("required") or c.get("result") != DOD_RESULT_FAIL:
+            continue
+        if c.get("replay_mismatch"):
+            continue  # already named, with a more specific remedy, below
+        test_first = c.get("test_first")
+        if not isinstance(test_first, dict):
+            continue
+        if test_first.get("authored_source") != "manifest":
+            continue
+        problems.append(
+            "%s failed against the acceptance cases sealed in this Cycle's "
+            "manifest, and a case the verifying receipt does not report is "
+            "not cheaper than one it reports honestly — both stop the done "
+            "edge. Re-dispatch the verifying stage with an outcome for every "
+            "authored case, mark a case `not-applicable` WITH a reason, or "
+            "supersede the authored set with `revise_manifest --reason`. %s"
+            % (cid, c.get("detail") or "No detail was recorded.")
+        )
     for cid, c in checks.items():
         if c.get("replay_mismatch"):
             problems.append(
@@ -478,14 +893,28 @@ def dod_gate_block_reason(dod_result: dict[str, Any] | None) -> str | None:
                 "agent so the evidence is real (or have the PO accept explicitly)"
             )
     if dod_result.get("compliance_required"):
-        c = checks.get("no_critical_findings", {})
-        if c.get("required") and c.get("passed") is not True:
-            problems.append(
-                "compliance-engineer audit (no_critical_findings) has not "
-                "passed — dispatch the compliance-engineer for this PHI-touching "
-                "story; it must write a {story}-ce.json receipt with "
-                "metrics.findings_critical == 0"
-            )
+        # #487 — the remedy names whoever OWES the declared result on this
+        # lifecycle, not a dispatch identity that may no longer exist. On SPQ
+        # the compliance-engineer is not dispatched per Work Unit, so telling
+        # the orchestrator to dispatch it was an instruction with no
+        # executable meaning: the unit blocked and the named recovery could
+        # not be performed. Scrum and Kanban resolve to `ce` and read exactly
+        # as they did.
+        _decl = dod_result.get("compliance") or {}
+        _owner = _decl.get("accountable_role") or "ce"
+        _owner_name = _ROLE_ABBREV_TO_NAME.get(_owner, "compliance-engineer")
+        for cid in dod_result.get("compliance_checks") or list(COMPLIANCE_CHECKS):
+            c = checks.get(cid, {})
+            if c.get("required") and c.get("passed") is not True:
+                problems.append(
+                    "the declared compliance check %s has not returned a "
+                    "passing result — this PHI-touching story's compliance "
+                    "evaluation is owed by the %s stage, which must record "
+                    "metrics.findings_critical == 0 on its {story}-%s.json "
+                    "receipt. An absent count is not a clean audit: it is "
+                    "%s, and it blocks here."
+                    % (cid, _owner_name, _owner, CRITERIA_GAP_DECLARED)
+                )
     if dod_result.get("runtime_required"):
         c = checks.get("runtime_verified", {})
         if c.get("required") and c.get("passed") is not True:
@@ -692,8 +1121,15 @@ DOD_CHECKS: dict[str, dict[str, Any]] = {
 # `runtime_verified` (QE must deploy + exercise the story) into the active
 # set when a healthcare project (`healthcare.baa_enforced: true`) ships a
 # PHI-touching story — or when `quality.runtime_verification: required` is
-# set. For those stories the orchestrator dispatches CE per-story so the
-# gate is satisfiable; for every other project the behaviour is unchanged.
+# set. For those stories Scrum and Kanban dispatch CE per-story so the gate
+# is satisfiable; for every other project the behaviour is unchanged.
+#
+# #487: SPQ never had that per-Work-Unit CE dispatch. No SPQ ceremony file
+# describes one, so the promotion produced a gate whose only documented
+# remedy pointed at `modes/sprint.md`, which is Scrum's answer. The
+# compliance obligation is therefore DECLARED on the SPQ gate and owed by
+# the verifying stage (`compliance_accountable_role`), which is what makes
+# it satisfiable on that lifecycle rather than a silent dead end.
 DOD_TIER_CHECKS: dict[str, list[str]] = {
     "early": ["tests_pass", "build_succeeds"],
     "growing": ["tests_pass", "build_succeeds", "code_reviewed"],
@@ -1033,6 +1469,9 @@ def create_story(
     labels: list[str] | None = None,
     depends_on: list[str] | None = None,
     file_scope: list[str] | None = None,
+    acceptance_cases: list[Any] | None = None,
+    criteria_gap_declared: dict[str, Any] | None = None,
+    project_dir: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Create a new story record in 'queued' state.
 
@@ -1055,13 +1494,40 @@ def create_story(
                   story may join a parallel dispatch batch (#134 GAP-6).
         file_scope: Declared glob/dir scopes this story touches; required
                   for shared-workspace parallelism (#134 GAP-8).
+        acceptance_cases: The acceptance cases AUTHORED AT COMMIT (#406), from
+                  the sealed Cycle manifest. These are the producer's target
+                  and the prover's executable set, and the fact they were
+                  declared before any producing dispatch is what satisfies
+                  `SP-WRK-007` by construction rather than by review.
+        criteria_gap_declared: Recorded when this unit was admitted WITHOUT an
+                  authored set (`{reason, declared, declared_by, declared_at}`
+                  from `spq_state_machine.admit_authored_cases`). Present on
+                  the story so the absence travels with the work instead of
+                  living only in a Cycle-level summary nobody reads.
+        project_dir: The project this story belongs to. REQUIRED FOR THE EVENT
+                  TO LAND IN THE PROJECT: `synaptory_logger.emit` falls back to
+                  `host_env.project_dir()`, which falls back to `os.getcwd()`,
+                  so omitting it writes `story_create` and the shared
+                  `chain-id` into whatever directory the process happened to be
+                  in rather than into the project it was handed (#380). Every
+                  other `_log_emit` in this module already passes it; this one
+                  and `_cli_receipt_gated_refusal` did not, which is why a
+                  `./synaptory test` run grew a `.synaptory/.orchestrator/` in
+                  the checkout under test -- invisible, because `.synaptory/*`
+                  is gitignored.
+
+                  When it is None the event is DROPPED rather than addressed
+                  to the cwd -- see `_emit_project_event`, which is where that
+                  decision is made once for every event this module logs.
 
     Returns:
         Story record dict ready to insert into current_stories.
     """
     _ = backends  # retained for API compat; plugin-claude is Claude-only
     now = _now()
-    _log_emit("story_create", story_id=story_id, title=title)
+    _emit_project_event(
+        "story_create", project_dir=project_dir, story_id=story_id, title=title
+    )
     ac_texts = _normalize_ac_texts(acceptance_criteria)
     kind_norm = (kind or "").strip().lower()
     return {
@@ -1082,6 +1548,17 @@ def create_story(
         # reach `done` without browser/e2e proof (or explicit PO acceptance).
         # #134 GAP-4: a PO-declared non-UI kind beats the keyword heuristic.
         "acceptance_criteria": ac_texts,
+        # #406 — the authored set and, where there is none, the recorded gap.
+        # Both are always present as keys (list / None) so a reader never has
+        # to distinguish "no cases" from "this record predates the field": the
+        # board is rebuilt from the manifest on every projection, so the
+        # manifest is the only place where key absence carries meaning.
+        "acceptance_cases": _normalize_authored_cases(acceptance_cases),
+        "criteria_gap_declared": (
+            dict(criteria_gap_declared)
+            if isinstance(criteria_gap_declared, dict) and criteria_gap_declared
+            else None
+        ),
         "kind": kind_norm,
         "labels": list(labels or []),
         "depends_on": list(depends_on or []),
@@ -1166,7 +1643,7 @@ def transition_story(
         {"state": to_state, "entered_at": now, "exited_at": None}
     )
 
-    _log_emit(
+    _emit_project_event(
         "transition",
         project_dir=project_dir,
         story_id=story_id,
@@ -1220,7 +1697,7 @@ def unblock_story(
         {"state": restore_to, "entered_at": now, "exited_at": None}
     )
 
-    _log_emit(
+    _emit_project_event(
         "unblock",
         project_dir=project_dir,
         story_id=story_id,
@@ -1248,6 +1725,529 @@ _REJECTION_NEXT_STATE: dict[str, str] = {
 }
 
 
+#: Where a story keeps the human verdicts recorded against it. Append-only:
+#: a recorded verdict is never rewritten, which is what "immutable once
+#: recorded" means in a state file nothing else guards (#403).
+JUDGED_VERDICTS_KEY = "judged_verdicts"
+
+#: Receipt fields that name a HUMAN principal. `agent` / `role` are not here
+#: on purpose: they name an agent role, and comparing a human UPN against a
+#: role name would always differ and so would always "prove" independence.
+_PRODUCER_PRINCIPAL_KEYS = ("principal", "produced_by", "dispatched_by")
+
+
+#: What a judged verdict's candidate identity was derived FROM. On the item so
+#: no reader can mistake a verdict bound to an artifact the platform did not
+#: produce for one bound to the receipts it did (#495).
+CANDIDATE_SOURCE_INTAKE = "external_intake"
+CANDIDATE_SOURCE_LEDGER = "consumed_receipt_ledger"
+CANDIDATE_SOURCE_RECEIPT_BYTES = "receipt_bytes"
+
+#: "the caller did not pre-read the intake", distinct from `None`, which means
+#: "consulted, and there is no intake path to consult". Two facts, two
+#: representations (#521's rule).
+_UNREAD = object()
+
+
+def _read_external_intake(project_dir: str | None, story_id: str):
+    """`external_intake.read_intake`, or None when the module is unavailable.
+
+    Imported lazily because `external_intake` resolves the receipts directory
+    through this module, so a module-level import either way is a cycle. None
+    means "the intake path could not be consulted at all", which the caller
+    treats as "no admission" -- the pre-#495 behaviour, unchanged.
+    """
+    if not project_dir:
+        return None
+    try:
+        import external_intake
+    except ImportError:  # pragma: no cover - composed trees always carry it
+        return None
+    try:
+        return external_intake.read_intake(str(project_dir), story_id)
+    except Exception as exc:  # noqa: BLE001 - a verdict must not raise here
+        # FAILS CLOSED. If the intake path could not be consulted we do not
+        # know whether an admission exists, and returning None here would fall
+        # through to the receipt derivations and credit a verdict that might
+        # have had an external subject all along.
+        return external_intake.IntakeRead(
+            admitted=True,
+            problems=[
+                "the intake record for this unit could not be consulted (%s), "
+                "so whether an external candidate was admitted is unknown" % exc
+            ],
+        )
+
+
+def _unauthorized_verifier(
+    story: dict[str, Any],
+    story_id: str,
+    project_dir: str | None,
+    intake: Any,
+) -> str | None:
+    """Why the verifying receipt is not proof a verifying stage RAN, or None.
+
+    #495 P2. Everything before this establishes that a valid receipt declaring
+    a verifying role names the admitted bytes. That is matching by SHAPE, and a
+    document written by hand has the same shape as one a dispatched verifier
+    wrote -- which is what #553's review answered: epic #339 built the identity
+    that settles it (`attempt_id`, the durable fenced form of `dispatch_id`),
+    so the vocabulary exists and this path simply did not use it.
+
+    HERE RATHER THAN IN `external_intake`, because "was this stage authorized"
+    is a question about the Work Unit's dispatch history, which lives on the
+    story. That module names the receipts (`verified_by`) and this one holds
+    the story, so neither reaches into the other's data.
+
+    `advance_kernel.attempt_history` is the SUPPORTED reader for the attempts a
+    kernel authorized, so this does not re-derive the state key. A receipt
+    matches when it names an attempt the kernel issued for that stage, or the
+    dispatch currently active for it; `attempt_id` is preferred because it
+    survives the active binding being replaced.
+
+    WHY THIS IS NOT THE PIPELINE-WIDE RULE. On an ordinary story the Claude
+    orchestrator calls `begin_dispatch` only for `dispatch_se`, so QE and CR
+    receipts legitimately carry no dispatch identity, and `advance_kernel`
+    deliberately allows an unbound receipt there rather than refusing the
+    normal pipeline (#592). This does not change that. A verify-only Work Unit
+    has no producing stage, its verifying stage is the ONLY kernel-visible work
+    in the whole job, and `next_action` selects that dispatch for it -- so here
+    an unauthorized verifier is the difference between a checked candidate and
+    an unchecked one, not a normal receipt missing an optional field.
+    """
+    names = list(getattr(intake, "verified_by", None) or [])
+    if not names:
+        # `binds` is already False without a verifier, so reaching here with no
+        # names would mean the two disagreed. Refuse rather than credit.
+        return (
+            "the admitted candidate has no named verifying receipt, so there "
+            "is nothing whose authorization could be established"
+        )
+    try:
+        import advance_kernel as _ak
+    except Exception:  # noqa: BLE001
+        # NO KERNEL IS NOT AUTHORIZATION. A runtime that cannot ask which
+        # attempts were authorized cannot answer that one was, and crediting
+        # `judged` here would turn an import failure into a bypass.
+        return (
+            "this runtime cannot read the dispatch history that would show a "
+            "verifying stage was authorized, so the verification on record "
+            "cannot be distinguished from a document written by hand"
+        )
+    active = story.get("mcp_active_dispatches")
+    active = active if isinstance(active, dict) else {}
+    for name in names:
+        receipt = _read_receipt_for_binding(project_dir, story_id, name)
+        if receipt is None:
+            continue
+        abbrev = str(receipt.get("agent_abbrev") or "").strip().lower()
+        if not abbrev:
+            abbrev = _abbrev_from_receipt_name(name)
+        if not abbrev:
+            continue
+        authorized = {
+            str(rec.get("attempt_id") or "")
+            for rec in _ak.attempt_history(story, abbrev)
+            if isinstance(rec, dict) and rec.get("attempt_id")
+        }
+        claimed_attempt = str(receipt.get("attempt_id") or "").strip()
+        if claimed_attempt and claimed_attempt in authorized:
+            return None
+        binding = active.get(abbrev)
+        live = ""
+        if isinstance(binding, dict):
+            live = str(binding.get("dispatch_id") or "").strip()
+        if live and str(receipt.get("dispatch_id") or "").strip() == live:
+            return None
+    return (
+        "the verifying receipt for the admitted candidate (%s) names no "
+        "attempt or dispatch this kernel authorized, so what is on record is a "
+        "document with the right shape rather than evidence that a verifying "
+        "stage ran. Dispatch the verifying stage through the kernel so the "
+        "receipt carries an attempt identity that can be checked."
+        % ", ".join(sorted(names))
+    )
+
+
+def _abbrev_from_receipt_name(name: str) -> str:
+    """`US-901-qe.json` -> `qe`. The filename is the fallback, never the source.
+
+    `_declared_abbrev` on the receipt body is what `external_intake` matched
+    on, so the body is preferred above; this covers a receipt whose body omits
+    the field, where refusing outright would be stricter than the match that
+    got us here.
+    """
+    stem = str(name or "").rsplit(".", 1)[0]
+    return stem.rsplit("-", 1)[-1].strip().lower() if "-" in stem else ""
+
+
+def _read_receipt_for_binding(
+    project_dir: str | None, story_id: str, name: str
+) -> dict | None:
+    """One receipt body by filename, through `external_intake`'s own resolver.
+
+    Reusing `_story_receipt_names` rather than joining a path: the hosts differ
+    in receipt layout (flat versus nested), and a second definition of where a
+    receipt lives is the drift that makes a check pass on one host and silently
+    find nothing on another.
+    """
+    if not project_dir:
+        return None
+    import json as _json
+    import os as _os
+
+    try:
+        import external_intake as _ei
+
+        paths = _ei._story_receipt_names(str(project_dir), str(story_id))
+    except Exception:  # noqa: BLE001
+        return None
+    for path in paths:
+        if _os.path.basename(path) != name:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                body = _json.load(handle)
+        except (OSError, ValueError):
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
+def _story_candidate_digest(
+    story: dict[str, Any],
+    story_id: str,
+    project_dir: str | None,
+    intake: Any = _UNREAD,
+) -> tuple[str | None, str | None, str | None]:
+    """The candidate a human verdict binds to: `(digest, why_absent, source)`.
+
+    A judged verdict has to name the exact thing judged, or it is an opinion
+    with no subject: accepting "the story" leaves nothing to detect when the
+    story changes afterwards. Three derivations, in precedence order:
+
+    0. An external candidate admitted at intake (`external_intake.read_intake`).
+       First in precedence because it is the only derivation that can answer at
+       all for a verify-only job -- the platform produced nothing, so there are
+       no receipts to digest (#495, proposal section 5 S4). The digest is
+       re-derived on every read from the artifact bytes the record names, so the
+       record's own digest field is a claim that is checked rather than trusted.
+       **An admission that exists but does not yield a candidate STOPS here**
+       rather than falling through to 1 and 2: a substituted artifact must leave
+       the verdict unbacked, never quietly re-bound to receipt bytes, which
+       would read as backed.
+    1. The advance kernel's consumed-receipt ledger
+       (`story["mcp_consumed_receipts"]`). Each entry is a sha256 over the
+       exact receipt bytes a transition consumed, computed by the kernel from
+       the bytes it read. Where it exists it is the best candidate identity
+       in the tree, so the last entry is the candidate.
+    2. A digest over the story's receipt files on disk, filename and bytes,
+       in sorted order. Weaker (it is computed now rather than at the moment
+       of consumption) but still binds the verdict to content that changes
+       when the work changes.
+
+    All three are DERIVED. None reads a digest a caller supplied at the moment
+    of the verdict, which is why a forged verdict cannot pick its own subject.
+    What derivation 0 changes is WHEN and BY WHOM the subject is fixed -- at
+    intake, before any checking ran -- and not whether the verdict may choose
+    it. `external_intake`'s docstring states what that does and does not buy.
+
+    Returns `(None, reason, None)` when no derivation has anything to work
+    with, and the reason is recorded on the verdict. That case is honest and
+    it is not rare: a story with no receipts has produced no candidate, and
+    saying so beats inventing a digest over the story's own id.
+    """
+    if intake is _UNREAD:
+        intake = _read_external_intake(project_dir, story_id)
+    if intake is not None and intake.admitted:
+        if intake.binds:
+            unauthorized = _unauthorized_verifier(
+                story, story_id, project_dir, intake
+            )
+            if unauthorized is not None:
+                return None, unauthorized, None
+            return intake.candidate_digest, None, CANDIDATE_SOURCE_INTAKE
+        return None, intake.why_absent, None
+    ledger = story.get("mcp_consumed_receipts")
+    if isinstance(ledger, list):
+        recorded = [d for d in ledger if isinstance(d, str) and d.strip()]
+        if recorded:
+            return (
+                "sha256:%s" % recorded[-1].strip(),
+                None,
+                CANDIDATE_SOURCE_LEDGER,
+            )
+    if not project_dir:
+        return None, (
+            "no consumed-receipt ledger on the story and no project directory "
+            "to read receipts from, so no candidate identity could be derived"
+        ), None
+    try:
+        receipts_dir = _resolve_receipts_dir(str(project_dir))
+        paths = sorted(
+            p for p in Path(receipts_dir).glob("%s-*.json" % story_id) if p.is_file()
+        )
+    except OSError:
+        paths = []
+    if not paths:
+        return None, (
+            "no receipts exist for this story and no external candidate was "
+            "admitted at intake, so there is no candidate for a verdict to "
+            "bind to"
+        ), None
+    import hashlib
+
+    h = hashlib.sha256()
+    for path in paths:
+        try:
+            h.update(path.name.encode("utf-8"))
+            h.update(path.read_bytes())
+        except OSError:
+            return None, (
+                "a receipt for this story could not be read, so the candidate "
+                "digest would describe a different set of bytes than the one "
+                "judged"
+            ), None
+    return "sha256:%s" % h.hexdigest(), None, CANDIDATE_SOURCE_RECEIPT_BYTES
+
+
+def _producer_principals(story_id: str, project_dir: str | None) -> set[str]:
+    """The HUMAN principals recorded as having produced this story's work.
+
+    Empty is the normal case today: receipts record `agent` and `role`, not a
+    human, so there is usually nothing here to compare a judge against. That
+    emptiness is exactly why `independent_of_producer` fails closed below
+    rather than defaulting to true. Giving receipts a human principal is what
+    would make independence derivable, and that is #435's provenance work,
+    not something this function can assume.
+    """
+    if not project_dir:
+        return set()
+    try:
+        receipts = collect_story_receipts(
+            _resolve_receipts_dir(str(project_dir)), story_id
+        )
+    except Exception:  # noqa: BLE001 - a verdict must not fail on a bad receipt
+        return set()
+    out: set[str] = set()
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        for key in _PRODUCER_PRINCIPAL_KEYS:
+            value = receipt.get(key)
+            if isinstance(value, str) and value.strip():
+                out.add(value.strip().lower())
+    return out
+
+
+
+
+def _uncreditable_for_digest(
+    story: dict[str, Any], digest: "str | None", why_absent: "str | None"
+) -> "tuple[str | None, str | None]":
+    """Why a verdict over an ALREADY derived candidate could not be credited.
+
+    Private, and it stays private. #604 exposed a public `uncreditable_verdict`
+    that derived its own candidate, and #592's re-review found it answered
+    differently from the record path: its optional `intake` argument defaulted
+    to `None`, which in `_story_candidate_digest` means "intake was already
+    consulted and there is none" rather than "read it now". So it skipped an
+    admitted external candidate and fell through to receipt bytes, and reported
+    a SUBSTITUTED artifact as creditable while the record path correctly
+    refused it.
+
+    The fix was not a better default. A caller wanting to know whether a
+    verdict can be credited asks `record_judged_verdict(..., commit=False)`,
+    which cannot disagree with the record path because it IS the record path.
+    Two derivations of one fact drift; that is the whole lesson of this thread,
+    and a second answer that merely happens to be right today is still a second
+    answer.
+    """
+    if digest is None:
+        return "no_candidate", why_absent
+    existing = story.get(JUDGED_VERDICTS_KEY)
+    if isinstance(existing, list) and any(
+        isinstance(prior, dict) and prior.get("candidate_digest") == digest
+        for prior in existing
+    ):
+        return "already_judged", (
+            "a verdict is already recorded against candidate %s; a judged "
+            "verdict is immutable once recorded, so re-judging requires a new "
+            "candidate (produce new evidence, then judge that)" % digest
+        )
+    return None, None
+
+
+def record_judged_verdict(
+    story: dict[str, Any],
+    story_id: str,
+    *,
+    verdict: str,
+    principal: str,
+    project_dir: str | None = None,
+    commit: bool = True,
+) -> dict[str, Any]:
+    """Record a human verdict on a story as `judged` evidence (#403).
+
+    `commit=False` PREPARES the item and writes nothing, so a caller can
+    inspect the exact verdict it is about to record and decline. That exists
+    because deriving the candidate twice, once to check and once to record,
+    let the two describe different moments (#592 re-review).
+
+    The ONE place `accept_story` and `reject_story` both go through, so there
+    is a single acceptance path rather than two shapes of the same decision.
+    The item is the judged-verdict shape from `runtime_contracts`: a named
+    principal, the verdict bound to the exact candidate identity, the
+    recording instant, and independence from the producing principal
+    RECORDED rather than assumed.
+
+    Every discipline field is DERIVED here, and that is the whole forgeability
+    answer for this class. `accepted_by` / `rejected_by` is the only caller
+    input, and it is the principal, which is the one field a verdict is
+    supposed to be a claim by. The candidate digest comes from the kernel's
+    consumed-receipt ledger or from the receipt bytes on disk, never from an
+    argument, so a verdict cannot choose what it is a verdict about.
+    `independent_of_producer` is computed against the recorded producer set
+    and FAILS CLOSED: false unless a human producer is on record and it is
+    someone else. False is valid and recorded, never refused (the decision
+    pinned during #399), so failing closed costs nothing except an
+    unearned claim of independence.
+
+    **When the candidate came from intake (#495) the producer is outside the
+    platform, and `independent_of_producer` is then FALSE by decision, not by
+    computation.** #495 asked what the field means in that case, and the answer
+    it forbids is the tempting one: the in-platform producer set for a
+    verify-only unit contains at most the CHECKER's receipts, so a judge who is
+    not the checker would compute `true` and the record would claim
+    independence from a producer nobody ever recorded. `independence_basis`
+    names the outside producer, and names the intake principal so the case
+    where the judge admitted their own candidate is visible rather than
+    inferred.
+
+    Immutability is enforced by refusing to CREDIT a second verdict against
+    the same candidate: re-judging requires a new candidate, so a second
+    verdict on unchanged evidence is appended as unbacked, with the reason,
+    and the first recording is left exactly as it was. Returns the appended
+    item, whose `evidence_class` is None whenever the discipline could not be
+    met -- an unbacked claim is unbacked, never credited at its class.
+    """
+    recorded_at = _now()
+    # Read the intake ONCE and hand it to the derivation: two reads would let
+    # the digest come from one snapshot and the intake principal from another.
+    intake = _read_external_intake(project_dir, story_id)
+    digest, _why_absent, source = _story_candidate_digest(
+        story, story_id, project_dir, intake
+    )
+    producers = _producer_principals(story_id, project_dir)
+    principal_key = str(principal or "").strip().lower()
+    external = source == CANDIDATE_SOURCE_INTAKE
+    independent = (
+        False if external else (bool(producers) and principal_key not in producers)
+    )
+
+    item: dict[str, Any] = {
+        "evidence_class": "judged",
+        "principal": str(principal or ""),
+        "candidate_digest": digest,
+        "verdict": verdict,
+        "recorded_at": recorded_at,
+        "independent_of_producer": independent,
+        "check_id": "po_acceptance",
+    }
+    if source:
+        item["candidate_source"] = source
+    if external:
+        admitted_by = str((intake.record if intake else {}).get("admitted_by") or "")
+        item["intake_principal"] = admitted_by
+        item["candidate_artifact"] = str(
+            (intake.record if intake else {}).get("artifact_path") or ""
+        )
+        same_hand = bool(admitted_by) and admitted_by.strip().lower() == principal_key
+        item["independence_basis"] = (
+            "the candidate was produced outside this platform, so independence "
+            "from the producing principal is not derivable here and is recorded "
+            "false rather than computed against a producer set that holds only "
+            "this platform's checkers; the candidate was admitted by %s%s"
+            % (
+                admitted_by or "an unrecorded principal",
+                ", who is also the judge" if same_hand else "",
+            )
+        )
+    elif not producers:
+        item["independence_basis"] = (
+            "no receipt for this story records a human principal, so "
+            "independence from the producing principal could not be "
+            "established; recorded false rather than assumed true"
+        )
+    else:
+        item["independence_basis"] = (
+            "compared against the human principals recorded on this story's "
+            "receipts"
+        )
+
+    # WHY a verdict is uncredited decides what a caller may do about it, so the
+    # two cases carry a machine-readable code and not only prose (#592
+    # re-review). They are not degrees of the same thing:
+    #
+    # * `no_candidate` -- nothing was produced to bind to. The verdict backs
+    #   nothing, which is why it is uncredited, but it overrules nothing
+    #   either. `TestOrdinaryJobsAreUnaffected` pins this as an ordinary
+    #   outcome, and it must stay one.
+    # * `already_judged` -- a verdict IS recorded against this exact candidate.
+    #   Crediting a second one would let it overrule the first, which is what
+    #   the immutability rule exists to refuse.
+    # Judged against the digest THIS call derived, not against a fresh read.
+    # Re-deriving here is what let the check and the record describe different
+    # moments (#592 re-review), so the snapshot taken above is the only one
+    # this verdict is ever judged against.
+    unbacked_code, unbacked_reason = _uncreditable_for_digest(
+        story, digest, _why_absent
+    )
+    if unbacked_reason:
+        item["evidence_class"] = None
+        item["unbacked_reason"] = unbacked_reason
+        item["unbacked_code"] = unbacked_code
+
+    if not commit:
+        # PREPARED ONLY. Nothing has been written, not even the verdict list:
+        # `setdefault` would add an empty key to the story, which is a mutation
+        # a refused acceptance must not leave behind (#592 re-review).
+        return item
+    return commit_judged_verdict(story, item, story_id, project_dir=project_dir)
+
+
+def commit_judged_verdict(
+    story: dict[str, Any],
+    item: dict[str, Any],
+    story_id: str,
+    project_dir: "str | None" = None,
+) -> dict[str, Any]:
+    """Append and log THIS prepared verdict. The only writer of the ledger.
+
+    Separated from preparation so a caller can inspect the exact item it is
+    about to record and decline to record it. `accept_story` does that: the
+    verdict it judges and the verdict it stores are the same object, derived
+    from one candidate snapshot, so nothing can change underneath between the
+    decision and the record (#592 re-review).
+    """
+    existing = story.setdefault(JUDGED_VERDICTS_KEY, [])
+    if not isinstance(existing, list):  # a corrupt slot must not lose the verdict
+        existing = []
+        story[JUDGED_VERDICTS_KEY] = existing
+    existing.append(item)
+    _emit_project_event(
+        "story_judged",
+        project_dir=project_dir,
+        story_id=story_id,
+        verdict=item.get("verdict"),
+        principal=item["principal"],
+        candidate_digest=item.get("candidate_digest"),
+        independent_of_producer=item.get("independent_of_producer"),
+        evidence_class=item["evidence_class"],
+    )
+    return item
+
+
 def request_acceptance(
     state: dict[str, Any],
     story_id: str,
@@ -1265,13 +2265,45 @@ def request_acceptance(
     )
 
 
+
+
+
 def accept_story(
     state: dict[str, Any],
     story_id: str,
     accepted_by: str,
     project_dir: str | None = None,
 ) -> dict[str, Any]:
-    """PO accepts a story at Sprint Review (#116). awaiting_acceptance → done."""
+    """PO accepts a story at Sprint Review (#116). awaiting_acceptance → done.
+
+    **This is ADR-029's declared exception (#486): the one forward edge written
+    outside the advance kernel, and the path all three hosts specify.** The
+    discipline here is `record_judged_verdict`, not the kernel's — no
+    anti-replay, no dispatch binding, no `next_action` agreement, and
+    `accepted_by` is authenticated by nothing.
+
+    **An acceptance whose verdict cannot be credited is refused (#592).** The
+    controlling proposal says a judged verdict binds to the exact candidate and
+    is immutable once recorded; `record_judged_verdict` applies that rule and
+    returns the answer; this function reads it. Both uncredited cases are
+    refused, because both leave the board saying `done` while the evidence says
+    the acceptance was unbacked, and a state and its signal disagreeing is the
+    split this epic exists to remove:
+
+    * `already_judged` — a verdict is recorded against this exact candidate, so
+      crediting a second one lets it overrule the first.
+    * `no_candidate` — nothing was produced to bind to, so the verdict names no
+      subject and there is no evidence for `done` to mean.
+
+    Only a CREDITED acceptance reaches an emission, so an approval row always
+    describes an acceptance that had evidence bound to it. The
+    `evidence_dod / returned` path #599 added for uncredited verdicts became
+    unreachable once refusal moved ahead of the write, and was removed.
+
+    What is NOT provided, and belongs to #435: an authenticated verdict channel.
+    `accepted_by` remains a caller-supplied string, so a credited verdict proves
+    that evidence existed and was bound, never who judged it.
+    """
     story = _find_story(state, story_id)
     if story is None:
         raise ValueError(f"Story not found: {story_id}")
@@ -1280,9 +2312,40 @@ def accept_story(
             f"Story {story_id} is not awaiting acceptance "
             f"(state: {story['state']})"
         )
+    # ONE candidate snapshot decides and is recorded. #603 asked the question
+    # with a separate read and then let `record_judged_verdict` take its own,
+    # so a receipt removed between the two passed the check and stored an
+    # uncredited verdict while the unit advanced to `done` (#592 re-review,
+    # reproduced: three derivations, `evidence_class: null`, `state: done`).
+    #
+    # The verdict is PREPARED without writing, judged as the exact object it
+    # is, and then either refused or committed unchanged. Nothing re-reads the
+    # candidate in between, so there is no window to change it in.
+    #
+    # A refusal writes nothing at all, not even the empty verdict list, which
+    # is why preparation must not `setdefault` (#592, previous round).
+    item = record_judged_verdict(
+        story,
+        story_id,
+        verdict="accepted",
+        principal=accepted_by,
+        project_dir=project_dir,
+        commit=False,
+    )
+    if item.get("unbacked_code"):
+        raise ValueError(
+            "Story %s cannot be accepted: the acceptance verdict could not be "
+            "credited (%s). Acceptance binds to a candidate, so completing the "
+            "unit requires evidence to judge, not a sign-off alone."
+            % (story_id, item.get("unbacked_reason") or "no reason recorded")
+        )
     story["accepted_by"] = accepted_by
     story["accepted_at"] = _now()
-    _log_emit(
+    # #403 — the acceptance IS a judged verdict, so it is stored as one rather
+    # than as two loose fields no reader can bind to a candidate. This commits
+    # the very item judged above.
+    commit_judged_verdict(story, item, story_id, project_dir=project_dir)
+    _emit_project_event(
         "story_accept",
         project_dir=project_dir,
         story_id=story_id,
@@ -1334,13 +2397,23 @@ def reject_story(
         "rejected_at": _now(),
     }
     story.setdefault("rejection_feedback", []).append(feedback_entry)
+    # #403 — a rejection is a judged verdict on the same candidate an
+    # acceptance would have bound to. Recorded through the same function, so
+    # neither direction of the decision gets its own private shape.
+    record_judged_verdict(
+        story,
+        story_id,
+        verdict="rejected",
+        principal=rejected_by,
+        project_dir=project_dir,
+    )
 
     if reason_class == "defer":
         # Tag for the next sprint's carry-over picker. Caller decides
         # which sprint to land in; we just mark it.
         story["carry_over"] = True
 
-    _log_emit(
+    _emit_project_event(
         "story_reject",
         project_dir=project_dir,
         story_id=story_id,
@@ -1394,7 +2467,7 @@ def record_retry(
     role_hashes = failure_hashes.setdefault(role_abbrev, [])
     role_hashes.append(reason_hash)
 
-    _log_emit(
+    _emit_project_event(
         "retry_recorded",
         project_dir=project_dir,
         story_id=story_id,
@@ -1731,10 +2804,62 @@ _GATE_REMEDIATION_ROLE = {
     # replay-mismatch block reason (which names the static check id).
     "tests_pass": "qe",             # QE test evidence did not reproduce
     "build_succeeds": "se",         # SE build evidence did not reproduce
+    # #403 — the two remaining static checks, reachable here only through a
+    # `criteria_gap_declared` block. Appended last so the conditional gates
+    # above keep their matching priority, per the note at the top.
+    "code_reviewed": "cr",          # a review is the CR's own act
+    "coverage_no_decrease": "qe",   # QE records metrics.coverage_delta
 }
 
 
-def _gate_remediation(story: dict[str, Any]) -> dict[str, Any] | None:
+def _attach_compliance_declaration(
+    out: dict[str, Any],
+    compliance: dict[str, Any] | None,
+    receipts_dir: str | None,
+    story: dict[str, Any],
+) -> None:
+    """Fill `out["dod"]["compliance"]` and extend `declared_checks` (#487).
+
+    The PHI verdict is recomputed from the unit's receipts on disk, using the
+    same `story_touches_phi` predicate `evaluate_story_dod` will use at the
+    gate. Two evaluators reading one predicate is the point: a declaration
+    that could disagree with the gate would be worse than no declaration,
+    because a dispatch would produce evidence for a check the gate never
+    required and skip one it did.
+
+    No-op without compliance inputs, which is every Scrum and Kanban caller
+    (proposal 7) and every caller written before this ticket.
+    """
+    if not isinstance(compliance, dict):
+        return
+    baa_enforced = bool(compliance.get("baa_enforced"))
+    required = False
+    if baa_enforced and receipts_dir:
+        signals = tuple(compliance.get("phi_signals") or DEFAULT_PHI_RISK_SIGNALS)
+        try:
+            receipts = collect_story_receipts(receipts_dir, str(story.get("id", "")))
+        except Exception:
+            receipts = []
+        required = story_touches_phi(receipts, signals)
+    declaration = compliance_declaration(
+        baa_enforced=baa_enforced,
+        required=required,
+        build_mode=compliance.get("build_mode"),
+    )
+    out["dod"]["compliance"] = declaration
+    if required:
+        declared = out["dod"].get("declared_checks") or []
+        for cid in declaration["checks"]:
+            if cid not in declared:
+                declared.append(cid)
+        out["dod"]["declared_checks"] = declared
+
+
+def _gate_remediation(
+    story: dict[str, Any],
+    *,
+    accountable: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     """If the story was blocked by an unmet conditional DoD gate, return
     {tier:'gate_remediation', role, gate, reason}; else None.
 
@@ -1750,6 +2875,13 @@ def _gate_remediation(story: dict[str, Any]) -> dict[str, Any] | None:
         return None
     for gate, role in _GATE_REMEDIATION_ROLE.items():
         if gate in reason:
+            # #487 — a declared check's remediation role is whoever the gate
+            # said OWES it on this lifecycle, which for the compliance set on
+            # SPQ is the verifying stage rather than a per-unit
+            # compliance-engineer dispatch that no orchestrator schedules.
+            # Absent an override (Scrum, Kanban, any caller that does not
+            # pass one) the table below answers exactly as it always did.
+            role = (accountable or {}).get(gate, role)
             return {"tier": "gate_remediation", "role": role, "gate": gate, "reason": reason}
     return {"tier": "gate_remediation", "role": "qe", "gate": "unknown", "reason": reason}
 
@@ -1757,9 +2889,42 @@ def _gate_remediation(story: dict[str, Any]) -> dict[str, Any] | None:
 # DoD check whose pass/fail tells us a stage's receipt actually verified.
 _ROLE_VERIFY_CHECK = {"se": "build_succeeds", "qe": "tests_pass", "cr": "code_reviewed"}
 
+#: The verdict `next_action` stamps on a recovery it selected because the
+#: stage's bound attempt is no longer live (#690). The literal IS
+#: `advance_kernel.ATTEMPT_NOT_LIVE`, deliberately: the planner's reason for
+#: routing around the edge and the kernel's reason for refusing it are one
+#: fact, and spelling them differently is how two components came to be each
+#: correct and jointly stuck. `test_failed_attempt_recovery` asserts they
+#: still agree.
+ATTEMPT_NOT_LIVE_VERDICT = "attempt_not_live"
+
+
+def _unadvanceable_attempt(
+    story: dict[str, Any], role: str
+) -> dict[str, Any] | None:
+    """`advance_kernel.unadvanceable_attempt`, asked safely from the planner.
+
+    NO KERNEL, NO REFUSAL. A runtime that cannot import the kernel cannot hit
+    the refusal this routes around either, so answering "not a recovery" is
+    exactly right rather than conservative. Contrast `_unauthorized_verifier`,
+    which refuses on the same import failure: there the kernel's absence would
+    have CREDITED something, here it would only decline to reroute.
+    """
+    try:
+        import advance_kernel as _ak
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return _ak.unadvanceable_attempt(story, role)
+    except Exception:  # noqa: BLE001
+        return None
+
 
 def _receipt_verification_verdict(
-    receipts_dir: str | None, story_id: str, role: str
+    receipts_dir: str | None,
+    story_id: str,
+    role: str,
+    story: dict[str, Any] | None = None,
 ) -> str | None:
     """'failed' when the role's receipt is present but its verification/status
     is DEFINITIVELY failed, 'unverified' when the receipt is present but its
@@ -1772,7 +2937,16 @@ def _receipt_verification_verdict(
     agree on what "failed" means. 'failed' always loops; 'unverified' loops
     only at the mature/release tiers (issue #179 E6a) — at those tiers the
     DoD gate would reject the unverifiable evidence anyway, so catching it
-    at the stage saves a full stage-cycle."""
+    at the stage saves a full stage-cycle.
+
+    `story` (#406) is what keeps that agreement true. Omit it and `tests_pass`
+    is evaluated on the pre-#406 rules here while the gate evaluates it
+    against the authored set, so a QE receipt with a green suite and no
+    per-case outcomes reads as VERIFIED to the loop (the story advances out of
+    `testing`) and as a criteria gap to the gate (it cannot reach `done`). The
+    loop exists to catch at the stage what the gate would reject later; two
+    different definitions of "failed" is precisely the divergence that stops
+    it doing so."""
     if not receipts_dir:
         return None
     check = _ROLE_VERIFY_CHECK.get(role)
@@ -1788,7 +2962,7 @@ def _receipt_verification_verdict(
         return None
     if not isinstance(receipt, dict):
         return None
-    verdict = _evaluate_check(check, receipt)
+    verdict = _evaluate_check(check, receipt, story=story)
     if verdict is False:
         return "failed"
     if verdict is None:
@@ -1890,17 +3064,15 @@ def dep_context(
     """
     spq = state.get("spq") if isinstance(state.get("spq"), dict) else {}
     cycle_id = state.get("_cycle_id") or spq.get("cycle_id")
-    workstream_id = state.get("_workstream_id") or spq.get("workstream_id")
     if not cycle_id:
         cycle = state.get("current_cycle")
         cycle_id = str(cycle) if cycle not in (None, "") else None
 
     context: dict[str, Any] = {
         "cycle_id": cycle_id,
-        "workstream_id": workstream_id,
-        # The workstream projection records the manifest it was hydrated from
-        # on state, not on every individual story. Keep both hashes in the
-        # context so dispatch can reject a superseded projection.
+        # The Cycle records the declaration it hydrated from on state, not on
+        # every individual unit. Keep both hashes in the context so dispatch
+        # can reject a superseded one.
         "story_manifest_hash": state.get("manifest_hash"),
         "manifest_hash": None,
         "manifest_present": False,
@@ -1908,18 +3080,18 @@ def dep_context(
         "admitted": None,
         "satisfied": {},
         "ledger_fresh": True,
+        # ALWAYS FALSE, AND NOT A SETTING. It was documented as
+        # `spq.sync.accept_unverified_events` and named in two refusals, and
+        # nothing ever read a config value into it -- so the toggle was
+        # advertised and inert. Two ways to fix that, and this is the stricter
+        # one: an unverified claim never unblocks downstream work, and the
+        # method asks for no toggle. Wiring it would have added a documented
+        # route to weaken an evidence gate in order to make a docs page true.
+        #
+        # Kept as a field rather than inlined, because `story_dep_status` reads
+        # it at three sites and a caller-supplied context is how a test pins
+        # the OPEN behaviour it must never have.
         "accept_unverified": False,
-        # ── cross-Cycle (#305) ────────────────────────────────────────────
-        # Defaults are FAIL-CLOSED. `coordination_fresh` is False, not True:
-        # absence of a coordination ledger is not freshness, and an edge that
-        # cannot be resolved must not dispatch.
-        "coordination_cycle_id": None,
-        "cross_cycle": {},
-        "declared_cross_keys": (),
-        "coordination_fresh": False,
-        "coordination_detail": (
-            "no Coordination Cycle names this Cycle as a child here"
-        ),
     }
 
     # With a sealed manifest, a cross-workstream edge stops being an
@@ -1931,23 +3103,28 @@ def dep_context(
     if not cycle_id or str(state.get("build_mode") or "").lower() != "spq":
         return context
     try:
-        import spq_manifest
+        import cycle_records
         import spq_state_machine
 
         manifest = spq_state_machine.read_manifest(project_dir, cycle_id)
         if not manifest:
             return context
-        # A manifest whose hash does not verify is treated as ABSENT, not as
+        # A declaration whose hash does not verify is treated as ABSENT, not as
         # authority. Trusting a tampered admitted set would be worse than
-        # having none: it could license a dispatch the real manifest forbids.
-        if not spq_manifest.verify_hash(manifest):
+        # having none: it could license a dispatch the real one forbids.
+        if not cycle_records.verify_hash(manifest):
             return context
         context["manifest_present"] = True
-        context["manifest_hash"] = manifest.get("manifest_hash")
-        context["owners"] = spq_manifest.owners(manifest)
-        context["admitted"] = spq_manifest.admitted_ids(manifest)
-        policy = manifest.get("integration_policy") or {}
-        context["accept_unverified"] = bool(policy.get("accept_unverified_events"))
+        context["manifest_hash"] = manifest.get(cycle_records.HASH_FIELD)
+        # No owner map. `SPD-194` retires the Workstream, so a unit is owned by
+        # the Cycle that admitted it and there is no second owner to resolve
+        # against -- which is why `owners` is empty rather than absent: a
+        # resolver reading it gets "no other owner", not "unknown".
+        context["owners"] = {}
+        context["admitted"] = [
+            str(u.get("id")) for u in manifest.get("admitted_units") or []
+            if u.get("id")
+        ]
     except Exception:  # noqa: BLE001 - no manifest means local-board-only
         return context
 
@@ -1965,52 +3142,16 @@ def dep_context(
     except Exception:  # noqa: BLE001 - no ledger means nothing is satisfied
         context["ledger_fresh"] = False
 
-    # The parent, when this Cycle has one. Read from the child manifest's own
-    # `coordination_cycle_id`, which is the only place the binding travels to a
-    # workstream clone: the coordination pin and index live under the gitignored
-    # orchestrator tree, so a clone that merely hydrated a Cycle has neither.
-    #
-    # Cache only, like the ledger above -- `next_action` is on a hot loop and
-    # must not become a network operation.
-    try:
-        import spq_paths
-
-        # NOT just `manifest["coordination_cycle_id"]`. A child opens its Cycle
-        # BEFORE the release exists, so that field is sealed as None and stays
-        # None -- which made every cross-Cycle edge unresolvable in the shipped
-        # flow while the release manifest sat in the clone's own tree. Resolution
-        # falls through to the committed transport, which is the only place the
-        # binding reaches a child.
-        ccid = spq_paths.resolve_coordination_id(project_dir, manifest=manifest)
-        if ccid:
-            import coordination_cycle
-
-            parent = coordination_cycle.read_manifest(project_dir, str(ccid))
-            if parent and coordination_cycle.verify_hash(parent):
-                snap = coordination_cycle.snapshot(project_dir, str(ccid))
-                context["coordination_cycle_id"] = str(ccid)
-                context["coordination_fresh"] = bool(snap.get("fresh"))
-                context["coordination_detail"] = snap.get("detail") or ""
-                context["cross_cycle"] = coordination_cycle.satisfied_map(snap, parent)
-                context["declared_cross_keys"] = tuple(
-                    coordination_cycle.declared_keys(parent)
-                )
-            elif parent:
-                # A parent manifest that does not match its own hash is treated
-                # as ABSENT, not as authority -- the same rule the child manifest
-                # gets above. Trusting a tampered release could license a
-                # dispatch the real one forbids.
-                context["coordination_detail"] = (
-                    "Coordination Cycle %s does not match its own hash; treating "
-                    "it as absent" % ccid
-                )
-            else:
-                context["coordination_detail"] = (
-                    "Coordination Cycle %s is named here but no manifest for it "
-                    "is readable; pull the release branch" % ccid
-                )
-    except Exception:  # noqa: BLE001 - fail closed, defaults already set
-        pass
+    # There is no parent. `SPD-194` retires the Coordination Cycle
+    # (`SC-MTH-011`): composition existed only because integration was
+    # deferred, and with trunk integration at Checkpoint there is nothing left
+    # to compose. A change that must land atomically with its consumer cannot
+    # be ORDERED, so it cannot be SPLIT -- it is admitted to one Cycle
+    # (`SC-MTH-012`), which is why there is no cross-Cycle resolver here and
+    # `cycle_records` refuses a dependency naming a unit this Cycle did not
+    # admit. Coupling across separately released repositories goes through
+    # published, versioned artifacts consumed at the consumer's own next Commit
+    # (`SC-MTH-013`).
     return context
 
 
@@ -2345,12 +3486,32 @@ def story_dep_status(
                 # publish the event, not what the event has to prove.
                 event = satisfied.get(unit_id)
                 if event is None:
+                    # TWO UNSATISFIED STATES, AND THE DISTINCTION IS THE POINT.
+                    # "We have never looked" is not "we looked and there is
+                    # nothing": only the second means chasing the producer
+                    # rather than running a refresh. Both fail closed, so this
+                    # costs no safety and is the whole difference between a
+                    # hold an operator can act on and one they cannot.
+                    #
+                    # It used to live only on the non-local branch, where a
+                    # cross-lane edge was resolved. `SPD-194` puts every
+                    # admitted unit on one board, so that branch became
+                    # unreachable and the distinction was lost with it -- the
+                    # gate reported "no such event is recorded" for a cache it
+                    # had never read.
                     _hold(
                         dep,
-                        DEP_CONDITION_UNVERIFIED,
+                        DEP_CONDITION_UNVERIFIED if ledger_fresh else DEP_LEDGER_STALE,
                         "%s declares condition %r, which is proven by a Cycle "
                         "ledger event rather than by board state; no such event "
-                        "is recorded" % (unit_id, condition),
+                        "is recorded%s"
+                        % (
+                            unit_id,
+                            condition,
+                            "" if ledger_fresh else
+                            " and the local ledger cache is behind, so run "
+                            "refresh_ledger before believing it",
+                        ),
                         owner,
                     )
                     continue
@@ -2368,11 +3529,37 @@ def story_dep_status(
                         dep,
                         DEP_CONDITION_UNVERIFIED,
                         "the %s event for %s is a claim, not proof, and "
-                        "spq.sync.accept_unverified_events is off"
+                        "an unverified claim never unblocks downstream "
+                        "work: name a condition the consumer can check"
                         % (condition, unit_id),
                         owner,
                     )
                     continue
+                if st == "cancelled":
+                    _hold(
+                        dep,
+                        DEP_CANCELLED,
+                        "%s was cut from the Cycle, so this edge can never be "
+                        "satisfied — re-admit it or drop the dependency"
+                        % unit_id,
+                        owner,
+                    )
+                    continue
+                # A SATISFYING VERIFIED EVENT IS THE ANSWER, and the producer's
+                # board state is not additionally required. Declaring a
+                # condition SMALLER than `done` exists precisely to unblock
+                # earlier: `contract_published` is published while the producer
+                # is still in progress, which is #303's "prefer the smallest
+                # sufficient condition".
+                #
+                # Falling through to the `done` check below made every
+                # conditioned edge wait for the producer to finish anyway, so
+                # the mechanism collapsed into "wait for done, plus extra
+                # proof". It was invisible while a lane owned the upstream,
+                # because the cross-lane branch never consulted board state;
+                # with the Workstream retired every unit is local and the
+                # fall-through applies to every edge.
+                continue
             if st == "done":
                 continue
             if st == "cancelled":
@@ -2439,7 +3626,8 @@ def story_dep_status(
                     dep,
                     DEP_CONDITION_UNVERIFIED,
                     "the %s event for %s is a claim, not proof, and "
-                    "spq.sync.accept_unverified_events is off"
+                    "an unverified claim never unblocks downstream "
+                    "work: name a condition the consumer can check"
                     % (condition, unit_id),
                     owner,
                 )
@@ -2510,7 +3698,11 @@ def _parallel_batch(
     """Compute the parallelizable dispatch batch for a serial action (#134 GAP-6).
 
     `batch[0]` is ALWAYS the serial action, so an orchestrator that ignores
-    the `parallel` block behaves exactly as today. Additional members are
+    the `parallel` block behaves exactly as today. (`attach_dispatch_dod_contract`
+    later adds a per-member `dod` block to each entry, the lead included; that
+    is additive and leaves the dispatch identity untouched — a batch is N
+    dispatches for N stories, and the promoted gates are a per-story fact.)
+    Additional members are
     SE-stage dispatches only (queued stories, or in_progress stories whose SE
     receipt is absent): the wall-clock lives in the build stage, and scoping
     parallelism to SE keeps QE's dev-server/browser work serialized on the
@@ -2773,8 +3965,23 @@ def next_action(
     parallelism: dict[str, Any] | None = None,
     dep_context: dict[str, Any] | None = None,
     dependency_gate: str = "enforce",
+    compliance: dict[str, Any] | None = None,
+    verify_only: "set[str] | frozenset[str] | None" = None,
 ) -> dict[str, Any]:
     """Deterministically choose the orchestrator's next pipeline step.
+
+    `verify_only` names the Work Units whose deliverable was produced outside
+    the platform and admitted at intake (#495 P2). It is passed IN as data
+    rather than derived here, and that is not a preference: this function has
+    no `project_dir` and stays pure, which is the same reason
+    `attach_dispatch_dod_contract` lives in the state machines. Recognising a
+    verify-only unit means reading its intake record off disk, so the read
+    belongs where the other project reads already are.
+
+    Omitting it gives the pre-#495 selection for every unit, which is the
+    honest degradation: a verify-only unit then selects `dispatch_se` and its
+    sign-off stays unbacked with intake's own reason, rather than silently
+    crediting a verifier nobody authorized.
 
     NOTE on the ``role`` field in the returned action (#204): it is an
     **abbreviation** (``se`` / ``qe`` / ``cr``), matching the receipt *filename*
@@ -2790,7 +3997,17 @@ def next_action(
     top of every iteration instead of trusting model memory for "what's
     next"; the P2 Stop-hook loop engine renders the same output as its
     continuation reason. Pure function of (state, toggles, receipt files)
-    — no state writes, no environment reads.
+    — no state writes, no environment reads. Config that the result depends
+    on is resolved by the caller and passed in (`dod_tier_info`,
+    `parallelism`, `compliance`); receipt files are read (#487's PHI verdict
+    reads them here, and the freshness checks always have).
+
+    Consequence for the `dod` block: it can only carry the STATIC tier list,
+    because the four CONDITIONAL gates are promoted from `.synaptory.yaml`
+    plus the story record. Every impure caller must therefore run the result
+    through `attach_dispatch_dod_contract`, which replaces `active_checks`
+    with the set the gate will actually enforce. Without it the prompt states
+    a narrower contract than the gate applies — see that helper's docstring.
 
     Selection policy: finish the furthest-along in-flight story first
     (reviewing → testing → in_progress), then pull queued stories FIFO,
@@ -2817,6 +4034,16 @@ def next_action(
     dispatch, the output gains an ADDITIVE `parallel` block whose
     `batch[0]` always equals the serial action — an orchestrator that
     ignores it behaves exactly as before.
+
+    compliance (#487, default None): the caller's project-level compliance
+    inputs, `{"baa_enforced": bool, "phi_signals": (...), "build_mode": str}`.
+    Passed in rather than read here because this function is a pure function
+    of (state, toggles, receipt files) and reads no environment; the caller
+    owns `.synaptory.yaml`. When provided, the output's `dod` block gains a
+    `compliance` declaration naming the checks, who owes them, the evidence
+    shape, and what an absent result becomes — the `SP-WRK-019` surface the
+    pipeline previously had nowhere to state. When absent (Scrum, Kanban, and
+    every pre-existing caller) the block is None and nothing changes.
     """
     stories = state.get("current_stories", [])
     counts = {st: 0 for st in STORY_STATES}
@@ -2852,6 +4079,20 @@ def next_action(
         "receipt_present": False,
         "transition_to": None,
         "recovery": None,
+        # #402 — the capability-profile pair this dispatch runs under, named
+        # alongside the legacy `role` above so a dispatch prompt can state it
+        # and the agent can copy it back onto its receipt verbatim (the pair
+        # the advance kernel will hold that receipt to). Additive: None
+        # wherever the action dispatches nobody.
+        "profile": None,
+        # #406 — the acceptance cases this Cycle authored at COMMIT. The
+        # PRODUCING dispatch reads them as its target; the VERIFYING dispatch
+        # executes them and reports a per-case outcome for each. Additive:
+        # None wherever the action dispatches nobody, and carrying
+        # `authored_at_commit: false` plus the recorded reason on the
+        # migration path so a dispatch never has to infer which regime it is
+        # running under.
+        "authored_cases": None,
         # #134 GAP-11 — every next_action output carries the active DoD tier
         # and its base check set so dispatch prompts can state the gate
         # expectations instead of agents discovering them at gate time.
@@ -2861,6 +4102,20 @@ def next_action(
             "active_checks": list(
                 DOD_TIER_CHECKS.get(intensity, DOD_TIER_CHECKS["early"])
             ),
+            # #487 — the checks this dispatch is actually held to, tier set
+            # PLUS the conditional promotions that are already determinable.
+            # Both lists start as the STATIC tier list here because this
+            # function is pure and cannot resolve a promotion. Every
+            # orchestrator entry point then runs the result through
+            # `attach_dispatch_dod_contract`, which fills `active_checks` with
+            # the set the gate will enforce and unions it into this one. Read
+            # neither field as final until that has run.
+            "declared_checks": list(
+                DOD_TIER_CHECKS.get(intensity, DOD_TIER_CHECKS["early"])
+            ),
+            # The compliance declaration, per story, filled by `_fill`. None
+            # for every caller that passes no compliance inputs.
+            "compliance": None,
         },
     }
     if not stories:
@@ -2876,6 +4131,23 @@ def next_action(
             story_title=story.get("title") or None,
             **kw,
         )
+        out["profile"] = _profile_pair_for_role(out.get("role"))
+        # #406 — attached for every action that names a pipeline role. CR gets
+        # it too: it reviews the diff against the same declared criteria, and
+        # a reviewer who cannot see the target is reviewing the diff against
+        # itself, which is the bias this ticket exists to remove.
+        out["authored_cases"] = (
+            authored_cases_target(story)
+            if out.get("role") in ("se", "qe", "cr")
+            else None
+        )
+        # #487 — declare the compliance obligation on the dispatch contract.
+        # Attached for every action that names a pipeline role, including SE:
+        # the promotion is driven by what the DIFF touches, so the producing
+        # stage is the first one able to know its unit is heading for the
+        # gate, and telling only the verifier is telling it too late to have
+        # scoped the work.
+        _attach_compliance_declaration(out, compliance, receipts_dir, story)
         _attach_parallel_batch(
             out,
             state,
@@ -2908,6 +4180,38 @@ def next_action(
                 cand_id = str(cand.get("id", ""))
                 dep = story_dep_status(state, cand, dep_context=dep_context)
                 if dep["met"]:
+                    # A VERIFY-ONLY WORK UNIT HAS NO PRODUCING STAGE (#495 P2,
+                    # proposal section 5 S4). Its deliverable was produced
+                    # outside the platform and admitted at intake, so selecting
+                    # the software-engineer here would dispatch a producer to
+                    # produce what already exists -- and, because
+                    # `evaluate_dispatch` authorizes only the role
+                    # `next_action` selected, it would leave the VERIFYING
+                    # stage unable to be authorized at all. That is what made a
+                    # hand-written verifier receipt indistinguishable from a
+                    # dispatched one: there was no authorized attempt for it to
+                    # name.
+                    #
+                    # GATED ON AN ADMITTED CANDIDATE, so no unit that exists
+                    # today changes behaviour: a queued unit with no intake
+                    # record still selects `dispatch_se`. And this is a
+                    # SELECTION change only -- it adds no transition, so a
+                    # queued unit still cannot reach a later state without the
+                    # receipt its edge already demands. A verify-only unit
+                    # skipping production is a property of what was admitted,
+                    # never of an edge anyone else can take.
+                    if cand_id in (verify_only or ()):
+                        return _fill(
+                            cand,
+                            action="dispatch_qe",
+                            role="qe",
+                            reason=(
+                                f"{cand_id} is queued with an external "
+                                "candidate admitted at intake and no producing "
+                                "stage — dispatch the quality-engineer to "
+                                "verify the admitted bytes"
+                            ),
+                        )
                     return _fill(
                         cand,
                         action="dispatch_se",
@@ -2947,7 +4251,11 @@ def next_action(
         def _verify_loop(role: str) -> dict[str, Any] | None:
             if not verification_loops:
                 return None
-            verdict = _receipt_verification_verdict(receipts_dir, sid, role)
+            # #406 — pass the story so the loop's `tests_pass` definition is
+            # the gate's. See `_receipt_verification_verdict`'s docstring.
+            verdict = _receipt_verification_verdict(
+                receipts_dir, sid, role, story=story
+            )
             if verdict is None:
                 return None
             if verdict == "unverified" and intensity not in ("mature", "release"):
@@ -2958,13 +4266,60 @@ def next_action(
                 "verdict": verdict,
             }
 
+        # #690. THE OTHER REASON A FRESH RECEIPT IS NOT ADVANCEABLE, and the
+        # one nothing here could see. A canonical receipt whose bound attempt
+        # the board records as cancelled, expired or failed is refused by
+        # `advance_kernel.evaluate_advance` as `attempt_not_live`. Offering
+        # the ordinary transition anyway is what deadlocked the governed loop:
+        # the refusal asks for a new attempt, and `begin_dispatch` refuses to
+        # mint one while the receipt is still there.
+        #
+        # It routes through the SAME H3-F1 ladder the verification loop uses
+        # -- the issue says "according to the retry ladder" and this is the
+        # one that exists -- because that is what makes the successor
+        # reachable: `evaluate_dispatch` waives `receipt_already_present` for
+        # a recovery, and `execute_dispatch` archives the receipt under the
+        # dead attempt before minting the next one. A second recovery concept
+        # would have been a second ladder.
+        #
+        # NOT gated on `resilience.verification_loops`. That toggle decides
+        # whether a receipt's own VERDICT re-dispatches a stage; this is not a
+        # verdict about the work at all, it is the board reporting that the
+        # execution which produced it is over. With the toggle off there is
+        # still no legal transition, so skipping the recovery would restore
+        # the dead end rather than preserve a behaviour.
+        def _attempt_loop(role: str) -> dict[str, Any] | None:
+            dead = _unadvanceable_attempt(story, role)
+            if dead is None:
+                return None
+            return {
+                **recommend_recovery_action(state, sid, role),
+                "role": role,
+                "verdict": ATTEMPT_NOT_LIVE_VERDICT,
+                **dead,
+            }
+
         def _verify_action(role: str, vl: dict[str, Any], stage_label: str) -> dict[str, Any]:
             agent = {"se": "software-engineer", "qe": "quality-engineer",
                      "cr": "code-reviewer"}[role]
-            problem = (
-                "failed verification" if vl.get("verdict") == "failed"
-                else "carries unverifiable evidence (intent, not proof)"
-            )
+            verdict = vl.get("verdict")
+            if verdict == ATTEMPT_NOT_LIVE_VERDICT:
+                problem = (
+                    "is bound to attempt %s, which the board records as %s (%s), "
+                    "so it cannot be advanced on"
+                    % (
+                        vl.get("attempt_id") or "an unnamed attempt",
+                        vl.get("attempt_state") or "not live",
+                        vl.get("failure_class") or "no failure class recorded",
+                    )
+                )
+                loop = "attempt recovery; the failed attempt and this receipt are kept"
+            elif verdict == "failed":
+                problem = "failed verification"
+                loop = "verification loop"
+            else:
+                problem = "carries unverifiable evidence (intent, not proof)"
+                loop = "verification loop"
             if vl["tier"] == RETRY_TIER_BLOCK:
                 return _fill(
                     story,
@@ -2986,7 +4341,7 @@ def next_action(
                 recovery=vl,
                 reason=(
                     f"{sid} {stage_label} receipt {problem} — re-dispatch "
-                    f"the {agent} ({vl['tier']}); verification loop"
+                    f"the {agent} ({vl['tier']}); {loop}"
                 ),
             )
 
@@ -3003,6 +4358,13 @@ def next_action(
                     ),
                 )
             if has_cr:
+                # Attempt liveness FIRST. A dead attempt's receipt cannot
+                # advance whatever its verdict says, so asking the verdict
+                # first would report the second-order problem and route the
+                # operator into an edge that is refused either way.
+                _al = _attempt_loop("cr")
+                if _al:
+                    return _verify_action("cr", _al, "review")
                 _vl = _verify_loop("cr")
                 if _vl:
                     return _verify_action("cr", _vl, "review")
@@ -3018,6 +4380,39 @@ def next_action(
                         "transition to awaiting_acceptance for the PO walk"
                     ),
                 )
+            # A GATE THAT ALREADY REFUSED THIS PROMOTION (#396). Under a
+            # `refuse` policy the unit stays in `reviewing`, so without this
+            # the board advertised `promote_story -> done` again and a
+            # compliant orchestrator retried an action that cannot succeed,
+            # forever. The FIRST pass still advertises the promotion: the DoD
+            # gate is what should refuse it, with its own typed reason, and it
+            # cannot do that if the board never offers the edge.
+            _refused = _dod_gate_refusal(
+                story, receipt_evidence_digest(receipts_dir, sid)
+            )
+            if _refused:
+                _owed: dict[str, str] = {}
+                if isinstance(compliance, dict):
+                    _who = compliance_accountable_role(compliance.get("build_mode"))
+                    _owed = {cid: _who for cid in COMPLIANCE_CHECKS}
+                _gate = _gate_remediation(
+                    {"blocked_reason": _refused}, accountable=_owed
+                )
+                if _gate:
+                    return _fill(
+                        story,
+                        action="recover_blocked",
+                        role=_gate["role"],
+                        recovery=_gate,
+                        receipt_present=has_cr,
+                        reason=(
+                            f"{sid} cannot be promoted: DoD gate "
+                            f"'{_gate['gate']}' refused it, so the transition "
+                            f"would be refused again. Dispatch {_gate['role']} "
+                            "per the gate reason, then advance (NOT an SE "
+                            f"retry). {_refused}"
+                        ),
+                    )
             return _fill(
                 story,
                 action="promote_story",
@@ -3033,6 +4428,14 @@ def next_action(
         # in_progress / testing
         action, role, next_state = _STAGE_DISPATCH[stage]
         if _fresh_receipt(receipts_dir, sid, role, story, stage):
+            # #690: a receipt whose bound attempt is no longer live is not
+            # advanceable at all, so that is asked BEFORE the verdict. The
+            # stage this branch used to end in -- "transition instead of
+            # re-dispatching" -- is precisely the recommendation `advance`
+            # then refused.
+            _al = _attempt_loop(role)
+            if _al:
+                return _verify_action(role, _al, stage)
             # P5: if the fresh receipt FAILED verification, re-dispatch this
             # stage (ladder permitting) or block it (ladder exhausted) instead
             # of advancing on a bad receipt.
@@ -3070,8 +4473,18 @@ def next_action(
         #    (compliance-engineer / QE runtime / QE browser-qa) — never the
         #    SE retry ladder, which can't clear a conditional gate and would
         #    loop. Highest priority: the reason names the exact next step.
+        # #487 — the compliance gate's remediation role follows the
+        # declaration, so a PHI-blocked SPQ unit routes to the stage that
+        # owes the result rather than to a per-unit compliance-engineer
+        # dispatch SPQ does not schedule. Empty for every caller that passes
+        # no compliance inputs, which leaves `_GATE_REMEDIATION_ROLE`
+        # answering unchanged.
+        _gate_accountable: dict[str, str] = {}
+        if isinstance(compliance, dict):
+            _owner = compliance_accountable_role(compliance.get("build_mode"))
+            _gate_accountable = {cid: _owner for cid in COMPLIANCE_CHECKS}
         for s in blocked:
-            gate = _gate_remediation(s)
+            gate = _gate_remediation(s, accountable=_gate_accountable)
             if gate:
                 return _fill(
                     s,
@@ -3312,7 +4725,7 @@ def set_dod_tier(
         "decided_at": _now(),
     }
     state["dod_tier"] = record
-    _log_emit(
+    _emit_project_event(
         "dod_tier_set",
         project_dir=project_dir,
         tier=tier,
@@ -3419,6 +4832,352 @@ def _dod_check_waived(project_dir: str, story_id: str, check_id: str) -> bool:
     return isinstance(waived, list) and check_id in waived
 
 
+def receipt_evidence_digest(receipts_dir: str | None, story_id: str) -> str:
+    """A cheap fingerprint of the evidence a story currently has.
+
+    Name, size and mtime of each of the story's receipts. It changes whenever a
+    receipt is written, which is exactly when a previous DoD verdict stops
+    being about the evidence on disk. Deliberately not a content hash: this
+    runs on every `next_action` and only has to answer "is this the same
+    evidence", not "what does it say".
+    """
+    if not receipts_dir:
+        return ""
+    try:
+        base = Path(receipts_dir)
+        parts = []
+        for path in sorted(base.glob("%s-*.json" % story_id)):
+            st = path.stat()
+            parts.append("%s:%d:%d" % (path.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        return ""
+    if not parts:
+        return ""
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _dod_gate_refusal(story: Any, evidence: str) -> str:
+    """The reason a DoD gate refused THIS evidence, or "".
+
+    Written by the advance kernel when its policy is `refuse`: the story does
+    not move, and the board learns why so it can route to the agent that owes
+    the missing result instead of re-offering the promotion (#396).
+
+    THE NOTE IS SCOPED TO THE EVIDENCE IT JUDGED. A refusal that outlived the
+    condition it described would be worse than the loop it fixes: an engineer
+    who dispatched the remediation, produced the missing result and came back
+    would find the board still routing to remediation and the advance refused
+    as `next_action_mismatch`, with no way to clear it. So the note records the
+    evidence fingerprint it was computed from, and a note about evidence that
+    has since changed is ignored rather than obeyed. The Cursor MCP suite
+    caught exactly this: fix the coverage, re-advance, and the stale note
+    refused the legitimate retry.
+    """
+    if not isinstance(story, dict):
+        return ""
+    note = story.get("dod_gate_refusal")
+    if not isinstance(note, dict):
+        return ""
+    recorded = str(note.get("evidence") or "")
+    if recorded and evidence and recorded != evidence:
+        return ""
+    return str(note.get("reason") or "")
+
+
+def story_gate_promotions(
+    project_dir: str,
+    story_id: str,
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The conditional-gate promotion flags for a story, given the receipts so far.
+
+    Extracted from `evaluate_story_dod` so the DISPATCH side (#501) and the
+    GATE side compute promotion from one body of code. Two copies of this
+    logic would let a dispatch prompt state a check set the gate does not
+    use, which is a worse failure than stating none at all: the agent would
+    be told a contract, satisfy it, and still be blocked.
+
+    `receipts` is the evidence available AT THE MOMENT OF THE CALL. At the
+    gate that is every receipt for the story; at dispatch it is whatever the
+    earlier stages already wrote (nothing, for an SE dispatch). Two of the
+    flags read receipts, so the result is monotonic rather than final — see
+    `dispatch_dod_contract`, which reports that difference instead of hiding
+    it.
+    """
+    # #31/#30 — promote the conditional gates for PHI-sensitive healthcare
+    # stories (compliance-engineer must run; story must be exercised live) and
+    # for any project that opts into mandatory runtime verification.
+    baa_enforced = healthcare_baa_enforced(project_dir)
+    phi_touching = baa_enforced and story_touches_phi(
+        receipts, phi_risk_signals(project_dir)
+    )
+    # #134 GAP-3 — per-story verification tier. PHI always forces `full`:
+    # scoping may reduce intensity, never the compliance class.
+    story_rec: dict[str, Any] | None = None
+    _state_for_manifest: dict[str, Any] | None = None
+    try:
+        _state_for_manifest = _read_state(project_dir)
+        story_rec = _find_story(_state_for_manifest, story_id)
+    except Exception:
+        story_rec = None
+    # #406 — the authored set comes from the hash-SEALED Cycle manifest, not
+    # from the board. `pipeline-state.json` is agent-writable, so a board-only
+    # authority would have made the authored set exactly as forgeable as the
+    # receipt it exists to check. This also means an unreadable board or a
+    # story that has left it no longer silently reverts to the pre-#406 rules,
+    # since `manifest_authored_cases` can resolve the Cycle from the index.
+    story_rec = _authoritative_story(
+        project_dir, story_rec or {"id": story_id}, _state_for_manifest
+    )
+    verification_tier = resolve_verification_tier(project_dir, story_rec)
+    if phi_touching:
+        verification_tier = "full"
+    return {
+        "baa_enforced": baa_enforced,
+        # The manifest-authoritative story record (#406). Returned rather than
+        # recomputed by the caller: `_authoritative_story` can resolve a story
+        # that has left the board, so a second lookup would not be the same
+        # record, and `evaluate_story_dod` keys the authored-case checks off it.
+        "story_rec": story_rec,
+        "verification_tier": verification_tier,
+        "compliance_required": phi_touching,
+        "runtime_required": phi_touching or verification_tier == "full",
+        # #44 — promote the UI-acceptance gate for stories whose AC describes
+        # a user-facing screen, so a green backend suite can't carry it to
+        # `done`. #134: `minimal`-tier stories suppress the gate entirely (PHI
+        # can't be minimal — forced to full above).
+        "ui_required": (
+            verification_tier != "minimal"
+            and _story_is_ui_bearing_in_state(project_dir, story_id)
+        ),
+        # #44 phase 5 — promote the integration gate when the story CLAIMS an
+        # external service is wired/connected, so a stub against placeholder
+        # creds can't be reported as a delivered integration.
+        "integration_required": _story_claims_integration_in_state(
+            project_dir, story_id, receipts
+        ),
+    }
+
+
+#: Conditional gates whose promotion depends on receipt evidence, mapped to the
+#: sentence that says what would still activate them. A gate listed here and NOT
+#: in `active_checks` at dispatch time is undetermined, not inactive — see
+#: `dispatch_dod_contract`.
+#: Kept to short fragments on purpose: this text is rendered into every
+#: dispatch, and the fixed-payload budget (#404) leaves single-digit words of
+#: headroom. The reason has to fit in a clause or it does not ship at all.
+_RECEIPT_DEPENDENT_PROMOTIONS: dict[str, str] = {
+    "no_critical_findings": "if a receipt shows PHI",
+    "runtime_verified": "if a receipt shows PHI",
+    "integration_verified": "if you claim a service is live",
+}
+
+
+def dispatch_dod_contract(
+    project_dir: str,
+    story_id: str,
+    *,
+    receipts_dir: str | None = None,
+    state: dict[str, Any] | None = None,
+    tier: str | None = None,
+) -> dict[str, Any]:
+    """The DoD block a dispatch prompt should state for `story_id` (#501).
+
+    Returns `{tier, tier_source, active_checks, undetermined_checks}`.
+
+    `active_checks` is the check set the gate would use if it ran right now:
+    the tier's base checks plus every conditional gate already promoted by
+    the story record and the receipts written so far, computed by the SAME
+    `story_gate_promotions` the gate itself calls.
+
+    `undetermined_checks` exists because two promotions read receipts that do
+    not exist yet at dispatch — PHI detection (`no_critical_findings`,
+    `runtime_verified`) and the integration claim (`integration_verified`).
+    Shipping only `active_checks` would present "not promoted yet" and "will
+    never be promoted" as the same fact, and the agent would read a shorter
+    list as a lighter contract. Each entry is `{check, why}`: what activates
+    it, so the agent can tell an absent check from an unmeasured one.
+
+    `tier` (optional) pins the base-check tier to one the caller already
+    resolved, so the contract cannot state a check the caller's own routing
+    did not plan for. `tier_source` is unaffected — see the comment below.
+
+    Never raises: a dispatch prompt losing its DoD block is bad, a dispatch
+    that cannot be issued is worse. On failure the tier falls back to the
+    computed default and `undetermined_checks` says the promotions were not
+    evaluated — which is the honest reading, not an empty list.
+    """
+    try:
+        if state is None:
+            state = _read_state(project_dir)
+    except Exception:
+        state = {}
+    try:
+        tier_info = resolve_dod_tier(project_dir, state or {})
+    except Exception:
+        tier_info = {"tier": "early", "tier_source": "computed"}
+    # `tier` pins WHICH TIER'S base checks are selected, to the tier the caller
+    # already routed on (`attach_dispatch_dod_contract` passes `next_action`'s).
+    # Resolving it a second time here would let the stated contract carry
+    # `code_reviewed` while the same output's routing never asked for a CR --
+    # the two must move together or the prompt describes a pipeline the
+    # orchestrator is not running. It does NOT override `tier_source`, which
+    # answers a different question (was the tier a recorded planning decision,
+    # or silently computed?) and which the modes files act on.
+    if tier not in DOD_TIER_CHECKS:
+        tier = str(tier_info.get("tier") or "early")
+    out: dict[str, Any] = {
+        "tier": tier,
+        "tier_source": str(tier_info.get("tier_source") or "computed"),
+        "active_checks": list(DOD_TIER_CHECKS.get(tier, DOD_TIER_CHECKS["early"])),
+        "undetermined_checks": [],
+    }
+    try:
+        if receipts_dir is None:
+            receipts_dir = _resolve_receipts_dir(project_dir)
+        receipts = collect_story_receipts(receipts_dir, story_id)
+        promotions = story_gate_promotions(project_dir, story_id, receipts)
+    except Exception:
+        out["undetermined_checks"] = [
+            {"check": check, "why": "promotion could not be evaluated"}
+            for check in sorted(_RECEIPT_DEPENDENT_PROMOTIONS)
+        ]
+        return out
+
+    active = active_dod_checks(
+        tier,
+        compliance_required=promotions["compliance_required"],
+        runtime_required=promotions["runtime_required"],
+        ui_required=promotions["ui_required"],
+        integration_required=promotions["integration_required"],
+    )
+    out["active_checks"] = list(active)
+    out["verification_tier"] = promotions["verification_tier"]
+
+    undetermined: list[dict[str, str]] = []
+    for check, why in _RECEIPT_DEPENDENT_PROMOTIONS.items():
+        if check in active:
+            continue
+        # A non-healthcare project can never promote the PHI pair, so those
+        # two are DETERMINED absent there. Listing them anyway would turn the
+        # honest signal into noise on every ordinary project.
+        if check != "integration_verified" and not promotions["baa_enforced"]:
+            continue
+        undetermined.append({"check": check, "why": why})
+    out["undetermined_checks"] = undetermined
+    return out
+
+
+#: The keys `attach_dispatch_dod_contract` OVERWRITES on a `next_action` `dod`
+#: block. `declared_checks` is unioned rather than overwritten (it must stay a
+#: superset), and `tier` / `tier_source` / the SPQ `compliance` stanza (#487)
+#: are left alone because they answer questions the per-story contract does not.
+_DISPATCH_DOD_KEYS = ("active_checks", "undetermined_checks", "verification_tier")
+
+
+def attach_dispatch_dod_contract(
+    out: dict[str, Any],
+    project_dir: str,
+    *,
+    state: dict[str, Any] | None = None,
+    receipts_dir: str | None = None,
+) -> dict[str, Any]:
+    """Upgrade a `next_action` output's `dod` block to the PER-STORY contract.
+
+    `next_action` is a pure function of the board, so the `dod` block it builds
+    can only carry the STATIC tier list (`DOD_TIER_CHECKS`). The gate does not
+    stop there: `active_dod_checks` promotes four CONDITIONAL gates
+    (`ui_acceptance`, `runtime_verified`, `no_critical_findings`,
+    `integration_verified`) from `.synaptory.yaml` and the receipts, and
+    `evaluate_story_dod` enforces the promoted set. Every modes file and the
+    backend wrapper tell the orchestrator to paste `dod.active_checks` into the
+    dispatch prompt as the Evidence Contract, so the tier-only block made the
+    STATED contract systematically narrower than the ENFORCED one for exactly
+    the stories that need it widest: UI-bearing ones, `verification_tier: full`
+    ones, PHI-touching ones on a `baa_enforced` project, and any story claiming
+    an external integration.
+
+    The fix belongs HERE rather than inside `next_action` because this is the
+    seam where a `project_dir` exists. All four orchestrator entry points --
+    `story_pipeline.py next_action`, and the `next_action(project_dir)` wrapper
+    in each of the scrum / kanban / spq state machines -- are already impure and
+    already enrich the result (`spec_id`, `resume_candidate`, the compliance
+    declaration). Routing through one helper keeps them from drifting: a
+    lifecycle that forgot to call this would silently keep the narrow contract,
+    which is the bug rather than a smaller version of it.
+
+    The tier is PINNED to the one `next_action` routed on, so the stated
+    contract can never require a `code_reviewed` the same output's routing did
+    not schedule a CR for.
+
+    Parallel batch members (#134 GAP-6) each get their OWN `dod` block: a batch
+    is N dispatches for N different stories, and `ui_bearing` is a per-story
+    fact, so one shared block would hand the lead's contract to every member.
+
+    Best-effort and in-place: any failure leaves the tier-only block exactly as
+    `next_action` built it. A dispatch that states a narrow contract is a bug; a
+    dispatch that cannot be issued at all is worse.
+    """
+    dod = out.get("dod")
+    if not isinstance(dod, dict):
+        return out
+    tier = dod.get("tier") if isinstance(dod.get("tier"), str) else None
+
+    cache: dict[str, dict[str, Any]] = {}
+
+    def _contract(story_id: str) -> dict[str, Any] | None:
+        if story_id in cache:
+            return cache[story_id]
+        try:
+            resolved = dispatch_dod_contract(
+                project_dir,
+                story_id,
+                receipts_dir=receipts_dir,
+                state=state,
+                tier=tier,
+            )
+        except Exception:
+            return None
+        cache[story_id] = resolved
+        return resolved
+
+    story_id = out.get("story_id")
+    if isinstance(story_id, str) and story_id:
+        resolved = _contract(story_id)
+        if resolved is not None:
+            for key in _DISPATCH_DOD_KEYS:
+                if key in resolved:
+                    dod[key] = resolved[key]
+            # #487 built `declared_checks` as "the tier set PLUS the
+            # determinable promotions" but only ever extended it with the
+            # compliance check. Union it with the resolved set so the two stay
+            # ordered the way their names claim -- declared is a superset of
+            # active, never a stale subset of it.
+            declared = list(dod.get("declared_checks") or [])
+            for cid in resolved.get("active_checks") or []:
+                if cid not in declared:
+                    declared.append(cid)
+            dod["declared_checks"] = declared
+
+    parallel = out.get("parallel")
+    if isinstance(parallel, dict):
+        for entry in parallel.get("batch") or []:
+            if not isinstance(entry, dict):
+                continue
+            member_id = entry.get("story_id")
+            if not isinstance(member_id, str) or not member_id:
+                continue
+            resolved = _contract(member_id)
+            if resolved is None:
+                continue
+            entry["dod"] = {
+                "tier": resolved.get("tier", tier),
+                "tier_source": dod.get("tier_source"),
+                **{k: resolved[k] for k in _DISPATCH_DOD_KEYS if k in resolved},
+            }
+    return out
+
+
 def evaluate_story_dod(
     project_dir: str,
     story_id: str,
@@ -3437,40 +5196,14 @@ def evaluate_story_dod(
 
     receipts = collect_story_receipts(receipts_dir, story_id)
 
-    # #31/#30 — promote the conditional gates for PHI-sensitive healthcare
-    # stories (compliance-engineer must run; story must be exercised live) and
-    # for any project that opts into mandatory runtime verification.
-    baa_enforced = healthcare_baa_enforced(project_dir)
-    phi_touching = baa_enforced and story_touches_phi(
-        receipts, phi_risk_signals(project_dir)
-    )
-    # #134 GAP-3 — per-story verification tier. PHI always forces `full`:
-    # scoping may reduce intensity, never the compliance class.
-    story_rec: dict[str, Any] | None = None
-    try:
-        story_rec = _find_story(_read_state(project_dir), story_id)
-    except Exception:
-        story_rec = None
-    verification_tier = resolve_verification_tier(
-        project_dir, story_rec or {"id": story_id}
-    )
-    if phi_touching:
-        verification_tier = "full"
-    runtime_required = phi_touching or verification_tier == "full"
-    # #44 — promote the UI-acceptance gate for stories whose AC describes a
-    # user-facing screen, so a green backend suite can't carry it to `done`.
-    # #134: `minimal`-tier stories suppress the gate entirely (PHI can't be
-    # minimal — forced to full above).
-    ui_required = (
-        verification_tier != "minimal"
-        and _story_is_ui_bearing_in_state(project_dir, story_id)
-    )
-    # #44 phase 5 — promote the integration gate when the story CLAIMS an
-    # external service is wired/connected, so a stub against placeholder creds
-    # can't be reported as a delivered integration.
-    integration_required = _story_claims_integration_in_state(
-        project_dir, story_id, receipts
-    )
+    promotions = story_gate_promotions(project_dir, story_id, receipts)
+    phi_touching = promotions["compliance_required"]
+    runtime_required = promotions["runtime_required"]
+    ui_required = promotions["ui_required"]
+    integration_required = promotions["integration_required"]
+    verification_tier = promotions["verification_tier"]
+    story_rec = promotions["story_rec"]
+    baa_enforced = promotions["baa_enforced"]
     active_checks = active_dod_checks(
         intensity,
         compliance_required=phi_touching,
@@ -3503,11 +5236,18 @@ def evaluate_story_dod(
 
         passed: bool | None = None
         source: str | None = None
+        # Re-initialized per check on purpose: the detail branch below reads it
+        # and a value left over from the previous check would be read as this
+        # check's verdict.
+        authored_veto = False
 
         if required and receipt:
             source = _receipt_source_path(story_id, role_abbrev, receipt)
             passed = _evaluate_check(
-                check_id, receipt, verification_tier=verification_tier
+                check_id,
+                receipt,
+                verification_tier=verification_tier,
+                story=story_rec,
             )
         elif not required:
             passed = None  # Not evaluated at this intensity.
@@ -3520,12 +5260,18 @@ def evaluate_story_dod(
             # or dropped authored case recorded by QE. Without this guard the
             # `any_with_proof` fallback re-opens the exact bypass the nominal
             # `_evaluate_check` closes.
+            #
+            # #406 asks the same question of the set authored at COMMIT rather
+            # than of the receipt's own `total`. `authored_case_negative` is
+            # deliberately NARROWER than the primary verdict: only an explicit
+            # non-passing status vetoes across receipts, because a receipt
+            # reporting a subset is silent about the rest and silence must not
+            # let one receipt writer fail another's satisfied check (#445's
+            # blocking direction). With no authored set it is the #187
+            # predicate exactly, so one call covers both regimes.
             authored_veto = (
                 check_id == "tests_pass"
-                and any(
-                    _authored_cases_pass(r.get("metrics", {})) is False
-                    for r in receipts
-                )
+                and any(authored_case_negative(story_rec or {}, r) for r in receipts)
             )
             if authored_veto:
                 fallback = "none"
@@ -3547,7 +5293,10 @@ def evaluate_story_dod(
                     if r is None:
                         continue
                     if _evaluate_fallback_proof(
-                        check_id, r, verification_tier=verification_tier
+                        check_id,
+                        r,
+                        verification_tier=verification_tier,
+                        story=story_rec,
                     ) is True:
                         passed = True
                         source = _receipt_source_path(story_id, ab, r)
@@ -3561,35 +5310,61 @@ def evaluate_story_dod(
         # Self-explaining gate verdicts (#134 GAP-1): when the check is
         # required but unresolvable, say exactly what evidence shape is
         # missing so the orchestrator's retry prompt can teach the agent.
-        if required and passed is None and check_id in (
-            "tests_pass", "build_succeeds"
-        ):
-            entry["detail"] = (
-                f"{check_id} is unverified: `verification_commands` contains "
-                "no executed proof objects. Plain-string commands are replay "
-                "instructions, not evidence — record each command you actually "
-                'ran as {"command": "...", "exit_code": 0, "summary": "..."}.'
-            )
-        elif required and passed is False and check_id == "code_reviewed":
+        #
+        # #403 moved the unresolvable case to the typed classification pass
+        # below, which produces the same text through `criteria_gap_detail`
+        # for EVERY required check rather than for these two, and stamps the
+        # `criteria_gap_declared` result beside it. The two remaining branches
+        # are definitive negatives, which are fails and not gaps: evidence
+        # exists and it says no.
+        if required and passed is False and check_id == "code_reviewed":
             entry["detail"] = (
                 "code_reviewed failed: the CR receipt must carry top-level "
                 '`"status": "complete"` (or `story_dod.code_reviewed: true`).'
             )
-        elif (
-            required
-            and passed is not True
-            and check_id == "tests_pass"
-            and any(
-                _authored_cases_pass(r.get("metrics", {})) is False
-                for r in receipts
-            )
-        ):
-            entry["detail"] = (
-                "tests_pass failed: an authored test case is failed/blocked or "
-                "dropped in `metrics.authored_test_cases`. A green runner exit "
-                "code from any receipt cannot clear this — every authored case "
-                "must end `passed` or `not-applicable`."
-            )
+        elif required and passed is not True and check_id == "tests_pass":
+            # #406 — say WHICH of the three things is wrong (a failed case, a
+            # dropped case, or an execution that pre-dates the producing
+            # stage), because the retry prompt teaches from this text.
+            #
+            # The NOMINAL receipt is asked first and its answer wins. Scanning
+            # in `collect_story_receipts` order would let an SE or CE receipt's
+            # "carries no `metrics.authored_test_cases` object" be reported as
+            # the reason tests_pass is unresolved while the QE receipt is the
+            # one at fault, and the orchestrator would then re-dispatch the
+            # wrong role.
+            _ordered = [receipt] if receipt else []
+            _ordered += [_r for _r in receipts if _r is not receipt]
+            _neg_detail: str | None = None
+            _gap_detail: str | None = None
+            for _r in _ordered:
+                _v, _d = authored_cases_verdict(story_rec or {}, _r)
+                if _v is False and _d and _neg_detail is None:
+                    _neg_detail = _d
+                elif _v is None and _d and _gap_detail is None:
+                    _gap_detail = _d
+            # A cross-receipt veto with no detail of its own still has to say
+            # something, and the #187 wording is what the legacy path says.
+            if _neg_detail is None and authored_veto:
+                _neg_detail = (
+                    "tests_pass failed: an authored test case is failed/blocked "
+                    "or dropped in `metrics.authored_test_cases`. A green "
+                    "runner exit code from any receipt cannot clear this — "
+                    "every authored case must end `passed` or "
+                    "`not-applicable`."
+                )
+            if _neg_detail is not None:
+                entry["detail"] = _neg_detail
+                # #403 — a definitively failed authored case is negative
+                # EVIDENCE, so this check is a `fail` and not a
+                # `criteria_gap_declared`, even though `passed` is None
+                # because no executed object was recorded. A gap says
+                # "nothing here to evaluate"; this says "something here, and
+                # it says no". Keeping them distinct is why the gap result is
+                # worth having.
+                entry["definitive_negative"] = True
+            elif _gap_detail is not None:
+                entry["detail"] = _gap_detail
         checks[check_id] = entry
 
     # #44 phase 5 — `integration_verified` spans the whole receipt set (the
@@ -3687,7 +5462,7 @@ def evaluate_story_dod(
                         f"exit {first_bad.get('actual_exit_code')} — the "
                         "attested evidence does not reproduce."
                     )
-                    _log_emit(
+                    _emit_project_event(
                         "evidence_replay_mismatch",
                         project_dir=project_dir,
                         story_id=story_id,
@@ -3724,6 +5499,65 @@ def evaluate_story_dod(
                     except Exception:
                         pass  # never block the gate on telemetry
 
+    # #403 — typed classification. Runs LAST, after the waiver has demoted
+    # build_succeeds and after the #179 E1 replay has had its chance to flip a
+    # verdict, so `result` describes the check's final standing and never a
+    # midway one.
+    # Both spellings a `source` can take, so the class derivation can find the
+    # receipt that actually sourced a check: `_receipt_source_path` prefers the
+    # loaded filename, while the integration branch above uses the canonical
+    # name. A source that resolves to no receipt simply yields no class.
+    receipt_by_source: dict[str, dict[str, Any]] = {}
+    for _ab, _r in receipt_by_role.items():
+        receipt_by_source[_receipt_source_path(story_id, _ab, _r)] = _r
+        receipt_by_source.setdefault(get_story_receipt_path(story_id, _ab), _r)
+    # #406 — the test-first posture, stamped on the check it governs. This is
+    # the fourth of the four surfaces the migration path is visible on (the
+    # others: the story record, the Cycle's `test_first` state block, and the
+    # `authored_cases` block on every dispatch). 13.3's failure was not a
+    # wrong verdict, it was four of five checks emitting nothing while the
+    # gate rendered green, so a gate evaluated WITHOUT test-first has to say
+    # so on the record a reader actually reads.
+    if "tests_pass" in checks:
+        _authored_ids = story_authored_case_ids(story_rec or {})
+        _gap = (story_rec or {}).get("criteria_gap_declared")
+        _disagreement = (story_rec or {}).get("_authored_disagreement")
+        checks["tests_pass"]["test_first"] = {
+            "authored_at_commit": bool(_authored_ids),
+            "authored_case_ids": _authored_ids,
+            "criteria_gap_declared": (
+                dict(_gap) if isinstance(_gap, dict) and _gap else None
+            ),
+            "producing_stage_entered_at": _producing_stage_entered_at(
+                story_rec or {}
+            ),
+            # WHERE the authored set came from: `manifest` (the seal),
+            # `untrusted_manifest` (a seal that failed its own hash),
+            # `missing_manifest` (#507: a unit under a seal no copy of which
+            # can be read), or `board` (no manifest to consult -- Scrum,
+            # Kanban, pre-manifest). Reported because "the gate trusted the
+            # board" and "the gate trusted the seal" are different guarantees
+            # and a reader cannot otherwise tell which one they got.
+            "authored_source": (story_rec or {}).get("_authored_source"),
+            # #507 — WHICH copy of the seal answered (`local`, `committed`,
+            # `git`), and, when none did, what still said one existed. "The
+            # gate read the local copy" and "the gate had to recover the seal
+            # from HEAD because the working tree lost it" are different facts
+            # about the same verdict, so they do not share a representation.
+            "authored_seal_origin": (story_rec or {}).get("_authored_seal_origin"),
+            "authored_seal_witness": (
+                (story_rec or {}).get("_authored_seal_witness") or None
+            ),
+            # Present ONLY when the board and the seal name different sets.
+            # The board diverges from a hash-sealed document by being edited,
+            # so it is surfaced rather than silently corrected.
+            "authored_disagreement": (
+                dict(_disagreement) if isinstance(_disagreement, dict) else None
+            ),
+        }
+
+    typed_results = _classify_dod_checks(checks, receipts, receipt_by_source)
+
     required_checks = {k: v for k, v in checks.items() if v["required"]}
     all_required_passed = all(
         v["passed"] is True for v in required_checks.values()
@@ -3750,6 +5584,18 @@ def evaluate_story_dod(
         # verifier for this story before it can reach `done`.
         "baa_enforced": baa_enforced,
         "compliance_required": phi_touching,
+        # #487 — the declared compliance check set, and who owes its result
+        # on THIS lifecycle. `compliance_required` above stays exactly what it
+        # was so every existing reader is unaffected; these two are additive
+        # and are what lets the block reason name a stage that can actually be
+        # dispatched, instead of a per-unit compliance-engineer dispatch that
+        # SPQ no longer schedules.
+        "compliance_checks": list(COMPLIANCE_CHECKS),
+        "compliance": compliance_declaration(
+            baa_enforced=baa_enforced,
+            required=phi_touching,
+            build_mode=_project_build_mode(project_dir),
+        ),
         "runtime_required": runtime_required,
         # #44 — true when this story's AC describes a user-facing screen, so
         # the orchestrator knows to dispatch QE browser-qa (or get PO
@@ -3759,9 +5605,15 @@ def evaluate_story_dod(
         # wired/connected, so a stubbed integration can't be reported as done
         # without a live smoke proof (or PO acceptance/deferral).
         "integration_required": integration_required,
+        # #403 — the typed per-check results, in the shape the control plane
+        # reads (`analytics.DOD_CHECK_RESULTS_KEY`). One entry per REQUIRED
+        # check, carrying pass | fail | criteria_gap_declared, the
+        # missing-evidence description for a gap, and the evidence class that
+        # actually backed the check (never one a payload claimed).
+        DOD_CHECK_RESULTS_KEY: typed_results,
         "evaluated_at": _now(),
     }
-    _log_emit(
+    _emit_project_event(
         "dod_evaluated",
         project_dir=project_dir,
         story_id=story_id,
@@ -3930,9 +5782,11 @@ def receipts_dir_for(project_dir: str, *, intended: bool = False) -> str:
 
     Three layouts coexist and each is selected by a different mechanism:
 
-        SPQ            `spq/cycles/<cycle-id>/workstreams/<ws>/receipts`
-                       from NATIVE identity (#303/#304/#305). Never resolved
-                       through `active_spec` or `SYNAPTORY_ACTIVE_SPEC`.
+        SPQ            `spq/cycles/<cycle-id>/receipts` from NATIVE identity
+                       (#303/#304/#305, flattened by #644 with the lane).
+                       Never resolved through `active_spec` or
+                       `SYNAPTORY_ACTIVE_SPEC`, and never falling through to
+                       the branch that would.
         multi-spec     `specs/<active>/receipts` for scrum/kanban, unchanged.
         flat           `receipts`.
 
@@ -3951,50 +5805,57 @@ def receipts_dir_for(project_dir: str, *, intended: bool = False) -> str:
     """
     orch = os.path.join(project_dir, ".synaptory", ".orchestrator")
 
-    # A COORDINATION clone first (#305). It owns no child Cycle, so
-    # `resolve_identity` returns no `cycle_id`, the SPQ branch below is skipped,
-    # and control reaches the Multi-Spec branch -- which resolves a directory
-    # from `SYNAPTORY_ACTIVE_SPEC`. A `RELEASE-{seq}` receipt would land in a
-    # spec slot chosen by whatever happened to be exported, which is exactly what
-    # #305 forbids in as many words. `spq_paths.receipts_dir` cannot help either:
-    # it raises without a `cycle_id`, so there was no legal home for one at all.
-    try:
+    # SPQ FIRST, AND SPQ NEVER FALLS THROUGH. The Multi-Spec branch below
+    # resolves a directory from `SYNAPTORY_ACTIVE_SPEC`, so an SPQ receipt
+    # reaching it lands in a spec slot chosen by whatever happened to be
+    # exported -- #303/#304 forbid that in as many words.
+    #
+    # IT HAD BEEN HAPPENING ON EVERY SPQ PROJECT SINCE THE REWRITE, and this
+    # handler is both load-bearing and where the bug lived. The block branched
+    # on `ident.workstream_id` before choosing its call; `SPD-194` retires the
+    # Workstream so `Identity` carries no such attribute; the AttributeError
+    # was swallowed by a bare `except` whose comment described the
+    # fall-through as intentional. The guard against the fall-through had
+    # become the fall-through.
+    #
+    # WHAT THAT COST, in the words of this function's own docstring: there
+    # were previously TWO resolvers and the whole reason the second exists is
+    # that "the dispatch-contract path and the gate-read path had diverged."
+    # The gates calling `spq_paths.receipts_dir` directly --
+    # `acceptance_readiness`, and `close_cycle`'s per-unit DoD aggregation --
+    # kept reading `spq/cycles/<cycle-id>/receipts`, so a receipt filed
+    # through this resolver was invisible to the gate that required it.
+    #
+    # TWO LESSONS TAKEN HERE. The `except` names the failure it tolerates:
+    # `IdentityError` is "no Cycle open", the one legitimate reason resolution
+    # fails, and a broad catch around a branch whose whole job is to refuse a
+    # fall-through will always be able to cause one. And the branch RETURNS
+    # rather than dropping out, so nothing below it can be reached by an SPQ
+    # project regardless of what fails.
+    #
+    # A dead COORDINATION block sat above this one, calling
+    # `spq_paths.read_coordination_pin` and `coordination_receipts_dir`, both
+    # retired with the Coordination Cycle. It could only ever raise into a
+    # handler. Deleted rather than left swallowed: an exception handler is no
+    # place to keep dead code, because it hides the live failure standing next
+    # to it -- which is how the `workstream_id` line survived at all.
+    _state = _read_state(project_dir) or {}
+    if str(_state.get("build_mode") or "").lower() == "spq":
         import spq_paths
 
-        state = _read_state(project_dir)
-        if str(state.get("build_mode") or "").lower() == "spq":
-            ccid = spq_paths.read_coordination_pin(project_dir)
-            if ccid and not spq_paths.resolve_identity(
-                project_dir, state=state
-            ).cycle_id:
-                candidate = spq_paths.coordination_receipts_dir(project_dir, ccid)
-                if intended or os.path.isdir(candidate):
-                    return candidate
-    except Exception:  # noqa: BLE001 - fall through exactly as before
-        pass
-
-    # SPQ next: an SPQ project must never fall through to a spec slot.
-    try:
-        import spq_paths
-
-        state = _read_state(project_dir)
-        if str(state.get("build_mode") or "").lower() == "spq":
-            ident = spq_paths.resolve_identity(project_dir, state=state)
-            if ident.cycle_id:
-                if ident.workstream_id:
-                    candidate = spq_paths.receipts_dir(
-                        project_dir,
-                        cycle_id=ident.cycle_id,
-                        workstream_id=ident.workstream_id,
-                    )
-                else:
-                    candidate = spq_paths.receipts_dir(
-                        project_dir, cycle_id=ident.cycle_id
-                    )
-                if intended or os.path.isdir(candidate):
-                    return candidate
-    except Exception:  # noqa: BLE001 - an unresolvable identity falls through
-        pass
+        try:
+            ident = spq_paths.resolve_identity(project_dir, state=_state)
+        except spq_paths.IdentityError:
+            # No Cycle open yet -- DISCOVERY, or a clone that has not
+            # hydrated. A legitimate state with a legitimate answer, and the
+            # answer is the flat directory. An unresolvable identity is not
+            # permission to consult `active_spec`.
+            ident = None
+        if ident is not None and ident.cycle_id:
+            candidate = spq_paths.receipts_dir(project_dir, ident.cycle_id)
+            if intended or os.path.isdir(candidate):
+                return candidate
+        return os.path.join(orch, "receipts")
 
     # Multi-spec, for scrum and kanban. Retained: #303/#304/#305 scope the
     # decoupling to SPQ, and removing this would be a capability regression for
@@ -4080,12 +5941,18 @@ def _cli_receipt_gated_refusal(
     *,
     forced: bool,
     reason: str | None,
+    project_dir: str | os.PathLike[str] | None = None,
 ) -> str | None:
     """Return a CLI refusal message, or None if the transition may proceed.
 
     Shared by `story_pipeline.py transition` and the Scrum/Kanban/SPQ
     `transition_story` verbs so a public CLI cannot promote without a receipt.
     A `--force-recovery` override is recorded as a `forced_transition` signal.
+
+    `project_dir` is where that signal is recorded. Without it the override
+    lands in the process's cwd instead of the project (#380) -- and an operator
+    override nobody can find in the project's own event log is the one signal
+    that must not go missing.
     """
     if _is_receipt_gated_edge(from_state, to_state) and not forced:
         return _RECEIPT_GATED_CLI_REFUSAL % (
@@ -4097,8 +5964,9 @@ def _cli_receipt_gated_refusal(
     if forced:
         if not reason:
             return "--force-recovery requires --reason '<why>'"
-        _log_emit(
+        _emit_project_event(
             "forced_transition",
+            project_dir=project_dir,
             story_id=story_id,
             from_state=from_state,
             to_state=to_state,
@@ -4276,7 +6144,10 @@ def _evaluate_test_proof(receipt: dict[str, Any]) -> bool | None:
 
 
 def _evaluate_fallback_proof(
-    check_id: str, receipt: dict[str, Any], verification_tier: str = "full"
+    check_id: str,
+    receipt: dict[str, Any],
+    verification_tier: str = "full",
+    story: dict[str, Any] | None = None,
 ) -> bool | None:
     """Strict per-check proof matcher for evidence-based fallback (#134 GAP-10).
 
@@ -4285,10 +6156,25 @@ def _evaluate_fallback_proof(
     Lenient defaults that are safe on the nominal receipt (e.g.
     `findings_critical` defaulting to 0, coverage "assume pass") would let a
     stray receipt vacuously satisfy a gate it knows nothing about.
+
+    `story` (#406): once a Cycle has authored acceptance cases, a recognisable
+    test command is no longer sufficient proof of `tests_pass` from ANY
+    receipt. The fallback then demands the same authored-case evidence the
+    nominal path demands, so "role is a preference, structured evidence is the
+    requirement" still holds -- the requirement simply got stricter. Without
+    it the `any_with_proof` fallback re-opens the bypass on the primary path,
+    which is #187's finding restated one layer up.
     """
     if check_id == "build_succeeds":
         return _evaluate_build_proof(receipt)
     if check_id == "tests_pass":
+        # `under_authored_regime` rather than the board's ids alone (#507): a
+        # recognisable test command from a stray receipt must not satisfy
+        # tests_pass for a unit whose seal is unreadable either. That was the
+        # live half of the bypass -- the nominal path already refused, and this
+        # fallback then promoted an SE receipt's green `pytest` back to a pass.
+        if under_authored_regime(story):
+            return evaluate_tests_pass(receipt, story)[0]
         return _evaluate_test_proof(receipt)
     if check_id == "no_critical_findings":
         metrics = receipt.get("metrics", {})
@@ -4305,6 +6191,951 @@ def _evaluate_fallback_proof(
         # `_evaluate_check` (None without it) — safe to reuse directly.
         return _evaluate_check(check_id, receipt, verification_tier=verification_tier)
     return None
+
+
+# ─── the test-first prove path (#406, proposal 3.3, ADR-032 section 4) ───────
+
+
+def _fallback_normalize_cases(raw: Any) -> list[dict[str, Any]]:
+    """`spq_manifest.normalize_cases` for a tree without `spq_manifest`.
+
+    Must produce the SAME ids, positional fallback included. The first version
+    of this omitted the positional `AC-%d`, so every case authored in the
+    low-friction form `commit.md` documents (a bare string, or a dict with no
+    explicit id) normalized to an empty id, got skipped by
+    `story_authored_case_ids`, and silently reverted the unit to the pre-#406
+    rules. A degraded path that disables the check on exactly the shape the
+    docs encourage is worse than no degraded path.
+    """
+    out: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        positional = "AC-%d" % (index + 1)
+        if isinstance(entry, dict):
+            out.append({
+                "id": str(entry.get("id") or positional).strip(),
+                "statement": str(
+                    entry.get("statement") or entry.get("text") or ""
+                ).strip(),
+                "criterion_ref": str(entry.get("criterion_ref") or "").strip(),
+            })
+        else:
+            out.append({
+                "id": positional,
+                "statement": str(entry or "").strip(),
+                "criterion_ref": "",
+            })
+    return out
+
+
+try:
+    from spq_manifest import normalize_cases as _normalize_cases_impl
+except ImportError:  # pragma: no cover - partial install
+    _normalize_cases_impl = _fallback_normalize_cases
+
+
+def _normalize_authored_cases(raw: Any) -> list[dict[str, Any]]:
+    """The authored acceptance cases for a story, normalized.
+
+    Delegates to `spq_manifest.normalize_cases` so the manifest and the board
+    spell a case exactly one way. A second spelling here would be a second
+    place for a case id to be understood differently, and the id is what the
+    manifest/receipt match is performed on. Resolved once at import rather
+    than per call: this runs per receipt inside the gate's veto scan, its
+    detail loop and its fallback matcher, and a module-level binding also
+    makes the degraded path reachable from a test.
+    """
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return []
+    return _normalize_cases_impl(raw)
+
+
+def story_authored_case_ids(story: dict[str, Any]) -> list[str]:
+    """The case ids this story's Cycle authored at COMMIT, in order.
+
+    Empty for a story admitted with a declared (or implicit) criteria gap, and
+    empty for every Scrum / Kanban story: those lifecycles have no COMMIT
+    event to author against, and this pilot is SPQ-only (ADR-032 section 6).
+    Emptiness therefore means "the pre-#406 rules apply here", which is a
+    different statement from "the authored set is satisfied".
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for case in _normalize_authored_cases(story.get("acceptance_cases")):
+        cid = case.get("id") or ""
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+#: `_authored_source` values meaning "a seal governs this unit and no copy of
+#: it could be read". Spelled once because two consumers switch on it and a
+#: third would otherwise be added without them.
+SEAL_UNREADABLE_SOURCES = ("untrusted_manifest", "missing_manifest")
+
+
+def seal_authority_unreadable(story: dict[str, Any] | None) -> bool:
+    """Is this unit's seal governing but unreadable (tampered, or gone)?"""
+    return (story or {}).get("_authored_source") in SEAL_UNREADABLE_SOURCES
+
+
+def under_authored_regime(story: dict[str, Any] | None) -> bool:
+    """Do the #406 rules govern `tests_pass` for this story?
+
+    The board's own authored ids, OR a seal the gate could not read. The
+    second clause is #507's correction and the reason this predicate exists at
+    all: both consumers used to ask `story_authored_case_ids` directly, so the
+    BOARD decided whether the strict rules applied — and the board is the
+    agent-writable file the seal exists to distrust. Emptying
+    `acceptance_cases` therefore bought the pre-#406 rules back, on a Cycle
+    whose seal had just been tampered with or deleted, which made the refusal
+    conditional on the cooperation of the party it refuses.
+    """
+    return bool(story_authored_case_ids(story or {})) or seal_authority_unreadable(
+        story
+    )
+
+
+def authored_cases_target(story: dict[str, Any]) -> dict[str, Any]:
+    """The authored-case block a dispatch carries (#406).
+
+    This is how the producer receives the authored cases as its TARGET and the
+    prover receives them as the set to execute. Deliberately a per-dispatch
+    payload and not a line in the rendered Execution Envelope: #404 cut the
+    SE fixed instruction payload to 3,987 words against a 4,000-word enforced
+    ceiling, and spending the last thirteen on a stanza that repeats per-task
+    data would have bought a fragile budget for no new information.
+
+    `authored_at_commit` is the field a reader should branch on. When it is
+    false the block still says so and carries the recorded reason, so a
+    dispatch under the migration path announces that it is under the migration
+    path.
+    """
+    cases = _normalize_authored_cases(story.get("acceptance_cases"))
+    gap = story.get("criteria_gap_declared")
+    return {
+        "authored_at_commit": bool(cases),
+        "count": len(cases),
+        "cases": cases,
+        "criteria_gap_declared": dict(gap) if isinstance(gap, dict) and gap else None,
+    }
+
+
+#: Sentinel for "this Cycle's sealed manifest exists but cannot be trusted",
+#: distinct from None ("there is no manifest to consult"). The difference is
+#: load-bearing: no manifest means a Scrum / Kanban / pre-manifest story and
+#: the board is the only record there is, while an unverifiable manifest means
+#: the authored set is unestablishable and must resolve to a criteria gap.
+#: Falling back to the board in the second case would reward tampering with
+#: the very document that makes the authored set tamper-evident.
+_MANIFEST_UNTRUSTED = object()
+
+#: Sentinel for "this unit believes it is under a seal, and no copy of that
+#: seal can be read" (#507). A THIRD answer, deliberately: deleting the
+#: manifest and never having had one are different facts, and while they
+#: shared the `None` representation one `rm` reverted a sealed unit to the
+#: pre-#406 rules -- cheaper than the dishonesty #494 had just made expensive,
+#: and against the document that makes the authored set tamper-evident.
+#:
+#: It is not "the manifest file is absent". Absence is correct and common for
+#: Scrum, for Kanban and for every Cycle predating #406, so this fires only
+#: where a record OTHER than the missing file says a manifest was sealed for
+#: the Cycle this story is being graded against (`_seal_witness`).
+_MANIFEST_MISSING = object()
+
+#: How far ahead of now a `completed_at` may sit before the ordering check
+#: treats the clock as wrong. Fifteen minutes: wide enough for real host clock
+#: skew on a developer laptop or a CI runner, narrow enough that a receipt
+#: dated next year cannot satisfy "the proving followed the producing".
+_FUTURE_TOLERANCE_S = 900
+
+
+def _resolved_cycle_id(project_dir: str, state: dict[str, Any] | None) -> str:
+    """Which Cycle is this checkout grading against?
+
+    The state pointer FIRST and `spq_paths`' own cycle index second. The second
+    lookup is not redundancy for its own sake: `evaluate_story_dod` reaches the
+    manifest with `story_rec = None` whenever the state file cannot be read or
+    the unit has left the board, and resolving the identity from the index
+    means an unreadable board no longer silently reverts an authored unit to
+    the pre-#406 rules. The index is a different file with a different writer,
+    so one being lost does not take the other with it.
+    """
+    try:
+        import spq_paths
+    except ImportError:  # pragma: no cover - partial install
+        return ""
+    try:
+        if state is None:
+            state = _read_state(project_dir)
+        cycle_id = str((state or {}).get("_cycle_id") or "")
+    except Exception:  # noqa: BLE001 - an unreadable board is not the end of it
+        cycle_id = ""
+    if cycle_id:
+        return cycle_id
+    try:
+        rows = [
+            r for r in spq_paths.list_cycles(project_dir)
+            if isinstance(r, dict) and _index_row_cycle_id(r)
+        ]
+        return _index_row_cycle_id(max(rows, key=lambda r: int(r.get("seq") or 0)))
+    except Exception:  # noqa: BLE001 - no index, no Cycle, no verdict
+        return ""
+
+
+def _index_row_cycle_id(row: dict[str, Any]) -> str:
+    """`record_cycle` writes the key as `cycle_id`; `id` is accepted so a
+    future index shape does not silently disable the lookup, which is exactly
+    how the first version of it failed (it filtered on `id` alone and matched
+    nothing)."""
+    return str(row.get("cycle_id") or row.get("id") or "")
+
+
+def _seal_witness(
+    project_dir: str, cycle_id: str, state: dict[str, Any] | None
+) -> str:
+    """What, other than the missing file, says this Cycle sealed a manifest?
+
+    The whole of #507 is this question, because the fix cannot be "block when
+    the manifest is absent". Absence is the correct and common state for
+    Scrum, for Kanban and for every Cycle predating #406, and blocking on it
+    would brick all three. What distinguishes deletion from never-had-one is
+    whether some OTHER record still says a seal existed for the Cycle this
+    story is being graded against.
+
+    Returns a phrase for the operator, or `""` for "nothing here ever sealed a
+    manifest", which is the answer that leaves the unsealed lifecycles alone.
+
+    Ordered by how far the record sits from the gate's own subject, and the
+    ordering is the honest part of this function:
+
+      1. **git history for the committed transport.** The only rung an agent
+         cannot reach by writing files: dropping the path from `HEAD` takes a
+         commit, and that commit is itself the record. Everything below is on
+         the same filesystem as the agent, so each is one more deliberate act
+         rather than an impossibility -- see this function's caller docstring
+         for the residual that follows from that.
+      2. **another Cycle's readable seal.** This project demonstrably seals
+         manifests; the one for THIS Cycle is the copy that is gone.
+      3. **the committed cycle directory**, surviving without its manifest.
+      4. **the cycle index**, written by `record_cycle` -- a different file
+         with a different writer. Naming a DIFFERENT Cycle counts too: that is
+         the `_cycle_id` repoint, where the pointer selects a Cycle whose seal
+         this checkout has never held while the index still names the real one.
+      5. **the board's own path.** The SPQ board lives under
+         `spq/cycles/<cycle-id>/workstreams/<ws>/`, and `open_cycle` seals the
+         manifest before writing it, so a board under a Cycle's directory
+         records that this checkout hydrated that Cycle from a seal. An edit
+         to the file cannot change where the file is.
+      6. **the board's own hydration stamp** (`manifest_hash`,
+         `manifest_revision`) and #406's `test_first` block. A self-witness,
+         named as such: it lives in the same file as the story record, so it
+         raises the price of the forgery by one edit and proves nothing on its
+         own.
+    """
+    try:
+        import spq_manifest
+        import spq_paths
+    except ImportError:  # pragma: no cover - partial install
+        return ""
+
+    if spq_manifest.sealed_in_history(project_dir, cycle_id):
+        return (
+            "git history carries this Cycle's committed manifest at %s, so the "
+            "seal existed and this working tree no longer has it"
+            % spq_manifest.committed_relpath(project_dir, cycle_id)
+        )
+
+    try:
+        cycles_root = os.path.dirname(spq_paths.cycle_root(project_dir, cycle_id))
+        siblings = sorted(os.listdir(cycles_root))
+    except Exception:  # noqa: BLE001 - no store, no siblings
+        siblings = []
+    for other in siblings:
+        if other == cycle_id:
+            continue
+        try:
+            found, _origin = spq_manifest.read_sealed(
+                project_dir, other, allow_git=False
+            )
+        except Exception:  # noqa: BLE001 - an unreadable sibling witnesses nothing
+            continue
+        if found:
+            return (
+                "Cycle %s in this same store has a readable sealed manifest, so "
+                "this project seals them and %s's is the copy that is gone"
+                % (other, cycle_id)
+            )
+
+    try:
+        if os.path.isdir(spq_paths.committed_cycle_dir(project_dir, cycle_id)):
+            return (
+                "the committed transport directory %s survives without its "
+                "manifest.json"
+                % os.path.relpath(
+                    spq_paths.committed_cycle_dir(project_dir, cycle_id),
+                    str(project_dir),
+                )
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        rows = [
+            _index_row_cycle_id(r) for r in spq_paths.list_cycles(project_dir)
+            if isinstance(r, dict) and _index_row_cycle_id(r)
+        ]
+    except Exception:  # noqa: BLE001
+        rows = []
+    if cycle_id in rows:
+        return (
+            "this Cycle is recorded in the cycle index (%s), which `open_cycle` "
+            "writes alongside the seal"
+            % os.path.relpath(spq_paths.index_path(project_dir), str(project_dir))
+        )
+    if rows:
+        return (
+            "the cycle index names %s, not %s, so the identity this board is "
+            "pointed at is one whose seal this checkout has never held"
+            % (", ".join(rows), cycle_id)
+        )
+
+    # The board's own LOCATION, which an in-place edit cannot change. Under SPQ
+    # the board is `spq/cycles/<cycle-id>/execution-state.json`, and
+    # `open_cycle` seals the declaration before it writes that file, so a board
+    # sitting under a Cycle's directory is a record that this checkout hydrated
+    # that Cycle from a seal. Moving it is possible and changes which board the
+    # runtime reads at all, which is why this outranks the stamps INSIDE the
+    # file.
+    #
+    # ONE BOARD PER CYCLE. This rung used to scan
+    # `<cycle-root>/workstreams/<ws>/execution-state.json`, a directory
+    # `spq_paths` no longer produces -- so it always found nothing, and the
+    # ladder fell through to the self-witnessing stamps in rung 6. A rung that
+    # cannot answer is worse than an absent one: it reads as "no such record"
+    # when the record is right there under a different name.
+    try:
+        board = spq_paths.execution_state_path(project_dir, cycle_id)
+    except Exception:  # noqa: BLE001 - a malformed identity has no board path
+        board = ""
+    if board and os.path.exists(board):
+        return (
+            "this checkout has a hydrated board for Cycle %s at %s, and "
+            "`open_cycle` seals the declaration before it writes that file"
+            % (cycle_id, os.path.relpath(board, str(project_dir)))
+        )
+
+    stamped = state if isinstance(state, dict) else {}
+    if stamped.get("manifest_hash"):
+        return (
+            "this board records being hydrated from manifest %s, and no copy "
+            "of that document can be read" % stamped.get("manifest_hash")
+        )
+    test_first = stamped.get("test_first")
+    if isinstance(test_first, dict) and test_first.get("cycle_id"):
+        return (
+            "this board's `test_first` block records %d unit(s) admitted under "
+            "Cycle %s's seal"
+            % (
+                int(test_first.get("units_admitted") or 0),
+                test_first.get("cycle_id"),
+            )
+        )
+    return ""
+
+
+def _recorded_revision(project_dir: str, cycle_id: str) -> tuple[str, str]:
+    """`(manifest_hash, problem)` from the control plane, or `("", "")`.
+
+    Wrapped so the gate has ONE place that decides what an unavailable
+    authority means, and so a tree without the emitter reads as unconfigured
+    rather than as unreachable: a partial install is not a connected project
+    whose record is missing.
+    """
+    try:
+        import manifest_emitter
+    except ImportError:  # pragma: no cover - partial host install
+        return "", ""
+    reader = getattr(manifest_emitter, "read_cycle_authority", None)
+    if reader is None:  # pragma: no cover - older composed runtime
+        return "", ""
+    try:
+        recorded, problem = reader(project_dir, cycle_id)
+    except Exception as exc:  # noqa: BLE001 - an unreadable authority is a problem
+        return "", "the recorded revision could not be read (%s)" % exc
+    return str(recorded or ""), str(problem or "")
+
+
+def resolve_authored_cases(
+    project_dir: str, story_id: str, state: dict[str, Any] | None = None
+) -> tuple[Any, str, str]:
+    """`(cases, seal_origin, witness)` for `story_id` (#406, #507).
+
+    `cases` is the case records, `None` when there is no seal to consult,
+    `_MANIFEST_UNTRUSTED` when a copy exists and does not match its own hash,
+    or `_MANIFEST_MISSING` when no copy can be read and something else still
+    says one was sealed. `seal_origin` names which copy answered
+    (`spq_manifest.SEAL_*`); `witness` is `_seal_witness`'s phrase, non-empty
+    only on the `_MANIFEST_MISSING` path.
+
+    Why the gate reads the seal at all, and it is the answer to a forgery it
+    could not otherwise refuse. The DoD gate reads the STORY record, because
+    `next_action` has to stay a pure function of state and the board is what it
+    can see. But the board is agent-writable, so an agent can drop a case it
+    cannot pass, report the remainder green, and clear the gate. Comparing the
+    receipt against the board would have made the authored set exactly as
+    forgeable as the receipt it is meant to check.
+
+    So the gate consults the hash-sealed manifest and the board is only a cache
+    of it. #507 is what was left: the seal is written to TWO places and this
+    function read ONE, so `rm` of the local copy resolved to "no manifest to
+    consult" -- the same answer a Scrum project gives -- while an identical
+    committed copy sat on disk beside it. That made deleting the seal cheaper
+    than honouring it and cheaper than the omission #494 had just priced.
+
+    Both halves of the fix are here:
+
+    - **Recovery.** `spq_manifest.read_sealed` consults every copy of the seal
+      (local, committed, `HEAD`), so removing one is not cheaper, it is
+      ineffective. This is the better half: no block is needed, because the
+      authored set still binds.
+    - **Detection.** When no copy reads and `_seal_witness` still names one,
+      the answer is `_MANIFEST_MISSING`, which the verdict turns into a
+      criteria gap. Unknowable, not satisfied -- and a gap blocks the done
+      edge, so a complete deletion costs at least what declaring the gap does.
+
+    **What this does NOT close, stated plainly.** `manifest_hash` is an
+    UNKEYED checksum: it proves a document is internally consistent, not that
+    this system authored it. An agent that writes a whole replacement manifest
+    -- units, cases, recomputed hash -- is not refused by anything here, and no
+    rung above can refuse it, because every local record is on the filesystem
+    the agent writes to. The only record of a seal genuinely beyond its reach
+    is the control plane's `cycle_manifests` row (shipped by
+    `manifest_emitter` at `open_cycle`) plus git history for a project that
+    tracks `.synaptory/cycles/`, and the gate consults the second but not the
+    first: an offline project must still be able to evaluate its own DoD. So
+    what changed is the PRICE -- one `rm` bought a downgrade, and now a
+    downgrade takes authoring a counterfeit document -- not the guarantee.
+    Signing the seal is what would close it, and it is a separate ticket.
+    """
+    try:
+        import spq_manifest
+    except ImportError:  # pragma: no cover - partial install
+        return None, "", ""
+    cycle_id = _resolved_cycle_id(project_dir, state)
+    if not cycle_id:
+        return None, "", ""
+    # THE REVISION THE BOARD IS EXECUTING, handed to the reader so its git rung
+    # can tell "the current seal, recovered" from "an older one, found" (#396).
+    # `open_cycle` and `revise_manifest` both stamp it, and it is the only
+    # local record of which revision is in force once both working-tree copies
+    # are gone.
+    # `sealed_manifest_hash` is the revision IN FORCE; `manifest_hash` is the
+    # one this board was projected from, and the two differ exactly between a
+    # revision and the reprojection that follows it. The fallback keeps a board
+    # written before this field existed working, where the two are the same.
+    expect_hash = ""
+    if isinstance(state, dict):
+        expect_hash = str(
+            state.get("sealed_manifest_hash") or state.get("manifest_hash") or ""
+        )
+    # A CONNECTED PROJECT ASKS THE CONTROL PLANE INSTEAD (#507). The board is a
+    # file the graded principal writes, so on its own it raises the price of a
+    # downgrade without closing it: rewrite `sealed_manifest_hash` to a
+    # superseded revision, restore that revision, and every rung agrees again.
+    # `cycle_manifests` is append-only and written by a different process, so
+    # for a project configured for a control plane it is the authority the
+    # working tree cannot be. An offline project keeps the local marker and its
+    # declared limit, which §3.3 requires: local delivery state is canonical
+    # and an offline project must still evaluate its own DoD.
+    recorded, authority_problem = _recorded_revision(project_dir, cycle_id)
+    if authority_problem:
+        # Connected, and the record could not be read. FAIL CLOSED: a connected
+        # project whose authority is unreachable has less evidence than an
+        # offline one, not more, and answering from the local marker here would
+        # hand it the offline guarantee without saying so.
+        return _MANIFEST_MISSING, "", (
+            "this project reports to a control plane, and the revision it "
+            "records for Cycle %s could not be read, so which revision is in "
+            "force cannot be established here: %s" % (cycle_id, authority_problem)
+        )
+    if recorded:
+        expect_hash = recorded
+    try:
+        manifest, origin = spq_manifest.read_sealed(
+            project_dir, cycle_id, expect_hash=expect_hash
+        )
+    except Exception:  # noqa: BLE001 - a broken read is not a verdict
+        manifest, origin = None, ""
+    if not isinstance(manifest, dict) or not manifest:
+        witness = ""
+        try:
+            witness = _seal_witness(project_dir, cycle_id, state)
+        except Exception:  # noqa: BLE001 - a witness that cannot be read is none
+            witness = ""
+        if origin == getattr(spq_manifest, "SEAL_STALE", "stale"):
+            # A copy exists, and it is not this revision. Blocking, like a
+            # missing seal, and for the same reason: what the gate would
+            # otherwise consume is not the authored set in force. The witness
+            # names the revision the board expects so the remedy is obvious
+            # (commit or restore the current one), rather than reading as a
+            # deletion.
+            return _MANIFEST_MISSING, "", (
+                witness
+                or "every readable copy of this Cycle's seal is an earlier "
+                "revision than the one this board is executing (%s), so the "
+                "current revision was never committed and its working-tree "
+                "copies are gone" % expect_hash
+            )
+        if witness:
+            return _MANIFEST_MISSING, "", witness
+        return None, "", ""
+    try:
+        # `verify_sealed` and `sealed_units`, not `verify_hash` and
+        # `work_units`. `open_cycle` writes a `cycle_records` declaration keyed
+        # on `declaration_hash` with its units under `admitted_units`, and the
+        # retired spellings did not fail loudly against it: the hash read as
+        # ABSENT, so every Cycle the replacement state machine opens graded as
+        # `untrusted_manifest` and no Work Unit could ever reach done.
+        if not spq_manifest.verify_sealed(manifest):
+            return _MANIFEST_UNTRUSTED, origin, ""
+        for unit in spq_manifest.sealed_units(manifest):
+            if isinstance(unit, dict) and str(unit.get("id") or "") == str(story_id):
+                # Key ABSENCE survives the round trip: a unit sealed before
+                # #406 carries no `acceptance_cases`, and reporting `[]` for it
+                # would be this module inventing a position the document does
+                # not hold. `None` sends it down the board path, where
+                # `open_cycle` already recorded the migration gap.
+                if "acceptance_cases" not in unit:
+                    return None, origin, ""
+                return (
+                    spq_manifest.normalize_cases(unit.get("acceptance_cases")),
+                    origin,
+                    "",
+                )
+        return None, origin, ""  # not a unit of the current Cycle
+    except Exception:  # noqa: BLE001 - a broken manifest is not a verdict
+        return None, origin, ""
+
+
+def manifest_authored_cases(
+    project_dir: str, story_id: str, state: dict[str, Any] | None = None
+) -> Any:
+    """The authored cases for `story_id` from the SEALED Cycle manifest (#406).
+
+    The `cases` half of `resolve_authored_cases`, kept as the name every
+    caller and test already uses. Read that function's docstring for what each
+    return value means and for the residual none of them closes.
+    """
+    return resolve_authored_cases(project_dir, story_id, state)[0]
+
+
+def _authoritative_story(
+    project_dir: str, story: dict[str, Any] | None, state: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """`story` with its authored set replaced by the sealed manifest's (#406).
+
+    Adds read-only markers the gate surfaces on the `test_first` stanza:
+    `_authored_source` (`manifest` / `board` / `untrusted_manifest` /
+    `missing_manifest`), `_authored_seal_origin` naming WHICH copy of the seal
+    answered (#507), `_authored_seal_witness` carrying what said a seal
+    existed when none could be read, and `_authored_disagreement` when the
+    board and the manifest name different sets. A disagreement is reported
+    rather than silently corrected, because the board only diverges from a
+    hash-sealed document by being edited, and that is worth seeing.
+    """
+    story = dict(story or {})
+    cases, origin, witness = resolve_authored_cases(
+        project_dir, str(story.get("id") or ""), state
+    )
+    if cases is _MANIFEST_UNTRUSTED:
+        # Refuse rather than fall back. `story_authored_case_ids` still reports
+        # the board's ids so the gate can say WHICH set it could not trust,
+        # and the marker turns tests_pass into a gap below.
+        story["_authored_source"] = "untrusted_manifest"
+        story["_authored_seal_origin"] = origin
+        return story
+    if cases is _MANIFEST_MISSING:
+        # #507 — no copy of the seal reads, and `witness` names what still
+        # says one was sealed. Distinct from `untrusted_manifest` because the
+        # operator action differs (restore a deleted document vs. explain a
+        # document that no longer matches its hash) and because a deletion and
+        # a tamper must not share a representation.
+        story["_authored_source"] = "missing_manifest"
+        story["_authored_seal_witness"] = witness
+        return story
+    if cases is None:
+        story["_authored_source"] = "board"
+        if origin:
+            # A seal WAS read; it just holds no position for this unit (a
+            # pre-#406 record, or a unit this Cycle does not admit).
+            story["_authored_seal_origin"] = origin
+        return story
+    board_ids = story_authored_case_ids(story)
+    sealed_ids = [c["id"] for c in cases if c.get("id")]
+    story["acceptance_cases"] = cases
+    story["_authored_source"] = "manifest"
+    story["_authored_seal_origin"] = origin
+    if board_ids != sealed_ids:
+        story["_authored_disagreement"] = {
+            "board": board_ids,
+            "manifest": sealed_ids,
+        }
+    return story
+
+
+def _producing_stage_entered_at(story: dict[str, Any]) -> str | None:
+    """When this story most recently entered the PRODUCING stage.
+
+    `in_progress` is the SE stage in the shared SE->QE->CR pipeline, so its
+    latest `entered_at` is the moment the current candidate started being
+    produced. Read through `_stage_entered_at` rather than a second scan of
+    `pipeline_log`, because next_action, `evaluate_dispatch` and the advance
+    kernel already share that one clock and a second one would drift
+    (`receipt_timestamp_is_fresh`'s docstring says why: mtime is not it).
+    """
+    return _stage_entered_at(story, "in_progress")
+
+
+def authored_execution_after_producer(
+    story: dict[str, Any], receipt: dict[str, Any]
+) -> bool | None:
+    """Did this receipt's work happen AFTER the producing stage's latest entry?
+
+    True  — the verifying work is contemporaneous with or later than the
+            current candidate, so its per-case outcomes are about the code
+            that exists now.
+    False — the receipt PRE-DATES the producing stage's latest entry. That is
+            a definitive negative, not a gap: the evidence exists and it is
+            about a candidate that has since been rebuilt. This is the same
+            staleness `_fresh_receipt` refuses at dispatch time, applied at
+            the gate, because a story can be advanced by a host that never
+            consulted next_action.
+    None  — the ordering cannot be established (no producing-stage entry, no
+            parseable `completed_at`, or a `completed_at` implausibly far in
+            the FUTURE). Unknowable, so it resolves to a criteria gap rather
+            than to either verdict.
+
+    The future bound is not decoration. `completed_at` is a field in an
+    agent-written file and this ordering is the one structural guarantee #406
+    claims over #187, so `"completed_at": "2099-01-01T00:00:00Z"` would
+    otherwise satisfy it unconditionally, from any receipt, forever. A
+    future-dated receipt makes the ordering unestablishable rather than
+    disproven, hence a gap: the clock is wrong, which is not the same claim as
+    the work being stale. `_FUTURE_TOLERANCE_S` is deliberately generous
+    against real clock skew, because the cost of a false gap is a blocked
+    story and the cost of no bound at all is a bypass.
+
+    A naive `completed_at` is read as UTC, exactly as the advance kernel reads
+    it (`_parse_iso_timestamp`). The receipt protocol requires UTC; an agent
+    writing local naive time east of Greenwich will read as EARLIER than
+    reality and can therefore be scored stale. That is a real sharp edge and
+    it is the receipt contract's to fix, not this function's: guessing a zone
+    here would mean two clocks again.
+
+    Note what this does NOT claim. It fixes the ORDER of two events on one
+    story's own clock. It does not bind the execution to a content digest of
+    the candidate, because no per-story candidate digest exists in the kernel
+    today -- `selected_sha` is coordination-level (`coordination_barrier.py`)
+    and names a whole child Cycle's increment. A producer that edits the tree
+    after writing its receipt, without re-entering `in_progress`, is not
+    caught here. Naming that gap is more useful than a check that implies a
+    guarantee the state cannot support.
+    """
+    entered = _parse_iso_timestamp(_producing_stage_entered_at(story))
+    if entered is None:
+        return None
+    completed = _parse_iso_timestamp(receipt.get("completed_at"))
+    if completed is None:
+        return None
+    if (completed - datetime.now(timezone.utc)).total_seconds() > _FUTURE_TOLERANCE_S:
+        return None  # the clock is wrong; the ordering is unestablishable
+    return receipt_timestamp_is_fresh(completed, entered)
+
+
+def _case_result_is_settled(result: Any) -> bool:
+    """Is one per-case result an honest `passed` or `not-applicable`?
+
+    `not-applicable` requires a non-empty `reason`. Without one it is the
+    cheapest possible forgery on this whole path: a prover that cannot pass a
+    case writes `{"status": "not-applicable"}` for it, or for all of them, and
+    clears the gate having proven nothing. Demanding a sentence does not make
+    the claim true, but it makes it a claim someone wrote and a reviewer can
+    read, which is the same standard `unit_case_problems` holds an authored
+    case's `statement` to. The QE contract already asks for the reason; this
+    is the line that enforces it.
+    """
+    if not isinstance(result, dict):
+        return False
+    status = result.get("status")
+    if status == "passed":
+        return True
+    if status != "not-applicable":
+        return False
+    return bool(str(result.get("reason") or "").strip())
+
+
+def authored_case_negative(story: dict[str, Any], receipt: dict[str, Any]) -> bool:
+    """Does THIS receipt carry a negative no other receipt may override?
+
+    The cross-receipt veto, and it is deliberately narrower than
+    `authored_cases_verdict`. Under the authored regime the veto fires only on
+    an EXPLICIT non-passing status for a case the receipt actually reports. A
+    receipt reporting a SUBSET is silent about the rest, and silence is not a
+    negative.
+
+    That distinction is the #445 blocking direction, which matters as much as
+    the clearing one. `authored_cases_verdict`'s dropped-case rule is correct
+    for the receipt CLAIMING to satisfy the check, and wrong as a veto: a
+    code-reviewer receipt that happened to note the two cases it looked at
+    would otherwise turn a `tests_pass` another receipt legitimately satisfied
+    into a definitive FAIL, handing any receipt writer a way to stall another
+    workstream's story. "It only ever makes things stricter" is not an
+    argument for trusting untrusted input.
+
+    With no authored set this is exactly the #187 predicate, unchanged.
+    """
+    metrics = receipt.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    if not story_authored_case_ids(story or {}):
+        return _authored_cases_pass(metrics) is False
+    atc = metrics.get("authored_test_cases")
+    if not isinstance(atc, dict):
+        return False
+    results = atc.get("results")
+    if not isinstance(results, dict):
+        return False
+    return any(
+        isinstance(r, dict)
+        and r.get("status") is not None
+        and not _case_result_is_settled(r)
+        for r in results.values()
+    )
+
+
+def authored_cases_verdict(
+    story: dict[str, Any], receipt: dict[str, Any]
+) -> tuple[bool | None, str | None]:
+    """The authored-case verdict for one receipt: `(verdict, detail)`.
+
+    This is the PRIMARY evaluation of `tests_pass` (#406, promoting the #187
+    fallback veto). Where an authored set exists it is the authority, and the
+    runner's exit code becomes a second requirement rather than the first:
+
+    - a case reported `failed` / `blocked` / unknown          -> False
+    - an authored case MISSING from the receipt's results     -> False
+    - a receipt claiming coverage with no per-case results    -> False
+    - execution that pre-dates the producing stage's entry    -> False
+    - no `metrics.authored_test_cases` object at all          -> None (gap)
+    - ordering unestablishable                                -> None (gap)
+
+    The missing-case rule is the one the #187 veto could not express. That
+    veto compared the receipt against ITSELF (`total` vs `len(results)`), so a
+    receipt declaring `total: 2` with two passing results satisfied it even
+    when the Cycle had authored five cases. Comparing against the sealed
+    manifest's ids instead is what makes dropping a case you cannot pass a
+    refusal rather than an omission nobody can see.
+
+    With no authored set (declared gap, implicit gap, or a Scrum / Kanban
+    story) this falls back to `_authored_cases_pass` unchanged, so the pre-#406
+    receipt-internal veto keeps working exactly as it did.
+    """
+    metrics = receipt.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    story = story or {}
+    if story.get("_authored_source") == "untrusted_manifest":
+        # The Cycle's sealed manifest does not match its own hash, so what was
+        # authored at COMMIT cannot be established. That is unknowable, not
+        # disproven: a gap, which still blocks the done edge.
+        return None, (
+            "tests_pass is unverified: this Cycle's sealed manifest does not "
+            "match its own hash, so the acceptance cases authored at COMMIT "
+            "cannot be established. The board's own copy is not authority for "
+            "this: it is agent-writable, which is why the seal exists. Restore "
+            "the manifest, or supersede it with `revise_manifest --reason`."
+        )
+    if story.get("_authored_source") == "missing_manifest":
+        # #507 — no copy of this Cycle's seal can be read, and something other
+        # than the missing file says one was sealed. Deleting the document is
+        # therefore not the same fact as never having had one, and it resolves
+        # the same way tampering does: unknowable, which is a gap, which blocks.
+        #
+        # Note what this branch is checked BEFORE: `story_authored_case_ids`.
+        # A deletion is usually accompanied by an empty board set (the two
+        # edits cost one action together), and keying on the board's ids would
+        # have made the second edit sufficient to escape the first refusal.
+        return None, (
+            "tests_pass is unverified: no copy of this Cycle's sealed manifest "
+            "can be read -- not the local store, not the committed transport "
+            "under `.synaptory/cycles/`, not HEAD -- while %s. A seal that is "
+            "MISSING is not a Cycle that never had one, so the acceptance cases "
+            "authored at COMMIT cannot be established. Restore it (`git "
+            "checkout -- .synaptory/cycles/`, or re-pull the Cycle branch), or "
+            "supersede the authored set with `revise_manifest --reason`."
+            % (story.get("_authored_seal_witness") or "another record names it")
+        )
+    authored = story_authored_case_ids(story)
+    if not authored:
+        return _authored_cases_pass(metrics), None
+
+    atc = metrics.get("authored_test_cases")
+    if not isinstance(atc, dict):
+        return None, (
+            "tests_pass is unverified: this Cycle authored %d acceptance case%s "
+            "at COMMIT (%s) and the receipt carries no "
+            "`metrics.authored_test_cases` object, so no per-case outcome was "
+            "recorded. A suite exit code is not evidence the authored cases "
+            "ran." % (
+                len(authored),
+                "" if len(authored) == 1 else "s",
+                ", ".join(authored),
+            )
+        )
+    results = atc.get("results")
+    if not isinstance(results, dict) or not results:
+        return False, (
+            "tests_pass failed: the receipt claims authored-case coverage but "
+            "records no per-case results for the %d case%s authored at COMMIT."
+            % (len(authored), "" if len(authored) == 1 else "s")
+        )
+
+    missing = [cid for cid in authored if cid not in results]
+    if missing:
+        return False, (
+            "tests_pass failed: authored case%s %s %s no recorded outcome. The "
+            "authored set is fixed in the sealed Cycle manifest, so a case the "
+            "verifying receipt does not report is a DROPPED case, not an "
+            "absent one." % (
+                "" if len(missing) == 1 else "s",
+                ", ".join(missing),
+                "has" if len(missing) == 1 else "have",
+            )
+        )
+
+    # EVERY reported case, not only the authored ids. Iterating `authored`
+    # alone would have made the authored path LOOSER than the #187 veto it
+    # replaces: that veto read `all(results.values())`, so a case QE added
+    # itself and reported `failed` used to fail the gate, and would silently
+    # stop doing so under a key the manifest does not name.
+    bad = [
+        cid for cid in sorted(set(authored) | set(results))
+        if not _case_result_is_settled(results.get(cid))
+    ]
+    if bad:
+        return False, (
+            "tests_pass failed: case%s %s did not end `passed`, or ended "
+            "`not-applicable` with no `reason`. A green runner exit code "
+            "cannot clear this. Cases outside the authored set count too: a "
+            "case the prover added and could not pass is still a failure."
+            % ("" if len(bad) == 1 else "s", ", ".join(bad))
+        )
+
+    ordered = authored_execution_after_producer(story or {}, receipt)
+    if ordered is False:
+        return False, (
+            "tests_pass failed: the verifying receipt's `completed_at` (%s) "
+            "pre-dates this story's latest entry into the producing stage "
+            "(%s), so the authored cases were executed against a candidate "
+            "that has since been rebuilt. SP-WRK-007 wants the authored "
+            "criteria proven on the candidate under review." % (
+                receipt.get("completed_at") or "absent",
+                _producing_stage_entered_at(story or {}) or "absent",
+            )
+        )
+    if ordered is None:
+        return None, (
+            "tests_pass is unverified: the authored cases passed, but the "
+            "execution cannot be ordered against the producing stage. Needs "
+            "the story's `in_progress` entry timestamp and the receipt's "
+            "`completed_at`; one of the two is absent or unparseable, so "
+            "whether proving followed producing is unknown."
+        )
+    return True, None
+
+
+def _runner_test_verdict(receipt: dict[str, Any]) -> bool | None:
+    """The pre-#406 `tests_pass` runner verdict, unchanged.
+
+    False when the receipt records no `verification_commands` at all, None
+    when none of them is an executed proof object (#106: a plain string is a
+    replay instruction, not evidence), else whether every executed command
+    exited 0.
+    """
+    cmds = receipt.get("verification_commands", [])
+    if not cmds:
+        return False
+    executed = [c for c in cmds if isinstance(c, dict) and "exit_code" in c]
+    if not executed:
+        return None
+    return all(c.get("exit_code") == 0 for c in executed)
+
+
+def evaluate_tests_pass(
+    receipt: dict[str, Any], story: dict[str, Any] | None = None
+) -> tuple[bool | None, str | None]:
+    """The `tests_pass` verdict, authored cases FIRST (#406).
+
+    Order of authority WHERE CASES WERE AUTHORED, and the ticket is entirely
+    about this order:
+
+    1. A definitive authored-case negative wins outright. A failed, blocked or
+       DROPPED case fails the check whatever the runner reported, and whether
+       or not the runner reported anything at all.
+    2. An absent per-case record is a criteria gap. A green exit code does not
+       get promoted into a pass just because the receipt carried one: the
+       check is "the authored cases pass", and a receipt silent about them has
+       not answered it.
+    3. Then, and only then, the runner verdict still has to be green. Both are
+       required; neither substitutes for the other.
+
+    With NO authored set the pre-#406 behaviour is exact, down to the position
+    of the veto. That precision is not fussiness: the veto used to be reachable
+    only when the runner verdict was already True, so a receipt with a failed
+    authored case and no executed proof object resolved to None (a gap) rather
+    than False. Applying the veto unconditionally here would have tightened
+    every legacy SPQ unit, every Scrum story and every Kanban story as a side
+    effect of a pilot scoped to SPQ (ADR-032 section 6), which is exactly the
+    kind of quiet blast radius the epic's forgeability rule is aimed at. An
+    exhaustive 56-shape comparison against `origin/dev` found this one
+    divergence and it is the reason for the branch below.
+
+    **#507, and it is a correction to the above.** The "no authored set means
+    the pre-#406 path" rule was keyed on `story_authored_case_ids`, which reads
+    the BOARD. That is fine for a story with no seal and wrong for a story
+    whose seal cannot be read, because the board is the agent-writable file the
+    seal exists to distrust. Measured consequence on `origin/dev`: tamper with
+    the manifest AND empty the board's `acceptance_cases`, and
+    `authored_cases_verdict` correctly answers "this Cycle's sealed manifest
+    does not match its own hash" while this function DISCARDED that answer and
+    returned the runner's green exit code. So the tamper refusal #406 shipped,
+    and #505 pinned, was escapable by a second edit to the same file the first
+    forgery already required. The seal-derived sentinels are therefore resolved
+    FIRST, before anything consults the board.
+    """
+    story = story or {}
+    verdict, detail = authored_cases_verdict(story, receipt)
+    runner = _runner_test_verdict(receipt)
+    if story.get("_authored_source") in ("untrusted_manifest", "missing_manifest"):
+        # Unknowable, whatever the board says and whatever the runner says. The
+        # board cannot vote on whether its own authority is readable.
+        return None, detail
+    if story_authored_case_ids(story):
+        if verdict is False:
+            return False, detail
+        if verdict is None:
+            return None, detail
+        if runner is not True:
+            return runner, None
+        return True, None
+    # Pre-#406 path: the runner verdict, with the receipt-internal veto folded
+    # in exactly where `_evaluate_check` folded it in before — under `if ok`,
+    # so a definitive negative on a receipt carrying no executed proof stays
+    # the gap it has always been.
+    if runner is True and verdict is False:
+        return False, None
+    return runner, None
 
 
 def _authored_cases_pass(metrics: dict[str, Any]) -> bool | None:
@@ -4336,10 +7167,70 @@ def _authored_cases_pass(metrics: dict[str, Any]) -> bool | None:
     )
 
 
+def _recorded_count(value: Any) -> int | None:
+    """A count a receipt actually RECORDED, or None when it recorded no count.
+
+    #540's rule for `coverage_delta`, reused for the two counts on
+    `metrics.ui_verification`: a value that cannot be read as a number is not
+    a measurement, and neither is a bool. `flows_failed: true` is an `int` in
+    Python and would compare `== 0` as "one flow failed" or, worse,
+    `routes_tested: true` would satisfy `>= 1`, crediting a claim as a count.
+    Returning None keeps the caller's absence branch and its gap.
+
+    It also removes a crash: `int("n/a")` raises, and this ticket makes
+    `routes_tested` load-bearing at the `full` tier where it was previously
+    ignored, so an unparseable value that used to be inert would otherwise
+    take the DoD gate down instead of gapping it.
+
+    TOTAL OVER ARBITRARY JSON, which the first cut was not (#396). It caught
+    `ValueError` around `int(float(...))` and nothing else, so `"Infinity"`
+    parsed to a non-finite float and `int()` raised `OverflowError`: a valid
+    JSON string in a receipt whose `metrics` the validator accepts took
+    `evaluate_story_dod` down for every host rather than gapping. A parser
+    whose whole job is to make an untrusted value safe has to be the one place
+    that cannot raise.
+
+    NON-INTEGRAL IS NOT A COUNT EITHER. `"1.5"` truncated to 1 and satisfied
+    `routes_tested >= 1`, so a value the published shape calls an `int` was
+    credited by rounding it into one. A count that was not recorded as a whole
+    number was not recorded.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return _whole(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except (TypeError, ValueError):
+            return None
+        return _whole(parsed)
+    return None
+
+
+def _whole(value: float) -> int | None:
+    """`value` as an int when it is a finite whole number, else None.
+
+    `math.isfinite` before `is_integer` because `float("nan").is_integer()` is
+    False but `float("inf").is_integer()` is False too on some builds and True
+    on none of them worth relying on; and `int()` on either raises. One guard,
+    stated once, so the two callers cannot drift.
+    """
+    if not math.isfinite(value) or not float(value).is_integer():
+        return None
+    try:
+        return int(value)
+    except (OverflowError, ValueError):  # pragma: no cover - guarded above
+        return None
+
+
 def _evaluate_check(
     check_id: str,
     receipt: dict[str, Any],
     verification_tier: str = "full",
+    story: dict[str, Any] | None = None,
 ) -> bool | None:
     """Evaluate a single DoD check against a receipt.
 
@@ -4351,29 +7242,50 @@ def _evaluate_check(
 
     `verification_tier` (#134 GAP-3) relaxes `ui_acceptance` at the
     `standard` tier to a render assertion; every other check ignores it.
+
+    `story` (#406) is the story's state record, carrying the acceptance cases
+    authored at COMMIT. `tests_pass` is evaluated against them FIRST when they
+    exist (`evaluate_tests_pass`); absent, the pre-#406 behaviour is exact.
+    Optional so the many callers that evaluate a receipt out of board context
+    keep working unchanged.
     """
-    if check_id in ("tests_pass", "build_succeeds"):
+    if check_id == "tests_pass":
+        # #406 — authored cases are the primary evaluation, not a veto layered
+        # over a runner verdict. `evaluate_tests_pass` owns the whole order.
+        return evaluate_tests_pass(receipt, story)[0]
+
+    if check_id == "build_succeeds":
         cmds = receipt.get("verification_commands", [])
         if not cmds:
             return False
         executed = [c for c in cmds if isinstance(c, dict) and "exit_code" in c]
         if not executed:
             return None
-        ok = all(c.get("exit_code") == 0 for c in executed)
-        if check_id == "tests_pass" and ok:
-            # Authored test-case evidence (quality.test_cases): when the QE
-            # receipt carries metrics.authored_test_cases, a failed/blocked
-            # or dropped authored case fails the gate exactly like a failing
-            # AC test — green runner exit codes alone cannot clear it.
-            authored = _authored_cases_pass(receipt.get("metrics", {}))
-            if authored is False:
-                return False
-        return ok
+        return all(c.get("exit_code") == 0 for c in executed)
 
     elif check_id == "no_critical_findings":
+        # #487 — an ABSENT count is not a clean audit. This branch used to
+        # read `metrics.get("findings_critical", 0)`, so a nominal-role
+        # receipt that recorded no count at all scored a pass: two member-
+        # written strings (`role: compliance-engineer`) satisfying a security
+        # gate with no security finding in them. `_MISSING_EVIDENCE_SHAPE`
+        # already said the opposite in the text it hands the retry prompt
+        # ("a security verdict cannot be inferred from its absence"), and the
+        # strict cross-role matcher in `_evaluate_fallback_proof` has always
+        # returned None here. The lenient default was the odd one out, and
+        # the ticket that turns this into a DECLARED check cannot leave a
+        # branch that reads an absent result as a pass (#403's rule: an
+        # unbacked claim is unbacked; #445's: a member-supplied result is
+        # self-reported, never computed).
+        #
+        # None, not False: nothing was evaluated. `_classify_dod_checks`
+        # stamps `criteria_gap_declared` and `dod_gate_block_reason` refuses
+        # the done edge, so the story blocks with the missing-evidence text
+        # instead of completing silently.
         metrics = receipt.get("metrics", {})
-        critical = metrics.get("findings_critical", 0)
-        return critical == 0
+        if "findings_critical" not in metrics:
+            return None
+        return metrics.get("findings_critical") == 0
 
     elif check_id == "runtime_verified":
         # #30 — fail-closed like tests_pass: a string note ("deployed and
@@ -4395,20 +7307,69 @@ def _evaluate_check(
         # Preferred contract: an explicit structured proof object written by
         # QE browser-qa — {rendered: true, routes_tested: N, flows_failed: 0}.
         if isinstance(uv, dict):
-            rendered = bool(uv.get("rendered"))
-            flows_failed = int(uv.get("flows_failed", 0) or 0)
             if verification_tier == "standard":
                 # #134 GAP-3 — render assertion: the screen was served and at
                 # least one route exercised; full browser-qa flows are not
                 # demanded at this tier (but a recorded failed flow still fails).
-                routes = int(uv.get("routes_tested", 0) or 0)
-                return rendered and routes >= 1 and flows_failed == 0
-            return rendered and flows_failed == 0
+                # The absent flow count is WAIVED here, by the tier, in writing.
+                # That is what makes it different from the absences below: an
+                # absence a tier declares it does not need is not an absence
+                # the check is crediting to itself. A flow count that IS
+                # recorded and cannot be read is neither, so it gaps.
+                if "routes_tested" not in uv:
+                    # UNRECORDED IS A GAP, NOT A FAILURE (#396). This returned
+                    # False, which asserts that a measurement was taken and
+                    # came back bad. The same absence gaps at the `full` tier,
+                    # and the contract text says an absent count is
+                    # UNEVALUABLE, so the two tiers disagreed about the same
+                    # missing evidence and the standard one named the wrong
+                    # cause. Both outcomes block; only one sends the operator
+                    # to the stage that owes the count. A recorded
+                    # `routes_tested: 0` is the real False, below.
+                    return None
+                routes = _recorded_count(uv.get("routes_tested"))
+                flows_failed = (
+                    _recorded_count(uv.get("flows_failed"))
+                    if "flows_failed" in uv
+                    else 0  # waived by this tier, in writing
+                )
+                if routes is None or flows_failed is None:
+                    return None  # recorded and unreadable is not a measurement
+                return bool(uv.get("rendered")) and routes >= 1 and flows_failed == 0
+            # #540's census, applied to the tier that demands the MOST. The
+            # `full` tier read `rendered and flows_failed == 0` with
+            # `flows_failed` defaulting to 0, which is the same
+            # `.get(key, 0)` shape #487 removed from `findings_critical`: a
+            # receipt that recorded no flow outcomes was credited with zero
+            # failed flows. It ignored `routes_tested` outright, so
+            # `{"rendered": true}` alone scored the gate whose own
+            # `_MISSING_EVIDENCE_SHAPE` text demands
+            # {rendered, routes_tested, flows_failed}. Two consequences, both
+            # live on `dev` before this: the check disagreed with its own
+            # documented shape, and `full` was strictly WEAKER than the
+            # `standard` relaxation of it, since only `standard` insisted a
+            # route was exercised.
+            #
+            # None, not False, and for #540's reason: nothing was counted, so
+            # this is a criteria gap that routes to QE rather than an assertion
+            # that a flow failed. A recorded failure still fails.
+            routes = _recorded_count(uv.get("routes_tested"))
+            flows_failed = _recorded_count(uv.get("flows_failed"))
+            if routes is None or flows_failed is None:
+                return None
+            return bool(uv.get("rendered")) and routes >= 1 and flows_failed == 0
         # Back-compat: the legacy browser-qa metric shape (routes_tested /
         # flows_passed / flows_failed) is also accepted as browser evidence.
+        # `flows_failed` is required here at every tier: `standard` waived the
+        # flow count on the STRUCTURED object #134 defined, and a legacy
+        # browser-qa run that reports routes and omits its flow outcomes is
+        # the plain absence again, one shape away.
         routes = metrics.get("routes_tested")
-        if isinstance(routes, (int, float)) and routes > 0:
-            return int(metrics.get("flows_failed", 0) or 0) == 0
+        if isinstance(routes, (int, float)) and not isinstance(routes, bool) and routes > 0:
+            flows_failed = _recorded_count(metrics.get("flows_failed"))
+            if flows_failed is None:
+                return None
+            return flows_failed == 0
         return None  # no browser/e2e verification recorded → unverified
 
     elif check_id == "integration_verified":
@@ -4430,19 +7391,212 @@ def _evaluate_check(
         return False
 
     elif check_id == "coverage_no_decrease":
-        metrics = receipt.get("metrics", {})
-        delta = metrics.get("coverage_delta", "")
-        if isinstance(delta, str):
-            # Parse "+3.2%" or "-1.5%"
-            try:
-                return float(delta.replace("%", "")) >= 0
-            except ValueError:
-                return True  # Cannot determine — assume pass.
-        elif isinstance(delta, (int, float)):
+        # #540. The same defect #487 fixed on `no_critical_findings`, left
+        # standing on the neighbour. This branch defaulted the delta to `""`,
+        # failed to parse it, and returned True with the comment "cannot
+        # determine, assume pass". So a receipt that measured nothing scored a
+        # coverage gate, and `_MISSING_EVIDENCE_SHAPE` said the opposite in the
+        # text it hands the retry prompt. `evidence-contract.json` had codified
+        # the lenient default as intended behaviour, which is precisely how
+        # #487's half survived review.
+        #
+        # None, not False: nothing was evaluated, so this is a criteria gap
+        # rather than a measured regression. `_classify_dod_checks` stamps
+        # `criteria_gap_declared` and the done edge is refused, which is what
+        # #403 and #494 require of an unbacked claim. False would say coverage
+        # dropped, which is a different and unsupported assertion.
+        metrics = receipt.get("metrics")
+        if not isinstance(metrics, dict) or "coverage_delta" not in metrics:
+            return None
+        delta = metrics["coverage_delta"]
+        # A bool is an int in Python, and `coverage_delta: true` is a claim
+        # rather than a measurement.
+        if isinstance(delta, bool):
+            return None
+        if isinstance(delta, (int, float)):
             return delta >= 0
-        return True
+        if isinstance(delta, str):
+            # "+3.2%" or "-1.5%". An unparseable string is not a measurement
+            # either, so it gaps rather than passing.
+            try:
+                return float(delta.strip().replace("%", "")) >= 0
+            except ValueError:
+                return None
+        return None
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Typed evidence classification (#403)
+# ---------------------------------------------------------------------------
+
+
+def _attempt_id_of(receipt: Any) -> str | None:
+    """The producing attempt identity on a receipt, or None.
+
+    Shape-checked against the vocabulary's own pattern rather than a local
+    copy of it, so the kernel and the validator agree on what an attempt id
+    looks like. Lazy import in the `_host_env` idiom: a partial install must
+    degrade to "no attempt identity", which under-credits, never over-credits.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    attempt_id = receipt.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        return None
+    try:
+        from runtime_contracts import ATTEMPT_ID_RE
+    except ImportError:  # pragma: no cover - partial install
+        return None
+    return attempt_id if ATTEMPT_ID_RE.match(attempt_id) else None
+
+
+def backing_evidence_class(
+    entry: dict[str, Any], receipt: dict[str, Any] | None
+) -> str | None:
+    """The evidence class that ACTUALLY backs a DoD check entry, or None.
+
+    Derived from what the pipeline observed, never read from a payload. This
+    is the local half of the #432 rule: a class is credited because something
+    in this process produced evidence of that class, not because a receipt
+    named one.
+
+      `replayed` — the #179 E1 DoD-time replay re-executed this check's
+                   commands through `verification_runner.py` and they
+                   reproduced. That runner IS the replayed class, so a
+                   verdict it confirmed is the one case where a machine can
+                   re-derive the answer.
+      `attested` — the check resolved from a receipt that carries its
+                   producing attempt identity, so the attestation is bound to
+                   one bounded execution (the proposal's own example of
+                   attested evidence is a review verdict).
+      None       — everything else, including a check that resolved from a
+                   receipt with no attempt id. Depth of zero shows as zero
+                   (proposal 3.3 / the 13.3 shape); it does not round up to
+                   the weakest class that would fit.
+
+    A check that was never evaluated has no class either: `passed is None`
+    with no replay and no attempt id is a gap, and a gap is backed by
+    nothing by definition.
+    """
+    replay = entry.get("replay")
+    if isinstance(replay, dict) and replay.get("skipped") is False:
+        if replay.get("passed") is True and entry.get("passed") is True:
+            return "replayed"
+    if entry.get("passed") is None and not entry.get("definitive_negative"):
+        return None
+    return "attested" if _attempt_id_of(receipt) else None
+
+
+def _self_reported_check_results(receipts: list[dict[str, Any]]) -> dict[str, dict]:
+    """Typed DoD check results the RECEIPTS claim, keyed by check id.
+
+    A member-supplied check result is self-reported and never computed
+    (#445). It is parsed here so the record shows what was claimed, and it is
+    written to a `self_reported` slot that no gate reads: it can neither clear
+    a check nor block one. Both directions matter. Letting a claim clear a
+    check is the obvious forgery; letting one BLOCK a check would hand any
+    writer of an unrestricted payload a way to stall another workstream's
+    story, and "it only ever makes things stricter" is not an argument for
+    trusting an untrusted input.
+
+    Malformed entries are dropped rather than reported: `receipt_validator`
+    already refuses them at the receipt boundary with a message naming the
+    field, and a second, quieter refusal here would only mean the same
+    payload was described two ways.
+    """
+    out: dict[str, dict] = {}
+    try:
+        from runtime_contracts import validate_dod_check_result
+    except ImportError:  # pragma: no cover - partial install
+        return {}
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        items = receipt.get(DOD_CHECK_RESULTS_KEY)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if validate_dod_check_result(item):
+                continue
+            key = str(item.get("check_id", "")).strip().lower().replace("-", "_")
+            if key not in DOD_CHECKS:
+                continue
+            claim: dict[str, Any] = {"result": item["result"]}
+            if isinstance(item.get("detail"), str) and item["detail"].strip():
+                claim["detail"] = item["detail"]
+            out[key] = claim
+    return out
+
+
+def _classify_dod_checks(
+    checks: dict[str, dict[str, Any]],
+    receipts: list[dict[str, Any]],
+    receipt_by_source: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Stamp `result` on every check and return the typed result list (#403).
+
+    Three results, and the third is the point of the ticket:
+
+      pass                   — required, and the evidence says yes.
+      fail                   — required, and the evidence says no. Includes a
+                               required check whose `passed` is None because
+                               of a definitive negative (a failed authored
+                               test case): evidence exists, and it refuses.
+      criteria_gap_declared  — required, and there is no evidence this check
+                               can be evaluated from at all. Carries the
+                               missing-evidence description, and NEVER reads
+                               as a pass: `passed` stays None, so every
+                               existing consumer still sees "not passed", and
+                               `dod_gate_block_reason` blocks the done edge
+                               on it.
+
+    A check that is not required at this tier (or was waived to N/A) gets no
+    result and no entry: it was not evaluated, and inventing a result for it
+    would be the same silent-nothing this result exists to remove.
+
+    The typed result list is derived HERE, from the pipeline's own verdicts.
+    A receipt-supplied claim is merged per check into a `self_reported` slot
+    and cannot change `result` in either direction (#436: computed verdicts
+    outrank typed claims; #445: a member-supplied result is self-reported).
+    Merging per check rather than per story is the #432 amplification fix
+    restated locally: a claim about one check must leave the other four
+    computed verdicts exactly as they were.
+    """
+    receipt_by_source = receipt_by_source or {}
+    claimed = _self_reported_check_results(receipts)
+    typed: list[dict[str, Any]] = []
+    for check_id, entry in checks.items():
+        claim = claimed.get(check_id)
+        if claim is not None:
+            # Recorded beside the computed verdict, never instead of it.
+            entry["self_reported"] = dict(claim)
+        if not entry.get("required"):
+            entry.pop("result", None)
+            entry.pop("evidence_class", None)
+            continue
+        passed = entry.get("passed")
+        source = entry.get("source")
+        if passed is True:
+            result = DOD_RESULT_PASS
+        elif passed is False or entry.get("definitive_negative"):
+            result = DOD_RESULT_FAIL
+        else:
+            result = CRITERIA_GAP_DECLARED
+            if not entry.get("detail"):
+                entry["detail"] = criteria_gap_detail(check_id, source=source)
+        entry["result"] = result
+        entry["evidence_class"] = backing_evidence_class(
+            entry, receipt_by_source.get(source or "")
+        )
+        item: dict[str, Any] = {"check_id": check_id, "result": result}
+        if entry.get("detail"):
+            item["detail"] = entry["detail"]
+        if entry.get("evidence_class"):
+            item["evidence_class"] = entry["evidence_class"]
+        typed.append(item)
+    return typed
 
 
 # ---------------------------------------------------------------------------
@@ -4458,6 +7612,31 @@ def _state_path(project_dir: str) -> str:
 
 def _is_spq(full: dict[str, Any]) -> bool:
     return str(full.get("build_mode") or "").lower() == "spq"
+
+
+def _project_build_mode(project_dir: str | os.PathLike) -> str:
+    """The project's lifecycle, or "" when it cannot be read.
+
+    Mirrors `advance_kernel.build_mode`'s two lookups (the top-level pointer,
+    then the active spec slot) without its ValueError on an unknown value:
+    the caller here is `evaluate_story_dod`, and a DoD evaluation must not
+    fail because the board is unreadable. An empty string resolves the
+    compliance owner to `ce`, which is the pre-#487 behaviour, so the
+    degraded path is the old path rather than a new one.
+    """
+    try:
+        from spec_state import read_full_state
+
+        full = read_full_state(str(project_dir)) or {}
+        mode = str(full.get("build_mode") or "").lower()
+        if mode:
+            return mode
+    except Exception:
+        pass
+    try:
+        return str(_read_state(str(project_dir)).get("build_mode") or "").lower()
+    except Exception:
+        return ""
 
 
 def _read_state(project_dir: str) -> dict[str, Any]:
@@ -4545,6 +7724,7 @@ def main() -> None:
                     labels=_parse_json_flag(args, "--labels"),
                     depends_on=_parse_json_flag(args, "--depends-on"),
                     file_scope=_parse_json_flag(args, "--file-scope"),
+                    project_dir=project_dir,
                 )
                 state.setdefault("current_stories", []).append(story)
                 _write_state(project_dir, state)
@@ -4576,6 +7756,7 @@ def main() -> None:
                     story_id,
                     forced=forced,
                     reason=reason,
+                    project_dir=project_dir,
                 )
                 if refused:
                     _die(refused)
@@ -4685,6 +7866,16 @@ def main() -> None:
                 verification_loops=verification_loops_active(project_dir),
                 dod_tier_info=resolve_dod_tier(project_dir, state),
                 parallelism=parallelism_config(project_dir),
+            )
+            # #501 follow-up — replace the tier-only `dod` block with the
+            # per-story contract the gate will actually enforce. Done here (and
+            # in each state-machine wrapper) rather than inside `next_action`,
+            # which has no project_dir and stays pure.
+            attach_dispatch_dod_contract(
+                result,
+                project_dir,
+                state=state,
+                receipts_dir=_resolve_receipts_dir(project_dir),
             )
             result["spec_id"] = state.get("_spec_id")
             # #134 GAP-12 — resume-first: a dispatch with no receipt but

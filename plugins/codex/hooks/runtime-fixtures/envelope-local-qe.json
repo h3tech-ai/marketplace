@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "kind": "synaptory.dispatch.envelope",
+  "attempt_id": "att_01J6ABCDEF",
+  "dispatch_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  "project_id": "taskflow",
+  "cycle_id": "003-9f2c41ab",
+  "manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workstream_id": "api",
+  "story_id": "WU-142",
+  "stage": "testing",
+  "stage_profile": "verifying",
+  "role": "qe",
+  "role_name": "quality-engineer",
+  "receipt_required_fields": [
+    "story_id",
+    "role",
+    "backend",
+    "model",
+    "artifacts",
+    "verification_commands",
+    "metrics",
+    "completed_at"
+  ],
+  "capability_profile": "prover",
+  "adapter_profile_id": "codex-local-v1",
+  "runtime_family": "codex",
+  "placement": "local",
+  "model_route": {
+    "requested": "policy-default",
+    "resolved_model_id": "codex-runtime-reported-id"
+  },
+  "source_revision": "cccccccccccccccccccccccccccccccccccccccc",
+  "materialization": null,
+  "connector_refs": null,
+  "config_refs": null,
+  "workspace": {
+    "mode": "existing-locked-worktree"
+  },
+  "capability_ceiling": [
+    "workspace.read",
+    "process.test",
+    "receipt.v2"
+  ],
+  "network_allowlist": "project-default",
+  "budget": {
+    "wall_clock_seconds": 3600
+  },
+  "receipt_path": ".synaptory/.orchestrator/spq/cycles/003-9f2c41ab/workstreams/api/receipts/WU-142-qe.json",
+  "expires_at": "2026-09-01T13:00:00Z",
+  "fencing_token": "tok_01J6ABC",
+  "required_evidence": [
+    "test-result",
+    "changed-files",
+    "final-summary"
+  ]
+}

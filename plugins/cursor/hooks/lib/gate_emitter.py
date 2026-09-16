@@ -85,6 +85,46 @@ def _warn_unaddressed() -> None:
     )
 
 
+# The channel-identity probe lives in `cli_probe` because `session_manager`
+# needs the same answer, and spelling it twice is how the second copy kept the
+# defect the first one fixed (#568 mechanism 3 here, then #396 there).
+#
+# The names are re-bound into this module rather than reached through it, so
+# the tests that monkeypatch `gate_emitter._probe_channel_identity` keep
+# binding the call the resolver below actually makes, and a reader still sees
+# which verdicts that resolver branches on.
+from cli_probe import (  # noqa: F401 - re-exported deliberately
+    MATCH as _MATCH,
+    MISMATCH as _MISMATCH,
+    PROBE_TIMEOUT_DEFAULT as _PROBE_TIMEOUT_DEFAULT,
+    TIMEOUT as _TIMEOUT,
+    UNREADABLE as _UNREADABLE,
+    Unprobeable as _Unprobeable,
+    probe_channel_identity as _probe_channel_identity,
+    probe_timeout as _probe_timeout,
+)
+
+
+#: Printed once per process when no candidate could be probed in time.
+_UNPROBEABLE_WARNED = False
+
+
+def _warn_unprobeable(candidate: str, timeout: float) -> None:
+    global _UNPROBEABLE_WARNED
+    if _UNPROBEABLE_WARNED:
+        return
+    _UNPROBEABLE_WARNED = True
+    print(
+        f"gate_emitter: not emitting — `{candidate} status` did not answer "
+        f"within {timeout:g}s, twice, so this runtime could not tell whether "
+        "that binary belongs to its own control plane. This is 'could not "
+        "tell', NOT 'the binary does not match': the usual cause is a loaded "
+        "machine, and the event is spooled for the next session rather than "
+        "lost. Raise SYNAPTORY_CLI_PROBE_TIMEOUT if it keeps happening.",
+        file=sys.stderr,
+    )
+
+
 def _resolve_cli() -> str | None:
     """Resolve the synaptory CLI path.
 
@@ -111,35 +151,34 @@ def _resolve_cli() -> str | None:
         local = False
         channel_source = ""
     identity_known = bool(channel_source)
+    timeout = _probe_timeout()
+    # ONE retry for the whole resolution, not one per candidate. A probe timing
+    # out is a statement about the MACHINE, not about the binary, so the next
+    # candidate is overwhelmingly likely to observe the same thing -- spending
+    # another full ceiling per candidate to re-learn it inside a ceremony is the
+    # wrong trade. Bounding it here keeps the worst case at roughly two probes
+    # (~10s), against the old code's four × 2.0s, while making the common
+    # transient spike survivable instead of silently fatal.
+    grace = [1]
 
     def identity_matches(candidate: str, *, explicit: bool = False) -> bool:
+        """True to accept the candidate; raises `_Unprobeable` if we cannot tell."""
         if not identity_known:
             return True
-        try:
-            probe = subprocess.run(
-                [candidate, "status"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=2.0,
-            )
-            identity = next(
-                (
-                    line.split(":", 1)[1].strip()
-                    for line in probe.stdout.splitlines()
-                    if line.startswith("control_plane_url:")
-                ),
-                "",
-            )
-            # Explicit CI shims may not implement status. A real CLI that does
-            # expose its identity must match the immutable plugin channel.
-            if not identity:
-                return explicit
-            from host_env import is_loopback_url
-
-            return is_loopback_url(identity) == local
-        except (OSError, subprocess.SubprocessError, StopIteration):
+        verdict = _probe_channel_identity(candidate, local, timeout)
+        if verdict == _TIMEOUT and grace[0]:
+            grace[0] -= 1
+            verdict = _probe_channel_identity(candidate, local, timeout)
+        if verdict == _TIMEOUT:
+            # An explicitly named binary is the documented CI/e2e escape hatch
+            # and is already accepted when it answers nothing; a slow answer is
+            # weaker evidence still, so it keeps the same benefit of the doubt.
+            if explicit:
+                return True
+            raise _Unprobeable(candidate)
+        if verdict == _UNREADABLE:
             return explicit
+        return verdict == _MATCH
 
     override = os.environ.get("SYNAPTORY_CLI_BIN")
     if override and os.path.isfile(override) and os.access(override, os.X_OK):
@@ -165,7 +204,17 @@ def _resolve_cli() -> str | None:
         if rendered in seen or not candidate.is_file() or not os.access(candidate, os.X_OK):
             continue
         seen.add(rendered)
-        if not identity_matches(rendered):
+        try:
+            matched = identity_matches(rendered)
+        except _Unprobeable as unprobeable:
+            # Distinct from "no candidate matched" and from "no stamp", because
+            # the operator's next move differs: a mismatch means the wrong CLI is
+            # installed, an unstamped tree means run `deploy local`, and this
+            # means the machine was too busy to answer. Folding all three into a
+            # silent `return None` is #568 mechanism 3.
+            _warn_unprobeable(str(unprobeable), timeout)
+            return None
+        if not matched:
             continue
         return rendered
     return None
@@ -534,12 +583,55 @@ def emit_evidence_dod_replay_mismatch(
 EVALUATED_DOD_REASON_PREFIX = "evidence_dod_evaluated"
 
 
+#: Evidence classes the reason string may carry (#435). Kept EQUAL to
+#: `runtime_contracts.EVIDENCE_CLASSES` and pinned equal by a test, in this
+#: module's existing local-literal idiom: gate emission must not fail to
+#: render because a sibling runtime module is missing from a partial install.
+_EVIDENCE_CLASSES = ("replayed", "attested", "judged")
+
+#: Wire token for a computed check verdict, keyed by the value
+#: `evaluate_story_dod` recorded. `true`/`false` are unchanged from #199 so an
+#: older control plane keeps parsing this reason string exactly as before.
+#:
+#: `gap` and `none` are DIFFERENT FACTS and deliberately do not share a token:
+#: `gap` is `criteria_gap_declared` (required, evaluated, and no evidence it
+#: could be evaluated from), `none` is "the tier did not require this check".
+#: Before #435 both arrived as `none`, so the only channel that could express
+#: a declared gap was the receipt payload — which is the channel this ticket
+#: stops crediting. A reader that predates `gap` drops the token and shows no
+#: signal, which under-credits rather than over-credits.
+_DOD_WIRE_TOKENS: dict[object, str] = {
+    True: "true",
+    False: "false",
+    None: "none",
+    "pass": "true",
+    "fail": "false",
+    "criteria_gap_declared": "gap",
+}
+
+
+def _dod_wire_token(value: object) -> str:
+    """The wire token for one check's computed verdict.
+
+    Accepts either the boolean `passed` (#199's shape) or the typed `result`
+    (#403's), because `evaluate_story_dod` records both and the caller should
+    not have to choose. An unrecognised value serializes as `none`: a verdict
+    this emitter cannot name is no signal, never a pass.
+    """
+    if isinstance(value, str):
+        return _DOD_WIRE_TOKENS.get(value.strip().lower(), "none")
+    if value is True or value is False or value is None:
+        return _DOD_WIRE_TOKENS[value]
+    return "none"
+
+
 def emit_evidence_dod_evaluated(
     spec_id: str,
     *,
-    checks: dict[str, bool | None],
+    checks: dict[str, object],
     passed: bool,
     tier: str | None = None,
+    classes: dict[str, str] | None = None,
     project_dir: str | None = None,
 ) -> bool:
     """Ship the pipeline's COMPUTED DoD verdict for a story (#199).
@@ -563,14 +655,32 @@ def emit_evidence_dod_evaluated(
 
     ``checks`` values may be None for a check the tier did not evaluate; those
     serialize as ``none`` and contribute to neither pass nor fail, matching how
-    `evidence-gates` already treats a missing key.
+    `evidence-gates` already treats a missing key. A value of
+    ``criteria_gap_declared`` serializes as ``gap`` — its own state (#407),
+    which before #435 this channel could not express at all.
+
+    ``classes`` (#435) carries the evidence class the pipeline DERIVED for a
+    check (`story_pipeline.backing_evidence_class`), appended as one additive
+    ``class=<check>:<class>,…`` token. It is additive on purpose: an older
+    reader skips the unknown key and still parses every verdict, where a
+    ``tests_pass=true:replayed`` spelling would have made it drop them. This
+    is the only channel a derived class can reach the control plane on — the
+    class a receipt payload declares about itself is a claim, and #396 stopped
+    crediting it.
     """
     parts = [EVALUATED_DOD_REASON_PREFIX]
     if tier:
         parts.append(f"tier={tier}")
     for key in sorted(checks):
-        v = checks[key]
-        parts.append(f"{key}={'none' if v is None else str(bool(v)).lower()}")
+        parts.append(f"{key}={_dod_wire_token(checks[key])}")
+    stamped = [
+        f"{key}:{(classes or {})[key]}"
+        for key in sorted(classes or {})
+        if (classes or {}).get(key) in _EVIDENCE_CLASSES
+        and _dod_wire_token(checks.get(key)) in ("true", "false")
+    ]
+    if stamped:
+        parts.append("class=" + ",".join(stamped))
     reason = " ".join(parts)
     if len(reason) > _REASON_MAX:
         reason = reason[:_REASON_MAX - 3] + "..."

@@ -190,7 +190,7 @@ Dispatch the Project Owner agent.
 PO_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
 ```
 
-> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the BRD/backlog work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="general-purpose", description="PO inception — vision and sprint 1 backlog", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-po.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the BRD/backlog work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="project-owner", description="PO inception — vision and sprint 1 backlog", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md`. The PO writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-po.json` as its last action.
 
 > **MANDATORY business-discovery floor — every engagement mode, including autonomous.**
 > Instruct the PO to run the Inception business-discovery floor (problem & who, core
@@ -230,7 +230,7 @@ Dispatch the Solution Architect agent.
 SA_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "solution-architect")
 ```
 
-> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="general-purpose", description="SA foundation architecture", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-sa.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the architecture work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="solution-architect", description="SA foundation architecture", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${SA_BACKEND}.md`. The SA writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-sa.json` as its last action.
 
 > **MANDATORY technical recommend-then-confirm — every engagement mode, including
 > autonomous.** Instruct the SA to present a **Technical Recommendation Summary**
@@ -347,7 +347,7 @@ The orchestrator generates the baseline itself, so `role` is `orchestrator` and
   "story_id": "INCEPTION-0",
   "role": "orchestrator",
   "backend": "claude",
-  "model": "claude-opus-4-8",
+  "model": "{model_id_used}",
   "artifacts": [".synaptory/design/mockups/index.html", ".synaptory/design/mockups/landing.html"],
   "metrics": {"screens": 3, "mockups_generated": 3},
   "verification_commands": ["test -s .synaptory/design/mockups/index.html"],
@@ -376,7 +376,7 @@ Dispatch the Platform Engineer agent.
 PE_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "platform-engineer")
 ```
 
-> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the infra work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="general-purpose", description="PE CI/CD bootstrap", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-pe.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the infra work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="platform-engineer", description="PE CI/CD bootstrap", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${PE_BACKEND}.md`. The PE writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-pe.json` as its last action.
 
 **PE output:**
 - CI/CD pipeline (GitHub Actions / GitLab CI / etc.)
@@ -398,7 +398,7 @@ Dispatch the Quality Engineer agent.
 QE_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
 ```
 
-> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the test-framework setup inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="general-purpose", description="QE test framework setup", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-qe.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the test-framework setup inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="quality-engineer", description="QE test framework setup", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/INCEPTION-qe.json` as its last action.
 
 **QE output:**
 - Test framework configuration (jest/pytest/go-test based on project)

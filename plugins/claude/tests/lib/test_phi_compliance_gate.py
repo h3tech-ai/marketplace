@@ -283,6 +283,12 @@ def test_gate_clears_after_compliance_and_runtime(tmp_path, monkeypatch):
         runtime={"deployed": True, "logs_inspected": True},
     )
     _write_receipt(p, "US-10", "compliance-engineer", metrics={"findings_critical": 0})
+    # #403 — `growing` requires code_reviewed, and this fixture never wrote a
+    # CR receipt, so that check had no evidence to evaluate. It used to score
+    # `None` and the gate ignored it; it now declares a criteria gap and
+    # blocks. A growing-tier story that has genuinely cleared its gates has
+    # been reviewed, so the fixture says so.
+    _write_receipt(p, "US-10", "code-reviewer", status="complete")
     res = _dod(p, "US-10", intensity="growing")
     assert sp.dod_gate_block_reason(res) is None  # → story may complete
 

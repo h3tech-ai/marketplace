@@ -25,11 +25,14 @@ from core import search, DATA_DIR
 # ============ CONFIGURATION ============
 REASONING_FILE = "ui-reasoning.csv"
 
+#: Domains aggregated into a design-system recommendation. Every key must be a
+#: key of core.CSV_CONFIG -- a `landing` entry sat here naming a corpus that was
+#: never shipped, so the landing half of every generated design system silently
+#: fell back to the hardcoded defaults below (#372).
 SEARCH_CONFIG = {
     "product": {"max_results": 1},
     "style": {"max_results": 3},
     "color": {"max_results": 2},
-    "landing": {"max_results": 2},
     "typography": {"max_results": 2}
 }
 
@@ -928,12 +931,14 @@ def _generate_intelligent_overrides(page_name: str, page_query: str, design_syst
     # Search across multiple domains for page-specific guidance
     style_search = search(combined_context, "style", max_results=1)
     ux_search = search(combined_context, "ux", max_results=3)
-    landing_search = search(combined_context, "landing", max_results=1)
 
     # Extract results from search response
     style_results = style_search.get("results", [])
     ux_results = ux_search.get("results", [])
-    landing_results = landing_search.get("results", [])
+    # No landing corpus ships (#372), so the section-structure block below takes
+    # its documented defaults. This is what already happened at runtime -- the
+    # search errored and `.get("results", [])` swallowed it -- minus the dead call.
+    landing_results = []
 
     # Detect page type from search results or context
     page_type = _detect_page_type(combined_context, style_results)

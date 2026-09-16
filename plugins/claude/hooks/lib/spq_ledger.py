@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""The Cycle dependency ledger: how one workstream unblocks another (#303 §3).
+"""The Cycle dependency ledger: what a `depends_on` edge is resolved against.
 
-Without this, a cross-workstream `depends_on` edge can never resolve. The #304
-gate correctly refuses it forever, which is safe but useless: the dependent unit
-is blocked with no mechanism that could ever unblock it. This module is that
-mechanism.
+Without this, an edge declaring a condition stronger than `done` can never
+resolve. The #304 gate correctly refuses it forever, which is safe but useless:
+the dependent unit is blocked with no mechanism that could ever unblock it. This
+module is that mechanism.
 
 ## An event is a CLAIM, not proof
 
-The same honesty `sync_barrier` already applies to readiness records. A workstream
-saying "my contract is published" is an assertion; whether the consumer can
-CHECK it differs per condition:
+A producer saying "my contract is published" is an assertion; whether the
+consumer can CHECK it differs per condition:
 
     contract_published / artifact_published   verifiable: recompute the digest
                                               against the producer's ref
@@ -18,37 +17,41 @@ CHECK it differs per condition:
                                               Cycle integration ref; under an
                                               incremental policy, also a green
                                               attestation for that exact HEAD
-    done (cross-workstream)                   claim only -- the other clone's
-                                              board is not visible from here
+    done                                      claim only -- the producer's own
+                                              claim about itself
     environment_ready                         claim only -- an out-of-band
                                               assertion nothing implies
-    cycle_integrated                          not satisfiable intra-Cycle (#305)
 
-`spq.sync.accept_unverified_events` defaults to **false**, so a
+An unverified claim NEVER unblocks downstream work -- there is no toggle, so a
 claim-only condition fails closed. That is a strong stance with a real cost: a
-plain-string cross-workstream `depends_on` becomes unusable, and the PO has to
-name a verifiable condition instead. That is precisely #303's "prefer the
-smallest sufficient condition", and it is the only way "an upstream integration
-event can SAFELY unblock a downstream Work Unit" is true rather than
+plain-string `depends_on` becomes unusable for anything but board state, and the
+PO has to name a verifiable condition instead. That is precisely #303's "prefer
+the smallest sufficient condition", and it is the only way "an upstream
+integration event can SAFELY unblock a downstream Work Unit" is true rather than
 aspirational.
 
 ## Where events live
 
-The committed `.synaptory/cycles/<cycle-id>/events/<workstream>/` files are the
-SOURCE OF TRUTH; `dependency-ledger.json` in the orchestrator tree is a local
-materialized cache with a `refreshed_at`. The cache is never authoritative and
-can be deleted safely -- it is rebuilt from git.
+The committed `.synaptory/cycles/<cycle-id>/events/` files are the SOURCE OF
+TRUTH; `dependency-ledger.json` in the orchestrator tree is a local materialized
+cache with a `refreshed_at`. The cache is never authoritative and can be deleted
+safely -- it is rebuilt from git.
 
-Per-workstream directories mean concurrent publishes from different clones are
-never a merge conflict, which one shared events file would guarantee.
+ONE DIRECTORY PER CYCLE, and one ref to read it from. The predecessor split both
+per lane, which only mattered because a lane was the thing publishing and the
+thing pushing. `SPD-194` retires the Workstream: a Work Unit is owned by the
+Cycle that admitted it, so there is no second publisher to keep apart and no
+second branch to enumerate. `spq_paths.committed_events_dir` and
+`spq_paths.integration_branch` are the single definitions of both, and this
+module reads them rather than re-deriving either.
 
 ## Propagation is human-gated, by the project's own rules
 
 `modes/init.md` forbids agents committing or pushing, so every cross-clone
 unblock has a mandatory human push in the middle. `publish` therefore prints the
 exact push command, and `dep_status` distinguishes `dep_event_local_only`
-(producer side: written, not pushed) from `dep_other_workstream_unresolved`
-(consumer side: nothing to see yet) so the latency never looks like a bug.
+(written, not pushed) from an edge with nothing published yet, so the latency
+never looks like a bug.
 
 Python 3.9 compatible: this file is projected into every host package.
 """
@@ -80,6 +83,53 @@ CLAIM_ONLY = frozenset({"done", "environment_ready", "cycle_integrated"})
 
 class LedgerError(RuntimeError):
     """A refusal the caller must surface, not swallow."""
+
+
+# ── the Cycle's own facts, read from one place each ─────────────────────────
+
+
+def integration_ref(manifest: Dict[str, Any]) -> str:
+    """The ref an `integrated` claim is checked for ancestry against.
+
+    Read through here rather than off the manifest, because the declaration
+    `cycle_records` seals carries no `integration_ref`: the per-lane branches
+    the predecessor's manifest enumerated are gone with the Workstream, and
+    what a Cycle has is one integration ref plus the trunk it integrates into
+    at Checkpoint (`SC-MTH-007`). `spq_paths.integration_branch` defines it.
+
+    An explicit `integration_ref` on the declaration still wins, so a project
+    that pins a different ref is not overridden by a default.
+    """
+    declared = str(manifest.get("integration_ref") or "").strip()
+    if declared:
+        return declared
+    cycle_id = str(manifest.get("cycle_id") or "").strip()
+    if not cycle_id:
+        return ""
+    import spq_paths
+
+    try:
+        return spq_paths.integration_branch(cycle_id)
+    except Exception:  # noqa: BLE001 - a malformed identity names no ref
+        return ""
+
+
+def admitted_ids(manifest: Dict[str, Any]) -> List[str]:
+    """The Work Unit ids this Cycle admitted, from the declaration's own key.
+
+    `cycle_records` names the set `admitted_units`. This existed as
+    `spq_manifest.owners`, which read `work_units` and returned a unit -> lane
+    map: against a sealed declaration it therefore answered `{}`, and every
+    publish refused with "not admitted to Cycle X" for a unit the Cycle had
+    admitted. Same class as the `advance_kernel` / `pipeline_board` re-point.
+    """
+    import cycle_records
+
+    return [
+        str(unit.get("id"))
+        for unit in manifest.get(cycle_records.UNITS_FIELD) or []
+        if isinstance(unit, dict) and unit.get("id")
+    ]
 
 
 # ── event identity ──────────────────────────────────────────────────────────
@@ -150,7 +200,6 @@ def build_event(
     *,
     cycle_id: str,
     manifest_hash: str,
-    workstream_id: str,
     unit_id: str,
     condition: str,
     output: Optional[Dict[str, Any]] = None,
@@ -162,13 +211,20 @@ def build_event(
     runner_id: str = "",
     seq: int = 0,
 ) -> Dict[str, Any]:
+    """One event record. `manifest_hash` is the WIRE key and stays spelled that
+    way for a release, so a control plane built against the old contract still
+    decodes; the sealed DOCUMENT it names has one key (`declaration_hash`).
+
+    No `workstream_id`. It named the lane that published, and `runner_id`
+    answers that question now -- an id `spq_paths` validates, rather than a
+    topology entry the declaration no longer carries.
+    """
     event = {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
         "seq": int(seq),
         "cycle_id": str(cycle_id),
         "manifest_hash": str(manifest_hash),
-        "workstream_id": str(workstream_id),
         "runner_id": str(runner_id),
         "unit_id": str(unit_id),
         "condition": str(condition),
@@ -236,10 +292,10 @@ def _verify_incremental_evaluation(
         "schema_version": INCREMENTAL_EVALUATION_SCHEMA_VERSION,
         "kind": INCREMENTAL_EVALUATION_KIND,
         "cycle_id": str(manifest.get("cycle_id") or ""),
-        "manifest_hash": str(manifest.get("manifest_hash") or ""),
+        "manifest_hash": str(manifest.get("declaration_hash") or ""),
         "unit_id": str(unit_id),
         "candidate_sha": str(commit_sha),
-        "integration_ref": str(manifest.get("integration_ref") or ""),
+        "integration_ref": integration_ref(manifest),
         "verdict": "green",
     }
     mismatched = [
@@ -325,7 +381,6 @@ def publish(
     *,
     cycle_id: str,
     manifest: Dict[str, Any],
-    workstream_id: str,
     unit_id: str,
     condition: str,
     output: Optional[Dict[str, Any]] = None,
@@ -337,40 +392,35 @@ def publish(
 ) -> Dict[str, Any]:
     """Record that `unit_id` reached `condition`. Verifies before writing.
 
-    Verification happens at PUBLISH time, on the producer side, where the facts
-    are available: this clone has the ref, the digest script and the commit. A
-    consumer re-checking later can only re-run the cheap parts, so an event that
-    was never checked here is an event nobody checks.
+    Verification happens at PUBLISH time, where the facts are available: this
+    clone has the ref, the digest script and the commit. A consumer re-checking
+    later can only re-run the cheap parts, so an event that was never checked
+    here is an event nobody checks.
+
+    NO `workstream_id`, AND NO OWNERSHIP CHECK. The predecessor refused a
+    publish about "another lane's Work Unit", which was a real guard while a
+    lane was the thing publishing. `SPD-194` retires the Workstream: a unit is
+    owned by the Cycle that admitted it, so admission IS the ownership check
+    and a second one would compare an id against a lane that does not exist.
+    `runner_id` records which executor published, which is the question the
+    lane id was actually answering.
     """
-    import spq_manifest
+    import cycle_records
     import spq_paths
     import state_store
 
-    if condition not in spq_manifest.DEP_CONDITIONS:
+    if condition not in cycle_records.DEP_CONDITIONS:
         raise LedgerError(
-            "unknown condition %r (known: %s)"
-            % (condition, ", ".join(spq_manifest.DEP_CONDITIONS))
-        )
-    if condition == "cycle_integrated":
-        raise LedgerError(
-            "cycle_integrated is a CROSS-Cycle condition owned by the "
-            "Coordination Cycle (#305); it cannot be published from inside a "
-            "Cycle"
+            "unknown condition %r (known: %s). `cycle_integrated` retired with "
+            "the Coordination Cycle (`SPD-194`): unorderable work is co-admitted "
+            "to one Cycle, so there is no second Cycle to wait on"
+            % (condition, ", ".join(cycle_records.DEP_CONDITIONS))
         )
 
-    owners = spq_manifest.owners(manifest)
-    owner = owners.get(unit_id)
-    if owner is None:
+    if unit_id not in admitted_ids(manifest):
         raise LedgerError(
             "%s is not admitted to Cycle %s, so no event about it can be "
             "meaningful" % (unit_id, cycle_id)
-        )
-    if owner != workstream_id:
-        raise LedgerError(
-            "%s is owned by workstream %r, not %r. A workstream publishing "
-            "events about another lane's Work Unit is how a dependency gets "
-            "satisfied by someone with no knowledge of it."
-            % (unit_id, owner, workstream_id)
         )
 
     verification = None
@@ -390,19 +440,18 @@ def publish(
                 % (condition, "verified", unit_id, verification.get("detail"))
             )
 
-    events_dir = spq_paths.committed_events_dir(project_dir, cycle_id, workstream_id)
+    events_dir = spq_paths.committed_events_dir(project_dir, cycle_id)
     os.makedirs(events_dir, exist_ok=True)
     seq = len([n for n in os.listdir(events_dir) if n.endswith(".json")]) + 1
 
     event = build_event(
         cycle_id=cycle_id,
-        manifest_hash=str(manifest.get("manifest_hash") or ""),
-        workstream_id=workstream_id,
+        manifest_hash=str(manifest.get(cycle_records.HASH_FIELD) or ""),
         unit_id=unit_id,
         condition=condition,
         output=output,
         commit_sha=commit_sha,
-        integration_ref=str(manifest.get("integration_ref") or ""),
+        integration_ref=integration_ref(manifest),
         verification=verification,
         published_at=state_store.now_iso(),
         published_by=published_by,
@@ -410,17 +459,17 @@ def publish(
         seq=seq,
     )
 
-    # Defence in depth for review finding P1(4). `spq_manifest.validate` refuses
-    # a malformed id at admission, but this is the write that would escape, and
-    # a containment check at the write does not depend on validation having run
-    # -- a manifest written by an older plugin, or a caller reaching this
-    # directly, must still not be able to place a file outside the events
-    # directory.
-    if not spq_manifest.WORK_UNIT_ID_RE.match(str(unit_id)):
+    # Defence in depth for review finding P1(4). `cycle_records.UNIT_ID_RE`
+    # refuses a malformed id at admission, but this is the write that would
+    # escape, and a containment check at the write does not depend on
+    # validation having run -- a declaration written by an older plugin, or a
+    # caller reaching this directly, must still not be able to place a file
+    # outside the events directory.
+    if not cycle_records.UNIT_ID_RE.match(str(unit_id)):
         raise LedgerError(
             "%r is not a valid Work Unit id: ids become event filenames, so "
             "they must match %s"
-            % (unit_id, spq_manifest.WORK_UNIT_ID_RE.pattern)
+            % (unit_id, cycle_records.UNIT_ID_RE.pattern)
         )
     path = os.path.join(
         events_dir, "%04d-%s-%s.json" % (seq, condition, unit_id)
@@ -486,7 +535,7 @@ def verify_condition(
                 "%s is an assertion this clone cannot check: %s"
                 % (
                     condition,
-                    "another workstream's board is not visible from here"
+                    "it is the producer's own claim about itself"
                     if condition == "done"
                     else "it is asserted out of band",
                 )
@@ -494,7 +543,7 @@ def verify_condition(
         }
 
     if condition == "integrated":
-        ref = str(manifest.get("integration_ref") or "")
+        ref = integration_ref(manifest)
         if not commit_sha:
             return {"verified": False, "detail": "integrated requires --sha"}
         if not _is_ancestor(project_dir, commit_sha, ref):
@@ -611,10 +660,16 @@ def refresh(
 ) -> Dict[str, Any]:
     """Rebuild the local cache from git. Never merges.
 
-    Reads each workstream's events off its remote branch with `git show`, the
-    same no-merge trick `sync_barrier.collect` uses: refreshing the ledger must
-    never mutate the working tree, or reading a dependency would be a
-    side-effecting operation.
+    Reads the Cycle's committed events off its remote integration ref with
+    `git show`: refreshing the ledger must never mutate the working tree, or
+    reading a dependency would be a side-effecting operation.
+
+    ONE REF, not a list of lane branches. The predecessor enumerated
+    `manifest["workstreams"]`, which a sealed declaration no longer carries --
+    so this loop ran zero times against a `cycle_records` document and the
+    refresh silently degraded to "whatever is already in this working tree",
+    reporting `refresh_ok: True` for having read nothing remote. `SPD-194`
+    leaves a Cycle with one integration ref, which `spq_paths` defines.
     """
     import spq_paths
     import state_store
@@ -631,46 +686,45 @@ def refresh(
     for event in _local_events(project_dir, cycle_id):
         events[str(event.get("event_id"))] = event
 
+    remote_ref = ""
     if manifest:
+        local_ref = integration_ref(manifest)
+        remote_ref = "%s/%s" % (remote, local_ref) if local_ref else ""
+    if remote_ref:
         rel_root = os.path.relpath(
             spq_paths.committed_events_dir(project_dir, cycle_id), project_dir
         )
-        for entry in manifest.get("workstreams") or []:
-            ws = str(entry.get("id") or "")
-            branch = str(entry.get("branch") or "")
-            if not ws or not branch:
-                continue
-            ref = "%s/%s" % (remote, branch)
-            code, listing, err = _git(
-                project_dir, "ls-tree", "-r", "--name-only", ref, "--",
-                os.path.join(rel_root, ws),
-            )
-            if code != 0:
-                # A ref this clone cannot read is NOT an empty ref. Swallowing it
-                # turned "I could not read spine" into "spine has published
-                # nothing", which reads the same as a satisfied-nothing-yet
-                # ledger while actually being no information at all. For one
-                # consumer asking about one upstream that was survivable, since
-                # no-event is already the fail-closed direction; for anything
-                # aggregating across refs it is a green built on silence.
-                #
-                # But a branch that DOES NOT EXIST YET is the normal state at the
-                # start of every Cycle -- no workstream has pushed. Treating that
-                # as unreadable would make the ledger permanently stale until the
-                # last lane pushes, which is a fail-closed that never opens. Only
-                # a ref that resolves and still cannot be listed is a real fault.
-                # (`ls-tree` on a resolvable ref exits 0 with empty output when
-                # the path is simply absent from that tree.)
-                if _ref_head(project_dir, ref):
-                    unreadable.append(
-                        {"workstream": ws, "ref": ref, "error": err.strip()[:200]}
-                    )
-                continue
+        code, listing, err = _git(
+            project_dir, "ls-tree", "-r", "--name-only", remote_ref, "--", rel_root,
+        )
+        if code != 0:
+            # A ref this clone cannot read is NOT an empty ref. Swallowing it
+            # turned "I could not read the integration ref" into "nothing has
+            # been published", which reads the same as a satisfied-nothing-yet
+            # ledger while actually being no information at all. For one
+            # consumer asking about one upstream that was survivable, since
+            # no-event is already the fail-closed direction; for anything
+            # aggregating across the Cycle it is a green built on silence.
+            #
+            # But a branch that DOES NOT EXIST YET is the normal state at the
+            # start of every Cycle -- nobody has pushed. Treating that as
+            # unreadable would make the ledger permanently stale until the
+            # first push, which is a fail-closed that never opens. Only a ref
+            # that resolves and still cannot be listed is a real fault.
+            # (`ls-tree` on a resolvable ref exits 0 with empty output when the
+            # path is simply absent from that tree.)
+            if _ref_head(project_dir, remote_ref):
+                unreadable.append(
+                    {"ref": remote_ref, "error": err.strip()[:200]}
+                )
+        else:
             for rel in listing.splitlines():
                 rel = rel.strip()
                 if not rel.endswith(".json"):
                     continue
-                code, blob, _ = _git(project_dir, "show", "%s:%s" % (ref, rel))
+                code, blob, _ = _git(
+                    project_dir, "show", "%s:%s" % (remote_ref, rel)
+                )
                 if code != 0:
                     continue
                 try:
@@ -682,7 +736,7 @@ def refresh(
 
     if unreadable and fetch_ok:
         fetch_detail = "unreadable refs: %s" % ", ".join(
-            "%s (%s)" % (u["workstream"], u["ref"]) for u in unreadable
+            "%s (%s)" % (u["ref"], u["error"]) for u in unreadable
         )
     cache = {
         "schema_version": SCHEMA_VERSION,
@@ -767,10 +821,11 @@ def satisfied_map(
     describe a unit that no longer exists, and letting it satisfy an edge would
     be resolving against a Cycle that is gone.
     """
+    import cycle_records
     import spq_manifest
 
     cycle_id = str(manifest.get("cycle_id") or "")
-    manifest_hash = str(manifest.get("manifest_hash") or "")
+    manifest_hash = str(manifest.get(cycle_records.HASH_FIELD) or "")
     best: Dict[str, Dict[str, Any]] = {}
     for event in snap.get("events") or []:
         if str(event.get("cycle_id") or "") != cycle_id:
@@ -792,23 +847,23 @@ def satisfied_map(
             "verified": verification.get("verified") is True,
             "sha": event.get("commit_sha"),
             "event_id": event.get("event_id"),
-            "workstream_id": event.get("workstream_id"),
+            "runner_id": event.get("runner_id"),
             "published_at": event.get("published_at"),
         }
     return best
 
 
-def local_only_units(project_dir: str, cycle_id: str, workstream_id: str) -> List[str]:
+def local_only_units(project_dir: str, cycle_id: str) -> List[str]:
     """Units whose event is written here but not yet visible on the remote.
 
-    This is what lets `dep_status` say `dep_event_local_only` on the PRODUCER
-    side instead of the consumer-side `dep_other_workstream_unresolved`. Without
-    the distinction, "I published it" and "nobody can see it" look identical,
-    and the mandatory human push looks like a bug.
+    This is what lets `dep_status` say `dep_event_local_only` instead of
+    reporting nothing published. Without the distinction, "I published it" and
+    "nobody can see it" look identical, and the mandatory human push looks
+    like a bug.
     """
     import spq_paths
 
-    events_dir = spq_paths.committed_events_dir(project_dir, cycle_id, workstream_id)
+    events_dir = spq_paths.committed_events_dir(project_dir, cycle_id)
     if not os.path.isdir(events_dir):
         return []
     rel = os.path.relpath(events_dir, project_dir)

@@ -19,6 +19,7 @@ from. These tests pin:
 
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import sys
@@ -229,25 +230,92 @@ def test_envelope_unknown_and_non_synaptory_return_empty():
 def test_envelope_bare_role_and_active_checks():
     env = ec.render_envelope(
         "software-engineer",
-        active_checks=["tests_pass", "build_succeeds", "code_reviewed"],
-        tier="growing",
+        dod={
+            "tier": "growing",
+            "tier_source": "planned",
+            "active_checks": ["tests_pass", "build_succeeds", "code_reviewed"],
+        },
     )
-    assert "active DoD checks" in env
+    assert "Definition of Done for this story" in env
     assert "code_reviewed" in env
     assert "growing" in env
 
 
 @pytest.mark.unit
-def test_envelope_tier_only_expands_tier_checks():
-    env = ec.render_envelope("synaptory:software-engineer", tier="mature")
-    assert "coverage_no_decrease" in env
+def test_render_envelope_offers_no_parameter_a_caller_cannot_supply():
+    """#501: `active_checks` and `tier` are gone from the signature.
+
+    What this asserts is impossible: reintroducing a parameter that reads as
+    covered while no caller can fill it. SubagentStart is told the ROLE, so a
+    precomputed check list is not something its hook can produce; the story
+    id is. Re-adding either name here would let the DoD stanza go quiet again
+    without anything failing, which is exactly how #501 survived from #163.
+    """
+    params = set(inspect.signature(ec.render_envelope).parameters)
+    assert "active_checks" not in params
+    assert "tier" not in params
+    assert {"dod", "dod_unresolved_reason"} <= params
+
+
+@pytest.mark.unit
+def test_ambiguous_story_sentinel_matches_the_resolver():
+    """The envelope CLI compares `--story-id` against its own copy of the
+    sentinel, so a rename on either side must fail here rather than silently
+    turn every ambiguous dispatch into an unresolved one."""
+    import dispatched_receipts as dr
+
+    assert ec.AMBIGUOUS_STORY == dr._AMBIGUOUS
+
+
+@pytest.mark.unit
+def test_envelope_names_an_unresolved_story_instead_of_going_quiet():
+    """Absent DoD data must produce a NAMED absence, never silence.
+
+    The zero rule at the renderer level: "not measured" and "measured, and
+    the base tier is all that applies" must not render as the same text.
+    """
+    env = ec.render_envelope("synaptory:software-engineer")
+    assert "Definition of Done for this story" in env
+    assert "NOT RESOLVED" in env
+    assert "Graded on:" not in env
+
+
+@pytest.mark.unit
+def test_envelope_separates_undetermined_from_inactive():
+    env = ec.render_envelope(
+        "synaptory:software-engineer",
+        dod={
+            "tier": "early",
+            "tier_source": "planned",
+            "active_checks": ["tests_pass", "build_succeeds"],
+            "undetermined_checks": [
+                {"check": "integration_verified", "why": "activates if you claim X"}
+            ],
+        },
+    )
+    assert "Unmeasured, NOT inactive" in env
+    assert "integration_verified" in env
+    # It must not be presented as part of the graded set.
+    active_line = next(
+        line for line in env.splitlines() if line.startswith("- Tier ")
+    )
+    assert "integration_verified" not in active_line
 
 
 @pytest.mark.unit
 def test_envelope_stays_terse():
+    dod = {
+        "tier": "growing",
+        "tier_source": "planned",
+        "active_checks": ["tests_pass", "build_succeeds", "code_reviewed"],
+    }
     for role in ("software-engineer", "quality-engineer", "code-reviewer"):
-        env = ec.render_envelope(f"synaptory:{role}", tier="growing")
-        assert 30 <= len(env.splitlines()) <= 80, f"{role} envelope size drifted"
+        env = ec.render_envelope(f"synaptory:{role}", dod=dod)
+        # Lower bound dropped 30 -> 27 by #501, which merged the duplicated
+        # GOOD/BAD example block into the two-forms items and folded the
+        # repeated "commit multi-step logic" bullet into the Forbidden line,
+        # to pay for the DoD stanza inside the #404 word budget.
+        assert 27 <= len(env.splitlines()) <= 80, f"{role} envelope size drifted"
 
 
 # ─── 5. explain_rejection ─────────────────────────────────────────────────────

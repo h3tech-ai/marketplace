@@ -118,16 +118,16 @@
     ]
   },
   {
-    "description": "syncing workstreams routes to the barrier",
-    "trigger_signal": "sync workstreams",
+    "description": "recording a cross-Cycle wait routes to the Sync event",
+    "trigger_signal": "record a sync",
     "expected_mode": "Sync",
     "expected_lifecycle": "spq",
     "expected_skills_include": [
-      "quality-engineer"
+      "software-engineer"
     ]
   },
   {
-    "description": "checkpoint closes the cycle after integration",
+    "description": "checkpoint closes the cycle through its barrier",
     "trigger_signal": "checkpoint",
     "expected_mode": "Checkpoint",
     "expected_lifecycle": "spq",

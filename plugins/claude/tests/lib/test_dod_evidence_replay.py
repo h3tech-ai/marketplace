@@ -324,3 +324,104 @@ def test_ship_evaluated_dod_ignores_malformed_input(tmp_path: Path, stub_cli):
     for bad in (None, {}, {"checks": "not-a-dict"}, {"passed": True}):
         ship_evaluated_dod("US-9", bad)          # must not raise
     assert not stub_cli.exists() or "gate-event" not in stub_cli.read_text()
+
+
+# ─── #435 — the credited channel carries the result and the derived class ────
+#
+# The control plane stopped crediting `payload.dod_check_results`, because a
+# receipt payload is member-supplied and written by the subject of the check.
+# That left this emission as the only channel a verdict is credited from, so
+# the two facts only the payload could carry had to move here: the typed
+# result (`criteria_gap_declared` has no boolean, and shipping `passed` alone
+# made a declared gap indistinguishable from a check the tier never required)
+# and the class `backing_evidence_class` DERIVED for the check.
+
+
+@pytest.mark.unit
+def test_ship_evaluated_dod_distinguishes_a_gap_from_an_unevaluated_check(
+    tmp_path: Path, stub_cli
+):
+    from story_pipeline import ship_evaluated_dod
+
+    ship_evaluated_dod("US-9", {
+        "passed": False,
+        "intensity": "mature",
+        "checks": {
+            # Required, evaluated, and no evidence it could be evaluated
+            # from: its own state, and now its own wire token.
+            "coverage_no_decrease": {
+                "passed": None, "result": "criteria_gap_declared",
+            },
+            # Not required at this tier: no result stamped, no signal.
+            "code_reviewed": {"passed": None},
+            "tests_pass": {"passed": True, "result": "pass"},
+        },
+    })
+
+    calls = stub_cli.read_text() if stub_cli.exists() else ""
+    assert "coverage_no_decrease=gap" in calls, (
+        "a declared gap must not ship as `none`; before #435 the two shared "
+        "a token and the gap could only live in the payload"
+    )
+    assert "code_reviewed=none" in calls
+    assert "tests_pass=true" in calls
+
+
+@pytest.mark.unit
+def test_ship_evaluated_dod_ships_the_derived_class_additively(
+    tmp_path: Path, stub_cli
+):
+    """The class is appended as its own token, not fused into the verdict.
+
+    `tests_pass=true:replayed` would have been shorter and would have made an
+    older control plane drop the verdict entirely (its parser accepts only
+    `true`/`false`), blanking the Evidence gate mid-upgrade. An unknown
+    `class=` key is skipped instead.
+    """
+    from story_pipeline import ship_evaluated_dod
+
+    ship_evaluated_dod("US-9", {
+        "passed": True,
+        "intensity": "mature",
+        "checks": {
+            "tests_pass": {
+                "passed": True, "result": "pass", "evidence_class": "replayed",
+            },
+            "code_reviewed": {
+                "passed": True, "result": "pass", "evidence_class": "attested",
+            },
+            # No class the pipeline could derive: depth of zero shows as zero.
+            "build_succeeds": {"passed": True, "result": "pass"},
+        },
+    })
+
+    calls = stub_cli.read_text() if stub_cli.exists() else ""
+    assert "tests_pass=true" in calls
+    assert "class=code_reviewed:attested,tests_pass:replayed" in calls
+    assert "build_succeeds:" not in calls
+
+
+@pytest.mark.unit
+def test_ship_evaluated_dod_refuses_a_class_it_does_not_recognise(
+    tmp_path: Path, stub_cli
+):
+    """`checks` and `evidence_class` reach this function from the pipeline's
+    own evaluation, but the emitter is the last thing before the wire, and a
+    class the control plane's own vocabulary does not contain must not be
+    forwarded as if it did."""
+    from story_pipeline import ship_evaluated_dod
+
+    ship_evaluated_dod("US-9", {
+        "passed": True,
+        "intensity": "early",
+        "checks": {
+            "tests_pass": {
+                "passed": True, "result": "pass", "evidence_class": "vouched",
+            },
+        },
+    })
+
+    calls = stub_cli.read_text() if stub_cli.exists() else ""
+    assert "tests_pass=true" in calls
+    assert "vouched" not in calls
+    assert "class=" not in calls

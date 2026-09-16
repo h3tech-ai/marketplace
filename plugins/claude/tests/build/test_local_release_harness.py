@@ -75,6 +75,16 @@ def test_e2e_runner_collects_all_failures_by_default(repo_root: Path) -> None:
 
 
 @pytest.mark.build
+def test_isolated_e2e_stack_exports_its_fixture_idp(repo_root: Path) -> None:
+    stack = (repo_root / "infra" / "scripts" / "e2e-stack.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'echo "export FIXTURE_URL=http://localhost:${E2E_IDP_PORT}"' in stack
+    assert 'echo "export SYNAPTORY_E2E_DB_CONTAINER=${E2E_PROJECT}-postgres"' in stack
+
+
+@pytest.mark.build
 def test_cli_build_refreshes_channel_marker_with_each_binary(repo_root: Path) -> None:
     build_script = (repo_root / "cli" / "scripts" / "build-all.sh").read_text(
         encoding="utf-8"

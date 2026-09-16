@@ -48,6 +48,7 @@ from story_pipeline import (
     verification_loops_active,
     list_stories_by_state,
     next_action as _sp_next_action,
+    attach_dispatch_dod_contract,
     dep_context,
     dependency_gate_mode,
     parallelism_config,
@@ -273,6 +274,7 @@ def pull_ticket(
         # #134 — kind/labels/depends_on/file_scope flow through exactly like
         # the scrum start_sprint path.
         kind=kind, labels=labels, depends_on=depends_on, file_scope=file_scope,
+        project_dir=project_dir,
     )
     state.setdefault("current_stories", []).append(story)
     state["cumulative_ticket_number"] = state.get("cumulative_ticket_number", 0) + 1
@@ -346,9 +348,21 @@ def transition_story(
         to_state, reason, _pre_dod = resolve_done_edge(
             project_dir, state, story_id, to_state, reason, mode="kanban"
         )
+    else:
+        _pre_dod = None
 
     state = _sp_transition_story(state, story_id, to_state, reason, project_dir)
     _write_state(project_dir, state)
+
+    # #403 — same as the scrum path: a gate-blocked ticket recorded no DoD
+    # verdict and shipped nothing, so the reason it stopped never left the
+    # machine. resolve_done_edge already computed it.
+    if to_state == "blocked" and _pre_dod is not None:
+        story = get_story(state, story_id)
+        if story:
+            story["dod"] = _pre_dod
+            _write_state(project_dir, state)
+            _sp_ship_evaluated_dod(story_id, _pre_dod, project_dir=project_dir)
 
     if to_state == "done":
         ticket_num = state.get("cumulative_ticket_number", 1)
@@ -424,6 +438,16 @@ def next_action(project_dir: str) -> dict[str, Any]:
         parallelism=parallelism_config(project_dir),
         dep_context=dep_context(project_dir, state),
         dependency_gate=dependency_gate_mode(project_dir),
+        verify_only=verify_only_units(project_dir, state),
+    )
+    # #501 follow-up — swap the tier-only `dod` block for the per-story
+    # contract the gate will actually enforce. Lives here, not in
+    # `story_pipeline.next_action`, which has no project_dir and stays pure.
+    attach_dispatch_dod_contract(
+        result,
+        project_dir,
+        state=state,
+        receipts_dir=_resolve_receipts_dir(project_dir),
     )
     result.update(base)
     return result
@@ -588,7 +612,12 @@ def main() -> None:
                 (get_story(read_state(project_dir), story_id) or {}).get("state") or ""
             )
             refused = _cli_receipt_gated_refusal(
-                from_state, to_state, story_id, forced=forced, reason=reason
+                from_state,
+                to_state,
+                story_id,
+                forced=forced,
+                reason=reason,
+                project_dir=project_dir,
             )
             if refused:
                 _die(refused)
@@ -656,6 +685,19 @@ def _consume_spec_flag(args: list[str]) -> tuple[list[str], str | None]:
 def _die(msg: str) -> None:
     print(msg, file=sys.stderr)
     sys.exit(1)
+
+def verify_only_units(project_dir: str, state: dict) -> "frozenset[str]":
+    """Kanban's view of #495 P2's verify-only Work Units.
+
+    DELEGATED, NOT COPIED. Both lifecycles ask the identical question of the
+    identical on-disk record, and the tracker-backend section of this repo is
+    the standing lesson about what a second copy of one rule costs. The
+    definition lives with Scrum only because that module is where it was needed
+    first; nothing about it is Scrum-shaped.
+    """
+    from scrum_state_machine import verify_only_units as _shared
+
+    return _shared(project_dir, state)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1301 @@
+"""The Checkpoint barrier, and the seven-step integration transaction (#645).
+
+The barrier moved. `ADR-035` decision 3: a Cycle closes through an
+all-or-nothing barrier **over the set admitted at its Commit**, publishing its
+criteria in advance and failing closed, and closing **integrates the admitted
+result to the shared trunk**. The predecessor put that barrier at Sync, over
+per-lane readiness records, with a config key whose value named the retired
+lane and admitted each one separately -- partial admission, spelled as a
+setting rather than as a branch anyone had to write.
+
+WHAT WAS LIFTED FROM THE OLD BARRIER, and it is why this is a move rather than
+a fresh start. Four properties, each named where it is implemented below:
+
+    closure BY IDENTITY, not by count   `_eval_admitted_set_closed`. Three lanes
+                                        each declaring "11 admitted" satisfied
+                                        the old barrier even when they had
+                                        admitted three different sets of eleven,
+                                        which is why the count is never
+                                        compared here and the set always is.
+    never passing on legacy             `_eval_path_scopes_disjoint` refuses a
+                                        declaration sealed under a different
+                                        path grammar, and `_normalize_result`
+                                        refuses a result declaring an unknown
+                                        schema. Treating absence of evidence as
+                                        evidence is how a barrier quietly stops
+                                        being one.
+    the safe direction on the unknown   a published criterion this module has no
+                                        evaluator for is UNMET, not skipped. A
+                                        project may ADD a criterion; adding one
+                                        the barrier cannot evaluate must not be
+                                        cheaper than meeting it.
+    its evidence is never a caller arg  `evaluate` takes FACTS -- unit results,
+                                        proof blocks, trunk observations -- and
+                                        derives every criterion VERDICT itself.
+                                        `declare_ready` refused `dod`, `replay`,
+                                        `work_units` and `shared_digests` for
+                                        the same reason: a field the caller can
+                                        set is decoration, not evidence.
+                                        `assert_no_caller_supplied_verdicts`
+                                        proves the absence rather than
+                                        documenting it.
+
+THE CRITERIA LIST IS NOT HERE. It is `cycle_records.BARRIER_CRITERIA`, and
+`CRITERIA` below is an alias so `import cycle_barrier; cycle_barrier.CRITERIA`
+resolves for a reader that expects it. Restating the list is the defect that
+shipped three different Sync-criteria counts in one product: eight documented,
+`9/9` printed, five emitted by two hosts.
+
+WHY `criteria_all_returned` IS ITSELF A CRITERION. Without it, "the barrier
+evaluated nothing" and "the barrier evaluated everything and passed" are the
+same verdict -- both are an empty list of failures. It is the only criterion
+computed over the others, so it is computed last and cannot be supplied.
+
+WHY `trunk_integrated` IS THE ONE CRITERION PROMOTION MAY CAUSE. §4.3 verifies
+the effective set on a candidate built on the observed trunk (step 4), promotes
+(step 5), then records the close (step 6). So before promotion `trunk_integrated`
+is legitimately unmet, and `promote` requires every OTHER criterion met while
+`close` requires all of them. Collapsing the two would either let a Cycle close
+from a staging branch or make promotion unreachable. `no partial admission` is
+untouched by this: the EFFECTIVE SET is all-or-nothing at both gates.
+
+WHAT THIS MODULE DOES NOT DO. It does not merge, does not write, and does not
+run a proof. It returns records for the caller to store, on the same rule as
+`cycle_authority` and `method_events`: a verdict stored where the deciding agent
+can edit it is a verdict the agent reached twice. The merge itself stays a
+human-controlled operation -- what is enforced here is that the close records
+one, bound to the exact candidate and the exact expected trunk revision.
+
+THE SEVEN STEPS OF §4.3, AND WHERE EACH ONE LIVES
+
+    1  publish the admitted set and criteria   `publish_criteria`, and
+                                               `cycle_records.seal` before it
+    2  verify units against their criteria     the kernel; read here as facts
+    3  record authorized cuts before close     `record_cut`, `effective_set`
+    4  verify the whole effective set on a
+       candidate built on the latest trunk     `evaluate`
+    5  promote atomically, refusing a moved
+       trunk                                   `promote`
+    6  observe the trunk update and record
+       Checkpoint and close durably            `close`
+    7  reconcile a crash without promoting
+       twice                                   `reconcile`, and `promote`'s
+                                               idempotence under one derived
+                                               operation identity
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+import cycle_authority
+import cycle_records
+import path_scope
+
+SCHEMA_VERSION = "1"
+
+#: An ALIAS, not a second list. See the module docstring: the criteria are
+#: published from `cycle_records` because that is the record they travel in.
+CRITERIA: Tuple[str, ...] = cycle_records.BARRIER_CRITERIA
+
+#: The result schema this barrier can read. A unit result declaring another
+#: version is UNPROVEN rather than passing -- the never-pass-on-legacy posture
+#: the old barrier applied to its pre-identity readiness records.
+RESULT_SCHEMA_VERSION = "1"
+
+#: What `reconcile` can conclude. Closed, because "something happened" is not a
+#: recovery instruction.
+RECONCILIATIONS = ("promote", "close", "complete", "rebuild")
+
+
+class BarrierError(ValueError):
+    """An operation the barrier refuses, with the reason and the remedy."""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _digest(body: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+# ─── Step 1: publish ─────────────────────────────────────────────────────────
+
+
+def publish_criteria(declaration: Mapping[str, Any]) -> List[str]:
+    """The criteria this Cycle sized against, read from its sealed declaration.
+
+    Read from the declaration rather than from `CRITERIA`, deliberately: a
+    project may ADD a criterion, and the barrier must evaluate the list the
+    Cycle committed to rather than the list the code shipped with. What it may
+    not do is remove one -- `cycle_records.seal` refuses that, so a sealed
+    declaration always carries at least the method's own.
+    """
+    if not cycle_records.verify_hash(declaration):
+        raise BarrierError(
+            "this declaration does not hash to what it claims, so the criteria "
+            "it publishes are not the criteria the Cycle was sealed against. "
+            "The barrier reads a sealed document or nothing."
+        )
+    published = [str(c) for c in declaration.get("barrier_criteria") or ()]
+    missing = [c for c in CRITERIA if c not in published]
+    if missing:
+        raise BarrierError(
+            "the sealed declaration omits %s. A project may add a criterion or "
+            "raise a threshold; it may not remove one the method declares."
+            % ", ".join(missing)
+        )
+    return published
+
+
+# ─── Step 3: cuts, and the effective set ─────────────────────────────────────
+
+
+def assert_baseline_unchanged(before: object, after: object) -> None:
+    """A cut must not move the approved baseline.
+
+    §8's whole reason for making the change-kind an accountable action: a cut
+    removes unfinished Work Units *inside* the baseline, and a re-baseline moves
+    the baseline. Naming the second as the first is how a commitment quietly
+    stops being one, so the digest is asserted on every cut rather than trusted.
+    """
+    if str(before or "") != str(after or ""):
+        raise BarrierError(
+            "the approved baseline digest changed (%s -> %s) across this "
+            "operation. Cutting is not a change disposition: it removes "
+            "unfinished work inside the baseline and leaves the commitment "
+            "where it was. Moving the baseline is a re-baseline, which is a "
+            "separate accountable action the client agrees to first."
+            % (str(before or "<none>"), str(after or "<none>"))
+        )
+
+
+def record_cut(
+    *,
+    declaration: Mapping[str, Any],
+    unit_id: str,
+    reason: str,
+    principal: str,
+    unit_state: str,
+    baseline_digest_before: object,
+    baseline_digest_after: object,
+    produced_by: Optional[str] = None,
+    outcome: str = "rework",
+) -> Dict[str, Any]:
+    """One durable, linked, accountable cut -- or a refusal.
+
+    Four refusals, and each one is a defect the predecessor had. Its
+    `cut_work_unit` supplied a DEFAULT reason (literally "cut at Sync to make
+    the barrier", naming the wrong event), accepted a finished unit, recorded no
+    backlog return a later Commit could name, and asserted nothing about the
+    baseline.
+    """
+    admitted = _admitted_index(declaration)
+    if str(unit_id) not in admitted:
+        raise BarrierError(
+            "unit %r is not in this Cycle's admitted set (%s), so there is "
+            "nothing here to cut. A unit that was never admitted is backlog, "
+            "not a cut." % (unit_id, ", ".join(sorted(admitted)) or "empty")
+        )
+    if not str(reason or "").strip():
+        raise BarrierError(
+            "a cut needs an explicit reason. The predecessor supplied a default "
+            "one, so every cut it recorded says the same thing and none of them "
+            "explains anything."
+        )
+    if str(unit_state) in ("done", "accepted"):
+        raise BarrierError(
+            "unit %s is %s. A cut is the valve for UNFINISHED work; cutting "
+            "finished work would discard a verified result and make the Cycle's "
+            "throughput unreadable. If it must not ship, that is a separate "
+            "accountable decision about the candidate."
+            % (unit_id, unit_state)
+        )
+    assert_baseline_unchanged(baseline_digest_before, baseline_digest_after)
+
+    cycle_id = str(declaration.get("cycle_id") or "")
+    decision = cycle_authority.decide(
+        action="cut-work-unit",
+        principal=principal,
+        outcome=outcome,
+        subject="%s/%s" % (cycle_id, unit_id),
+        subject_digest=str(declaration.get("declaration_hash") or ""),
+        produced_by=produced_by,
+        rationale=str(reason).strip(),
+    )
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "cut",
+        "cycle_id": cycle_id,
+        "declaration_hash": str(declaration.get("declaration_hash") or ""),
+        "unit_id": str(unit_id),
+        "reason": str(reason).strip(),
+        # The link a later Commit names. Derived from the pair rather than
+        # generated, so a re-admission cannot cite a key nobody issued and a
+        # retry of the same cut produces the same key rather than a second one.
+        "readmission_key": "cut:%s:%s" % (cycle_id, unit_id),
+        "backlog_ref": "backlog:%s" % unit_id,
+        "baseline_ref": str(declaration.get("baseline_ref") or ""),
+        "baseline_digest": str(baseline_digest_before or ""),
+        "cut_at": _now(),
+        "decision": decision,
+        "readmitted": None,
+    }
+    return record
+
+
+def link_readmission(
+    *,
+    cut: Mapping[str, Any],
+    readmission_key: str,
+    declaration: Mapping[str, Any],
+    principal: str,
+    baseline_digest: object,
+) -> Dict[str, Any]:
+    """Bind a cut to the later Commit that re-admitted it.
+
+    Without this link "cut and re-admitted" and "cut and forgotten" are the
+    same record, which is the state the predecessor left every cut in. Returns
+    a NEW record: the cut is immutable, so a re-admission adds a fact rather
+    than editing one.
+    """
+    expected = str(cut.get("readmission_key") or "")
+    if not expected or str(readmission_key) != expected:
+        raise BarrierError(
+            "re-admission cites key %r; this cut issued %r. A re-admission that "
+            "names a key nobody issued links to nothing, which is the same "
+            "record as a silent carryover."
+            % (readmission_key, expected or "<none>")
+        )
+    unit_id = str(cut.get("unit_id") or "")
+    if unit_id not in _admitted_index(declaration):
+        raise BarrierError(
+            "the re-admitting Cycle %r does not admit %s, so this is not a "
+            "re-admission of it. A cut returns the unit to the backlog; naming "
+            "the cut without admitting the unit records a carryover that never "
+            "happened." % (declaration.get("cycle_id"), unit_id)
+        )
+    assert_baseline_unchanged(cut.get("baseline_digest"), baseline_digest)
+    linked = dict(cut)
+    linked["readmitted"] = {
+        "cycle_id": str(declaration.get("cycle_id") or ""),
+        "declaration_hash": str(declaration.get("declaration_hash") or ""),
+        "readmitted_at": _now(),
+        "readmitted_by": str(principal or ""),
+    }
+    return linked
+
+
+def effective_set(
+    declaration: Mapping[str, Any], cuts: Sequence[Mapping[str, Any]] = ()
+) -> List[str]:
+    """The admitted set MINUS the recorded cuts, in declaration order.
+
+    The barrier's subject. `SC-MTH-009`: cutting is the one valve, so the
+    effective set is the only thing that shrinks -- the ORIGINAL admitted set
+    and the cut history both stay immutable, which is what keeps the cut-rate
+    denominator from moving under the metric.
+    """
+    admitted = _admitted_index(declaration)
+    cut_ids: Set[str] = set()
+    declaration_hash = str(declaration.get("declaration_hash") or "")
+    for cut in cuts:
+        unit_id = str(cut.get("unit_id") or "")
+        if unit_id not in admitted:
+            raise BarrierError(
+                "cut record names %r, which this Cycle did not admit. A cut "
+                "from another Cycle's set would shrink this barrier's subject "
+                "without appearing in its history." % unit_id
+            )
+        cut_hash = str(cut.get("declaration_hash") or "")
+        if declaration_hash and cut_hash and cut_hash != declaration_hash:
+            raise BarrierError(
+                "cut record for %s was taken against declaration %s, not %s. A "
+                "cut is bound to the declaration it was authorized under."
+                % (unit_id, cut_hash[:19], declaration_hash[:19])
+            )
+        cut_ids.add(unit_id)
+    remaining = [uid for uid in _admitted_order(declaration) if uid not in cut_ids]
+    if not remaining:
+        raise BarrierError(
+            "every admitted unit was cut, so the barrier's effective set is "
+            "empty. A barrier over nothing passes vacuously; a Cycle with "
+            "nothing left to integrate is closed by cutting it, not by "
+            "clearing a barrier."
+        )
+    return remaining
+
+
+def _admitted_order(declaration: Mapping[str, Any]) -> List[str]:
+    return [
+        str(u.get("id"))
+        for u in declaration.get("admitted_units") or ()
+        if isinstance(u, Mapping) and u.get("id")
+    ]
+
+
+def _admitted_index(declaration: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    return {
+        str(u.get("id")): u
+        for u in declaration.get("admitted_units") or ()
+        if isinstance(u, Mapping) and u.get("id")
+    }
+
+
+# ─── Step 4: the verdict ─────────────────────────────────────────────────────
+
+
+def _normalize_result(name: str, out: object) -> Dict[str, Any]:
+    """Fail closed on anything that is not an unambiguous pass.
+
+    `passed` must be the boolean `True`. `1`, `"true"` and `"yes"` are refused
+    on purpose: a truthy value is what a caller produces by accident, and the
+    difference between a check that passed and a check that returned a string
+    is exactly the difference this barrier exists to keep.
+    """
+    if not isinstance(out, Mapping):
+        return {
+            "passed": False,
+            "returned": False,
+            "detail": "%s returned %s rather than a result" % (name, type(out).__name__),
+        }
+    result = dict(out)
+    raw = result.get("passed")
+    result["passed"] = raw is True
+    result.setdefault("returned", True)
+    if raw is not True and raw not in (False, None):
+        result["detail"] = (
+            "%s reported passed=%r, which is not the boolean True. A truthy "
+            "value is not a pass: an unevaluated criterion counts as unmet."
+            % (name, raw)
+        )
+    if result.get("errored"):
+        result["passed"] = False
+    return result
+
+
+def _paths_outside_the_declaration(ctx: Dict[str, Any]) -> List[str]:
+    """Changed paths the declaration never claimed.
+
+    §5.2: validate the ACTUAL changed paths against the declaration before
+    candidate promotion. Everything else about paths here is a statement about
+    the declaration -- scopes disjoint, shared paths owned, cut code excluded --
+    and a declaration can be perfectly coherent while the candidate wandered
+    outside every region in it. That is the case a region reservation cannot
+    catch either: the registry keeps two CYCLES apart, and says nothing about
+    whether this one stayed inside the region it was granted.
+
+    A path is claimed if it falls inside the Cycle's `source_region`, inside
+    some effective unit's `path_scope`, or is a declared shared path. Three
+    sources rather than one because they are three different permissions: the
+    Cycle's own territory, a unit's slice of it, and an explicitly owned path
+    outside every region (`C-08`).
+
+    An empty `changed_paths` reports nothing. It is not evidence of a clean
+    candidate -- it is the absence of an observation -- and `trunk_integrated`
+    plus the promotion's own trunk check are what refuse an unobserved one.
+    """
+    changed = list(ctx.get("changed_paths") or ())
+    if not changed:
+        return []
+    declaration = ctx["declaration"]
+    index = ctx["admitted"]
+    claimed: List[object] = list(declaration.get("source_region") or ())
+    for uid in ctx["effective"]:
+        claimed.extend(list((index.get(uid) or {}).get("path_scope") or ()))
+    for entry in declaration.get("shared_path_owners") or ():
+        if isinstance(entry, Mapping) and entry.get("path"):
+            claimed.append(entry["path"])
+    if not claimed:
+        # Nothing was claimed, so nothing can be inside it. Reported rather
+        # than passed: a declaration with no region at all cannot seal, so
+        # reaching here means the barrier is reading something it should not.
+        return ["%s (the declaration claims no path at all)" % changed[0]]
+    # THE RUNTIME'S OWN TRANSPORT IS EXEMPT, and named from `spq_paths`
+    # rather than spelled here. Every Checkpoint commits the Cycle's records
+    # under it -- the events, the cut record, the barrier ledger -- so those
+    # paths are in every candidate and no declaration claims them. Requiring
+    # one to would be requiring the operator to grant the runtime permission
+    # to keep records, and the first declaration that forgot would fail a
+    # barrier for the runtime's own bookkeeping.
+    import spq_paths
+
+    transport = spq_paths.COMMITTED_RELDIR.replace(os.sep, "/") + "/"
+    outside: List[str] = []
+    for path in changed:
+        if str(path).replace(os.sep, "/").startswith(transport):
+            continue
+        try:
+            if not path_scope.covers(claimed, path):
+                outside.append(str(path))
+        except path_scope.PathScopeError as exc:
+            # An unreadable changed path is not evidence that it is inside.
+            outside.append("%s (%s)" % (path, exc))
+    return outside
+
+
+def _eval_admitted_set_closed(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Closure by IDENTITY, and cut code excluded from the candidate.
+
+    The count is never compared. Three lanes each declaring "11 admitted"
+    satisfied the old barrier even when they had admitted three different sets
+    of eleven (#303), which is the failure this criterion carries forward.
+    """
+    effective = set(ctx["effective"])
+    reported = {str(k) for k in ctx["unit_results"]}
+    missing = sorted(effective - reported)
+    extra = sorted(reported - effective)
+    cut_paths = _cut_code_in_candidate(ctx)
+    outside = _paths_outside_the_declaration(ctx)
+    parts = []
+    if missing:
+        parts.append("no result for: " + ", ".join(missing))
+    if extra:
+        parts.append("results for units not in the effective set: " + ", ".join(extra))
+    if cut_paths:
+        parts.append(
+            "already-produced code for cut unit(s) is in the candidate: "
+            + ", ".join(cut_paths)
+        )
+    if outside:
+        parts.append(
+            "the candidate changes paths the declaration never claimed: "
+            + ", ".join(outside)
+        )
+    return {
+        "passed": not parts,
+        "detail": "; ".join(parts) or (
+            "the reported set equals the effective set exactly, by identity "
+            "(%d units), no cut unit's paths are in the candidate, and every "
+            "changed path is inside the declaration" % len(effective)
+        ),
+        "missing": missing,
+        "extra": extra,
+        "cut_paths_in_candidate": cut_paths,
+        "paths_outside_the_declaration": outside,
+    }
+
+
+def _cut_code_in_candidate(ctx: Dict[str, Any]) -> List[str]:
+    """Changed paths that belong only to a cut unit.
+
+    §4.3 step 3: cut changes must be excluded from the candidate, INCLUDING
+    partial code already produced. A path a retained unit also owns is not cut
+    code -- it is shared work the retained unit answers for -- so only paths
+    owned exclusively by cut units are reported.
+    """
+    changed = list(ctx.get("changed_paths") or ())
+    if not changed:
+        return []
+    index = ctx["admitted"]
+    cut_ids = [uid for uid in index if uid not in set(ctx["effective"])]
+    if not cut_ids:
+        return []
+    retained_scopes: List[object] = []
+    for uid in ctx["effective"]:
+        retained_scopes.extend(list((index.get(uid) or {}).get("path_scope") or ()))
+    offending: List[str] = []
+    for path in changed:
+        try:
+            owned_by_cut = any(
+                path_scope.covers(list((index.get(uid) or {}).get("path_scope") or ()), path)
+                for uid in cut_ids
+            )
+            owned_by_retained = bool(retained_scopes) and path_scope.covers(
+                retained_scopes, path
+            )
+        except path_scope.PathScopeError:
+            # An unreadable changed path is not evidence that it is clean.
+            offending.append("%s (unreadable under grammar v%s)" % (path, path_scope.GRAMMAR_VERSION))
+            continue
+        if owned_by_cut and not owned_by_retained:
+            offending.append(str(path))
+    return offending
+
+
+def _eval_path_scopes_disjoint(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-derived at the barrier, and refused outright on a foreign grammar.
+
+    `cycle_records.seal` already checked this at Commit. It is checked again
+    here because §5.2 requires the declaration to be re-evaluated at every
+    ingress, and because a declaration sealed under a different path grammar
+    means something else than what this barrier would read it as.
+    """
+    grammar = str(ctx["declaration"].get("path_grammar") or "")
+    if grammar != path_scope.GRAMMAR_VERSION:
+        return {
+            "passed": False,
+            "detail": (
+                "this declaration was sealed under path grammar v%s and this "
+                "barrier reads v%s. A scope re-read under different rules is a "
+                "different scope, and an unproven criterion is unmet rather "
+                "than waived." % (grammar or "<none>", path_scope.GRAMMAR_VERSION)
+            ),
+            "code": "grammar_mismatch",
+        }
+    index = ctx["admitted"]
+    unsequenced: List[str] = []
+    units = [uid for uid in ctx["effective"]]
+    for i, left in enumerate(units):
+        for right in units[i + 1:]:
+            lu, ru = index.get(left) or {}, index.get(right) or {}
+            try:
+                if not path_scope.intersects(
+                    list(lu.get("path_scope") or ()), list(ru.get("path_scope") or ())
+                ):
+                    continue
+            except path_scope.PathScopeError as exc:
+                unsequenced.append("%s/%s: %s" % (left, right, exc))
+                continue
+            lo, ro = lu.get("execution_order"), ru.get("execution_order")
+            if not isinstance(lo, int) or not isinstance(ro, int) or lo == ro:
+                unsequenced.append(
+                    "%s and %s intersect with no distinct execution_order"
+                    % (left, right)
+                )
+    return {
+        "passed": not unsequenced,
+        "detail": "; ".join(unsequenced) or (
+            "every pair in the effective set is disjoint or explicitly ordered"
+        ),
+        "unsequenced": unsequenced,
+    }
+
+
+def _eval_shared_paths_owned(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Exactly one owner per shared path, over the EFFECTIVE set.
+
+    Which is where a cut has a consequence the declaration cannot foresee: cut
+    the unit that owned a shared path and the path now has none, so `whoever
+    merges last decides what it says`. That is a barrier failure, not a
+    bookkeeping detail.
+    """
+    index = ctx["admitted"]
+    owners = [
+        (uid, list((index.get(uid) or {}).get("path_scope") or ()))
+        for uid in ctx["effective"]
+    ]
+    problems: List[str] = []
+    for entry in ctx["declaration"].get("shared_path_owners") or ():
+        raw = entry.get("path") if isinstance(entry, Mapping) else None
+        declared = str((entry or {}).get("owning_unit_id") or "") if isinstance(entry, Mapping) else ""
+        try:
+            claimed = path_scope.owners_of(raw, owners)
+        except path_scope.PathScopeError as exc:
+            problems.append("shared path %r: %s" % (raw, exc))
+            continue
+        if declared and declared not in claimed:
+            problems.append(
+                "shared path %r is owned by %s, which is no longer in the "
+                "effective set (cut?); claimed now by: %s"
+                % (raw, declared, ", ".join(sorted(claimed)) or "no unit")
+            )
+        if len(claimed) > 1:
+            problems.append(
+                "shared path %r is claimed by %d units (%s)"
+                % (raw, len(claimed), ", ".join(sorted(claimed)))
+            )
+        if not claimed:
+            problems.append(
+                "shared path %r has no owner in the effective set" % (raw,)
+            )
+    return {
+        "passed": not problems,
+        "detail": "; ".join(problems) or "every declared shared path has exactly one owner",
+        "problems": problems,
+    }
+
+
+def _eval_acceptance_criteria_met(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Every declared criterion of every retained unit returned a pass.
+
+    One failing retained unit blocks the whole candidate -- that is what
+    all-or-nothing means at the level the work is actually judged. An absent
+    criterion result is unmet, so a unit that reported `done` while proving
+    nothing blocks the barrier rather than sliding through it.
+    """
+    index = ctx["admitted"]
+    unmet: List[str] = []
+    for uid in ctx["effective"]:
+        declared = [str(c) for c in (index.get(uid) or {}).get("acceptance_criteria") or ()]
+        result = ctx["unit_results"].get(uid)
+        if not isinstance(result, Mapping):
+            unmet.append("%s: no result" % uid)
+            continue
+        schema = str(result.get("schema_version") or "")
+        if schema and schema != RESULT_SCHEMA_VERSION:
+            unmet.append(
+                "%s: result declares schema %s, which this barrier cannot read; "
+                "unproven, not passing" % (uid, schema)
+            )
+            continue
+        reported = result.get("acceptance_criteria")
+        if not isinstance(reported, Mapping):
+            unmet.append("%s: reported no per-criterion results" % uid)
+            continue
+        for criterion in declared:
+            entry = reported.get(criterion)
+            if not isinstance(entry, Mapping):
+                unmet.append("%s: criterion %r returned nothing" % (uid, criterion))
+            elif entry.get("passed") is not True:
+                unmet.append("%s: criterion %r did not pass" % (uid, criterion))
+    return {
+        "passed": not unmet,
+        "detail": "; ".join(unmet[:8]) or "every declared criterion of every retained unit passed",
+        "unmet": unmet,
+    }
+
+
+def _eval_regression_green(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """The candidate's own regression, and a skipped one is not a passed one.
+
+    `--no-regression cannot bypass require_regression` was a review finding on
+    the old barrier; the shape of the mistake survives the move, so the refusal
+    does too. Absent, skipped and errored are all unmet.
+    """
+    proof = (ctx.get("proofs") or {}).get("regression")
+    if not isinstance(proof, Mapping):
+        return {
+            "passed": False,
+            "detail": (
+                "no regression proof was supplied for this candidate. Disjoint "
+                "paths do not eliminate behavioural integration failures, which "
+                "is the whole reason the effective set is verified together."
+            ),
+        }
+    if proof.get("skipped"):
+        return {
+            "passed": False,
+            "detail": "the regression was skipped (%s); a skipped proof is not a "
+                      "passed one" % (proof.get("reason") or "no reason given"),
+        }
+    return {
+        "passed": proof.get("passed") is True,
+        "detail": str(proof.get("detail") or proof.get("reason") or ""),
+        "proof": dict(proof),
+    }
+
+
+def _eval_trunk_integrated(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Is the candidate on the shared trunk the Cycle declared?
+
+    `trunk` appeared 0 times in `core/` before this. The old barrier verified
+    ancestry into a Cycle-scoped integration branch and recorded that promotion
+    to `dev` "stays a human PR", so a Cycle closed having integrated nothing
+    anyone else could see -- and a staging branch became the demonstrated final
+    result, which §4.3 forbids.
+    """
+    trunk = ctx.get("trunk")
+    if not isinstance(trunk, Mapping):
+        return {
+            "passed": False,
+            "detail": "no trunk observation was supplied, so integration is unproven",
+        }
+    declared_ref = str(ctx["declaration"].get("trunk_ref") or "")
+    observed_ref = str(trunk.get("trunk_ref") or "")
+    if observed_ref != declared_ref:
+        return {
+            "passed": False,
+            "detail": (
+                "the observation is about %r and this Cycle declared %r. One "
+                "shared trunk per Cycle: integrating into a different ref is "
+                "the deferred integration the composition layer existed to "
+                "gather." % (observed_ref or "<none>", declared_ref)
+            ),
+            "code": "wrong_trunk",
+        }
+    if not str(trunk.get("candidate_sha") or ""):
+        return {"passed": False, "detail": "the observation names no candidate revision"}
+    if trunk.get("candidate_is_ancestor_of_trunk") is not True:
+        return {
+            "passed": False,
+            "detail": (
+                "candidate %s is not an ancestor of %s, so nothing has been "
+                "integrated. Before promotion this is the correct state: "
+                "`promote` requires every OTHER criterion and `close` requires "
+                "this one." % (str(trunk.get("candidate_sha"))[:12], declared_ref)
+            ),
+            "code": "not_promoted",
+        }
+    return {
+        "passed": True,
+        "detail": "candidate %s is an ancestor of %s at %s"
+                  % (str(trunk.get("candidate_sha"))[:12], declared_ref,
+                     str(trunk.get("current_sha") or "")[:12]),
+    }
+
+
+#: Criterion -> the function that returns its result. `criteria_all_returned` is
+#: absent on purpose: it is computed over this table's output, so it cannot be
+#: one of its entries.
+_EVALUATORS = {
+    "admitted_set_closed": _eval_admitted_set_closed,
+    "path_scopes_disjoint": _eval_path_scopes_disjoint,
+    "shared_paths_owned": _eval_shared_paths_owned,
+    "acceptance_criteria_met": _eval_acceptance_criteria_met,
+    "regression_green": _eval_regression_green,
+    "trunk_integrated": _eval_trunk_integrated,
+}
+
+META_CRITERION = "criteria_all_returned"
+
+
+def _eval_all_returned(published: Sequence[str], results: Mapping[str, Any]) -> Dict[str, Any]:
+    """The criterion that makes "evaluated nothing" distinguishable from "passed".
+
+    Without it both verdicts are an empty list of failures, which is how a
+    barrier reports a green Cycle it never looked at.
+    """
+    silent = [
+        name for name in published
+        if name != META_CRITERION
+        and (results.get(name) or {}).get("returned") is not True
+    ]
+    errored = [
+        name for name in published
+        if name != META_CRITERION and (results.get(name) or {}).get("errored")
+    ]
+    parts = []
+    if silent:
+        parts.append("returned no result: " + ", ".join(silent))
+    if errored:
+        parts.append("errored: " + ", ".join(errored))
+    return {
+        "passed": not parts,
+        "returned": True,
+        "detail": "; ".join(parts) or (
+            "all %d published criteria returned a result"
+            % max(0, len(published) - 1)
+        ),
+        "silent": silent,
+        "errored_criteria": errored,
+    }
+
+
+def evaluate(
+    *,
+    declaration: Mapping[str, Any],
+    unit_results: Mapping[str, Any],
+    cuts: Sequence[Mapping[str, Any]] = (),
+    proofs: Optional[Mapping[str, Any]] = None,
+    trunk: Optional[Mapping[str, Any]] = None,
+    changed_paths: Sequence[object] = (),
+    opened_at: str = "",
+) -> Dict[str, Any]:
+    """One all-or-nothing verdict over the effective set.
+
+    Takes FACTS and returns VERDICTS. There is no parameter through which a
+    caller can supply a criterion result, which
+    `assert_no_caller_supplied_verdicts` proves rather than asserts -- and no
+    parameter through which one can select a partial mode, which
+    `assert_no_partial_admission_mode` proves for the same reason.
+
+    A published criterion with no evaluator is UNMET. That is the safe
+    direction, and it is the one that makes adding a project criterion honest:
+    a criterion the barrier cannot evaluate must not be cheaper to add than to
+    meet.
+    """
+    published = publish_criteria(declaration)
+    effective = effective_set(declaration, cuts)
+    ctx = {
+        "declaration": declaration,
+        "admitted": _admitted_index(declaration),
+        "effective": effective,
+        "unit_results": {str(k): v for k, v in (unit_results or {}).items()},
+        "proofs": dict(proofs or {}),
+        "trunk": trunk,
+        "changed_paths": list(changed_paths or ()),
+    }
+    results: Dict[str, Any] = {}
+    for name in published:
+        if name == META_CRITERION:
+            continue
+        evaluator = _EVALUATORS.get(name)
+        if evaluator is None:
+            results[name] = {
+                "passed": False,
+                "returned": False,
+                "detail": (
+                    "criterion %r has no evaluator in this barrier, so it "
+                    "returned no result. A project may add a criterion; adding "
+                    "one nothing evaluates counts as unmet rather than as "
+                    "passed." % name
+                ),
+            }
+            continue
+        try:
+            out = evaluator(ctx)
+        except Exception as exc:  # noqa: BLE001 - an error is unmet, never a pass
+            out = {
+                "passed": False,
+                "errored": True,
+                "detail": "%s raised %s: %s" % (name, type(exc).__name__, exc),
+            }
+        results[name] = _normalize_result(name, out)
+    if META_CRITERION in published:
+        results[META_CRITERION] = _eval_all_returned(published, results)
+
+    unmet = [name for name in published if results[name].get("passed") is not True]
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "barrier.verdict",
+        "cycle_id": str(declaration.get("cycle_id") or ""),
+        "declaration_hash": str(declaration.get("declaration_hash") or ""),
+        "trunk_ref": str(declaration.get("trunk_ref") or ""),
+        "baseline_ref": str(declaration.get("baseline_ref") or ""),
+        "admitted_unit_ids": _admitted_order(declaration),
+        "cut_unit_ids": sorted({str(c.get("unit_id")) for c in cuts if c.get("unit_id")}),
+        "effective_unit_ids": list(effective),
+        "criteria": results,
+        "published_criteria": published,
+        "unmet": unmet,
+        "green": not unmet,
+        "trunk": dict(trunk or {}),
+        "accepted_units": _accepted_units(ctx),
+        "opened_at": str(opened_at or ""),
+        "evaluated_at": _now(),
+    }
+    verdict = dict(body)
+    verdict["operation_id"] = operation_id(body)
+    verdict["verdict_digest"] = _digest(body)
+    return verdict
+
+
+def _accepted_units(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Acceptance credit read off the unit results, and never invented.
+
+    `SPQ-R16`: a change counts as delivered only once an accountable human has
+    accepted it as verified, so an agent reporting `done` credits nothing. A
+    unit whose result carries no `acceptance` block contributes no entry, and a
+    block naming the automated principal is dropped with the reason recorded --
+    a machine cannot be the accountable human.
+    """
+    out: List[Dict[str, Any]] = []
+    for uid in ctx["effective"]:
+        result = ctx["unit_results"].get(uid)
+        if not isinstance(result, Mapping):
+            continue
+        acceptance = result.get("acceptance")
+        if not isinstance(acceptance, Mapping):
+            continue
+        accepted_by = str(acceptance.get("accepted_by") or "")
+        if not accepted_by or accepted_by == cycle_authority.AUTOMATED_PRINCIPAL:
+            continue
+        out.append({
+            "unit_id": uid,
+            "accepted_by": accepted_by,
+            "accepted_at": str(acceptance.get("accepted_at") or ""),
+            "integrated_sha": str(
+                acceptance.get("integrated_sha")
+                or (ctx.get("trunk") or {}).get("candidate_sha")
+                or ""
+            ),
+        })
+    return out
+
+
+# ─── Step 5: promotion ───────────────────────────────────────────────────────
+
+
+def operation_id(verdict_body: Mapping[str, Any]) -> str:
+    """The identity a promotion is idempotent under.
+
+    DERIVED, not generated. §4.3 step 7: a crash after promotion and before the
+    local close record must reconcile the SAME operation rather than start a new
+    one, and a freshly generated id would make the retry a different operation
+    by construction -- which is how a candidate gets merged twice.
+
+    IT MUST BE STABLE ACROSS THE PROMOTION, and it was not. `observed_sha` was
+    in this digest, and that field is `merge-base(candidate, trunk)`: before the
+    merge it is the base the candidate was built on, and after the merge the
+    candidate IS an ancestor, so the merge-base becomes the candidate itself.
+    The documented sequence -- evaluate, promote, merge, re-evaluate, close --
+    therefore recomputed a different id at the last step and `close` could not
+    find its own promotion, failing with "no successful promotion is recorded".
+    A verdict-identity that changes because the operation succeeded is not an
+    identity.
+    #
+    WHAT IS LOST BY DROPPING IT: nothing that is not enforced elsewhere. Its
+    purpose was to make a promotion onto a MOVED trunk a different operation,
+    and `promote` refuses that case outright by comparing `observed_sha` to
+    `current_sha` before it looks at the identity at all. The refusal is the
+    stronger mechanism: it says rebuild and reverify, where a changed id would
+    only have said "this is a new attempt".
+
+    So the operation is: this Cycle, this declaration, this trunk ref, this
+    candidate, this effective set. Where the trunk happened to be when somebody
+    looked is a fact about the observation, not about which operation this is.
+    """
+    return _digest({
+        "cycle_id": str(verdict_body.get("cycle_id") or ""),
+        "declaration_hash": str(verdict_body.get("declaration_hash") or ""),
+        "trunk_ref": str(verdict_body.get("trunk_ref") or ""),
+        "candidate_sha": str((verdict_body.get("trunk") or {}).get("candidate_sha") or ""),
+        "effective_unit_ids": list(verdict_body.get("effective_unit_ids") or ()),
+    })
+
+
+def _of_kind(ledger: Sequence[Mapping[str, Any]], kind: str, cycle_id: str) -> List[Mapping[str, Any]]:
+    return [
+        r for r in ledger
+        if str(r.get("kind")) == kind and str(r.get("cycle_id")) == cycle_id
+    ]
+
+
+def promote(
+    *,
+    verdict: Mapping[str, Any],
+    ledger: Sequence[Mapping[str, Any]] = (),
+    principal: str,
+    rationale: str = "",
+    produced_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Authorize one atomic promotion of this exact candidate, or refuse.
+
+    Returns the record binding the human authorization to the candidate and the
+    expected trunk revision. It does not merge: the merge is the authorized
+    human-controlled mechanism, and what is enforced here is that no other
+    candidate, no moved trunk and no second promotion can hide behind it.
+    """
+    cycle_id = str(verdict.get("cycle_id") or "")
+    if _of_kind(ledger, "close", cycle_id):
+        raise BarrierError(
+            "Cycle %s is already closed. Nothing integrates behind a closed "
+            "barrier: `no closed Cycle can publish additional code later`, and "
+            "a promotion after the close would put work on the trunk that no "
+            "barrier ever ranged over." % cycle_id
+        )
+    blocking = [
+        name for name in verdict.get("unmet") or ()
+        if name != "trunk_integrated"
+    ]
+    if blocking:
+        raise BarrierError(
+            "the barrier is not met: %s. All or nothing over the effective set "
+            "(%s) -- one failing retained unit promotes nothing, and there is "
+            "no per-unit or per-lane partial admission to fall back to."
+            % (", ".join(blocking), ", ".join(verdict.get("effective_unit_ids") or ()))
+        )
+    trunk = dict(verdict.get("trunk") or {})
+    observed = str(trunk.get("observed_sha") or "")
+    current = str(trunk.get("current_sha") or "")
+    if not observed or not current:
+        raise BarrierError(
+            "promotion needs both the trunk revision the candidate was built on "
+            "and the trunk revision now. Without both, `the trunk moved` is "
+            "unobservable and a stale green verdict is indistinguishable from a "
+            "fresh one."
+        )
+    if observed != current:
+        raise BarrierError(
+            "the trunk moved: the candidate was built on %s and %s is now at "
+            "%s. Rebuild the candidate on the new trunk and reverify it. A "
+            "verdict bound to %s is not evidence about %s -- disjoint paths do "
+            "not eliminate behavioural integration failures."
+            % (observed[:12], trunk.get("trunk_ref"), current[:12],
+               observed[:12], current[:12])
+        )
+
+    op = str(verdict.get("operation_id") or "")
+    if not op:
+        raise BarrierError("this verdict carries no operation identity to be idempotent under")
+    for prior in _of_kind(ledger, "promotion", cycle_id):
+        if str(prior.get("outcome")) != "promoted":
+            continue
+        if str(prior.get("operation_id")) == op:
+            # §4.3 step 7. The retry reconciles the same operation instead of
+            # promoting twice or inventing a new approval.
+            reconciled = dict(prior)
+            reconciled["reconciled"] = True
+            return reconciled
+        raise BarrierError(
+            "Cycle %s already promoted candidate %s under operation %s. A "
+            "second successful promotion of a different candidate would publish "
+            "code the closed barrier never ranged over."
+            % (cycle_id, str((prior.get("trunk") or {}).get("candidate_sha"))[:12],
+               str(prior.get("operation_id"))[:19])
+        )
+
+    decision = cycle_authority.decide(
+        action="integrate-to-trunk",
+        principal=principal,
+        outcome="continue",
+        subject="%s -> %s" % (cycle_id, trunk.get("trunk_ref")),
+        subject_digest=str(trunk.get("candidate_sha") or ""),
+        produced_by=produced_by,
+        rationale=str(rationale or ""),
+        factors={
+            "effective_unit_ids": list(verdict.get("effective_unit_ids") or ()),
+            "observed_trunk_sha": observed,
+        },
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "promotion",
+        "cycle_id": cycle_id,
+        "operation_id": op,
+        "verdict_digest": str(verdict.get("verdict_digest") or ""),
+        "declaration_hash": str(verdict.get("declaration_hash") or ""),
+        "trunk": trunk,
+        "outcome": "promoted",
+        "decision": decision,
+        "promoted_at": _now(),
+        "reconciled": False,
+    }
+
+
+def record_promotion_failure(
+    *, verdict: Mapping[str, Any], reason: str
+) -> Dict[str, Any]:
+    """A promotion that did not land, recorded so no close can claim it did.
+
+    §4.3 step 7's second half: `if promotion fails, no successful
+    Checkpoint/close is recorded`. `close` requires a `promoted` record for its
+    own operation identity, so this record does not block the close -- it
+    simply is not the thing the close needs, which is the same outcome without
+    a second rule to keep in step.
+    """
+    if not str(reason or "").strip():
+        raise BarrierError("a failed promotion needs a reason; `it failed` recovers nothing")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "promotion",
+        "cycle_id": str(verdict.get("cycle_id") or ""),
+        "operation_id": str(verdict.get("operation_id") or ""),
+        "verdict_digest": str(verdict.get("verdict_digest") or ""),
+        "trunk": dict(verdict.get("trunk") or {}),
+        "outcome": "failed",
+        "reason": str(reason).strip(),
+        "recorded_at": _now(),
+    }
+
+
+# ─── Step 6: the close ───────────────────────────────────────────────────────
+
+
+def close(
+    *,
+    verdict: Mapping[str, Any],
+    ledger: Sequence[Mapping[str, Any]] = (),
+    principal: str,
+    rationale: str = "",
+    produced_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record the close, with the integrated revision and the Cycle's history.
+
+    Requires the FULL verdict -- `trunk_integrated` included -- and a
+    successful promotion under this verdict's own operation identity. A close
+    that could be recorded without either would let a staging branch become the
+    demonstrated final result, which is the one thing §4.3 says a staging
+    branch may never be.
+
+    A second close of the same Cycle reconciles rather than raising: a crash
+    between the promotion and the local record is the case this whole identity
+    exists for, and a retry that refused would leave a promoted Cycle
+    permanently unclosable.
+    """
+    cycle_id = str(verdict.get("cycle_id") or "")
+    existing = _of_kind(ledger, "close", cycle_id)
+    if existing:
+        reconciled = dict(existing[0])
+        reconciled["reconciled"] = True
+        return reconciled
+    if verdict.get("unmet"):
+        raise BarrierError(
+            "the barrier is not met: %s. The close is what integrates, so a "
+            "Cycle whose barrier is red closes nothing -- there is no partial "
+            "close and no per-unit promotion."
+            % ", ".join(verdict.get("unmet") or ())
+        )
+    op = str(verdict.get("operation_id") or "")
+    promoted = [
+        r for r in _of_kind(ledger, "promotion", cycle_id)
+        if str(r.get("outcome")) == "promoted" and str(r.get("operation_id")) == op
+    ]
+    if not promoted:
+        raise BarrierError(
+            "no successful promotion is recorded for operation %s. If promotion "
+            "fails, no successful Checkpoint or close is recorded: the close "
+            "reports an integrated trunk, and reporting one that never happened "
+            "is the failure the whole transaction is ordered to prevent."
+            % (op[:19] or "<none>")
+        )
+    decision = cycle_authority.decide(
+        action="close-cycle",
+        principal=principal,
+        outcome="continue",
+        subject=cycle_id,
+        subject_digest=str(verdict.get("verdict_digest") or ""),
+        produced_by=produced_by,
+        rationale=str(rationale or ""),
+    )
+    trunk = dict(verdict.get("trunk") or {})
+    closed_at = _now()
+    history = {
+        "schema_version": SCHEMA_VERSION,
+        "cycle_id": cycle_id,
+        "declaration_hash": str(verdict.get("declaration_hash") or ""),
+        "goal": "",
+        # The ORIGINAL admitted set, and the count taken at Commit. Both are
+        # carried so a later reader can detect a writer that shrank the
+        # denominator by removing cut units from the admitted list -- which is
+        # the one way the cut-rate can be made to lie.
+        "admitted_unit_ids": list(verdict.get("admitted_unit_ids") or ()),
+        "admitted_count_at_commit": len(verdict.get("admitted_unit_ids") or ()),
+        "cut_unit_ids": list(verdict.get("cut_unit_ids") or ()),
+        "effective_unit_ids": list(verdict.get("effective_unit_ids") or ()),
+        "accepted_units": list(verdict.get("accepted_units") or ()),
+        "integrated_sha": str(trunk.get("candidate_sha") or ""),
+        "trunk_ref": str(verdict.get("trunk_ref") or ""),
+        "opened_at": str(verdict.get("opened_at") or ""),
+        # The OBSERVED integration time, taken from the promotion record rather
+        # than from the close. §5.4's lead time ends at observed trunk
+        # integration, and using the close instead would fold the time between
+        # the merge and the bookkeeping into the delivery measurement.
+        "integrated_at": str(promoted[0].get("promoted_at") or ""),
+        "closed_at": closed_at,
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "close",
+        "cycle_id": cycle_id,
+        "operation_id": op,
+        "verdict_digest": str(verdict.get("verdict_digest") or ""),
+        "integrated_sha": str(trunk.get("candidate_sha") or ""),
+        "trunk_ref": str(verdict.get("trunk_ref") or ""),
+        "decision": decision,
+        "history": history,
+        "closed_at": closed_at,
+        "reconciled": False,
+    }
+
+
+# ─── Step 7: reconciliation ──────────────────────────────────────────────────
+
+
+def reconcile(
+    *, verdict: Mapping[str, Any], ledger: Sequence[Mapping[str, Any]] = ()
+) -> Dict[str, Any]:
+    """What a retry should do, decided from the ledger and the trunk facts.
+
+    Deterministic, and deliberately not "resume from where we think we were":
+    the answer comes from the trusted records plus the observed trunk, because
+    the process that crashed is exactly the one whose in-memory idea of its own
+    progress cannot be trusted.
+    """
+    cycle_id = str(verdict.get("cycle_id") or "")
+    if _of_kind(ledger, "close", cycle_id):
+        return {
+            "action": "complete",
+            "detail": "a close is recorded for %s; retrying would re-close it" % cycle_id,
+        }
+    op = str(verdict.get("operation_id") or "")
+    promoted = [
+        r for r in _of_kind(ledger, "promotion", cycle_id)
+        if str(r.get("outcome")) == "promoted"
+    ]
+    trunk = dict(verdict.get("trunk") or {})
+    landed = trunk.get("candidate_is_ancestor_of_trunk") is True
+    if promoted:
+        if landed:
+            return {
+                "action": "close",
+                "detail": (
+                    "operation %s promoted and the candidate is on %s; record "
+                    "the close rather than promoting again"
+                    % (op[:19], trunk.get("trunk_ref"))
+                ),
+            }
+        return {
+            "action": "rebuild",
+            "detail": (
+                "operation %s is recorded as promoted but candidate %s is not on "
+                "%s. The promotion did not land: rebuild on the current trunk "
+                "and reverify rather than reusing this verdict."
+                % (op[:19], str(trunk.get("candidate_sha"))[:12], trunk.get("trunk_ref"))
+            ),
+        }
+    observed = str(trunk.get("observed_sha") or "")
+    current = str(trunk.get("current_sha") or "")
+    if observed and current and observed != current:
+        return {
+            "action": "rebuild",
+            "detail": (
+                "nothing promoted and the trunk moved from %s to %s; this "
+                "verdict is stale" % (observed[:12], current[:12])
+            ),
+        }
+    return {
+        "action": "promote",
+        "detail": "nothing promoted and the trunk has not moved; promote this candidate",
+    }
+
+
+# ─── The absences, proved rather than asserted ───────────────────────────────
+
+
+def _own_functions():
+    for name, obj in sorted(globals().items()):
+        if name.startswith("_") or not inspect.isfunction(obj):
+            continue
+        if obj.__module__ != __name__:
+            continue
+        yield name, obj
+
+
+def assert_no_caller_supplied_verdicts() -> None:
+    """No public function here accepts a criterion result from its caller.
+
+    The lift of `declare_ready`'s refusal to be handed `dod`, `replay`,
+    `work_units` or `shared_digests`. A field the caller can set is decoration,
+    not evidence, and the barrier that reads it is certifying the caller's
+    opinion of itself.
+    """
+    forbidden = ("criteria", "results", "criteria_results", "verdict_results",
+                 "green", "passed", "dod", "replay", "work_units", "shared_digests")
+    offenders = []
+    for name, obj in _own_functions():
+        params = inspect.signature(obj).parameters
+        for bad in forbidden:
+            if bad in params:
+                offenders.append("%s(%s=...)" % (name, bad))
+    if offenders:
+        raise BarrierError(
+            "these functions accept their own evidence as an argument: %s. The "
+            "barrier takes facts and derives verdicts; a verdict it is handed "
+            "is the caller's opinion of itself with a barrier's name on it."
+            % ", ".join(offenders)
+        )
+
+
+def assert_no_partial_admission_mode() -> None:
+    """No function here can be asked to admit part of the effective set.
+
+    `C-04` refuses partial admission, and the predecessor offered it as a config
+    key -- a `mode` whose value named the retired lane -- which is the form this
+    refusal has to take seriously: not a code path somebody would write, a
+    setting somebody would set.
+    """
+    forbidden = ("mode", "quorum", "partial", "per_lane", "lane",
+                 "force", "skip_checks", "override", "no_verify", "allow_legacy")
+    offenders = []
+    for name, obj in _own_functions():
+        params = inspect.signature(obj).parameters
+        for bad in forbidden:
+            if bad in params:
+                offenders.append("%s(%s=...)" % (name, bad))
+    if offenders:
+        raise BarrierError(
+            "these functions accept a partial-admission or override argument: "
+            "%s. `C-04` admits the whole effective set or none of it, and the "
+            "predecessor's partial mode was a config key rather than a branch "
+            "anyone had to write." % ", ".join(offenders)
+        )

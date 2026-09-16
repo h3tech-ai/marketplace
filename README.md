@@ -3,14 +3,15 @@
 **Multi-agent adaptive delivery for Claude Code, Cursor, and Codex.**
 Published and maintained by [H3Tech Inc.](https://h3t.co)
 
-> **Catalog version: `1.2.1`** — this repository is a **generated
+> **Catalog version: `1.3.0`** — this repository is a **generated
 > distribution tree**. It is rebuilt and force-synced by
 > `./synaptory deploy prod` on every release. Do not open pull requests or
 > edit files here; changes are overwritten on the next publish.
 
 Synaptory turns one AI coding assistant into a governed delivery system: SPQ
-Cycles, role dispatch with capability-profile runtime routing, receipt-gated advancement,
-optional runtime federation, and pluggable tracker integrations (local,
+Cycles, role dispatch, receipt-gated advancement, runtime federation as an
+operator preview (bridge commands only, not yet on the normal dispatch path),
+and pluggable tracker integrations (local,
 GitHub, Jira, Teamwork, Linear). Scrum and Kanban remain compatibility paths
 for existing projects while retirement is planned. Current host packages and
 receipt wires retain the nine delivery-role names.

@@ -58,6 +58,61 @@ def test_cap_boundary_exact():
     assert len(out["additionalContext"].encode("utf-8")) == _CAP
 
 
+# ─── #501: protected_context survives the cap whole ──────────────────────────
+
+
+@pytest.mark.unit
+def test_protected_context_survives_an_overflowing_head():
+    """What this asserts is impossible: the cap silently eating the contract.
+
+    The cap is a blind head-truncation, so whatever is appended LAST is what
+    disappears — and the SubagentStart hook appended the Execution Envelope
+    last. Reserving the protected bytes moves the trim onto the reference
+    material, and announces it where it happens.
+    """
+    envelope = "ENVELOPE-START " + ("e" * 2000) + " ENVELOPE-END"
+    out = _emit(
+        event_name="SubagentStart",
+        additional_context="p" * (11 * 1024),
+        protected_context=envelope,
+    )
+    ctx = out["additionalContext"]
+
+    assert len(ctx.encode("utf-8")) <= _CAP, "reservation must respect the cap"
+    assert envelope in ctx, "the protected block lost bytes to the cap"
+    assert ctx.endswith(envelope), "the protected block must be last and whole"
+    assert "protocol index truncated" in ctx, (
+        "a trim that is not announced reads as a shorter contract, not a "
+        "truncated one"
+    )
+
+
+@pytest.mark.unit
+def test_protected_context_is_not_announced_when_nothing_is_trimmed():
+    out = _emit(
+        event_name="SubagentStart",
+        additional_context="p" * 100,
+        protected_context="ENVELOPE",
+    )
+    assert out["additionalContext"] == "p" * 100 + "ENVELOPE"
+    assert "truncated" not in out["additionalContext"]
+
+
+@pytest.mark.unit
+def test_protected_context_larger_than_the_cap_drops_the_head_not_its_own_start():
+    """No budget exists, so spend the cap on the contract rather than on the
+    reference material plus the contract's first few lines."""
+    out = _emit(
+        event_name="SubagentStart",
+        additional_context="PROTOCOLS" * 100,
+        protected_context="E" * (11 * 1024),
+    )
+    ctx = out["additionalContext"]
+    assert len(ctx.encode("utf-8")) <= _CAP
+    assert "PROTOCOLS" not in ctx
+    assert ctx.startswith("E")
+
+
 @pytest.mark.unit
 def test_pretooluse_permission_decision_nested():
     out = _emit(

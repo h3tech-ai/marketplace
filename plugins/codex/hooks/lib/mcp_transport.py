@@ -383,19 +383,38 @@ def schema(*names: str, required=()) -> Dict[str, Any]:
                 "type": "object",
                 "additionalProperties": True,
             },
-            # #305 release inputs. Typed as arrays because the default fallback
+            # Cycle-declaration inputs. Typed explicitly because the fallback
             # is `string`, and a caller handed a stringified list would have it
-            # accepted here and rejected deep inside `validate` -- with a message
-            # about the manifest rather than about the argument.
-            "children": {
+            # accepted here and rejected deep inside `cycle_records.problems`
+            # -- with a message about the declaration rather than about the
+            # argument. `source_region` and `path_scope` are the two that make
+            # this matter: a region arriving as a string silently declares one
+            # region literally named "src/, docs/".
+            "admitted_units": {
                 "type": "array",
                 "items": {"type": "object", "additionalProperties": True},
             },
-            "dependency_edges": {
+            "shared_path_owners": {
                 "type": "array",
                 "items": {"type": "object", "additionalProperties": True},
             },
-            "coordination_seq": {"type": "integer"},
+            "source_region": {"type": "array", "items": {"type": "string"}},
+            "crew": {"type": "array", "items": {"type": "string"}},
+            "specification_refs": {"type": "array", "items": {"type": "string"}},
+            "readmits": {"type": "array", "items": {"type": "string"}},
+            "calibration": {"type": "object", "additionalProperties": True},
+            # HOW a condition stronger than `done` is checked, sealed with
+            # what it checks. Typed as an object because the fallback is
+            # `string`: a stringified block would be accepted here and then
+            # refused inside `cycle_records.problems` with a message about the
+            # declaration rather than about the argument.
+            "verification": {"type": "object", "additionalProperties": True},
+            # The barrier's own verdict, passed through rather than rebuilt.
+            # `spq_state_machine.close_cycle` refuses one that is not green,
+            # names no criteria, or was produced against another Cycle or
+            # another declaration revision, so the shape is checked where the
+            # facts to check it against live.
+            "barrier_verdict": {"type": "object", "additionalProperties": True},
         }.get(name) or {"type": "string"}
     built: Dict[str, Any] = {"type": "object", "properties": properties}
     if required:
@@ -413,54 +432,94 @@ TRACKER_UPDATE_SCHEMA = schema("story_id", "status", "allow_skip",
 
 ACCEPT_STORY_SCHEMA = schema("story_id", "accepted_by",
                              required=("story_id", "accepted_by"))
-APPROVE_BASELINE_SCHEMA = schema("approved_by")
-OPEN_CYCLE_SCHEMA = schema("cycle_number", "goal", "work_units", "tracker_cycle")
-HYDRATE_CYCLE_SCHEMA = schema(
-    "cycle_number", "goal", "work_units", "tracker_cycle", "workstream_id",
-    required=("cycle_number",),
-)
-DECLARE_SYNC_READY_SCHEMA = schema("cycle_number", "workstream", "declared_by")
-CLEAR_SYNC_SCHEMA = schema("cycle_number", "cleared_by")
-CLOSE_CYCLE_SCHEMA = schema("proceed_to", "force")
-INITIALIZE_SCHEMA = schema("workstream_id")
-TRANSITION_SCHEMA = schema("to_state", "force", required=("to_state",))
 REQUEST_ACCEPTANCE_SCHEMA = schema("story_id", required=("story_id",))
-EVALUATE_SYNC_SCHEMA = schema("cycle_number", "use_cache")
 
-# Coordination Cycle CEREMONY schemas (#305). Separate from the `SPQ_*` ones
-# above because these are host ceremony tools, not the shared `spq_mcp` surface.
-OPEN_COORDINATION_SCHEMA = schema(
-    "release_goal", "children", "dependency_edges", "coordination_seq",
-    "baseline_sha", "created_by",
-    required=("release_goal", "children"),
-)
-REVISE_COORDINATION_SCHEMA = schema(
-    "coordination_cycle_id", "drop_child", "reason", "revised_by",
-    required=("drop_child", "reason"),
-)
-CLEAR_RELEASE_SCHEMA = schema("coordination_cycle_id", "cleared_by")
+# ── SPQ ceremony schemas ─────────────────────────────────────────────────────
+# One per verb `spq_state_machine` actually implements, and nothing else. Six
+# ceremony schemas were removed here rather than retargeted, because the verbs
+# they described are gone from the runtime with the Sync stage and the
+# release-composition layer (ADR-035): three Sync-stage verbs and three
+# composition verbs, six in all. A schema is a PROMISE the host advertises in tool discovery,
+# so leaving them would have kept a freshly installed package offering six
+# operations whose only possible outcome is `AttributeError`.
+#
+# `force` is absent from every schema on purpose, and so is `proceed_to`.
+# `C-12` places the recovery hatch outside the executing agent's reach, and an
+# argument is not outside it -- `cycle_lifecycle.check_transition` holds no
+# `force` parameter, and `ACCEPTANCE` vs `CYCLE` is derived from outstanding
+# commitments and a recorded handover rather than chosen by the caller.
 
-# ── SPQ Cycle schemas (#303/#304/#305) ───────────────────────────────────────
+INITIALIZE_SCHEMA = schema()
+TRANSITION_SCHEMA = schema("to_state", required=("to_state",))
+# `baseline_ref` is required because the whole point of the Discovery gate is
+# that the approval names the revision it approved. `calibration` is the
+# measured sample §5.1 asks the estimate to be calibrated against.
+APPROVE_BASELINE_SCHEMA = schema(
+    "approved_by", "baseline_ref", "calibration",
+    required=("approved_by", "baseline_ref"),
+)
+# The Commit. Everything required here is required because sealing refuses
+# without it: a declaration with no repository, no trunk to integrate to, no
+# region it may address, or no accountable Engineering Lead is not a
+# commitment. `crew` is optional -- a Crew grants nothing (`SC-MTH-012`), so an
+# unnamed one changes no admission.
+OPEN_CYCLE_SCHEMA = schema(
+    "goal", "repository", "trunk_ref", "source_region", "admitted_units",
+    "engineering_lead", "crew", "shared_path_owners", "baseline_ref",
+    "cycle_id", "specification_refs", "readmits", "verification",
+    required=(
+        "goal", "repository", "trunk_ref", "source_region", "admitted_units",
+        "engineering_lead",
+    ),
+)
+# BY CYCLE ID, and nothing else. Hydration used to take a sequence number plus
+# a lane and project that lane's slice; a clone now joins the Cycle and gets
+# the whole admitted set, because the admitted set is the Cycle's work.
+# `manifest_hash` is OPTIONAL and load-bearing: when a caller states which
+# declaration it believes it is joining, `spq_mcp.hydrate_cycle` refuses a
+# mismatch, so a stale prompt cannot hydrate a clone onto a revision the Cycle
+# has moved past. Optional rather than required because the ceremony prompts
+# that call this do not always carry the hash, and refusing them outright would
+# make the honest caller pay for the stale one.
+HYDRATE_CYCLE_SCHEMA = schema("cycle_id", "manifest_hash", required=("cycle_id",))
+# The close records what the barrier already permitted (`M-03`), so it carries
+# the trunk revision it integrated and the verdict that authorized it. Both are
+# required: a close with no revision is the deferred integration the retired
+# composition layer existed to gather.
+# NEITHER A VERDICT NOR A REVISION, and the absence is the security property.
+# This schema took `barrier_verdict` and `integrated_sha` as REQUIRED, which
+# made the caller -- on an MCP surface, the agent the barrier is judging -- the
+# source of both "did the barrier pass" and "what reached the trunk". The
+# kernel derives the verdict from `run_barrier` and reads the revision off its
+# trunk observation, so there is nothing here to supply.
+#
+# `principal` and `rationale` remain because they are the accountable human's
+# words, which nothing can derive.
+CLOSE_CYCLE_SCHEMA = schema("principal", "rationale", required=("principal",))
+# The promotion authorization. Same shape and the same reason: the candidate,
+# the trunk and the effective set come from the barrier, and the only thing a
+# caller adds is who authorized it.
+PROMOTE_CYCLE_SCHEMA = schema("principal", "rationale", required=("principal",))
+# A Sync RECORD, and every field says which wait cleared and how. There is no
+# `cycle_number` and no `declared_by`: this blocks nothing, so there is nobody
+# to attribute a decision to. A Sync naming no dependency would be the ceremony
+# §6 says Sync is not.
+RECORD_SYNC_SCHEMA = schema(
+    "waiting_unit_id", "producing_cycle_id", "resolution",
+    required=("waiting_unit_id", "producing_cycle_id", "resolution"),
+)
+
+# ── SPQ Cycle schemas (the shared `spq_mcp` surface) ─────────────────────────
 # Identities only: no manifest_path, record_path or ledger_path. A caller
 # therefore has no path to substitute, so the containment check that guards the
 # receipt path has nothing to guard here -- the attack surface is removed by
 # schema design rather than validated away. Every SPQ path is derived
-# server-side from (cycle_id, workstream_id) under
-# `.synaptory/.orchestrator/spq/`.
+# server-side from `cycle_id` under `.synaptory/.orchestrator/spq/`.
 #
-# `workstream_id` is the NATIVE SPQ identity. It is never SYNAPTORY_ACTIVE_SPEC:
-# #303/#304/#305 forbid SPQ resolving anything through Multi-Spec identity.
+# `cycle_id` is the NATIVE SPQ identity. It is never SYNAPTORY_ACTIVE_SPEC,
+# which remains the Multi-Spec variable SPQ ignores.
 
 SPQ_CYCLE_SCHEMA = schema("cycle_id")
-SPQ_HYDRATE_SCHEMA = schema(
-    "cycle_id", "workstream_id", "manifest_hash", "accept_revision",
-    required=("cycle_id", "workstream_id", "manifest_hash"),
-)
-SPQ_DECLARE_READY_SCHEMA = schema(
-    "cycle_id", "workstream_id", "run_regression",
-    required=("cycle_id", "workstream_id"),
-)
-SPQ_SYNC_SCHEMA = schema("cycle_id", required=("cycle_id",))
 SPQ_LEDGER_APPEND_SCHEMA = schema(
     "cycle_id", "work_unit_id", "condition", "manifest_hash", "commit_sha",
     "output", "evaluation",
@@ -475,26 +534,13 @@ SPQ_CUT_SCHEMA = schema(
     required=("cycle_id", "manifest_hash", "work_unit_id"),
 )
 
-
-# ── Coordination Cycle schemas (#305) ────────────────────────────────────────
-# Identities only, same as the Cycle schemas above: no manifest_path, no
-# ledger_path, no report_path. Every coordination path is derived server-side
-# under `.synaptory/.orchestrator/spq/coordination-cycles/`, so a caller has
-# nothing to substitute and the containment check has nothing to guard.
-
-SPQ_COORDINATION_SCHEMA = schema("coordination_cycle_id")
-SPQ_RELEASE_READINESS_SCHEMA = schema("coordination_cycle_id", "use_cache")
-# The producer side. `coordination_manifest_hash` and `cycle_manifest_hash` are
-# BOTH required and both checked against what this clone resolves: an event
-# published against a superseded release, or about a child revision the release
-# did not pin, describes a state that is gone.
-SPQ_CROSS_EVENT_SCHEMA = schema(
-    "coordination_cycle_id", "coordination_manifest_hash", "cycle_id",
-    "cycle_manifest_hash", "work_unit_id", "condition", "commit_sha", "output",
-    required=(
-        "coordination_cycle_id", "coordination_manifest_hash", "cycle_id",
-        "condition",
-    ),
+#: Admit an artifact the platform did not produce. NO `candidate_digest` field,
+#: and the absence is the contract: the digest is computed over bytes the
+#: platform read, so a schema that accepted a claimed one would move #403's
+#: forgery a step earlier instead of removing it (`external_intake`).
+SPQ_EXTERNAL_INTAKE_SCHEMA = schema(
+    "work_unit_id", "artifact_path", "admitted_by", "source_note",
+    required=("work_unit_id", "artifact_path", "admitted_by"),
 )
 
 

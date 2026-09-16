@@ -1,0 +1,1293 @@
+{
+  "coordinated_changes": {
+    "ADR-035-workstream-id-signed-field": {
+      "record": "docs/adrs/ADR-035-cycle-is-the-unit-of-parallelism.md",
+      "identifiers": [
+        "workstream_id",
+        "WorkstreamID"
+      ],
+      "reason": "`workstream_id` is a key in the signed envelope body, and what makes it undroppable is presence rather than requirement. It is not in `_ENVELOPE_REQUIRED_STR`; it is in `_ENVELOPE_PRESENT_STR` (`core/lib/runtime_contracts.py`), which demands the key even when the value is empty, `build_envelope` always emits it, and `ENVELOPE_SIGNED_FIELDS` lists it. So the control plane has signed a payload containing that key on every envelope it has ever issued, and a verifier that drops it from its list hashes a different byte string from the one signed: not the next envelope written, but all of them, including those already issued. ADR-035 records the consequence, that removing the field is one coordinated versioned contract change across envelope, signature, transport, receipt, schema and UI, not a field deletion. The signed-field list is hand-kept in three places (`core/lib/runtime_contracts.py`, `api/synaptory_api/envelope_signing.py`, `cli/internal/cpclient/envelope_verify.go`), so the drift guard between the copies catches a divergence and cannot see a removal made in all three at once, which is exactly what discharging one of these rows would look like to a careful sweeper. Therefore no row in this group is discharged on its own: the field leaves every file in the group in one release or it leaves none of them. Part of it is irreversible, because `workstream_id` attribution on `subagent_spans` and `gate_events` has no payload fallback and is archived before the columns are dropped."
+    }
+  },
+  "files": {
+    ".gitignore": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 4
+      }
+    },
+    "CLAUDE.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 1
+      }
+    },
+    "README.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "api/README.md": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "api/migrations/versions/20260528_0013_workstream_id.py": {
+      "category": "applied-migration",
+      "counts": {
+        "workstream": 18
+      }
+    },
+    "api/migrations/versions/20260827_0024_spq_cycle_observability.py": {
+      "category": "applied-migration",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 6
+      }
+    },
+    "api/migrations/versions/20260828_0025_coordination_cycle_observability.py": {
+      "category": "applied-migration",
+      "counts": {
+        "coordination_cycle": 27
+      }
+    },
+    "api/migrations/versions/20260901_0026_runtime_federation.py": {
+      "category": "applied-migration",
+      "counts": {
+        "workstream": 7
+      }
+    },
+    "api/migrations/versions/20260909_0035_retire_lane_and_release_composition.py": {
+      "category": "amend",
+      "counts": {
+        "coordination_cycle": 7,
+        "workstream": 3
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    },
+    "api/synaptory_api/envelope_signing.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 3
+      }
+    },
+    "api/synaptory_api/models.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 12,
+        "workstream": 26
+      }
+    },
+    "api/synaptory_api/routers/ingest.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 17,
+        "workstream": 26
+      }
+    },
+    "api/synaptory_api/routers/runtime.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 11
+      }
+    },
+    "api/tests/test_alembic_migrations.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 14,
+        "workstream": 4
+      }
+    },
+    "api/tests/test_cycle_analytics.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 12
+      }
+    },
+    "api/tests/test_cycle_declaration_ingest.py": {
+      "category": "amend",
+      "counts": {
+        "coordination_cycle": 4,
+        "workstream": 3
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    },
+    "api/tests/test_envelope_signing.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "api/tests/test_gate_events.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 11
+      }
+    },
+    "api/tests/test_kind_endpoint_contract.py": {
+      "category": "amend",
+      "counts": {
+        "coordination_cycle": 1
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    },
+    "api/tests/test_runtime_federation.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 6
+      }
+    },
+    "benchmarks/parallelism/pilot2-evidence-report.md": {
+      "category": "history",
+      "counts": {
+        "workstream": 15
+      }
+    },
+    "benchmarks/parallelism/pilot2-report-template.md": {
+      "category": "history",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "benchmarks/parallelism/pilot_metrics.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 11
+      }
+    },
+    "benchmarks/parallelism/tests/test_pilot_metrics.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 6
+      }
+    },
+    "cli/internal/cli/envelope_signature_test.go": {
+      "category": "guard",
+      "counts": {
+        "workstream": 6
+      },
+      "reason": "the guard names the retired field it now permits to be empty, and why: the field stays in the signed envelope for one release so an old bridge still decodes, and a test that cannot say so cannot explain what it pins"
+    },
+    "cli/internal/cli/outbox.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 3,
+        "workstream": 9
+      }
+    },
+    "cli/internal/cli/runtime.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 3
+      }
+    },
+    "cli/internal/cli/runtime_adapter.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "cli/internal/cli/runtime_contract.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 6
+      }
+    },
+    "cli/internal/cli/runtime_contract_test.go": {
+      "category": "guard",
+      "counts": {
+        "workstream": 12
+      },
+      "reason": "the guard names the retired field it now permits to be empty, and why: the field stays in the signed envelope for one release so an old bridge still decodes, and a test that cannot say so cannot explain what it pins"
+    },
+    "cli/internal/cli/runtime_cp_client.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "cli/internal/cli/runtime_local.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "cli/internal/cli/runtime_receipt_delivery_test.go": {
+      "category": "rewrite",
+      "reason": "Reasoned rather than left bare, because this row reads like a coordinated one and is not (#663 added the file; #657 and #661 built the coordinated set). The single occurrence is a path segment inside a fixture string at line 107, `.synaptory/.orchestrator/spq/cycles/009-abcd1234/workstreams/api/receipts/WU-009-qe.json`, and the case it feeds asserts that a filed receipt lands at the ENVELOPE's path rather than at an adapter-side constant. That assertion is path-agnostic: it compares the filed path to the envelope's own, so any nested relative path proves it and this one carries no contract. The file spells neither `workstream_id` nor `WorkstreamID`, so it is outside the signed-field group. It is `rewrite` and not `coordinated` because the segment names no live layout to coordinate with: `spq_paths.py` produces no `workstreams/` level (`execution_state_path`, `receipts_dir` and `tracker_data_path` all sit directly under `cycle_root`), nothing in the tree ever creates one, ADR-035 section 8 decided there is no state migration and that the board reader refuses the old layout by name, and three live assertions already require the segment to be absent (`plugin-codex/tests/test_codex_mcp.py:818`, `api/tests/test_cycle_analytics.py:234`, `e2e/scenarios/test_18_spq_cycle.py:407`). `core/lib/story_pipeline.py:5476` is the one place that still spells the segment in code, and it is a read-side tolerance scan in `companion_receipt_dirs` guarded by `os.path.isdir`, which finds a pre-SPD-194 tree if one is already on disk and never writes one. So the string models a shape the product does not write, and rewriting it makes the case more accurate rather than less.",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "cli/internal/cli/runtime_store.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "cli/internal/cli/spq_identity_test.go": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 7,
+        "workstream": 9
+      }
+    },
+    "cli/internal/cli/telemetry.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 13,
+        "workstream": 31
+      }
+    },
+    "cli/internal/cpclient/cpclient.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 5,
+        "workstream": 23
+      }
+    },
+    "cli/internal/cpclient/envelope_verify.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "cli/internal/cpclient/runtime.go": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "cli/internal/outbox/kind_contract_test.go": {
+      "category": "amend",
+      "counts": {
+        "coordination_cycle": 1
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    },
+    "conformance/capabilities.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "conformance/contract.json": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "conformance/drivers/hosts.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "conformance/factories.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "conformance/test_capability_profile_contract.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "conformance/test_runtime_federation_contract.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "conformance/test_spq_contract.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "conformance/test_spq_replacement_contract.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 4
+      },
+      "reason": "the replacement suite names the retired nouns in the reasons it refuses them"
+    },
+    "core/lib/advance_kernel.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 10
+      }
+    },
+    "core/lib/cycle_records.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      },
+      "reason": "Both mentions are deliberate and a rewrite has to preserve what they carry, not just the words: DEP_CONDITIONS explains why `cycle_integrated` is absent, and _dependency_problems names it in the refusal an author hits when they declare it. Classified with its siblings spq_state_machine.py and spq_paths.py, which name the retired nouns in the same explanatory register."
+    },
+    "core/lib/evidence_contract.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/lib/gate_emitter.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "core/lib/kanban_state_machine.py": {
+      "category": "other-sense",
+      "counts": {
+        "increment": 1
+      },
+      "reason": "`Increments cumulative counter.` in a docstring: the English verb, not the retired delivery unit. Nothing to sweep here."
+    },
+    "core/lib/loop_engine.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/lib/pipeline_board.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "slice": 1,
+        "workstream": 12
+      },
+      "reason": "The `Slice` occurrence names the pre-rename state layout this reader's shim accepts (ADR-028), so it records what was true rather than instructing new work. The row's binding constraint is still the coordinated one."
+    },
+    "core/lib/runtime_contracts.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 8
+      }
+    },
+    "core/lib/runtime_materialization.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      },
+      "reason": "resolves the managed fetch ref from the workstream branch; the Cycle's integration ref replaces it"
+    },
+    "core/lib/spq_ledger.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 6
+      }
+    },
+    "core/lib/spq_manifest.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 9,
+        "workstream": 41
+      }
+    },
+    "core/lib/spq_paths.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 3,
+        "workstream": 6
+      }
+    },
+    "core/lib/spq_state_machine.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "core/lib/state_store.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/lib/story_pipeline.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 9,
+        "increment": 1,
+        "workstream": 36
+      },
+      "reason": "The `Increment` occurrence is the English verb (`Increment the retry counter`), not the retired delivery unit. The row's binding constraint is the coordinated one."
+    },
+    "core/runtime-fixtures/dod-criteria-gap.json": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/runtime-fixtures/envelope-local-qe.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "core/runtime-fixtures/envelope-managed-se.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "core/runtime-fixtures/receipt-attempt-bound.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/runtime-fixtures/receipt-attempt-failed.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/runtime-fixtures/receipt-evidence-attested.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/runtime-fixtures/receipt-evidence-judged.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/runtime-fixtures/receipt-evidence-replayed.json": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "core/scripts/tracker/local_adapter.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "docs/RELEASE-POLICY.md": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "docs/SAD.md": {
+      "category": "other-sense",
+      "counts": {
+        "increment": 1
+      },
+      "reason": "`Increments recursive delegation depth`: the English verb describing a counter, not the retired delivery unit."
+    },
+    "docs/adrs/ADR-028-spq-cycle-vocabulary.md": {
+      "category": "amend",
+      "counts": {
+        "increment": 5,
+        "slice": 7,
+        "workstream": 2
+      },
+      "reason": "the Slice->Cycle rename stands; ADR-035 amends its vocabulary section. This is also the record that retires Slice and Increment, so it names them throughout and must keep doing so"
+    },
+    "docs/adrs/ADR-030-coordination-cycle.md": {
+      "category": "supersede",
+      "counts": {
+        "coordination_cycle": 13,
+        "workstream": 2
+      },
+      "reason": "ADR-035 supersedes it; the record stays, its status changes"
+    },
+    "docs/adrs/ADR-031-runtime-federation-pilot.md": {
+      "category": "history",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "docs/adrs/ADR-032-capability-profile-consolidation.md": {
+      "category": "history",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "docs/adrs/ADR-033-approved-baseline-binding.md": {
+      "category": "amend",
+      "counts": {
+        "coordination_cycle": 5,
+        "workstream": 2
+      },
+      "reason": "R17 changes what an approved baseline is; five coordination_cycle references to reconcile"
+    },
+    "docs/adrs/ADR-035-cycle-is-the-unit-of-parallelism.md": {
+      "category": "retirement-document",
+      "counts": {
+        "coordination_cycle": 12,
+        "cycle_of_cycles": 1,
+        "slice": 1,
+        "workstream": 16
+      },
+      "reason": "the decision record that retires the vocabulary necessarily names it, and it cites the earlier Slice->Cycle rename it builds on"
+    },
+    "docs/adrs/README.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 5,
+        "increment": 1,
+        "slice": 2,
+        "workstream": 1
+      },
+      "reason": "the ADR index lists ADR-030 and must record the supersession. The `Slice` and `Increment` occurrences are ADR-028's own title and decision quoted in its index row, and an index that renames the record it points at stops being an index"
+    },
+    "docs/codex-spq-e2e-report-2026-08-24.md": {
+      "category": "history",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "docs/codex-spq-fix-validation-2026-08-24.md": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "docs/plans/spq-methodology-alignment-requirements.md": {
+      "category": "retirement-document",
+      "counts": {
+        "coordination_cycle": 22,
+        "cycle_of_cycles": 7,
+        "the_implementation_phase": 1,
+        "workstream": 41
+      },
+      "reason": "the document that retires the vocabulary necessarily names it; the `implementation phase` occurrence is a live use of the earlier-revision phrase and is a sweep this row still owes"
+    },
+    "docs/proposals/approved-baseline-pilot.md": {
+      "category": "history",
+      "counts": {
+        "coordination_cycle": 7,
+        "workstream": 4
+      }
+    },
+    "docs/proposals/capability-profile-pilot.md": {
+      "category": "history",
+      "counts": {
+        "workstream": 8
+      }
+    },
+    "docs/proposals/governed-runtime-pilot.md": {
+      "category": "history",
+      "counts": {
+        "coordination_cycle": 7,
+        "workstream": 12
+      }
+    },
+    "docs/runbooks/claude-managed-runner-demo.md": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "docs/runbooks/downstream-hiro-to-synaptory.md": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "docs/runbooks/multi-runtime-demo-playbook.md": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 21
+      }
+    },
+    "docs/runtime-cross-comparison-2026-09-10.md": {
+      "category": "history",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "docs/runtime-decision-pilot-2026-09-10.md": {
+      "category": "history",
+      "reason": "The #357 runtime decision pilot report, dated and recording what the run observed. Every occurrence names the retired word in order to deny it: the envelope 'retained `workstream_id` as the required signed legacy key with an empty value' and 'created no Workstream or Sync lifecycle state' (:63-64), the 'required empty `workstream_id`' (:133), and a previously installed Codex package that 'still enforced a non-empty retired Workstream value' (:172). A report of what was true on a date does not stop being true when the vocabulary leaves, so the words stay. Same category and same reasoning as docs/runtime-cross-comparison-2026-09-10.md, classified by #683.",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "docs/spq-coordination-demo-findings-2026-08-28.md": {
+      "category": "history",
+      "counts": {
+        "coordination_cycle": 11,
+        "workstream": 16
+      }
+    },
+    "docs/spq-lifecycle-design.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 20,
+        "cycle_of_cycles": 1,
+        "workstream": 120
+      }
+    },
+    "docs/user-guide/concepts/delivery-lifecycle.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 4,
+        "workstream": 6
+      }
+    },
+    "docs/user-guide/concepts/spq-cycle-model.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "cycle_of_cycles": 1,
+        "workstream": 3
+      }
+    },
+    "docs/user-guide/guides/release.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 6
+      }
+    },
+    "docs/user-guide/guides/using-the-control-plane.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "docs/user-guide/index.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 8,
+        "workstream": 7
+      }
+    },
+    "docs/user-guide/reference/config.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 13
+      }
+    },
+    "docs/user-guide/reference/glossary.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1,
+        "cycle_of_cycles": 1,
+        "workstream": 3
+      }
+    },
+    "docs/user-guide/spq-setup-runbook.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 6,
+        "workstream": 15
+      }
+    },
+    "e2e/helpers/pipeline.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 13
+      }
+    },
+    "e2e/scenarios/test_18_spq_cycle.py": {
+      "category": "amend",
+      "counts": {
+        "workstream": 5
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    },
+    "e2e/scenarios/test_21_envelope_signing.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "infra/opentofu/aws/aws.tfvars.example": {
+      "category": "other-sense",
+      "reason": "Ordinary English, not the retired SPQ object. The line reads 'The synaptory-v1-prod account, once vended by the foundation workstream', meaning a stream of work in the AWS migration programme, in a comment in an OpenTofu tfvars example. SPQ's Workstream was a lifecycle object that promised a general mechanism for parallel execution; this is the generic word for a body of work and names no lifecycle state, no unit, and no SPQ concept. Not reworded, deliberately: `other-sense` exists so a false positive is read and recorded rather than edited away, and editing another change's prose to avoid a category built for this case would hide the match instead of judging it.",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "infra/scripts/migrate-downstream-db.sh": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 5
+      }
+    },
+    "infra/scripts/multi-runtime-scaffold.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 24
+      }
+    },
+    "plugin-claude/README.md": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-claude/hooks/synaptory-session-start.sh": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/skills/_shared/protocols/finding-memory.md": {
+      "category": "other-sense",
+      "counts": {
+        "increment": 1
+      },
+      "reason": "`Increment \"suppressed\" counter.`: the English verb in an instruction to the agent, not the retired delivery unit."
+    },
+    "plugin-claude/skills/_shared/protocols/receipt-protocol.md": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 3
+      }
+    },
+    "plugin-claude/skills/synaptory/ceremonies/sprint-review.md": {
+      "category": "other-sense",
+      "counts": {
+        "increment": 1
+      },
+      "reason": "`Deploy Increment to Preview` in a Scrum ceremony: Scrum's own Increment artifact, which ADR-028 retains explicitly (\"'Increment' stays with the platform delivery ladder\"). The word SPQ retired names SPQ's delivery unit, and this is not it."
+    },
+    "plugin-claude/skills/synaptory/modes/spq.md": {
+      "category": "retirement-document",
+      "counts": {
+        "coordination_cycle": 1,
+        "cycle_of_cycles": 1,
+        "workstream": 1
+      },
+      "reason": "The SPQ dispatcher names all three retired nouns in one line, on purpose: it is the routing surface, and a user will still ask to sync their lanes or to run the folk-term release that spans several Cycles. Recognising the word is how the dispatcher can say which replacement is meant -- a source region, a Crew, or another concurrent Cycle -- instead of failing to route. Removing the line would not remove the requests."
+    },
+    "plugin-claude/synaptory": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/conftest.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 7
+      }
+    },
+    "plugin-claude/tests/fixtures/retired_vocabulary_census.json": {
+      "category": "guard",
+      "counts": {
+        "coordination_cycle": 118,
+        "increment": 11,
+        "slice": 5,
+        "the_implementation_phase": 1,
+        "workstream": 218
+      },
+      "reason": "the census names the words it classifies, and the reasons that dismiss a false positive quote them too; its own entry closes the recursion"
+    },
+    "plugin-claude/tests/fixtures/retired_vocabulary_table.json": {
+      "category": "guard",
+      "counts": {
+        "coordination_cycle": 2,
+        "cycle_of_cycles": 1,
+        "increment": 2,
+        "slice": 2,
+        "the_implementation_phase": 1,
+        "workstream": 2
+      },
+      "reason": "the vendored copy of `spq-methodology.md` 10.2 that supplies the census's word list; it carries all six retired words by definition, and its own entry closes that recursion the way the census's does"
+    },
+    "plugin-claude/tests/hooks/test_boundary_guard.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "plugin-claude/tests/hooks/test_dispatch_envelope_wiring.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "plugin-claude/tests/hooks/test_governed_overlay_required.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-claude/tests/hooks/test_multi_spec_hooks.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 8
+      }
+    },
+    "plugin-claude/tests/hooks/test_verify_receipt_binding.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-claude/tests/lib/test_advance_kernel.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_capability_profile_contracts.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_coverage_evidence_absence.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 3
+      }
+    },
+    "plugin-claude/tests/lib/test_dependency_gate.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 3,
+        "workstream": 14
+      }
+    },
+    "plugin-claude/tests/lib/test_dispatch_runtime_selection.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 3
+      }
+    },
+    "plugin-claude/tests/lib/test_dropped_case_incentive.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "plugin-claude/tests/lib/test_envelope_signature.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_evidence_runtime_identity.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_gate_emitter.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 5,
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_gate_event_retry.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_kernel_attempt_binding.py": {
+      "category": "rewrite",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-claude/tests/lib/test_manifest_emitter.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "plugin-claude/tests/lib/test_mcp_transport.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "plugin-claude/tests/lib/test_retired_vocabulary_census.py": {
+      "category": "guard",
+      "counts": {
+        "coordination_cycle": 4,
+        "cycle_of_cycles": 3,
+        "increment": 7,
+        "slice": 4,
+        "the_implementation_phase": 3,
+        "workstream": 5
+      },
+      "reason": "the guard must name the words it searches for, or it cannot search"
+    },
+    "plugin-claude/tests/lib/test_rewrite_dropped_wiring.py": {
+      "category": "guard",
+      "counts": {
+        "workstream": 3
+      },
+      "reason": "the guard names the retired attribute whose disappearance caused the defect: `ident.workstream_id` is what `receipts_dir_for` branched on, and a test that cannot say so cannot explain what it pins"
+    },
+    "plugin-claude/tests/lib/test_runtime_contracts.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "plugin-claude/tests/lib/test_runtime_materialization.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      },
+      "reason": "asserts the fallback ref is refs/heads/cycle/<id>/ws/<ws>, a branch pattern the epic removes"
+    },
+    "plugin-claude/tests/lib/test_seal_absence.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-claude/tests/lib/test_spq_ledger.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 4
+      }
+    },
+    "plugin-claude/tests/lib/test_spq_manifest.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 17,
+        "workstream": 38
+      }
+    },
+    "plugin-claude/tests/lib/test_state_drift.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-claude/tests/lib/test_test_first_prove_path.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 7
+      }
+    },
+    "plugin-codex/scripts/compose.py": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1
+      }
+    },
+    "plugin-codex/tests/test_codex_mcp.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 2,
+        "workstream": 21
+      }
+    },
+    "plugin-codex/tests/test_package.py": {
+      "category": "amend",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    },
+    "plugin-cursor/hooks/lib/advance_kernel.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 10
+      }
+    },
+    "plugin-cursor/hooks/lib/cycle_records.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "plugin-cursor/hooks/lib/evidence_contract.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/lib/gate_emitter.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/lib/kanban_state_machine.py": {
+      "category": "other-sense",
+      "counts": {
+        "increment": 1
+      },
+      "reason": "Composed copy of `core/lib/kanban_state_machine.py`; the same English-verb occurrence. It follows its source on the next compose and owes no sweep of its own."
+    },
+    "plugin-cursor/hooks/lib/loop_engine.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/lib/pipeline_board.py": {
+      "category": "regenerate",
+      "counts": {
+        "slice": 1,
+        "workstream": 12
+      }
+    },
+    "plugin-cursor/hooks/lib/runtime_contracts.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 8
+      }
+    },
+    "plugin-cursor/hooks/lib/runtime_materialization.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/lib/spq_ledger.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 6
+      }
+    },
+    "plugin-cursor/hooks/lib/spq_manifest.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 9,
+        "workstream": 41
+      }
+    },
+    "plugin-cursor/hooks/lib/spq_paths.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 3,
+        "workstream": 6
+      }
+    },
+    "plugin-cursor/hooks/lib/spq_state_machine.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 2
+      }
+    },
+    "plugin-cursor/hooks/lib/state_store.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/lib/story_pipeline.py": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 9,
+        "increment": 1,
+        "workstream": 36
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/dod-criteria-gap.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/envelope-local-qe.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/envelope-managed-se.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 2
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/receipt-attempt-bound.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/receipt-attempt-failed.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/receipt-evidence-attested.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/receipt-evidence-judged.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/runtime-fixtures/receipt-evidence-replayed.json": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/hooks/synaptory-session-start.sh": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/skills/_shared/scripts/tracker/local_adapter.py": {
+      "category": "regenerate",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/skills/synaptory/ceremonies/sprint-review.md": {
+      "category": "other-sense",
+      "counts": {
+        "increment": 1
+      },
+      "reason": "Composed copy of `plugin-claude/skills/synaptory/ceremonies/sprint-review.md`; the same Scrum Increment artifact that ADR-028 retains."
+    },
+    "plugin-cursor/skills/synaptory/modes/spq.md": {
+      "category": "regenerate",
+      "counts": {
+        "coordination_cycle": 1,
+        "cycle_of_cycles": 1,
+        "workstream": 1
+      }
+    },
+    "plugin-cursor/tests/test_mcp.py": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "coordination_cycle": 1,
+        "workstream": 1
+      }
+    },
+    "scripts/check-retired-vocabulary-table": {
+      "category": "guard",
+      "counts": {
+        "coordination_cycle": 1,
+        "cycle_of_cycles": 1,
+        "the_implementation_phase": 1
+      },
+      "reason": "the tool that re-derives the vendored 10.2 table from a spec checkout and diffs it; it names three of the words to explain how their ids are derived, which a guard over a word list cannot avoid doing"
+    },
+    "web/README.md": {
+      "category": "rewrite",
+      "counts": {
+        "coordination_cycle": 1
+      }
+    },
+    "web/src/components/supervision/AttemptBindingCard.tsx": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 4
+      }
+    },
+    "web/src/lib/api.ts": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "web/src/lib/types.ts": {
+      "category": "coordinated",
+      "coordinated_change": "ADR-035-workstream-id-signed-field",
+      "counts": {
+        "workstream": 1
+      }
+    },
+    "web/src/test/components/CycleIntegrationPanel.test.tsx": {
+      "category": "amend",
+      "counts": {
+        "workstream": 1
+      },
+      "reason": "the file names what was retired and what replaced it; the nouns are its subject, not vocabulary in use"
+    }
+  }
+}

@@ -45,6 +45,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import access_token_client as atc  # noqa: E402
+import cli_probe  # noqa: E402
 import session_store  # noqa: E402
 from session_store import SessionRecord  # noqa: E402
 
@@ -172,45 +173,104 @@ class LocalBackend(Backend):
 # ── Control-plane backend (wired in v2.1.18, body filled in by v2.5 merge) ──
 
 def _cli_url_is_local(url: str) -> bool:
+    """Fallback classifier for a partial install without `host_env`.
+
+    Substring matching says True for anything CONTAINING "localhost" or
+    "127.", which is wrong for `https://localhost.example.com` and for a path
+    segment. `host_env.is_loopback_url` parses the host instead, and is what
+    the rest of the runtime uses, so this is only the last resort when that
+    import is unavailable.
+    """
     u = (url or "").lower()
     return "localhost" in u or "127." in u or "::1" in u
 
 
-def _resolve_cli_binary(url: str = "") -> str | None:
-    """Match hooks/_resolve-cli.sh and reject a mismatched CLI build identity."""
+def _is_local_url(url: str) -> bool:
+    try:
+        from host_env import is_loopback_url
+    except Exception:  # noqa: BLE001 - partial install
+        return _cli_url_is_local(url)
+    return is_loopback_url(url)
+
+
+#: Why no CLI was resolved, when the answer is not simply "there is none".
+#: `""` means the ordinary outcome; anything else is a diagnosis to report
+#: instead of the wrong one. `_resolve_cli_binary` returns None in both cases,
+#: and only this string tells them apart.
+UNRESOLVED_TIMEOUT = "probe-timeout"
+UNRESOLVED_UNADDRESSED = "no-channel"
+
+
+def resolve_cli_binary(url: str = "") -> tuple[str | None, str]:
+    """`(path, reason)`. Mirrors hooks/_resolve-cli.sh and `gate_emitter`.
+
+    Rejects a CLI stamped for the OTHER control plane (#320): a prod binary
+    must not serve a local runtime and the reverse ships local data to prod on
+    the first slug collision.
+
+    A probe that does not answer is NOT a rejection (#396). This resolver used
+    to fold `subprocess.TimeoutExpired` into the same `return explicit` as a
+    genuine mismatch, so on a loaded machine `ControlPlaneBackend` fell back to
+    local mode and reported the CLI as missing from PATH. The binary was on
+    PATH and correctly stamped; only the answer was late. The verdict now
+    survives to the caller as `UNRESOLVED_TIMEOUT`, and the whole resolution
+    gets ONE retry, because a timeout is a statement about the machine rather
+    than about any one candidate.
+
+    `identity_known` is the same idea `gate_emitter` carries: the channel this
+    runtime belongs to has to come from somewhere before a binary can be judged
+    against it. Here the caller names it, since `ControlPlaneBackend` is only
+    constructed with a URL it already resolved. With no URL and nothing on disk
+    saying otherwise, there is no claim to check a candidate against, so
+    candidates are taken unprobed rather than measured against an assumed
+    production channel.
+    """
     import shutil
-    import subprocess
     from pathlib import Path
 
-    local = _cli_url_is_local(url)
-
-    def identity_matches(candidate: Path, *, explicit: bool = False) -> bool:
+    if url:
+        local = _is_local_url(url)
+        identity_known = True
+    else:
         try:
-            result = subprocess.run(
-                [str(candidate), "status"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=2.0,
-            )
-        except (OSError, subprocess.SubprocessError):
+            from host_env import channel_signal
+
+            local, channel_source = channel_signal()
+        except Exception:  # noqa: BLE001
+            local, channel_source = False, ""
+        identity_known = bool(channel_source)
+
+    timeout = cli_probe.probe_timeout()
+    # ONE retry for the whole resolution, not one per candidate: a timeout says
+    # the machine is loaded, and the next candidate is overwhelmingly likely to
+    # observe the same thing. Bounding it here keeps the worst case near two
+    # probes rather than one full ceiling per candidate.
+    grace = [1]
+
+    def identity_matches(candidate: str, *, explicit: bool = False) -> bool:
+        """True to accept; raises `Unprobeable` when we cannot tell."""
+        if not identity_known:
+            return True
+        verdict = cli_probe.probe_channel_identity(candidate, local, timeout)
+        if verdict == cli_probe.TIMEOUT and grace[0]:
+            grace[0] -= 1
+            verdict = cli_probe.probe_channel_identity(candidate, local, timeout)
+        if verdict == cli_probe.TIMEOUT:
+            # An explicitly named binary is the documented CI/e2e escape hatch
+            # and is already accepted when it answers nothing useful; a slow
+            # answer is weaker evidence still, so it keeps the same benefit of
+            # the doubt.
+            if explicit:
+                return True
+            raise cli_probe.Unprobeable(candidate)
+        if verdict == cli_probe.UNREADABLE:
             return explicit
-        identity = next(
-            (
-                line.split(":", 1)[1].strip()
-                for line in result.stdout.splitlines()
-                if line.startswith("control_plane_url:")
-            ),
-            "",
-        )
-        if not identity:
-            return explicit
-        return _cli_url_is_local(identity) == local
+        return verdict == cli_probe.MATCH
 
     override = os.environ.get("SYNAPTORY_CLI_BIN")
     if override and os.path.isfile(override) and os.access(override, os.X_OK):
         path = Path(override)
-        return str(path) if identity_matches(path, explicit=True) else None
+        return (str(path) if identity_matches(str(path), explicit=True) else None), ""
 
     name = "synaptory-local" if local else "synaptory"
     candidates: list[Path] = []
@@ -223,14 +283,31 @@ def _resolve_cli_binary(url: str = "") -> str | None:
             candidates.append(Path(prod).parent / name)
     candidates.extend((Path.home() / ".local" / "bin" / name, Path.home() / "bin" / name))
     seen: set[str] = set()
+    unprobeable = ""
     for candidate in candidates:
         rendered = str(candidate)
         if rendered in seen or not candidate.is_file() or not os.access(candidate, os.X_OK):
             continue
         seen.add(rendered)
-        if identity_matches(candidate):
-            return rendered
-    return None
+        try:
+            matched = identity_matches(rendered)
+        except cli_probe.Unprobeable as slow:
+            # Distinct from "no candidate matched": the candidates are still
+            # there and may well be right. Remember it and keep going, so a
+            # second binary that DOES answer still resolves.
+            unprobeable = unprobeable or str(slow)
+            continue
+        if matched:
+            return rendered, ""
+    if unprobeable:
+        return None, UNRESOLVED_TIMEOUT
+    return None, ""
+
+
+def _resolve_cli_binary(url: str = "") -> str | None:
+    """The path only. Kept for callers that cannot act on the reason."""
+    return resolve_cli_binary(url)[0]
+
 
 
 class ControlPlaneBackend(Backend):
@@ -254,13 +331,31 @@ class ControlPlaneBackend(Backend):
 
     def __init__(self, control_plane_url: str, cli_path: str | None = None):
         self.url = control_plane_url
-        self.cli_path = cli_path or _resolve_cli_binary(control_plane_url)
+        if cli_path:
+            self.cli_path: str | None = cli_path
+            self.cli_unresolved = ""
+        else:
+            self.cli_path, self.cli_unresolved = resolve_cli_binary(control_plane_url)
 
     def name(self) -> str:
         return f"control-plane ({self.url})"
 
     def _run_cli(self, args: list[str], timeout: float = 30.0) -> tuple[int, str, str]:
         if not self.cli_path:
+            if self.cli_unresolved == UNRESOLVED_TIMEOUT:
+                # NOT "no CLI". The binary is on PATH; `status` did not answer
+                # in time, twice, so this runtime could not tell whether it
+                # belongs to the same control plane. Falling back to local is
+                # still the safe move, but saying "not found" sends the reader
+                # to install a CLI they already have (#396).
+                raise SessionError(
+                    f"synaptory CLI found, but `status` did not answer within "
+                    f"{cli_probe.probe_timeout():g}s, twice, so this runtime "
+                    f"could not confirm it belongs to {self.url}. This is "
+                    f"'could not tell', NOT 'wrong or missing binary': the "
+                    f"usual cause is a loaded machine. Raise "
+                    f"SYNAPTORY_CLI_PROBE_TIMEOUT if it persists."
+                )
             raise SessionError(
                 "synaptory CLI binary not found on PATH. Install the CLI that "
                 "matches this plugin: `synaptory` for prod, `synaptory-local` "

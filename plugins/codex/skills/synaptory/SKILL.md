@@ -69,23 +69,34 @@ content unnecessarily in chat. Tracker reads and mutations go through the
 
 ## Full SPQ lifecycle
 
-For an SPQ project, call `next_action` at every boundary. Outside
-`CYCLE_EXECUTION` it returns the exact ceremony operation or managed role to
-run; never call lifecycle Python modules directly.
+The lifecycle has **four stages** —
+`DISCOVERY → CYCLE → ACCEPTANCE → COMPLETE` — with `ACCEPTANCE → CYCLE` making
+Acceptance repeatable. Commit, Sync
+and Checkpoint are **recorded events inside those stages, never stages and
+never gates**. Call `next_action` at every boundary; it answers for every
+stage. Never call lifecycle Python modules directly.
 
-- `approve_baseline`, Sync entry after readiness publication, `clear_sync`, and
-  `complete_release` are human gates.
-  Require the user's explicit decision and pass the real principal as
-  `approved_by` to `spq_lifecycle`.
-- `open_cycle` admits the approved goal and non-empty Work Unit array. Workstream
-  clones use `hydrate_cycle` with their filtered Work Units.
-- After every Work Unit is `done` or explicitly cut, `next_action` first selects
-  `declare_ready` while the clone is still in Cycle execution. Call that MCP
-  operation, then stop for a human to commit and push the workstream head plus
-  readiness record. With that confirmation, pass the real principal as
-  `approved_by` to `spq_lifecycle(operation: "enter_sync")`. The integration
-  clone evaluates Sync after the human merge and calls `clear_sync` only on a
-  green verdict.
+- `approve_baseline` and `complete_release` are human gates. Require the user's
+  explicit decision and pass the real principal as `approved_by` to
+  `spq_lifecycle`.
+- `approve_baseline` also requires `baseline_ref`: an approval that does not
+  name the revision it approved cannot be the line a cut must not move.
+- `open_cycle` seals the Cycle declaration — the goal, the repository, the
+  trunk ref it will integrate to, the source region it may address, the
+  accountable `engineering_lead`, and a non-empty `admitted_units` array whose
+  every unit declares a `kind`, acceptance criteria and a `path_scope`. The
+  declaration is immutable afterwards, and two units whose `path_scope`
+  intersect are refused a concurrent execution set. Another clone joins with
+  `hydrate_cycle` and its `cycle_id`; there is no per-clone Work Unit filter,
+  because the admitted set is the Cycle's work.
+- After every Work Unit is `done` or explicitly cut, `next_action` selects
+  `close_cycle`. Run the Cycle barrier, then call `close_cycle` with the trunk
+  revision it integrated (`integrated_sha`) and the barrier's own
+  `barrier_verdict`. The close **records** a verdict; it does not derive one,
+  and a non-green verdict cuts work rather than closing.
+- If a cross-Cycle wait cleared, `record_sync` records which dependency and
+  how. It unblocks nothing — a satisfied dependency does that — and its absence
+  blocks nothing either.
 - At Checkpoint and Acceptance, a `dispatch_*` action uses
   `begin_lifecycle_dispatch`, then the named managed profile. Include the
   returned `execution_envelope` verbatim, including its pseudo story id,
@@ -95,10 +106,12 @@ run; never call lifecycle Python modules directly.
 - Dispatch Acceptance's `qe`, `ce`, `pe`, `tw`, and `cr` activities one at a
   time. Codex currently permits four total agent threads including the parent,
   so a five-agent parallel fan-out is not a valid execution plan.
-- `close_cycle` refuses an absent, invalid, failed, or wrongly bound Technical
-  Writer receipt. `complete` refuses any missing/invalid release receipt,
-  failed tests, critical security finding, non-approved Code Review, or Cycle
-  without a recorded green Sync verdict.
+- `close_cycle` refuses while `next_action` is anything other than
+  `close_cycle`, so outstanding work or owed evidence blocks it. `complete`
+  refuses any missing or invalid release receipt, and only the **final**
+  Acceptance offers it — whether an Acceptance is final is derived from
+  outstanding commitments and a recorded handover, never claimed by the
+  caller.
 
 ## Governed Work Unit loop
 
@@ -109,15 +122,26 @@ uncertified on Codex and require the warning and explicit choice above. Re-read
 
 1. Call `next_action`.
 2. If it returns an SPQ ceremony operation, follow the full lifecycle section.
-   If it returns a human gate, terminal action, `await_sync`, or an action
-   without a dispatch/transition contract, stop and report the exact reason.
-   Never skip a human gate.
+   If it returns a human gate, a terminal action, or an action without a
+   dispatch/transition contract, stop and report the exact reason. Never skip a
+   human gate. There is no `await_sync` to wait at: what holds a Work Unit is
+   an unmet dependency, and `next_action` names it and why.
 3. If it returns `transition_to` with a fresh receipt already present, call
    `advance` with exactly that `story_id` and `transition_to`. Do not dispatch
    another agent first.
 4. For `dispatch_*` or `recover_blocked`, call `begin_dispatch` with the exact
    selected story and role. Continue only when it returns `authorized: true`.
-5. Delegate to the custom agent named by `agent_profile`. The task must include
+5. **If `begin_dispatch` returned `dispatch_envelope`, call `execute_through_runtime`
+   with that envelope and the `project_dir`, and do NOT delegate to the custom
+   agent.** The kernel selected a runtime for this dispatch, and a receipt from
+   a different family is refused at `advance`: delegating natively there
+   produces a `runtime_family_mismatch`, not a result. The `runtime` block says
+   which profile was chosen and why. The bridge writes the receipt itself, so
+   **skip steps 6 and 7 and continue at step 8** with the receipt it reports.
+   Steps 6 and 7 are the native branch: entering them here would ask a second
+   executor for a receipt this dispatch already has.
+6. **Otherwise** (no `dispatch_envelope`) delegate to the custom agent named by
+   `agent_profile`. The task must include
    the complete returned envelope: story, current action, DoD expectations,
    recovery information, receipt path, and receipt contract. Add only the
    repository context needed to execute the bounded work. Spawn the custom
@@ -126,19 +150,21 @@ uncertified on Codex and require the warning and explicit choice above. Re-read
    custom agent profile with a full-history fork. Wait only on the concrete
    agent identifier returned by a successful spawn; a failed spawn is a
    fail-closed error, not an empty wait.
-6. Require the agent to write its receipt last to the exact `receipt_path`.
+7. Still the native branch: require the agent to write its receipt last to the
+   exact `receipt_path`.
    The receipt must use the full role name and `backend: codex`. Record the
    actual model identifier when available; otherwise use the honest value
    `codex-runtime-unattributed`, never a guessed model. Every verification
    command is an executed object with `command`, integer `exit_code`, and
    `summary`. Copy the returned `dispatch_id` exactly; a receipt from a previous
    or concurrent dispatch is refused.
-7. After the agent returns, call `validate_receipt`. If missing or invalid,
+8. After **either executor** returns, the bridge or the custom agent, call
+   `validate_receipt`. If missing or invalid,
    stop without changing state and report the repair needed. A successful call
    also reports `control_plane_delivery.handed_off: true`, meaning the API
    accepted the minimized projection or the CLI durably queued it. Never treat
    local validity alone as sufficient for central analytics.
-8. Call `next_action` again. Advance only when it returns a `transition_to`,
+9. Call `next_action` again. Advance only when it returns a `transition_to`,
    and pass that exact value to `advance`. Then begin the next iteration.
 
 Role mapping is deterministic: `se` is `synaptory-software-engineer`, `qe` is
@@ -154,8 +180,8 @@ memory.
 - Never advance or close a ceremony without valid, dispatch-bound receipts
   under `.synaptory/.orchestrator`.
 - Never bypass failed control-plane receipt handoff. The upload allowlist is
-  identifiers, model/token attribution, timestamps/workstream metadata, and
-  the five DoD booleans. Prompts, transcripts, artifact content or paths,
+  identifiers, model/token attribution, timestamps, the Cycle id, and the five
+  DoD booleans. Prompts, transcripts, artifact content or paths,
   commands, summaries, and findings remain local.
 - Never change the story, role, or transition returned by `next_action`.
 - A failed agent, missing receipt, invalid evidence, tracker error, or MCP error

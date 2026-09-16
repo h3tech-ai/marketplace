@@ -71,7 +71,7 @@ Dispatch the Project Owner agent to refine stories for this sprint.
 PO_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "project-owner")
 ```
 
-> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the refinement inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="general-purpose", description="PO sprint refinement", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md` for the full prompt template. The PO writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-po.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the refinement inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="project-owner", description="PO sprint refinement", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md` for the full prompt template. The PO writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-po.json` as its last action.
 
 Read the PO backend wrapper at `${PLUGIN_ROOT}/skills/_shared/backends/${PO_BACKEND}.md` and dispatch.
 
@@ -225,7 +225,7 @@ Dispatch the Quality Engineer agent to generate a test plan for this sprint's st
 QE_BACKEND=$(python3 "${PLUGIN_ROOT}/skills/_shared/scripts/backend/backend_config.py" "$(pwd)" "quality-engineer")
 ```
 
-> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the test-spec work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="general-purpose", description="QE test specification", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-qe-spec.json` as its last action.
+> **MANDATORY: Spawn this agent via the `Task()` tool — do not execute the test-spec work inline.** Inline execution skips the SubagentStop hook, so no receipt is written and the work never reaches `/cost` or `/quality`. The dispatch must look like `Task(subagent_type="quality-engineer", description="QE test specification", prompt=<self-contained prompt per the wrapper>)` — see `${PLUGIN_ROOT}/skills/_shared/backends/${QE_BACKEND}.md`. The QE writes its receipt to `.synaptory/.orchestrator/receipts/SPRINT-{N}-qe-spec.json` as its last action.
 
 **QE prompt context:**
 - Sprint stories (IDs, titles, acceptance criteria)

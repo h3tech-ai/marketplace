@@ -13,6 +13,17 @@
             "additionalContextLimit": 4096
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/run-hook.sh\" TelemetryFlush",
+            "timeout": 20,
+            "async": true
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -40,6 +51,19 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/run-hook.sh\" SubagentStart",
+            "timeout": 10,
+            "statusMessage": "Binding Synaptory dispatch telemetry..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": ".*",
@@ -48,6 +72,12 @@
             "type": "command",
             "command": "bash \"${PLUGIN_ROOT}/hooks/run-hook.sh\" Stop",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/run-hook.sh\" TelemetryFlush",
+            "timeout": 20,
+            "async": true
           }
         ]
       }

@@ -1,0 +1,8 @@
+{
+  "principal": "alice@h3t.co",
+  "candidate_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "verdict": "rejected",
+  "recorded_at": "2026-09-02T10:20:00Z",
+  "independent_of_producer": false,
+  "reason": "the pagination case fails against the acceptance cases authored at COMMIT; non-independence is recorded here, not refused: the judging principal also authored the candidate"
+}

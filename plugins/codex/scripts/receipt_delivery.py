@@ -37,12 +37,59 @@ SAFE_SCALAR_FIELDS = (
     "dispatch_id",
     "status",
     "completed_at",
-    "workstream_id",
+    # `cycle_id` REPLACES THE RETIRED LANE IDENTITY (ADR-035). A Work Unit
+    # belongs to a Cycle, and the Cycle is what the control plane can join an
+    # analytics row back to. Projecting the old field instead would have left
+    # every Codex row silently unattributed rather than visibly wrong, which is
+    # the harder failure to notice.
+    "cycle_id",
+    # THE ATTEMPT THIS RECEIPT CAME FROM (#396). Both are opaque identifiers
+    # the control plane already stores on the attempt row, and without them the
+    # analytics row cannot be checked against the attempt at all: a
+    # cross-family execution recorded under the wrong backend was invisible
+    # from the control plane's own data, which is where #346's runtime identity
+    # has to be visible.
+    "attempt_id",
+    "adapter_profile_id",
 )
+
+
+HOST_BACKEND = "codex"
 
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+#: The receipt vocabulary (`core/receipt-schema/evidence-contract.json`). A
+#: backend outside it is not canonicalized into the projection, because the
+#: analytics row is what the control plane groups on.
+KNOWN_BACKENDS = ("claude", "cursor", "codex", "gemini")
+
+
+def resolved_backend(receipt: dict) -> str:
+    """The backend that actually RAN this receipt's work.
+
+    The projection hardcoded the host's own backend, so a Cursor host shipping
+    a Codex-executed receipt recorded `backend: cursor` while the attempt row
+    beside it said `runtime_family: codex`. The control plane then grouped a
+    cross-family execution under the host that dispatched it, which is the one
+    fact #346 exists to make visible (#396).
+
+    The receipt's own backend is used when it carries an attempt binding, which
+    is the same condition `_backend_admissible` admits it on: by the time this
+    runs the receipt has passed `validate_receipt`, and the kernel's
+    family-mismatch guard has already checked that backend against the profile
+    the dispatch selected. Anything unbound, or naming a backend outside the
+    receipt vocabulary, projects as the host's own rather than inventing a
+    grouping key.
+    """
+    backend = str(receipt.get("backend") or "")
+    if backend == HOST_BACKEND or backend not in KNOWN_BACKENDS:
+        return HOST_BACKEND
+    if receipt.get("attempt_id") and receipt.get("adapter_profile_id"):
+        return backend
+    return HOST_BACKEND
 
 
 def _delivery_id(receipt: dict[str, Any], source_digest: str) -> str:
@@ -58,7 +105,7 @@ def _delivery_id(receipt: dict[str, Any], source_digest: str) -> str:
     dispatch_id = receipt.get("dispatch_id")
     if isinstance(dispatch_id, str) and dispatch_id.strip():
         identity = {
-            "backend": "codex",
+            "backend": resolved_backend(receipt),
             "dispatch_id": dispatch_id.strip(),
             "role": str(receipt.get("role") or ""),
             "story_id": str(receipt.get("story_id") or ""),
@@ -77,7 +124,7 @@ def analytics_projection(receipt: dict[str, Any], source_digest: str) -> dict[st
     projected: dict[str, Any] = {
         "analytics_schema_version": DELIVERY_SCHEMA_VERSION,
         "delivery_id": _delivery_id(receipt, source_digest),
-        "backend": "codex",
+        "backend": resolved_backend(receipt),
     }
     for key in SAFE_SCALAR_FIELDS:
         value = receipt.get(key)
@@ -259,6 +306,31 @@ def _normalize_token_usage(receipt_path: Path) -> bool:
         return False
 
 
+def _backend_admissible(receipt: dict) -> bool:
+    """Whether this host may ship a receipt naming that backend.
+
+    The host's own backend, always. And a receipt from a GOVERNED CROSS-FAMILY
+    DISPATCH, which names the runtime that ran rather than the host that
+    dispatched it: #346 is the capability that a host may invoke a runtime of
+    another family, and a rule comparing the receipt's backend to the host's
+    refused exactly the receipts that capability produces. The kernel already
+    admits them, so the delivery path was the one place that still assumed a
+    host only ever ships its own runtime's work (#396).
+
+    What makes such a receipt admissible is not its backend value but its
+    ATTEMPT BINDING. `attempt_id` and `adapter_profile_id` are written by the
+    dispatch the kernel authorized, so a receipt carrying them is provably the
+    product of one. A receipt some other tool dropped in the directory has
+    neither, which is the case this rule exists to refuse, and refusing it on
+    provenance is stronger than refusing it on a name it could simply have
+    written differently.
+    """
+    backend = str(receipt.get("backend") or "")
+    if backend == HOST_BACKEND:
+        return True
+    return bool(receipt.get("attempt_id")) and bool(receipt.get("adapter_profile_id"))
+
+
 def ship_validated_receipt(
     project: Path,
     receipt_path: Path,
@@ -302,8 +374,15 @@ def ship_validated_receipt(
         }
     if not isinstance(receipt, dict):
         return {"handed_off": False, "error": "receipt delivery requires a JSON object"}
-    if receipt.get("backend") != "codex":
-        return {"handed_off": False, "error": "receipt delivery requires backend: codex"}
+    if not _backend_admissible(receipt):
+        return {
+            "handed_off": False,
+            "error": (
+                "receipt delivery requires backend: %s, or a governed "
+                "cross-family receipt carrying its attempt binding"
+                % HOST_BACKEND
+            ),
+        }
 
     # Normalize `token_usage` before the digest is taken, so the digest covers
     # what is actually shipped. Claude and Cursor run this in their SubagentStop

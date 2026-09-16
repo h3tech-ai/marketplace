@@ -16,6 +16,9 @@ the shared Synaptory lifecycle engine. Validated receipts hand an allowlisted
 analytics projection to the authenticated Synaptory CLI/outbox so Activity,
 Cost, and Quality can populate without uploading prompts, transcripts,
 artifact content or paths, commands, summaries, or findings.
+Managed agent hooks also open dispatch-bound subagent rows and local OTLP spans;
+asynchronous session/stop handlers drain the outbox and trace files so the
+project-scoped Reliability view reflects Codex work.
 
 The package composes these host-neutral sources from `plugin-claude/`:
 

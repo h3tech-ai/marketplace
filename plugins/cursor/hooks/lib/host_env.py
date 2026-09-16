@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlsplit
 
 PROJECT_DIR_VARS = ("SYNAPTORY_PROJECT_DIR", "CLAUDE_PROJECT_DIR")
@@ -64,14 +64,63 @@ def plugin_root(default: str = "") -> str:
 def _read_stamp(directory: Path) -> str:
     """First usable cp-url value in `directory`, or "" when there is none."""
 
+    value, _unreadable = _read_stamp_state(directory)
+    return value
+
+
+def _read_stamp_state(directory: Path) -> Tuple[str, bool]:
+    """`(value, unreadable)` for `directory`'s stamp.
+
+    ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS (#396). `_read_stamp` collapses
+    them, which is right for its callers: they want a URL and "" means they do
+    not have one. It is wrong for a caller deciding whether a control plane
+    EXISTS, because a stamp that is present and cannot be read is an install
+    whose integrity is unknown, not a project that reports nowhere. A file that
+    is not there raises the same `OSError` as one whose permissions deny it, so
+    the two are separated by asking whether the path exists.
+    """
+    unreadable = False
     for name in CP_URL_FILENAMES:
+        path = directory / name
         try:
-            value = (directory / name).read_text(encoding="utf-8").strip()
+            value = path.read_text(encoding="utf-8").strip()
         except OSError:
+            try:
+                if path.exists():
+                    unreadable = True
+            except OSError:
+                unreadable = True
             continue
         if value and value != CP_URL_PLACEHOLDER:
-            return value
-    return ""
+            return value, unreadable
+    return "", unreadable
+
+
+def control_plane_stamp_state() -> Tuple[str, str]:
+    """`(state, detail)` where state is `stamped`, `unstamped` or `unreadable`.
+
+    The tri-state a caller needs when the QUESTION is whether a control plane
+    exists rather than what its URL is. `plugin_control_plane_url` answers the
+    second and cannot answer the first: it returns "" for a tree with no stamp,
+    for a placeholder stamp, and for a stamp it could not open, and only the
+    first two mean "this addresses nothing".
+    """
+    detail = ""
+    unreadable = False
+    root = plugin_root().strip()
+    if root:
+        value, missed = _read_stamp_state(Path(root) / "hooks" / "lib")
+        unreadable = unreadable or missed
+        if value:
+            return "stamped", "cp-url stamp (%s)" % value
+    value, missed = _read_stamp_state(RUNTIME_STAMP_DIR)
+    unreadable = unreadable or missed
+    if value:
+        return "stamped", "cp-url stamp (%s)" % value
+    if unreadable:
+        detail = "a cp-url stamp exists and could not be read"
+        return "unreadable", detail
+    return "unstamped", detail
 
 
 def plugin_control_plane_url() -> str:

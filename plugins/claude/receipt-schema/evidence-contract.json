@@ -283,7 +283,7 @@
       "evidence": {
         "field": "metrics.findings_critical",
         "shape": "integer",
-        "predicate": "equals 0 (absent key defaults to 0)"
+        "predicate": "equals 0; an absent key is UNEVALUABLE and declares a criteria gap, never a pass (#487)"
       }
     },
     "code_reviewed": {
@@ -322,7 +322,7 @@
       "evidence": {
         "field": "metrics.coverage_delta",
         "shape": "number or percent string (e.g. \"+3.2%\")",
-        "predicate": "numeric value >= 0; absent or unparseable delta is assumed to pass"
+        "predicate": "numeric value >= 0; an absent or unparseable delta is UNEVALUABLE and declares a criteria gap, never a pass (#540)"
       }
     },
     "runtime_verified": {
@@ -354,7 +354,7 @@
       "evidence": {
         "field": "metrics.ui_verification",
         "shape": "{rendered: bool, routes_tested: int, flows_failed: int}",
-        "predicate": "rendered true AND flows_failed == 0; legacy shape metrics.routes_tested > 0 with metrics.flows_failed == 0 also accepted; otherwise unverifiable"
+        "predicate": "rendered true AND routes_tested >= 1 AND flows_failed == 0, every count RECORDED; the standard verification tier waives the flow count only; legacy shape metrics.routes_tested > 0 with metrics.flows_failed == 0 also accepted; an absent, unparseable, non-finite or non-whole count is UNEVALUABLE and declares a criteria gap, never a pass (#540, #396)"
       }
     },
     "integration_verified": {

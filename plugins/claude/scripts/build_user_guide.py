@@ -34,7 +34,7 @@ DOC_GROUPS = [
     (
         "SPQ Concepts",
         [
-            "concepts/platform.md",
+            "concepts/how-it-works.md",
             "concepts/architecture.md",
             "concepts/identity-and-access.md",
             "concepts/personas.md",
@@ -45,7 +45,7 @@ DOC_GROUPS = [
             "concepts/agents.md",
             "concepts/engagement-modes.md",
             "concepts/enforcement.md",
-            "concepts/v2-roadmap.md",
+            "concepts/whats-next.md",
         ],
     ),
     (
@@ -53,7 +53,6 @@ DOC_GROUPS = [
         [
             "guides/spq-delivery.md",
             "spq-setup-runbook.md",
-            "guides/coordination-cycles.md",
             "guides/resuming-pipelines.md",
             "guides/using-the-control-plane.md",
             "guides/release.md",

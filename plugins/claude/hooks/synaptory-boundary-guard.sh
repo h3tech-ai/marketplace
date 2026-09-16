@@ -13,35 +13,37 @@
 #       operations must go through tracker_cli.py (iron law §1).
 #   G2. Block direct writes to pipeline-state.json — transitions must flow
 #       through story_pipeline.py / synaptory-pipeline-snapshot.sh.
-#   G3. Block direct write-tool access to .synaptory/sync/ — the Cycle
-#       readiness record is the ONLY channel by which quality evidence crosses
-#       the clone boundary in the SPQ hybrid topology (evidence_replay_mismatch
-#       and signals.jsonl are both local-only, so the integration clone can
-#       never see them). Barrier criterion 1 is satisfied by the record merely
-#       existing, so an agent that cannot make the barrier could otherwise
-#       hand-author one claiming it did. Denying agent writes makes the record
-#       producible only by `sync_barrier.py declare-ready <N>`, which derives it
-#       from local state and an executed regression.
+#   G3. GONE, with the directory it guarded (ADR-035 / `SPD-194`). It denied
+#       writes to `.synaptory/sync/`, the per-lane readiness record that the
+#       Sync-stage barrier collected a quorum of. The barrier is at Checkpoint
+#       now and evaluates the admitted set rather than a quorum of lane
+#       records, so nothing writes that directory and nothing reads it. A
+#       guard aimed at a path the product no longer creates is not defence in
+#       depth: it reads as coverage in this header while enforcing nothing,
+#       and the inputs that replaced the readiness record — the sealed
+#       declaration, the cut record, the dependency events — are all under a
+#       root G4 already covers.
+#   G4. Block direct write-tool access to the SPQ Cycle store, on both of its
+#       roots: `.synaptory/.orchestrator/spq/` (gitignored, local) and
+#       `.synaptory/cycles/` (committed transport). TWO ROOTS, and neither is
+#       redundant. The first holds this clone's board and its ledger cache.
+#       The second holds the sealed declaration, the dependency events and the
+#       append-only cut record — the things OTHER clones read, which is why
+#       `open_cycle` refuses to write them when they are gitignored.
+#       Everything under both must be DERIVED — by `open_cycle` /
+#       `hydrate_cycle` / `cut_work_unit` / the ledger verbs — never
+#       hand-authored. Hand-writing a dependency event would let a Work Unit
+#       be unblocked by a claim nothing verified; hand-writing a cut would let
+#       an agent shrink the admitted set it has to clear at the barrier. G2
+#       does not cover this: it matches only the literal string
+#       `pipeline-state.json`, so before G4 the entire SPQ store was
+#       unguarded.
 #       Honest scope: because this guard is active in structured mode only (or
 #       with SYNAPTORY_GUARDRAILS=1) and is switched off entirely by
-#       SYNAPTORY_GUARDRAILS=0, G3 is defence in depth — NOT a security
-#       boundary. It raises the cost of a fabricated record; it does not make
-#       the record self-attesting.
-#   G4. Block direct write-tool access to the SPQ store and the committed Cycle
-#       and Coordination-Cycle transports — `.synaptory/.orchestrator/spq/`,
-#       `.synaptory/cycles/` and `.synaptory/coordination-cycles/` (#303, #305)
-#       (#303). Same argument as G3, one layer earlier: the Cycle manifest is
-#       what every workstream hydrates its admitted set from, and a dependency
-#       event is what unblocks another workstream's Work Unit. Both must be
-#       DERIVED — by `open_cycle` / `hydrate_cycle` / the ledger verbs — never
-#       hand-authored, or an agent that cannot satisfy a dependency could write
-#       the event that says it did. G2 does not cover this: it matches only the
-#       literal string `pipeline-state.json`, so before G4 the entire SPQ store
-#       was unguarded.
-#       Same honest scope as G3, and one addition that matters: the manifest
-#       HASH is what actually makes tampering detectable. G4 makes accidental
-#       and casual tampering unlikely; the hash is what makes deliberate
-#       tampering visible.
+#       SYNAPTORY_GUARDRAILS=0, G4 is defence in depth — NOT a security
+#       boundary. The declaration HASH is what actually makes tampering
+#       detectable. G4 makes accidental and casual tampering unlikely; the
+#       hash is what makes deliberate tampering visible.
 #
 # PreToolUse stdin (Claude Code):
 #   {"tool_name": "…", "tool_input": {…}, "session_id": "…",
@@ -131,44 +133,25 @@ elif file_path and 'pipeline-state.json' in file_path:
     print('Direct writes to pipeline-state.json are blocked — pipeline transitions must go through advance_kernel.py (the only legal writer) or synaptory-pipeline-snapshot.sh for state restore.')
     sys.exit(0)
 
-# ---- G3: sync readiness records ----
-sync_dir = os.path.join(project_dir, '.synaptory', 'sync')
-if tool == 'Bash':
-    cmd = inp.get('command', '')
-    if re.search(r'[>|].*\\.synaptory/sync/', cmd):
-        print('deny')
-        print('Direct writes to .synaptory/sync/ are blocked — the Cycle readiness record must be derived by sync_barrier.py declare-ready <N>, never hand-authored.')
-        sys.exit(0)
-elif file_path:
-    abs_path = file_path if os.path.isabs(file_path) else os.path.join(project_dir, file_path)
-    try:
-        real_file = os.path.realpath(abs_path)
-        real_sync = os.path.realpath(sync_dir)
-        if real_file.startswith(real_sync + os.sep) or real_file == real_sync:
-            print('deny')
-            print('Direct writes to .synaptory/sync/ are blocked — the Cycle readiness record must be derived by sync_barrier.py declare-ready <N>, never hand-authored.')
-            sys.exit(0)
-    except Exception:
-        pass
+# ---- G3: retired with .synaptory/sync/ (ADR-035). See the header. ----
 
-# ---- G4: the SPQ store and the committed Cycle transport (#303) ----
+# ---- G4: the SPQ store and the committed Cycle transport ----
 _SPQ_DENY = (
-    'Direct writes to the SPQ Cycle store are blocked — the manifest, the '
-    'dependency ledger and Work Unit state must be DERIVED by '
-    'spq_state_machine.py (open_cycle / hydrate_cycle) and the ledger verbs, '
-    'never hand-authored. Hand-writing a dependency event would let a Work '
-    'Unit be unblocked by a claim nothing verified, and hand-writing a '
-    'coordination manifest would let a release ship a child increment nobody '
-    'integrated.'
+    'Direct writes to the SPQ Cycle store are blocked — the sealed '
+    'declaration, the dependency events, the cut record and Work Unit state '
+    'must be DERIVED by spq_state_machine.py (open_cycle / hydrate_cycle / '
+    'cut_work_unit) and the ledger verbs, never hand-authored. Hand-writing a '
+    'dependency event would let a Work Unit be unblocked by a claim nothing '
+    'verified, and hand-writing a cut would shrink the admitted set the '
+    'Checkpoint barrier has to clear.'
 )
 spq_roots = [
     os.path.join(project_dir, '.synaptory', '.orchestrator', 'spq'),
     os.path.join(project_dir, '.synaptory', 'cycles'),
-    os.path.join(project_dir, '.synaptory', 'coordination-cycles'),
 ]
 if tool == 'Bash':
     cmd = inp.get('command', '')
-    if re.search(r'[>|].*\.synaptory/(\.orchestrator/spq|cycles|coordination-cycles)/', cmd):
+    if re.search(r'[>|].*\.synaptory/(\.orchestrator/spq|cycles)/', cmd):
         print('deny')
         print(_SPQ_DENY)
         sys.exit(0)

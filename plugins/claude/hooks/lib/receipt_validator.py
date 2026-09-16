@@ -9,8 +9,22 @@ Validates receipt files against the v2 story-scoped receipt protocol:
 - verification_commands: list of simple command strings or command objects
 - Soft-required (warn-now-error-later): token_usage. Drives /cost.
 - Soft-required for SE/QE: story_dod. Drives /quality Evidence gates.
+- Conditionally required (#473): the #342 runtime-identity overlay pair
+  `stage_profile` / `capability_profile`. REQUIRED when the dispatch that
+  produced this receipt was governed, i.e. when the kernel recorded a runtime
+  selection on the stage's dispatch binding and therefore handed the agent a
+  dispatch envelope carrying both values; a warning otherwise, because an
+  ungoverned dispatch hands over no envelope and there is nothing to copy.
+  The governed condition is READ from the dispatcher's own record, never
+  re-derived from config — see `_governed_dispatch_authority`.
 - Optional: confidence, fallback_from, design_ref + design_verified +
   design_impl_notes
+- Optional, typed (#403): `evidence` (a list of items each carrying an
+  `evidence_class` of replayed | attested | judged) and `dod_check_results`
+  (a list of pass | fail | criteria_gap_declared results). Both are opt-in,
+  and both are refused when an item claims a class whose discipline it does
+  not carry — an unbacked claim is unbacked, never credited at its claimed
+  class. Disciplines live in runtime_contracts, not here.
 
 CLI: python3 receipt_validator.py <receipt.json> <project_dir>
 """
@@ -63,6 +77,22 @@ except ImportError:  # pragma: no cover
         from hooks.lib import evidence_contract as _evidence_contract  # type: ignore
     except ImportError:
         _evidence_contract = None  # type: ignore[assignment]
+
+# Typed evidence classes (#403, capability-profile-pilot.md 3.3). The
+# vocabulary and every class discipline live in `runtime_contracts` (#399) so
+# there is exactly one place that decides what a class claim has to carry;
+# this module only reports the refusals against a receipt. Optional sibling in
+# the same idiom as the two above — but note the difference in what absence
+# means: a missing evidence contract loses a stage HINT, while a missing
+# runtime_contracts module loses the ability to check a discipline at all, so
+# absence warns rather than passing quietly.
+try:  # pragma: no cover - import plumbing
+    import runtime_contracts as _runtime_contracts  # type: ignore
+except ImportError:  # pragma: no cover
+    try:
+        from hooks.lib import runtime_contracts as _runtime_contracts  # type: ignore
+    except ImportError:
+        _runtime_contracts = None  # type: ignore[assignment]
 
 # Hardcoded defaults — used when no cached policy is available.
 _DEFAULT_REQUIRED_FIELDS = {
@@ -215,9 +245,12 @@ STORY_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
 
 
 def infer_backend_from_model(model: str) -> Optional[str]:
-    """Map a model id to a receipt `backend` without guessing `claude`.
+    """Map a model id to its provider family without guessing `claude`.
 
-    Returns None when the id is empty or unrecognized (omit rather than invent).
+    This is not always the receipt ``backend``. Cursor is a runtime/router and
+    can truthfully report a model supplied by Claude, Gemini, or OpenAI while
+    retaining ``backend: cursor``. Returns None when the id is empty or
+    unrecognized (omit rather than invent).
     """
     m = (model or "").strip().lower()
     if not m:
@@ -262,6 +295,27 @@ class ValidationResult:
         }
 
 
+#: A model id that names no model. `<backend>-runtime-unattributed` was
+#: fabricated by `sync_barrier.py` for an unset `SYNAPTORY_MODEL`; that module
+#: is deleted (#644), so nothing produces it any more -- but the CLI bridge
+#: refuses the value on a receipt (`runtime_contract.go`), and until this
+#: validator refuses it too, a placeholder is rejected on the governed-dispatch
+#: path and accepted on the plain-session path. `C-14` wants the exact model
+#: identifier, and "the vendor or the family" is what it refuses; a value that
+#: names neither is worse than either.
+#:
+#: Refused here rather than warned, because a receipt is the provenance record
+#: and a regression traced to a model change is unattributable after the fact
+#: without it.
+UNATTRIBUTED_MODEL_SUFFIX = "-runtime-unattributed"
+
+
+def model_names_no_model(model: object) -> bool:
+    """Is this model id a placeholder rather than an identity?"""
+    text = str(model or "").strip().lower()
+    return not text or text.endswith(UNATTRIBUTED_MODEL_SUFFIX)
+
+
 def validate_receipt(receipt_path: str, project_dir: str) -> ValidationResult:
     """Validate a receipt JSON file against the v2 receipt protocol schema.
 
@@ -285,6 +339,220 @@ def validate_receipt(receipt_path: str, project_dir: str) -> ValidationResult:
         return result
 
     return validate_receipt_payload(receipt, project_dir)
+
+
+#: The payload key carrying typed DoD check results. The control plane reads
+#: the same key (`analytics.DOD_CHECK_RESULTS_KEY`), which #407 named as this
+#: ticket's seam, so the two spellings must stay identical.
+DOD_CHECK_RESULTS_KEY = "dod_check_results"
+
+#: The payload key carrying typed evidence items.
+EVIDENCE_KEY = "evidence"
+
+
+def _validate_typed_evidence(receipt: dict, result: "ValidationResult") -> None:
+    """Refuse a typed-evidence claim whose discipline is unmet (#403).
+
+    Two optional blocks, both opt-in: no receipt is required to carry either,
+    and a receipt that carries neither validates exactly as before. But once a
+    block IS present, every item in it is checked against the discipline its
+    own `evidence_class` (or its `result` value) names, because the claim is
+    what a reader would otherwise credit.
+
+    Severity is `error`, not `warn`, and that is what implements the original
+    ticket's "refused in strict mode, warned in the migration window" without
+    a new flag: `advance_kernel.RECEIPT_INVALID` is already in
+    `_EVIDENCE_CODES`, so a host running `enforcement="warn"` downgrades this
+    refusal to a warning while a structured-mode host refuses. The migration
+    window already exists; it did not need reinventing here.
+    """
+    has_evidence = EVIDENCE_KEY in receipt
+    has_typed_results = DOD_CHECK_RESULTS_KEY in receipt
+    if not has_evidence and not has_typed_results:
+        return
+    if _runtime_contracts is None:  # pragma: no cover - partial install
+        result.warn(
+            f"'{EVIDENCE_KEY}'/'{DOD_CHECK_RESULTS_KEY}' present but the "
+            "runtime_contracts module is not importable, so no evidence-class "
+            "discipline could be checked. Treat every class claim in this "
+            "receipt as unbacked."
+        )
+        return
+
+    if has_evidence:
+        evidence = receipt[EVIDENCE_KEY]
+        if not isinstance(evidence, list):
+            result.error(
+                f"'{EVIDENCE_KEY}' must be a list of typed evidence items, "
+                f"got: {type(evidence).__name__}"
+            )
+        else:
+            for i, item in enumerate(evidence):
+                for problem in _runtime_contracts.validate_evidence_item(item):
+                    result.error(f"{EVIDENCE_KEY}[{i}] {problem}")
+
+    if has_typed_results:
+        typed = receipt[DOD_CHECK_RESULTS_KEY]
+        if not isinstance(typed, list):
+            result.error(
+                f"'{DOD_CHECK_RESULTS_KEY}' must be a list of DoD check "
+                f"results, got: {type(typed).__name__}"
+            )
+        else:
+            for i, item in enumerate(typed):
+                for problem in _runtime_contracts.validate_dod_check_result(item):
+                    result.error(f"{DOD_CHECK_RESULTS_KEY}[{i}] {problem}")
+            # A receipt-supplied check result is SELF-REPORTED. It is recorded
+            # and rendered; it never becomes the pipeline's verdict and never
+            # clears a gate (#445). Say so once, where the writer will read it,
+            # so nobody ships one expecting it to count as evidence.
+            if isinstance(typed, list) and typed:
+                result.warn(
+                    f"'{DOD_CHECK_RESULTS_KEY}' is recorded as SELF-REPORTED: "
+                    "the DoD gate uses the verdict it computes from evidence, "
+                    "so a result posted here refines the record but never "
+                    "clears or blocks a check. Put the proof in "
+                    "`verification_commands` / `metrics` instead."
+                )
+
+
+#: The #342 runtime-identity overlay pair, in the order the refusal names it.
+#: On a governed dispatch the kernel hands both values over on
+#: `dispatch_envelope.stage_profile` / `dispatch_envelope.capability_profile`,
+#: which since #471 is verified against control-plane-signed bytes rather than
+#: against the local proposal. They are copied, never chosen.
+OVERLAY_PAIR = ("stage_profile", "capability_profile")
+
+#: Where the agent reads each overlay value from on a governed dispatch. The
+#: refusal names the field rather than the value, because naming the value
+#: would be telling the agent what to write instead of where to read it.
+OVERLAY_ENVELOPE_FIELD = {
+    "stage_profile": "dispatch_envelope.stage_profile",
+    "capability_profile": "dispatch_envelope.capability_profile",
+}
+
+
+def _overlay_absent(receipt: dict, field: str) -> bool:
+    """True when `field` carries no readable overlay value.
+
+    Absent, or a string that strips to empty — the same two cases
+    `advance_kernel._overlay_value` treats as absence, so the two modules
+    cannot disagree about what "the agent did not stamp one" means.
+
+    A PRESENT non-string is deliberately NOT absence here. It is a claim in an
+    unreadable shape, and the kernel already refuses it as `PROFILE_MISMATCH`
+    with a message that says so; reporting it here as "missing" would replace
+    a precise refusal with a misleading one.
+    """
+    if field not in receipt:
+        return True
+    raw = receipt[field]
+    return isinstance(raw, str) and not raw.strip()
+
+
+def _governed_dispatch_authority(receipt: dict, project_dir: str) -> tuple:
+    """`(pipeline_abbrev, authority)` for the dispatch that produced this receipt.
+
+    `pipeline_abbrev` is "" for a role that no receipt-gated pipeline edge is
+    bound to (technical-writer, orchestrator, research-advisor, …): those
+    receipts are outside the overlay contract entirely, so they get neither
+    the refusal nor the reminder. It is derived from the kernel's own
+    `TRANSITION_RECEIPT` table rather than listed here, so a table change moves
+    the scope with it.
+
+    `authority` is `{}` when the dispatch was not governed, meaning no envelope
+    was handed over.
+
+    THE SIGNAL COMES FROM THE DISPATCHER, NOT FROM THE RECEIPT AND NOT FROM
+    THE CONFIG. Two rejected alternatives, and the reasons are the design:
+
+    * **From the receipt.** Any field the agent writes — `attempt_id`, an
+      embedded envelope, a `governed: true` flag — makes the REQUIREMENT
+      itself forgeable by omission: drop the field that marks the dispatch as
+      governed and the pair stops being required. That is the exact incentive
+      inversion this ticket exists to remove, so the receipt is not consulted
+      for anything except which (story, stage) to look up.
+    * **From the config.** Re-reading `runtimes:`, the probe snapshot and the
+      profile registry answers for the tree as it is NOW, and all three can
+      move between dispatch and validation. A validator deciding "governed"
+      differently from the dispatcher would refuse honest receipts and admit
+      dishonest ones.
+
+    `advance_kernel.governed_dispatch_authority` reads the runtime selection
+    the dispatch persisted on the stage's binding, which is the same field
+    `evaluate_advance` uses to decide which executor was authorized. One
+    field, one writer, two readers.
+    """
+    story_id = receipt.get("story_id")
+    role = receipt.get("role")
+    if not isinstance(story_id, str) or not isinstance(role, str):
+        return "", {}
+    try:
+        # Lazy, and one-directional: the kernel imports THIS module inside
+        # `evaluate_advance` for the same reason, so neither import runs at
+        # module load and the pair cannot cycle.
+        import advance_kernel  # type: ignore
+
+        abbrev = advance_kernel.role_abbrev(role)
+        gated = {bound[1] for bound in advance_kernel.TRANSITION_RECEIPT.values()}
+        if not abbrev or abbrev not in gated:
+            return "", {}
+        return abbrev, advance_kernel.governed_dispatch_authority(
+            project_dir, story_id, abbrev
+        )
+    except Exception:  # noqa: BLE001 - validation must not crash on the kernel
+        return "", {}
+
+
+def _validate_runtime_identity_overlay(
+    receipt: dict, project_dir: str, result: "ValidationResult"
+) -> None:
+    """Require the #342 overlay pair on a governed dispatch's receipt (#473).
+
+    What requiring presence does and does not buy is worth stating where the
+    code is. It does NOT make the pair trustworthy: the agent still types it.
+    What makes it load-bearing is that `advance_kernel.profile_overlay_problems`
+    compares a present pair against the transition edge and refuses a
+    contradiction (#402). Before this function, ABSENCE was the cheapest way
+    to avoid that comparison — omit the pair and there is nothing to compare.
+    Closing that is the whole point: on a governed dispatch, omission now costs
+    a refusal instead of a warning, so declaring the pair honestly is the
+    cheapest remaining option and every declared pair meets the edge.
+    """
+    missing = [field for field in OVERLAY_PAIR if _overlay_absent(receipt, field)]
+    if not missing:
+        return
+    abbrev, authority = _governed_dispatch_authority(receipt, project_dir)
+    if not abbrev:
+        # Not a role any receipt-gated pipeline edge is bound to, so the
+        # overlay contract does not reach it. Silence rather than a reminder:
+        # this validator's output is read by an agent under a token budget.
+        return
+    named = ", ".join("'%s'" % field for field in missing)
+    if not authority:
+        # Ungoverned: no envelope was handed over, so there was nothing to
+        # copy. Unchanged from #342/#402 — a warning, and on a receipt-gated
+        # edge the advance kernel emits its own `profile_overlay_absent` too.
+        result.warn(
+            "%s missing — the #342 runtime-identity overlay is soft-required "
+            "here because this dispatch recorded no governed runtime "
+            "selection, so no dispatch envelope carried the pair. It is "
+            "REQUIRED on a governed dispatch (#473)." % named
+        )
+        return
+    result.error(
+        "%s missing on a governed dispatch's receipt. This dispatch was "
+        "authorized under runtime profile %s, so the kernel handed the agent a "
+        "dispatch envelope carrying the runtime-identity overlay: copy "
+        "VERBATIM from %s. Do not derive or choose either value — the advance "
+        "gate keys the stage on the pair and refuses one that names another "
+        "(#402), and omitting it is not a way around that check (#473)."
+        % (
+            named,
+            authority.get("adapter_profile_id") or authority["runtime_family"],
+            " and ".join(OVERLAY_ENVELOPE_FIELD[field] for field in missing),
+        )
+    )
 
 
 def validate_receipt_payload(receipt: Any, project_dir: str) -> ValidationResult:
@@ -356,12 +624,16 @@ def validate_receipt_payload(receipt: Any, project_dir: str) -> ValidationResult
             result.warn("'model' is empty — should identify the specific model used")
 
     # Honest backend↔model mapping (Cursor Router + multi-host receipts).
-    # `composer-*` / `grok-*` with `backend: claude` is a lie — fail closed.
+    # `backend` identifies the runtime host/router, while `model` is the exact
+    # model the runtime reports. Cursor may route to Claude, Gemini, or OpenAI,
+    # so a provider-shaped model does not contradict `backend: cursor`.
+    # The reverse remains false: `composer-*` / `grok-*` with
+    # `backend: claude` is a lie and fails closed.
     backend_val = receipt.get("backend")
     model_val = receipt.get("model")
     if isinstance(backend_val, str) and isinstance(model_val, str) and model_val.strip():
         inferred = infer_backend_from_model(model_val)
-        if inferred and inferred != backend_val:
+        if inferred and inferred != backend_val and backend_val != "cursor":
             result.error(
                 f"backend '{backend_val}' does not match model '{model_val}' "
                 f"(inferred backend '{inferred}'). Do not invent backend: claude."
@@ -488,6 +760,10 @@ def validate_receipt_payload(receipt: Any, project_dir: str) -> ValidationResult
             f"'story_dod' missing — role '{role_for_dod}' should populate it so "
             "/quality Evidence-gate scoreboard has a signal for this story"
         )
+
+    _validate_runtime_identity_overlay(receipt, project_dir, result)
+
+    _validate_typed_evidence(receipt, result)
 
     # Soft-required: token_usage. Without it the Cost dashboard at
     # /cost shows $0 for this row even when work was done.

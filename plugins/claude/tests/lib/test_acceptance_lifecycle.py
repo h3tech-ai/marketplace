@@ -84,15 +84,69 @@ def test_request_acceptance_moves_reviewing_to_awaiting():
 
 
 @pytest.mark.unit
-def test_accept_story_records_accepted_by_and_moves_to_done():
+def _project_with_receipts(tmp_path: Path, story_id: str) -> Path:
+    """A project whose Work Unit produced evidence a verdict can bind to.
+
+    Needed since #592: an acceptance whose verdict cannot be credited is
+    refused, and the candidate digest is derived from the receipts under the
+    project. An acceptance therefore has to name a project, which is a real
+    narrowing of this API and is asserted below rather than left implicit.
+    """
+    receipts = tmp_path / ".synaptory" / ".orchestrator" / "receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    for abbrev, role in (("se", "software-engineer"), ("qe", "quality-engineer")):
+        (receipts / ("%s-%s.json" % (story_id, abbrev))).write_text(
+            json.dumps(
+                {
+                    "task": "work",
+                    "story_id": story_id,
+                    "role": role,
+                    "backend": "claude",
+                    "model": "claude-opus-5",
+                    "artifacts": [],
+                    "verification_commands": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    return tmp_path
+
+
+def test_accept_story_records_accepted_by_and_moves_to_done(tmp_path):
+    project = _project_with_receipts(tmp_path, "US-2")
     state = {"current_stories": [sp.create_story("US-2", "Sample")]}
     for s in ("in_progress", "testing", "reviewing", "awaiting_acceptance"):
         state = sp.transition_story(state, "US-2", s)
-    state = sp.accept_story(state, "US-2", accepted_by="po@example.com")
+    state = sp.accept_story(
+        state, "US-2", accepted_by="po@example.com", project_dir=str(project)
+    )
     story = sp._find_story(state, "US-2")
     assert story["state"] == "done"
     assert story["accepted_by"] == "po@example.com"
     assert "accepted_at" in story
+
+
+@pytest.mark.unit
+def test_accept_story_refuses_a_unit_with_no_evidence_to_judge():
+    """The narrowing this API took in #592, asserted rather than discovered.
+
+    This test previously walked a Work Unit to `awaiting_acceptance` with no
+    project and no receipts and asserted it reached `done`. It was the only
+    test in the suite that pinned a barren acceptance as completing, and the
+    behaviour it pinned is the state and signal split the #592 review named:
+    the board said `done` while the gate said the acceptance was unbacked.
+
+    A consequence worth stating plainly: `accept_story` without a
+    `project_dir` can no longer succeed at all, because the candidate a verdict
+    binds to is derived from evidence that lives in the project. An acceptance
+    now has to say which project it is accepting in.
+    """
+    state = {"current_stories": [sp.create_story("US-2", "Sample")]}
+    for s in ("in_progress", "testing", "reviewing", "awaiting_acceptance"):
+        state = sp.transition_story(state, "US-2", s)
+    with pytest.raises(ValueError, match="could not be credited"):
+        sp.accept_story(state, "US-2", accepted_by="po@example.com")
+    assert sp._find_story(state, "US-2")["state"] == "awaiting_acceptance"
 
 
 @pytest.mark.unit
@@ -217,6 +271,43 @@ def test_toggle_off_when_key_missing(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
+def _green_receipts(project: Path, story_id: str) -> None:
+    """Executed proof for the two checks every tier requires.
+
+    #403 — before this, `scrum_project` walked a story to `done` with no
+    receipts at all, so tests_pass and build_succeeds had nothing to evaluate.
+    That used to score `None` and complete anyway; it now declares a criteria
+    gap and the gate redirects to `blocked`. These tests are about the
+    acceptance FSM and the toggle, not about thin evidence, so the fixture
+    supplies the evidence a story reaching done is supposed to carry.
+    """
+    receipts = project / ".synaptory" / ".orchestrator" / "receipts"
+    receipts.mkdir(parents=True, exist_ok=True)
+    for role, abbrev, command in (
+        ("software-engineer", "se", "npm run build"),
+        ("quality-engineer", "qe", "pytest -q"),
+    ):
+        (receipts / f"{story_id}-{abbrev}.json").write_text(
+            json.dumps({
+                "agent": role,
+                "story_id": story_id,
+                "verification_commands": [{"command": command, "exit_code": 0}],
+                "metrics": {"findings_critical": 0, "coverage_delta": "+0.5%"},
+            }),
+            encoding="utf-8",
+        )
+    (receipts / f"{story_id}-cr.json").write_text(
+        json.dumps({
+            "agent": "code-reviewer",
+            "story_id": story_id,
+            "status": "complete",
+            "verification_commands": [{"command": "ruff check .", "exit_code": 0}],
+            "metrics": {"findings_critical": 0},
+        }),
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
 def scrum_project(tmp_path: Path) -> Path:
     """A Scrum project initialised via the state machine CLI."""
@@ -224,6 +315,7 @@ def scrum_project(tmp_path: Path) -> Path:
     p.mkdir()
     sm.initialize(str(p))
     sm.add_story(str(p), "US-1", title="Toggle test")
+    _green_receipts(p, "US-1")
     return p
 
 

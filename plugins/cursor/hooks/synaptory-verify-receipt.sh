@@ -108,6 +108,21 @@ if [ -n "${SUBAGENT_AGENT_ID:-}" ]; then
   _marker_dir="${SUITE_DIR}/.orchestrator/subagent-markers"
   _safe_id=$(printf '%s' "$SUBAGENT_AGENT_ID" | tr -c 'A-Za-z0-9_.-' '_')
   if [ -e "${_marker_dir}/${_safe_id}" ]; then
+    # Read the role BEFORE removing the marker; it is what binds selection to
+    # one (work, role) pair rather than to every role on the current work.
+    SUBAGENT_ROLE=$(sed -n '1p' "${_marker_dir}/${_safe_id}" 2>/dev/null || true)
+    SUBAGENT_ROLE="${SUBAGENT_ROLE#synaptory:}"
+    # The marker's mtime is when this subagent STARTED. A receipt written
+    # before that cannot be its output, which excludes a stale receipt from an
+    # earlier run of the same role without ranking anything.
+    SUBAGENT_STARTED_AT=$(stat -f '%m' "${_marker_dir}/${_safe_id}" 2>/dev/null \
+      || stat -c '%Y' "${_marker_dir}/${_safe_id}" 2>/dev/null || echo 0)
+    # Line 2 correlates this stop to one dispatch, so a binding held by
+    # another role or another story cannot answer for it.
+    _marker_link=$(sed -n '2p' "${_marker_dir}/${_safe_id}" 2>/dev/null || true)
+    SUBAGENT_STORY="${_marker_link%%	*}"
+    SUBAGENT_DISPATCH="${_marker_link##*	}"
+    [ "$SUBAGENT_DISPATCH" = "$_marker_link" ] && SUBAGENT_DISPATCH=""
     rm -f "${_marker_dir}/${_safe_id}" 2>/dev/null || true
   else
     exit 0
@@ -199,31 +214,43 @@ if [ "${#RECEIPTS_TO_SHIP[@]}" -gt 0 ]; then
   fi
 fi
 
-# Pick the receipt(s) to validate. Selection binds to the actively
-# dispatched (story, role) when the kernel recorded one (#340): a receipt
-# belonging to another story or role being newer on disk must not satisfy
-# this hook. dispatched_receipts.py reads mcp_active_dispatches from
-# pipeline-state and resolves each binding through the kernel's canonical
-# resolver, so selection and the advance gate cannot disagree about which
-# file counts. Two selection paths:
+# Pick the receipt(s) to validate. Selection is ALWAYS scoped to work the
+# board names, never to filesystem time (#340, #396). Three paths:
 #
-#   dispatch_binding  status=bound: validate the canonical receipt(s); when
-#                     none is on disk the receipt is MISSING, even if an
-#                     unrelated file is newer.
-#   mtime_fallback    status=none (no pipeline-state, no active dispatch:
-#                     legacy sessions, ceremony receipts with pseudo story
-#                     ids) or the helper failed: newest receipt by mtime,
-#                     the prior behavior.
+#   dispatch_binding  status=bound: the kernel recorded an active dispatch;
+#                     validate its canonical receipt(s). When none is on disk
+#                     the receipt is MISSING, even if another file is newer.
+#   scoped            status=scoped: no dispatch is bound, but the board names
+#                     a current story or ceremony; validate the canonical
+#                     receipts for THAT work. This is the path Claude takes for
+#                     QE and CR, whose stages carry no binding because its
+#                     orchestrator calls begin_dispatch only for dispatch_se.
+#   unbound           status=none: the board names nothing resolvable, so
+#                     validate NOTHING and log it.
+#
+# There is deliberately no newest-by-mtime path any more. #340's acceptance
+# criterion is that no workflow chooses a receipt by file modification time,
+# and the fallback that survived it reintroduced the original defect on
+# exactly the workflows that lack a binding: an unrelated newer receipt could
+# satisfy this hook. Validating nothing is the honest answer, because a hook
+# that validates an arbitrary file reports a result about work nobody asked
+# it about.
 #
 # Either way selection ignores ship status -- we still want to flag
 # receipt_missing even if the only receipt failed to ship.
 RECENT_RECEIPT=""
 RECEIPTS_TO_VALIDATE=()
-SELECTION_MODE="mtime_fallback"
+SELECTION_MODE="unbound"
 if [ -f "$HOOK_LIB_DIR/dispatched_receipts.py" ] && [ -n "${_py:-}" ]; then
-  BOUND_LIST=$("$_py" "$HOOK_LIB_DIR/dispatched_receipts.py" "$CLAUDE_PROJECT_DIR" 2>/dev/null || true)
-  if [ "$(printf '%s\n' "$BOUND_LIST" | sed -n '1p')" = "status=bound" ]; then
-    SELECTION_MODE="dispatch_binding"
+  BOUND_LIST=$("$_py" "$HOOK_LIB_DIR/dispatched_receipts.py" "$CLAUDE_PROJECT_DIR" "${SUBAGENT_ROLE:-}" "${SUBAGENT_STARTED_AT:-0}" \
+    "${SUBAGENT_STORY:-}" "${SUBAGENT_DISPATCH:-}" 2>/dev/null || true)
+  _status=$(printf '%s\n' "$BOUND_LIST" | sed -n '1p')
+  case "$_status" in
+    status=bound)  SELECTION_MODE="dispatch_binding" ;;
+    status=scoped) SELECTION_MODE="scoped" ;;
+    *)             SELECTION_MODE="unbound" ;;
+  esac
+  if [ "$SELECTION_MODE" != "unbound" ]; then
     while IFS= read -r f; do
       [ -f "$f" ] || continue
       RECEIPTS_TO_VALIDATE+=("$f")
@@ -232,18 +259,6 @@ if [ -f "$HOOK_LIB_DIR/dispatched_receipts.py" ] && [ -n "${_py:-}" ]; then
     if [ "${#RECEIPTS_TO_VALIDATE[@]}" -gt 0 ]; then
       RECENT_RECEIPT="${RECEIPTS_TO_VALIDATE[0]}"
     fi
-  fi
-fi
-if [ "$SELECTION_MODE" = "mtime_fallback" ]; then
-  # NOT `| xargs ls -1t | head -1`: with no receipts GNU xargs runs `ls -1t`
-  # with no operands, which lists the CWD and hands back an unrelated
-  # filename, so the `-z` test below took the wrong branch on Linux CI and
-  # never logged receipt_missing. BSD xargs skips the command and returned
-  # empty, so the two platforms disagreed. `synaptory_recent_receipts`
-  # sorts by mtime itself and returns nothing when there is nothing.
-  RECENT_RECEIPT=$(synaptory_recent_receipts "$_orch" 1)
-  if [ -n "$RECENT_RECEIPT" ]; then
-    RECEIPTS_TO_VALIDATE=("$RECENT_RECEIPT")
   fi
 fi
 # Record which selection path ran; #340's defect was silent mis-selection.
@@ -272,8 +287,15 @@ except Exception:
   print('')
 " 2>/dev/null)
   fi
+  # Recovery is bound by the SAME assignment selection is (#396). Without
+  # this it reached past the refusal: an ambiguous marker made selection
+  # return nothing, recovery then wrote an unrelated story's receipt from the
+  # transcript, and a strict stop returned 0. Recovery reads text the agent
+  # produced rather than files it wrote, so it needs the constraint more, not
+  # less.
   RECOVERED=$("$_py" "$HOOK_LIB_DIR/receipt_recovery.py" \
-    "$TRANSCRIPT_PATH" "$RECEIPTS_DIR" "$STORY_HINT" 2>/dev/null || true)
+    "$TRANSCRIPT_PATH" "$RECEIPTS_DIR" "$STORY_HINT" \
+    "${SUBAGENT_ROLE:-}" "${SUBAGENT_STORY:-}" 2>/dev/null || true)
   if [ -n "$RECOVERED" ] && [ -f "$RECOVERED" ]; then
     RECENT_RECEIPT="$RECOVERED"
     RECEIPTS_TO_VALIDATE=("$RECOVERED")
@@ -308,9 +330,9 @@ if [ -z "$RECENT_RECEIPT" ]; then
   fi
 fi
 
-# Receipt(s) found -- validate with receipt_validator.py. Under
-# dispatch_binding every outstanding bound receipt is validated; under
-# mtime_fallback the list holds exactly the newest receipt, as before.
+# Receipt(s) found -- validate with receipt_validator.py. Every selected
+# receipt is validated, whether the list came from an active dispatch binding
+# or from the board's current story and ceremony scope.
 # Every failure branch inside exits the hook directly, so one bad receipt
 # ends the loop with the same exit codes a single receipt always produced.
 _validate_one_receipt() {

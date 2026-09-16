@@ -6,9 +6,12 @@ other Synaptory hosts.
 
 ## Certified lifecycle — SPQ only
 
-End-to-end certification on Codex covers **SPQ** (`build_mode: spq`). Scrum and
-Kanban share the same lifecycle kernel, receipt gates, and tracker adapters, but
-they have **not** been proven end-to-end on this host.
+End-to-end certification on Codex covers **SPQ** (`build_mode: spq`): four
+stages, `DISCOVERY → CYCLE → ACCEPTANCE → COMPLETE`, one Cycle per Engineering
+Lead and Crew, one board, and the all-or-nothing barrier at Checkpoint
+integrating to the shared trunk. Scrum and Kanban share the
+same lifecycle kernel, receipt gates, and tracker adapters, but they have
+**not** been proven end-to-end on this host.
 
 For a Scrum or Kanban project, warn before any delivery dispatch and recommend
 switching to SPQ. If the user explicitly continues, label the run uncertified,

@@ -2,7 +2,7 @@
 
 **Governed multi-agent SPQ delivery for Claude Code.** Synaptory coordinates role-based work through SPQ Cycles, validates dispatch-bound receipts and verification evidence, and stops at human decisions instead of treating agent completion as delivery acceptance.
 
-> **Version:** 1.2.1 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
+> **Version:** 1.3.0 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
 
 ## Requirements
 
@@ -96,7 +96,7 @@ Baseline approval, Cycle scope, Sync entry/clearance, Checkpoint direction, and 
 | **Technical Writer** | Cycle/Acceptance evidence and documentation |
 | **Research Advisor** | Research and structured option analysis |
 
-Claude Code supplies the host-native integration. Optional runtime federation can dispatch an authorized SPQ attempt to a certified Claude Code, Codex, Cursor, or managed profile. Installing another host package does not enable federation by itself.
+Claude Code supplies the host-native integration. Runtime federation is an **operator preview**: the bridge can execute an authorized SPQ attempt on a certified profile through `synaptory runtime execute`, but normal host dispatch does not route through it yet, so configuring `runtimes:` does not change an ordinary Cycle. Installing another host package does not enable federation by itself.
 
 ```bash
 synaptory runtimes list

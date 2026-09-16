@@ -163,6 +163,14 @@ def _parse_issue_type(backend_raw: dict) -> dict:
 @dataclass
 class GitHubConfig:
     repo: str = ""
+    cli_command: str = ""
+    """Command that speaks the `gh` argument grammar. Empty ⇒ plain `gh`, i.e.
+    whoever's `gh auth` session is on this machine, so tracker writes are
+    attributed to a person. An organization that wants agent writes attributed
+    to a bot identity points this at a broker wrapper that mints a scoped
+    token and enforces what that identity may do. A value set here wins over
+    the `SYNAPTORY_GITHUB_CLI` environment variable, so an ambient variable
+    cannot silently downgrade a committed identity."""
     label_prefix: str = "hc:"
     points_label_prefix: str = "points:"
     sprint_milestone_prefix: str = "Sprint "
@@ -439,6 +447,7 @@ class TrackerConfig:
             gh_raw = {}
         github = GitHubConfig(
             repo=gh_raw.get("repo", ""),
+            cli_command=str(gh_raw.get("cli_command", "") or ""),
             label_prefix=gh_raw.get("label_prefix", "hc:"),
             points_label_prefix=gh_raw.get("points_label_prefix", "points:"),
             sprint_milestone_prefix=gh_raw.get("sprint_milestone_prefix", "Sprint "),

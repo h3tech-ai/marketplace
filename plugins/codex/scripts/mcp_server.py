@@ -88,6 +88,7 @@ os.environ.setdefault("SYNAPTORY_IDE", "codex")
 # The shared gate. Every advance/dispatch check lives here so all three hosts
 # enforce one contract; this server only supplies Codex-specific policy.
 import advance_kernel  # noqa: E402
+import runtime_contracts  # noqa: E402
 import mcp_transport  # noqa: E402
 
 
@@ -539,13 +540,20 @@ def tool_next_action(arguments: dict[str, Any]) -> dict[str, Any]:
     if blocked:
         return blocked
     mode = _build_mode(project)
-    selected = _next_action(project)
     if mode == "spq":
-        if selected.get("action") == "not_in_execution":
-            selected = _spq_lifecycle_next_action(project)
-        elif selected.get("action") == "await_sync":
-            selected = _spq_sync_boundary_next_action(project, selected)
-    return {"build_mode": mode, "next_action": selected}
+        # ONE CALL, not a dispatcher result patched afterwards. The two `elif`
+        # branches this replaces keyed on `not_in_execution` and `await_sync`:
+        # the first because the host filled in every ceremony stage itself, the
+        # second because Sync was a state with a human gate. Neither exists --
+        # `spq_state_machine.next_action` answers for all four stages, and
+        # `await_sync` is gone. Keeping the sentinel-and-patch shape would have
+        # left the enrichment reachable only when the kernel happened to say
+        # `not_in_execution`, which under SPQ it no longer does.
+        return {
+            "build_mode": mode,
+            "next_action": _spq_lifecycle_next_action(project),
+        }
+    return {"build_mode": mode, "next_action": _next_action(project)}
 
 
 def _require_spq(project: Path) -> dict[str, Any] | None:
@@ -554,241 +562,28 @@ def _require_spq(project: Path) -> dict[str, Any] | None:
     return {"error": "SPQ lifecycle tools require build_mode: spq"}
 
 
-def _spq_sync_boundary_next_action(
-    project: Path, selected: dict[str, Any]
-) -> dict[str, Any]:
-    """Expose readiness publication before entering Sync.
-
-    ``declare_ready`` is valid only while the clone is still in
-    CYCLE_EXECUTION. Once its record exists, committing and pushing that record
-    is an explicit human gate; only then may the lifecycle enter SYNC.
-    """
-    barrier = importlib.import_module("sync_barrier")
-    config = barrier.load_spq_config(str(project))
-    workstreams = [item for item in config.get("workstreams", []) if isinstance(item, dict)]
-    current = barrier.current_branch(str(project))
-    state = _flat_state(project)
-    workstream = str(os.environ.get("SYNAPTORY_ACTIVE_SPEC") or "").strip()
-    if not workstream:
-        # Native SPQ persists workstream identity in the pointer/state store so
-        # the route cannot depend on one shell continuing to export an env var.
-        # This is especially important for the integration seat, whose branch
-        # is normally ``dev``/``sync/*`` rather than a delivery branch.
-        workstream = str(state.get("_workstream_id") or "").strip()
-    if not workstream and current:
-        match = next(
-            (str(item.get("id") or "") for item in workstreams if item.get("branch") == current),
-            "",
-        )
-        workstream = match
-    if not workstream and len(workstreams) == 1:
-        workstream = str(workstreams[0].get("id") or "")
-    if not workstream:
-        return {
-            **selected,
-            "action": "sync_workstream_unknown",
-            "operation": None,
-            "human_gate_pending": True,
-            "reason": (
-                "all Work Units are terminal, but the current Sync workstream "
-                "cannot be resolved from SYNAPTORY_ACTIVE_SPEC or the branch"
-            ),
-        }
-    cycle = int(state.get("current_cycle") or 0)
-    workstream_config = next(
-        (item for item in workstreams if str(item.get("id") or "") == workstream),
-        {},
-    )
-    if workstream_config.get("integration"):
-        readiness = barrier.status(str(project), cycle)
-        summary = {
-            "workstream": workstream,
-            "ready_count": int(readiness.get("ready_count") or 0),
-            "quorum": int(readiness.get("quorum") or 0),
-        }
-        if not readiness.get("records_present"):
-            return {
-                **selected,
-                **summary,
-                "action": "await_sync",
-                "operation": None,
-                "human_gate_pending": True,
-                "reason": (
-                    f"integration seat is waiting for Cycle {cycle} delivery "
-                    f"readiness ({summary['ready_count']}/{summary['quorum']})"
-                ),
-            }
-        return {
-            **selected,
-            **summary,
-            "action": "enter_sync",
-            "operation": "enter_sync",
-            "human_gate_pending": True,
-            "reason": (
-                "all delivery readiness records are present; after a human "
-                "confirms the integration branch and workstream heads, enter "
-                "the guarded Sync ceremony"
-            ),
-        }
-    record = project / barrier.record_relpath(config, cycle, workstream)
-    if not record.is_file():
-        return {
-            **selected,
-            "action": "declare_ready",
-            "operation": "declare_ready",
-            "workstream": workstream,
-            "human_gate_pending": False,
-            "reason": (
-                f"all admitted Work Units are terminal; derive the Cycle {cycle} "
-                f"readiness record for workstream {workstream} through spq_lifecycle"
-            ),
-        }
-    return {
-        **selected,
-        "action": "enter_sync",
-        "operation": "enter_sync",
-        "workstream": workstream,
-        "readiness_path": str(record.relative_to(project)),
-        "human_gate_pending": True,
-        "reason": (
-            "readiness exists; after a human commits and pushes the workstream "
-            "head and readiness record, enter the guarded Sync ceremony"
-        ),
-    }
-
-
 def _spq_lifecycle_next_action(project: Path) -> dict[str, Any]:
-    """Deterministic ceremony action outside Work Unit execution."""
-    module = importlib.import_module("spq_state_machine")
-    state = module.read_state(str(project))
-    lifecycle = str(state.get("lifecycle_state") or "DISCOVERY")
-    cycle = int(state.get("current_cycle") or 0)
-    base = {"lifecycle_state": lifecycle, "current_cycle": cycle, "story_id": None}
-    if lifecycle == "DISCOVERY":
-        return {
-            **base,
-            "action": "approve_baseline",
-            "operation": "approve_baseline",
-            "human_gate_pending": True,
-            "reason": "Discovery baseline needs explicit delivery-owner approval",
-        }
-    if lifecycle == "COMMIT":
-        return {
-            **base,
-            "action": "open_cycle",
-            "operation": "open_cycle",
-            "human_gate_pending": True,
-            "reason": "admit the approved Cycle goal and Work Units",
-        }
-    if lifecycle == "SYNC":
-        evaluation = state.get("sync_evaluation")
-        current_tree_state: str | None = None
-        try:
-            import verification_cache
+    """Delegate to the shared contract. Kept as a named function on purpose.
 
-            current_tree_state = verification_cache.tree_state(str(project))
-        except Exception:
-            pass
-        evaluation_is_current = bool(
-            isinstance(evaluation, dict)
-            and evaluation.get("cycle") == cycle
-            and evaluation.get("tree_state")
-            and evaluation.get("tree_state") == current_tree_state
-        )
-        if evaluation_is_current and evaluation.get("verdict") == "green":
-            return {
-                **base,
-                "action": "clear_sync",
-                "operation": "clear_sync",
-                "human_gate_pending": True,
-                "reason": (
-                    "the current integration tree has a green five-criterion "
-                    "Sync verdict; explicit human clearance is required"
-                ),
-            }
-        previous = (
-            "; blocking: " + ", ".join(evaluation.get("blocking") or [])
-            if evaluation_is_current and isinstance(evaluation, dict)
-            else ""
-        )
-        return {
-            **base,
-            "action": "evaluate_sync",
-            "operation": "evaluate_sync",
-            "human_gate_pending": False,
-            "reason": (
-                "collect merged workstreams and evaluate all five Sync criteria"
-                f"{previous}"
-            ),
-        }
-    if lifecycle == "CHECKPOINT":
-        readiness = module.checkpoint_readiness(str(project), state=state)
-        if not readiness["ready"]:
-            return {
-                **base,
-                "action": "dispatch_tw",
-                "role": "tw",
-                "story_id": readiness["story_id"],
-                "receipt_path": readiness["receipt_path"],
-                "human_gate_pending": False,
-                "reason": "; ".join(readiness["blocking"]),
-            }
-        return {
-            **base,
-            "action": "close_cycle",
-            "operation": "close_cycle",
-            "human_gate_pending": True,
-            "reason": "Checkpoint evidence is valid; choose another Cycle or Acceptance",
-        }
-    if lifecycle == "ACCEPTANCE":
-        readiness = module.acceptance_readiness(str(project), state=state)
-        for abbrev in ("qe", "ce", "pe", "tw", "cr"):
-            filename = f"{readiness['story_id']}-{abbrev}.json"
-            item = readiness["receipts"][abbrev]
-            role_blocked = not item["present"] or not item["valid"] or any(
-                filename in reason for reason in readiness["blocking"]
-            )
-            if role_blocked:
-                return {
-                    **base,
-                    "action": f"dispatch_{abbrev}",
-                    "role": abbrev,
-                    "story_id": readiness["story_id"],
-                    "receipt_path": item["receipt_path"],
-                    "human_gate_pending": False,
-                    "reason": next(
-                        (
-                            reason
-                            for reason in readiness["blocking"]
-                            if filename in reason
-                        ),
-                        f"missing valid {filename}",
-                    ),
-                }
-        if not readiness["ready"]:
-            return {
-                **base,
-                "action": "acceptance_blocked",
-                "human_gate_pending": True,
-                "reason": "; ".join(readiness["blocking"]),
-                "acceptance": readiness,
-            }
-        return {
-            **base,
-            "action": "complete_release",
-            "operation": "complete",
-            "human_gate_pending": True,
-            "reason": "all five Acceptance receipts and Cycle barriers are green",
-            "acceptance": readiness,
-        }
-    if lifecycle == "COMPLETE":
-        return {
-            **base,
-            "action": "complete",
-            "human_gate_pending": False,
-            "reason": "SPQ lifecycle is terminal",
-        }
-    return {**base, "action": "not_in_execution", "human_gate_pending": False}
+    This host's copy and Cursor's `spq_next.lifecycle_next_action` were a
+    line-for-line pair, each branching on seven lifecycle states, each calling
+    a `checkpoint_readiness` the rewrite removed, and each restating a
+    barrier-criteria count in prose -- this one said "five" while the barrier
+    published seven. Three encodings of one machine is the mechanism that
+    shipped three different criteria counts in one product (`#640`), so the
+    decision lives once, in `spq_mcp.lifecycle_next_action`, and both hosts ask
+    it.
+
+    `_spq_sync_boundary_next_action` IS DELETED, not ported, and every part of
+    it had lost its subject: it resolved a lane from `SYNAPTORY_ACTIVE_SPEC` --
+    Multi-Spec identity, which SPQ ignores -- or from the current branch;
+    counted a quorum of per-lane readiness records, where the barrier is now at
+    Checkpoint over the admitted set and `C-04` refuses partial admission; and
+    returned `await_sync` until the count was met, which was the human gate
+    `C-02` removes. Porting it would have rebuilt that gate under the new
+    stages.
+    """
+    return importlib.import_module("spq_mcp").lifecycle_next_action(str(project))
 
 
 def tool_begin_lifecycle_dispatch(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -816,8 +611,29 @@ def tool_begin_lifecycle_dispatch(arguments: dict[str, Any]) -> dict[str, Any]:
             }
         module = importlib.import_module("spq_state_machine")
         state = module.read_state(str(project))
+        if not selected.get("receipt_path"):
+            return {
+                "authorized": False,
+                "error": (
+                    "next_action selected %s but named no receipt path, so "
+                    "there is nothing to bind this dispatch to"
+                    % selected.get("action")
+                ),
+                "next_action": selected,
+            }
         path = Path(str(selected["receipt_path"]))
-        receipts_root = Path(module._resolve_receipts_dir(str(project))).resolve()
+        # `spq_paths.receipts_dir`, because `spq_state_machine` has no
+        # `_resolve_receipts_dir`: the containment check that keeps a lifecycle
+        # receipt inside the Cycle's receipts directory raised `AttributeError`
+        # and every Checkpoint and Acceptance dispatch on this host failed at
+        # the check meant to protect it. One derivation, and it is the one
+        # `spq_mcp.lifecycle_next_action` builds the path from.
+        spq_paths = importlib.import_module("spq_paths")
+        receipts_root = Path(
+            spq_paths.receipts_dir(str(project), str(state.get("_cycle_id") or ""))
+        )
+        receipts_root.mkdir(parents=True, exist_ok=True)
+        receipts_root = receipts_root.resolve()
         if path.is_symlink() or receipts_root.is_symlink():
             return {"authorized": False, "error": "lifecycle receipt path may not be a symlink"}
         path = path.resolve()
@@ -871,9 +687,14 @@ def tool_begin_lifecycle_dispatch(arguments: dict[str, Any]) -> dict[str, Any]:
         "compliance-engineer": "human compliance and release approver",
         "platform-engineer": "human operator and release approver",
         "technical-writer": (
-            "human SPQ Checkpoint decision-maker"
-            if stage == "CHECKPOINT"
-            else "release consumers, operators, and the human release approver"
+            # `stage == "CHECKPOINT"` used to select this, and CHECKPOINT is
+            # not a stage: it is a recorded event inside `CYCLE`. So the
+            # audience keys off the stage that exists -- a Technical Writer
+            # dispatched during a Cycle is writing for the close decision, one
+            # dispatched at ACCEPTANCE is writing for the go-live.
+            "release consumers, operators, and the human release approver"
+            if stage == "ACCEPTANCE"
+            else "human SPQ Checkpoint decision-maker"
         ),
         "code-reviewer": "human release approver",
     }
@@ -931,59 +752,139 @@ def tool_begin_lifecycle_dispatch(arguments: dict[str, Any]) -> dict[str, Any]:
 def _story_pipeline_mutation(
     project: Path, operation: str, arguments: dict[str, Any]
 ) -> dict[str, Any]:
-    """`record_retry` and `set_dod_tier` — the two ceremony mutations that live
-    on `story_pipeline` rather than `spq_state_machine`.
+    """Every per-Work-Unit board mutation, through `story_pipeline`.
 
-    Both take the state dict and leave persistence to the caller, so this
-    reads, mutates and writes through the same guarded state helpers the rest
-    of the lifecycle uses. Doing it here rather than telling the operator to
-    shell `story_pipeline.py` is the whole point: on Codex a prompt that names
-    a shell mutation is a prompt that cannot be followed.
+    Seven operations, and four of them arrived here because they were
+    addressed to `spq_state_machine`, which has never had them:
+    `request_acceptance`, `accept_story`, `reject_story` and `unblock_story`
+    are lifecycle-NEUTRAL board mutations shared by all three lifecycles, and
+    they live on `story_pipeline`. Under SPQ each was an `AttributeError`, so a
+    Work Unit could be dispatched and verified on this host and then not
+    accepted on it.
+
+    `story_pipeline` takes the state dict and leaves persistence to its caller,
+    so this reads, mutates and writes through the same guarded state helpers
+    the rest of the lifecycle uses. Doing it here rather than telling the
+    operator to shell `story_pipeline.py` is the whole point: on Codex a prompt
+    that names a shell mutation is a prompt that cannot be followed.
     """
     pipeline = importlib.import_module("story_pipeline")
     spq = importlib.import_module("spq_state_machine")
+
+    story_id = str(arguments.get("story_id") or "").strip()
+    if operation != "set_dod_tier" and not story_id:
+        return {"error": f"story_id is required for {operation}"}
+
+    # `evaluate_dod` is the one READ here: it takes the project directory and
+    # its own tier, writes nothing, and needs no state round-trip.
+    if operation == "evaluate_dod":
+        state = spq.read_state(str(project))
+        tier_info = spq.resolve_dod_tier(str(project), state) or {}
+        intensity = str(
+            tier_info.get("tier") or tier_info.get("intensity") or "growing"
+        )
+        spq_paths = importlib.import_module("spq_paths")
+        try:
+            return pipeline.evaluate_story_dod(
+                str(project),
+                story_id,
+                intensity,
+                receipts_dir=spq_paths.receipts_dir(
+                    str(project), str(state.get("_cycle_id") or "")
+                ),
+            )
+        except (ValueError, KeyError) as exc:
+            return {"error": f"evaluate_dod refused: {exc}"}
+
     state = spq.read_state(str(project))
 
-    if operation == "record_retry":
-        story_id = str(arguments.get("story_id") or "").strip()
-        role = str(arguments.get("role") or "").strip()
-        if not story_id or not role:
-            return {"error": "story_id and role are required for record_retry"}
-        count = pipeline.record_retry(
-            state,
+    if operation == "request_acceptance":
+        args: tuple = (story_id,)
+        kwargs: dict[str, Any] = {}
+    elif operation == "accept_story":
+        accepted_by = str(arguments.get("accepted_by") or "").strip()
+        # Acceptance is a HUMAN gate. An empty attributor would record the
+        # sign-off as having no author, which is the one thing an acceptance
+        # record exists to carry.
+        if not accepted_by:
+            return {"error": "accepted_by is required to accept a Work Unit"}
+        args, kwargs = (story_id, accepted_by), {}
+    elif operation == "reject_story":
+        rejected_by = str(arguments.get("rejected_by") or "").strip()
+        if not rejected_by:
+            return {"error": "rejected_by is required to reject a Work Unit"}
+        raw_changes = arguments.get("ac_changes") or []
+        if not isinstance(raw_changes, list):
+            return {"error": "ac_changes must be an array of strings"}
+        args = (
             story_id,
-            role,
-            str(arguments.get("summary") or ""),
-            project_dir=str(project),
+            str(arguments.get("reason") or "needs-fix"),
+            str(arguments.get("feedback") or ""),
+            rejected_by,
         )
-        spq._write_state(str(project), state)
-        return {"ok": True, "story_id": story_id, "role": role, "retries": count}
+        kwargs = {"acceptance_criteria_change": [str(c) for c in raw_changes]}
+    elif operation == "unblock_story":
+        args, kwargs = (story_id, str(arguments.get("reason") or "")), {}
+    elif operation == "record_retry":
+        role = str(arguments.get("role") or "").strip()
+        if not role:
+            return {"error": "story_id and role are required for record_retry"}
+        args = (story_id, role, str(arguments.get("summary") or ""))
+        kwargs = {}
+    else:  # set_dod_tier
+        tier = str(arguments.get("tier") or "").strip()
+        decided_by = str(arguments.get("decided_by") or "").strip()
+        if not tier:
+            return {"error": "tier is required for set_dod_tier"}
+        # The tier is a PLANNING DECISION with an author (#134 GAP-11).
+        # Accepting it unattributed would leave `tier_source: "planned"` with
+        # nobody who planned it, which reads as computed-but-lying rather than
+        # as a recorded decision.
+        if not decided_by:
+            return {"error": "decided_by is required to set the DoD tier"}
+        args = (tier, decided_by, str(arguments.get("reason") or ""))
+        kwargs = {}
 
-    tier = str(arguments.get("tier") or "").strip()
-    decided_by = str(arguments.get("decided_by") or "").strip()
-    if not tier:
-        return {"error": "tier is required for set_dod_tier"}
-    # The tier is a PLANNING DECISION with an author (#134 GAP-11). Accepting it
-    # unattributed would leave `tier_source: "planned"` with nobody who planned
-    # it, which reads as computed-but-lying rather than as a recorded decision.
-    if not decided_by:
-        return {"error": "decided_by is required to set the DoD tier"}
     try:
-        result = pipeline.set_dod_tier(
-            state,
-            tier,
-            decided_by,
-            str(arguments.get("reason") or ""),
-            project_dir=str(project),
+        result = getattr(pipeline, operation)(
+            state, *args, project_dir=str(project), **kwargs
         )
-    except (ValueError, KeyError) as exc:
-        return {"error": f"set_dod_tier refused: {exc}"}
+    except (ValueError, TypeError, KeyError) as exc:
+        return {"error": f"{operation} refused: {exc}"}
     spq._write_state(str(project), state)
-    return result
+    if operation == "record_retry":
+        return {
+            "ok": True, "story_id": story_id,
+            "role": str(arguments.get("role") or ""), "retries": result,
+        }
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 def tool_spq_lifecycle(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Execute one explicit SPQ ceremony operation through guarded APIs."""
+    """Execute one explicit SPQ ceremony operation through guarded APIs.
+
+    SIX OPERATIONS WERE REMOVED from this verb and from its enum (ADR-035),
+    and removing them from the ENUM is the half that matters: the enum is what
+    a fresh Codex install advertises in `tools/list`, so an operation left
+    there is a promise the package makes to whichever model reads it.
+
+      declare_ready, evaluate_sync, clear_sync, enter_sync, sync_status
+          Sync as a lifecycle STATE, with a quorum of per-lane readiness
+          records behind it. `C-02` makes Sync a recorded event that blocks
+          nothing and moves the all-or-nothing barrier to Checkpoint over the
+          admitted set, so none of these had an implementation left to call --
+          each resolved through `getattr(spq_state_machine, ...)` against a
+          name the rewrite removed, and `sync_status` additionally imported the
+          deleted `sync_barrier`. `record_sync` is what survives.
+      the three release-composition verbs
+          That layer existed only because integration was deferred; every
+          Cycle integrates to the shared trunk at its own Checkpoint now, so
+          there is no parent to gather anything.
+      record_method_signal
+          a free-text signal with no schema. `method_events` records exactly
+          three kinds and refuses a fourth, because a fourth would be a stage
+          in disguise.
+    """
     project = _project(arguments)
     operation = str(arguments.get("operation") or "")
     module = importlib.import_module("spq_state_machine")
@@ -993,213 +894,254 @@ def tool_spq_lifecycle(arguments: dict[str, Any]) -> dict[str, Any]:
             return blocked
         if _state_path(project).exists():
             return {"error": "initialize refused: pipeline state already exists"}
+        # THE LANE ARGUMENT IS GONE from the list. A clone no longer needs to
+        # know which lane it is, because there is one board per Cycle -- and
+        # while `initialize` still swallows unknown kwargs, keeping the
+        # argument would have let a caller believe it seeded an identity
+        # nothing reads.
         return module.initialize(
             str(project),
             agent_backends=arguments.get("agent_backends") or {
                 "default": "codex", "roles": {}
             },
             spec_id=arguments.get("spec_id"),
-            workstream_id=arguments.get("workstream"),
         )
 
-    # A fresh workstream clone deliberately has no gitignored pipeline state.
+    # A fresh clone deliberately has no gitignored pipeline state.
     # ``hydrate_cycle`` is its guarded state-creation path, so requiring SPQ
     # state/readiness before calling it makes the documented operation
     # impossible.  Authenticate and verify the explicit repository config here;
     # after hydration, normal doctor/readiness checks apply to every dispatch.
-    if operation == "hydrate_cycle" and not _state_path(project).is_file():
-        blocked = _require_authenticated(project) or _require_standard_project(project)
-        if blocked:
-            return blocked
-        if _configured_build_mode(project) != "spq":
-            return {"error": "SPQ lifecycle tools require build_mode: spq"}
-        work_units = arguments.get("work_units")
-        if not isinstance(work_units, list) or not work_units:
-            return {"error": "work_units must be a non-empty array"}
-        cycle = arguments.get("cycle")
-        if not isinstance(cycle, int) or isinstance(cycle, bool):
-            return {"error": "cycle is required for hydrate_cycle and must be an integer"}
-        module.initialize(
-            str(project),
-            agent_backends=arguments.get("agent_backends") or {
-                "default": "codex", "roles": {}
-            },
-            workstream_id=arguments.get("workstream"),
-        )
-        return module.hydrate_cycle(
-            str(project), cycle, work_units, goal=str(arguments.get("goal") or ""),
-            tracker_cycle=arguments.get("tracker_cycle"),
-            workstream_id=arguments.get("workstream"),
-        )
-
-    # A RELEASE clone owns no child Cycle and dispatches no Work Unit, so
-    # `_require_execution_ready` -- which checks the nine managed agent profiles
-    # among other things -- is the wrong gate: it demands provisioning for
-    # dispatches that will never happen. Observed with a real Codex agent, which
-    # had to install nine profiles into a clone whose only job is to pin child
-    # increments.
-    #
-    # Same treatment as `initialize` and the fresh-clone `hydrate_cycle` above,
-    # and for the same stated reason: these CREATE state in a clone that has
-    # none. Authentication and the compliance refusal both still apply, so a
-    # regulated project is still refused.
-    if operation in (
-        "open_coordination_cycle",
-        "revise_coordination_manifest",
-        "clear_release",
-    ):
-        blocked = _require_authenticated(project) or _require_standard_project(
-            project
-        )
-        if blocked:
-            return blocked
-
-    if operation == "open_coordination_cycle":
-        children = arguments.get("children")
-        if not isinstance(children, list) or not children:
-            return {"error": "children must be a non-empty array"}
-        try:
-            return module.open_coordination_cycle(
-                str(project),
-                release_goal=str(arguments.get("release_goal") or ""),
-                children=children,
-                dependency_edges=arguments.get("dependency_edges") or [],
-                coordination_seq=arguments.get("coordination_seq"),
-                baseline_sha=str(arguments.get("baseline_sha") or ""),
-                created_by=str(arguments.get("created_by") or ""),
+    if operation == "hydrate_cycle":
+        cycle_id = str(arguments.get("cycle_id") or "").strip()
+        if not cycle_id:
+            return {"error": "cycle_id is required for hydrate_cycle"}
+        fresh = not _state_path(project).is_file()
+        if fresh:
+            blocked = _require_authenticated(project) or _require_standard_project(
+                project
             )
-        except Exception as exc:  # noqa: BLE001 - a tool refuses, never raises
-            return {"error": str(exc)}
-    if operation == "revise_coordination_manifest":
-        try:
-            return module.revise_coordination_manifest(
+            if blocked:
+                return blocked
+            if _configured_build_mode(project) != "spq":
+                return {"error": "SPQ lifecycle tools require build_mode: spq"}
+            module.initialize(
                 str(project),
-                coordination_cycle_id=arguments.get("coordination_cycle_id"),
-                drop_child=str(arguments.get("drop_child") or ""),
-                reason=str(arguments.get("reason") or ""),
-                revised_by=str(arguments.get("revised_by") or ""),
+                agent_backends=arguments.get("agent_backends") or {
+                    "default": "codex", "roles": {}
+                },
             )
-        except Exception as exc:  # noqa: BLE001
-            return {"error": str(exc)}
-    if operation == "clear_release":
-        try:
-            return module.clear_release(
-                str(project),
-                coordination_cycle_id=arguments.get("coordination_cycle_id"),
-                cleared_by=arguments.get("cleared_by"),
+        else:
+            blocked = (
+                _require_standard_project(project)
+                or _require_spq(project)
+                or _require_execution_ready(project)
             )
-        except Exception as exc:  # noqa: BLE001
-            return {"error": str(exc)}
+            if blocked:
+                return blocked
+        # THROUGH `spq_mcp`, which is where the body lives so that the
+        # manifest-hash refusal exists on both hosts rather than on whichever
+        # was edited last. The Cursor server calls the same function. This
+        # host's own copy passed a sequence number, a filtered unit list, a
+        # goal, a tracker cycle and a lane id to a signature that takes only
+        # `cycle_id`, so every hydration was a `TypeError` reported as a
+        # lifecycle error.
+        return importlib.import_module("spq_mcp").hydrate_cycle({
+            "project_dir": str(project),
+            "cycle_id": cycle_id,
+            "manifest_hash": arguments.get("manifest_hash"),
+        })
 
     blocked = _require_standard_project(project) or _require_spq(project)
     if blocked:
         return blocked
-    if operation in {"sync_status", "acceptance_status"}:
-        state = module.read_state(str(project))
-        if operation == "sync_status":
-            from sync_barrier import status  # type: ignore
-
-            cycle = int(arguments.get("cycle") or state.get("current_cycle") or 0)
-            return status(str(project), cycle)
-        return module.acceptance_readiness(str(project), state=state)
+    if operation == "acceptance_status":
+        # NO `state=`. `acceptance_readiness` takes the project and reads the
+        # board itself; the `state=` this host passed was a `TypeError` on
+        # every call, so the one read that tells an operator what an Acceptance
+        # still owes was the read that could not be made.
+        return module.acceptance_readiness(str(project))
 
     blocked = _require_execution_ready(project)
     if blocked:
         return blocked
     if operation == "approve_baseline":
         approved_by = str(arguments.get("approved_by") or "").strip()
+        baseline_ref = str(arguments.get("baseline_ref") or "").strip()
         if not approved_by:
             return {"error": "approved_by is required for the Discovery human gate"}
-        return module.approve_baseline(str(project), approved_by=approved_by)
-    if operation in {"open_cycle", "hydrate_cycle"}:
-        work_units = arguments.get("work_units")
-        if not isinstance(work_units, list) or not work_units:
-            return {"error": "work_units must be a non-empty array"}
-        cycle = arguments.get("cycle")
-        if cycle is not None and (not isinstance(cycle, int) or isinstance(cycle, bool)):
-            return {"error": "cycle must be an integer"}
-        if operation == "open_cycle":
-            return module.open_cycle(
-                str(project), cycle, str(arguments.get("goal") or ""), work_units,
-                tracker_cycle=arguments.get("tracker_cycle"),
-            )
-        if cycle is None:
-            return {"error": "cycle is required for hydrate_cycle"}
-        return module.hydrate_cycle(
-            str(project), cycle, work_units, goal=str(arguments.get("goal") or ""),
-            tracker_cycle=arguments.get("tracker_cycle"),
-            workstream_id=arguments.get("workstream"),
-        )
-    if operation == "enter_sync":
-        approved_by = str(arguments.get("approved_by") or "").strip()
-        if not approved_by:
+        if not baseline_ref:
+            # An approval that does not name the revision it approved is a
+            # boolean with a signature on it: the next Cycle seals against a
+            # baseline nobody can point at.
             return {
                 "error": (
-                    "approved_by is required to confirm the workstream head and "
-                    "readiness record were committed and pushed"
+                    "baseline_ref is required: the approval records the exact "
+                    "revision whose scope, timeline and cost were approved"
                 )
             }
-        result = module.transition(str(project), "SYNC")
-        result.pop("sync_evaluation", None)
-        result.setdefault("process_log", []).append({
-            "at": datetime.now(timezone.utc).isoformat(),
-            "event": "sync_entry_approved",
-            "approved_by": approved_by,
-        })
-        module._write_state(str(project), result)
-        return result
-    if operation == "declare_ready":
-        return module.declare_sync_ready(
-            str(project), arguments.get("cycle"),
-            workstream=arguments.get("workstream"),
-            declared_by=arguments.get("approved_by"),
-            run_regression=arguments.get("run_regression", True),
+        calibration = arguments.get("calibration")
+        if calibration is not None and not isinstance(calibration, dict):
+            return {"error": "calibration must be an object (the measured sample)"}
+        return module.approve_baseline(
+            str(project),
+            approved_by=approved_by,
+            baseline_ref=baseline_ref,
+            calibration=calibration,
         )
-    if operation == "evaluate_sync":
-        return module.evaluate_sync(
-            str(project), arguments.get("cycle"),
-            use_cache=arguments.get("use_cache", True),
-        )
-    if operation == "clear_sync":
-        approved_by = str(arguments.get("approved_by") or "").strip()
-        if not approved_by:
-            return {"error": "approved_by is required to clear the Sync human gate"}
-        return module.clear_sync(
-            str(project), arguments.get("cycle"), cleared_by=approved_by
-        )
-    if operation == "record_method_signal":
-        return module.record_method_signal(
-            str(project), str(arguments.get("kind") or ""),
-            str(arguments.get("summary") or ""), arguments.get("data"),
-        )
-    if operation == "close_cycle":
-        readiness = module.checkpoint_readiness(str(project))
-        if readiness.get("ready"):
-            receipt = _validate_and_deliver_receipt(
-                project,
-                _scoped_receipt_path(project, str(readiness["receipt_path"])),
+    if operation == "open_cycle":
+        # THE ARGUMENT LIST IS THE DECLARATION. It replaces `(cycle,
+        # work_units, goal, tracker_cycle)`, whose four values map onto exactly
+        # one of the things a Cycle commits to -- and `open_cycle` has not
+        # taken a cycle NUMBER since the identity became a Cycle id.
+        units = arguments.get("admitted_units")
+        if not isinstance(units, list) or not units:
+            return {"error": "admitted_units must be a non-empty array"}
+        try:
+            return module.open_cycle(
+                str(project),
+                goal=str(arguments.get("goal") or ""),
+                repository=str(arguments.get("repository") or ""),
+                trunk_ref=str(arguments.get("trunk_ref") or ""),
+                source_region=list(arguments.get("source_region") or []),
+                admitted_units=units,
+                engineering_lead=str(arguments.get("engineering_lead") or ""),
+                crew=list(arguments.get("crew") or []),
+                shared_path_owners=list(arguments.get("shared_path_owners") or []),
+                baseline_ref=str(arguments.get("baseline_ref") or ""),
+                cycle_id=str(arguments.get("cycle_id") or "") or None,
+                specification_refs=list(arguments.get("specification_refs") or []),
+                readmits=list(arguments.get("readmits") or []),
+                verification=(arguments.get("verification") or None),
             )
-            if not receipt.get("valid"):
+        except Exception as exc:  # noqa: BLE001 - a tool refuses, never raises
+            return {"error": str(exc)}
+    if operation == "record_sync":
+        # Read the closed set from the constant rather than restating it. A
+        # copy of a closed set is the same defect that shipped three different
+        # barrier-criteria counts in one product.
+        allowed = tuple(importlib.import_module("method_events").SYNC_RESOLUTIONS)
+        resolution = str(arguments.get("resolution") or "").strip()
+        if resolution not in allowed:
+            return {
+                "error": (
+                    "resolution must be one of %s -- \"it cleared somehow\" is "
+                    "not a record anyone can act on later." % ", ".join(allowed)
+                )
+            }
+        try:
+            return module.record_sync(
+                str(project),
+                waiting_unit_id=str(arguments.get("waiting_unit_id") or ""),
+                producing_cycle_id=str(arguments.get("producing_cycle_id") or ""),
+                resolution=resolution,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+    if operation == "promote_cycle":
+        # A PROMOTION IS SOMEBODY'S DECISION, so the principal is required and
+        # the verdict is not accepted. `run_barrier` evaluates the criteria,
+        # observes the trunk, and records the promotion the close then has to
+        # find -- none of which a caller can supply.
+        principal = str(arguments.get("principal") or "")
+        if not principal:
+            return {
+                "error": (
+                    "promote_cycle needs the principal promoting: a barrier "
+                    "verdict nobody signed is not a decision (`M-03`)."
+                )
+            }
+        try:
+            return module.promote_cycle(
+                str(project),
+                principal=principal,
+                rationale=str(arguments.get("rationale") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+    if operation == "close_cycle":
+        # THE CLOSE TAKES NO VERDICT AND NO SHA. It derives both: `run_barrier`
+        # evaluates the criteria against the unit results, executes the
+        # regression, observes the trunk itself, and `close_cycle` then
+        # requires a matching successful promotion to exist.
+        #
+        # This host used to validate a caller-supplied `barrier_verdict` and
+        # pass a caller-supplied `integrated_sha`, which reads as a strong
+        # gate: not green, no criteria and a foreign Cycle were all refused.
+        # A shaped JSON object satisfying those three closed a Cycle whose
+        # barrier had never run -- and the shape is trivially guessable from
+        # the refusals themselves. Validating a claim is not the same as
+        # deriving the fact, and `M-03` asks for the second.
+        #
+        # `proceed_to` is gone for the same reason: whether the next stage is
+        # another Cycle or Acceptance is derived from outstanding commitments
+        # and a recorded handover, not chosen here.
+        for retired, replacement in (
+            ("barrier_verdict", "it is derived by `run_barrier`"),
+            ("integrated_sha", "the trunk is observed, not asserted"),
+        ):
+            if arguments.get(retired) is not None:
                 return {
-                    "error": "close_cycle refused: Checkpoint receipt delivery failed",
-                    "receipt": receipt,
+                    "error": (
+                        "close_cycle no longer accepts %s: %s. Run the barrier, "
+                        "promote with a principal, merge, then close."
+                        % (retired, replacement)
+                    )
                 }
-        proceed_to = str(arguments.get("proceed_to") or "COMMIT").upper()
-        return module.close_cycle(str(project), proceed_to=proceed_to)
+        # THE KERNEL DECIDES WHETHER A CLOSE IS EVEN THE NEXT STEP, and this
+        # host asks rather than re-deriving. `next_action` returns
+        # `close_cycle` exactly when every admitted Work Unit is done or cut,
+        # and a `dispatch_*` while evidence is still owed -- so "is anything
+        # outstanding" is one question with one answer, and asking it here
+        # cannot disagree with the loop the operator is following.
+        selected = _spq_lifecycle_next_action(project)
+        if str(selected.get("action") or "") != "close_cycle":
+            return {
+                "error": (
+                    "close_cycle refused: next_action is %s, so the Cycle has "
+                    "outstanding work or evidence. %s"
+                    % (selected.get("action"), selected.get("reason") or "")
+                ).strip(),
+                "next_action": selected,
+            }
+        try:
+            return module.close_cycle(
+                str(project),
+                principal=str(arguments.get("principal") or ""),
+                rationale=str(arguments.get("rationale") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+    if operation in ("enter_cycle", "enter_acceptance"):
+        # THROUGH `transition`, which runs `check_transition`. Writing the
+        # stage directly is the hole `open_cycle` had before #644: `COMPLETE`
+        # was terminal only for callers that used this verb.
+        target = "CYCLE" if operation == "enter_cycle" else "ACCEPTANCE"
+        try:
+            return module.transition(str(project), target)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
     if operation == "complete":
         approved_by = str(arguments.get("approved_by") or "").strip()
         if not approved_by:
             return {"error": "approved_by is required for release approval"}
         readiness = module.acceptance_readiness(str(project))
         if readiness.get("ready"):
+            state = module.read_state(str(project))
+            seq = int(state.get("current_cycle") or 0)
+            spq_paths = importlib.import_module("spq_paths")
+            receipts = spq_paths.receipts_dir(
+                str(project), str(state.get("_cycle_id") or "")
+            )
             deliveries: dict[str, Any] = {}
-            for abbreviation, item in readiness.get("receipts", {}).items():
+            for abbreviation in sorted(module.ACCEPTANCE_ROLES):
                 path = _scoped_receipt_path(
-                    project, str(item.get("receipt_path") or "")
+                    project,
+                    os.path.join(
+                        receipts, "ACCEPTANCE-%d-%s.json" % (seq, abbreviation)
+                    ),
                 )
-                deliveries[str(abbreviation)] = _validate_and_deliver_receipt(
-                    project, path
-                )
+                deliveries[abbreviation] = _validate_and_deliver_receipt(project, path)
             failed = {
                 role: result
                 for role, result in deliveries.items()
@@ -1210,60 +1152,27 @@ def tool_spq_lifecycle(arguments: dict[str, Any]) -> dict[str, Any]:
                     "error": "complete refused: Acceptance receipt delivery failed",
                     "receipts": failed,
                 }
-        return module.transition(str(project), "COMPLETE", approved_by=approved_by)
-    # ── Per-Work-Unit ceremony mutations (#303 host parity) ──────────────────
+        # NO `approved_by=` ON THE TRANSITION. `cycle_lifecycle.check_transition`
+        # takes a current stage and a target and nothing else; the attributor is
+        # checked above, where it can actually refuse.
+        return module.transition(str(project), "COMPLETE")
+    # ── Per-Work-Unit board mutations (#303 host parity) ─────────────────────
     # These exist because the SPQ ceremony prompts INSTRUCT them, and the Codex
     # ceremony composer fails the build on any prompt mutation with no MCP
     # equivalent. Before this, Acceptance and DoD-recovery were reachable on
     # Claude and Cursor but not on Codex, so composing the prompts would have
     # told a Codex operator to shell a script the host forbids.
-    if operation == "request_acceptance":
-        story_id = str(arguments.get("story_id") or "").strip()
-        if not story_id:
-            return {"error": "story_id is required for request_acceptance"}
-        return module.request_acceptance(str(project), story_id)
-    if operation == "evaluate_dod":
-        story_id = str(arguments.get("story_id") or "").strip()
-        if not story_id:
-            return {"error": "story_id is required for evaluate_dod"}
-        return module.evaluate_story_dod(str(project), story_id)
-    if operation == "accept_story":
-        story_id = str(arguments.get("story_id") or "").strip()
-        accepted_by = str(arguments.get("accepted_by") or "").strip()
-        if not story_id:
-            return {"error": "story_id is required for accept_story"}
-        # Acceptance is a HUMAN gate. An empty attributor would record the
-        # sign-off as having no author, which is the one thing an acceptance
-        # record exists to carry.
-        if not accepted_by:
-            return {"error": "accepted_by is required to accept a Work Unit"}
-        return module.accept_story(str(project), story_id, accepted_by)
-    if operation == "reject_story":
-        story_id = str(arguments.get("story_id") or "").strip()
-        rejected_by = str(arguments.get("rejected_by") or "").strip()
-        if not story_id:
-            return {"error": "story_id is required for reject_story"}
-        if not rejected_by:
-            return {"error": "rejected_by is required to reject a Work Unit"}
-        raw_changes = arguments.get("ac_changes") or []
-        if not isinstance(raw_changes, list):
-            return {"error": "ac_changes must be an array of strings"}
-        return module.reject_story(
-            str(project),
-            story_id,
-            str(arguments.get("reason") or "needs-fix"),
-            str(arguments.get("feedback") or ""),
-            rejected_by,
-            ac_changes=[str(c) for c in raw_changes],
-        )
-    if operation == "unblock_story":
-        story_id = str(arguments.get("story_id") or "").strip()
-        if not story_id:
-            return {"error": "story_id is required for unblock_story"}
-        return module.unblock_story(
-            str(project), story_id, str(arguments.get("reason") or "")
-        )
-    if operation in {"record_retry", "set_dod_tier"}:
+    #
+    # ALL OF THEM NOW ROUTE THROUGH `story_pipeline`, where they live. Four
+    # were addressed to `spq_state_machine`, which has never had them: they are
+    # lifecycle-NEUTRAL board mutations shared by all three lifecycles, so
+    # every one of `request_acceptance`, `accept_story`, `reject_story` and
+    # `unblock_story` was an `AttributeError` on this host -- a Work Unit could
+    # be dispatched and verified here and then not accepted here.
+    if operation in {
+        "request_acceptance", "evaluate_dod", "accept_story", "reject_story",
+        "unblock_story", "record_retry", "set_dod_tier",
+    }:
         return _story_pipeline_mutation(project, operation, arguments)
     return {"error": f"unsupported SPQ lifecycle operation: {operation}"}
 
@@ -1420,8 +1329,202 @@ def tool_begin_dispatch(arguments: dict[str, Any]) -> dict[str, Any]:
         "next_action": selected,
         "recovery": selected.get("recovery"),
         "archived_receipt": decision.extra.get("archived_receipt"),
+        # #690. The superseded receipt's full digest, so an archived file can
+        # be tied back to the failed attempt without reading the directory.
+        "archived_receipt_digest": decision.extra.get("archived_receipt_digest"),
         "retry_count": decision.extra.get("retry_count"),
+        # The governed runtime surface (#396 finding 1). The kernel selects an
+        # adapter profile and mints a dispatch envelope; a host that dropped
+        # them left Auto/Prefer/Pin unable to affect a real dispatch and gave
+        # the operator no way to see which runtime was chosen or to hand the
+        # envelope to the bridge. Absent on a project that has not opted in,
+        # which is what `runtime.state == "inert"` says.
+        **_runtime_surface(decision),
     }
+
+
+def _runtime_surface(decision: Any) -> dict[str, Any]:
+    """The selection account and the dispatch envelope, when there is one.
+
+    Kept out of `receipt_contract`: that block describes the EVIDENCE the agent
+    must produce, while these describe the authority it runs under. Folding one
+    into the other would make a host that reads only the receipt shape look
+    like it had honoured the envelope.
+    """
+    account = decision.extra.get("runtime_selection")
+    if not account:
+        return {}
+    surface: dict[str, Any] = {"runtime": account}
+    envelope = decision.extra.get("dispatch_envelope")
+    if envelope:
+        surface["dispatch_envelope"] = envelope
+        surface["runtime_execute_hint"] = (
+            "Hand this envelope to `synaptory runtime execute --envelope -` "
+            "rather than running the agent directly: the control plane signs "
+            "it at registration and the bridge verifies that signature before "
+            "it prepares anything."
+        )
+    return surface
+
+
+def tool_execute_through_runtime(args: dict[str, Any]) -> dict[str, Any]:
+    """Run a dispatch through the SELECTED runtime, not this host's own agent.
+
+    Surfacing an envelope was not integration (#396): the host displayed the
+    selection and then spawned its native agent regardless, so Auto/Prefer/Pin
+    could be shown and could not change which executor ran. This is the
+    deterministic boundary. It invokes the Runtime Bridge with the
+    control-plane-signed envelope and returns the attempt record, so a
+    cross-family dispatch is a tool call rather than a suggestion the model may
+    or may not follow.
+
+    The kernel enforces the other half: a receipt produced by a family the
+    dispatch did not select is refused at advance, so skipping this tool does
+    not quietly succeed.
+    """
+    envelope = args.get("dispatch_envelope")
+    if not isinstance(envelope, dict) or not envelope:
+        return {
+            "executed": False,
+            "error": (
+                "no dispatch envelope: call begin_dispatch first and pass the "
+                "`dispatch_envelope` it returned. A dispatch with no envelope "
+                "is not a governed one and runs through the host's own agent."
+            ),
+        }
+    cli = _runtime_cli()
+    if not cli:
+        return {
+            "executed": False,
+            "error": (
+                "no synaptory CLI resolved for this installation, so the "
+                "selected runtime cannot be invoked. The dispatch must not "
+                "fall back to this host's agent: the selection chose "
+                "%s." % (envelope.get("runtime_family") or "another runtime")
+            ),
+        }
+    # THE REQUESTED PROJECT, explicitly (#396). The tool schema takes
+    # `project_dir` and this ignored it, so the bridge walked upward from the
+    # MCP SERVER's working directory: outside a project it refused, and inside
+    # a different checkout it ran the selected runtime there and stored the
+    # attempt there, while the envelope named the intended project.
+    project = str(_project(args))
+    proc = subprocess.run(
+        [
+            cli, "runtime", "execute",
+            "--envelope", "-", "--json",
+            "--project-dir", project,
+        ],
+        input=json.dumps(envelope),
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=project,
+    )
+    payload: dict[str, Any] = {
+        "executed": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "runtime_family": envelope.get("runtime_family"),
+        "adapter_profile_id": envelope.get("adapter_profile_id"),
+    }
+    try:
+        payload["attempt"] = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        payload["stdout"] = proc.stdout[-4000:]
+    if proc.returncode != 0:
+        payload["error"] = (proc.stderr or proc.stdout)[-4000:]
+
+    # RECONCILE THE BOARD with the generation the bridge actually held (#396).
+    #
+    # The kernel mints a LOCAL random fencing token at dispatch; the control
+    # plane issues the authoritative one at claim. Without this the two never
+    # meet, and a correctly claimed receipt is refused as `fencing_token_stale`
+    # against the local value. This is the caller `reconcile_dispatch` was
+    # written for, and the host is where it belongs: the Go bridge has no path
+    # to the Python kernel, and the host has both.
+    #
+    # Best effort AFTER the run: a reconciliation failure must not discard an
+    # attempt that already executed, and the reason is reported rather than
+    # swallowed so an operator can see why the receipt will be refused.
+    attempt = payload.get("attempt")
+    if isinstance(attempt, dict):
+        payload["reconciled"] = _reconcile_board(project, envelope, attempt)
+    return payload
+
+
+def _reconcile_board(
+    project: str, envelope: dict[str, Any], attempt: dict[str, Any]
+) -> dict[str, Any]:
+    """Put the claim's generation and the run's outcome on the dispatch binding.
+
+    ON THE RECORD'S OWN AUTHORITY, never on the envelope's. The first version
+    read `fencing_token` and `state` from the record but `attempt_id`, story
+    and role from the ENVELOPE, so whatever the bridge reported was relabelled
+    as the requested attempt and the kernel's exact-attempt guard could never
+    fire: envelope A in, a record for B out, and B's generation landed on A's
+    binding. So the two documents are matched first, and the identity passed
+    down is the REPORTED one, which leaves the kernel's guard as a second
+    refusal rather than a formality (#396).
+    """
+    problems = runtime_contracts.attempt_record_disagreements(envelope, attempt)
+    if problems:
+        return {"applied": False, "reason": "; ".join(problems)}
+    # ONLY A CP-CONFIRMED CLOSE IS PROJECTED. A holder that was fenced out or
+    # asked to cancel can still finish its adapter and describe itself as
+    # completed; adopting that puts a stale generation and a state the control
+    # plane never accepted onto the board, and turns evidence that says stop
+    # into a receipt that can advance.
+    if not runtime_contracts.attempt_close_confirmed(attempt):
+        return {
+            "applied": False,
+            "reason": (
+                "the control plane did not confirm a terminal close for this "
+                "attempt, so its generation and state are this process's own "
+                "opinion and must not be projected onto the board"
+            ),
+        }
+    token = str(attempt.get("fencing_token") or "")
+    state = str(attempt.get("state") or "")
+    if not token and not state:
+        return {"applied": False, "reason": "the bridge reported no generation or state"}
+    try:
+        decision = advance_kernel.reconcile_dispatch(
+            project,
+            str(attempt.get("story_id") or ""),
+            str(attempt.get("role") or ""),
+            attempt_id=str(attempt.get("attempt_id") or ""),
+            fencing_token=token,
+            attempt_state=state,
+            # #492. The record already carries WHY the attempt ended, from the
+            # control plane's own close, and until this was forwarded the
+            # board learned only THAT it ended. Passed through rather than
+            # normalized here: the kernel owns the closed vocabulary, and a
+            # host that quietly dropped a class it did not like would make a
+            # human cancellation indistinguishable from a technical failure.
+            failure_class=str(attempt.get("failure_class") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"applied": False, "reason": "reconciliation failed: %s" % exc}
+    return {
+        "applied": bool(decision.allowed),
+        "reason": decision.reason,
+        "code": decision.code,
+    }
+
+
+def _runtime_cli() -> str:
+    """The synaptory binary this installation is stamped for, or "".
+
+    Reuses the shared resolver rather than searching PATH: an unstamped tree
+    addresses no control plane, and inventing one here would be the #320
+    fall-through in a new place.
+    """
+    try:
+        from gate_emitter import _resolve_cli  # type: ignore
+
+        return _resolve_cli() or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _dispatch_error_text(decision: Any) -> str:
@@ -1565,12 +1668,42 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": "Return the deterministic next dispatch, transition, or human gate.",
         "schema": mcp_transport.PROJECT_ONLY_SCHEMA,
     },
+    "execute_through_runtime": {
+        "fn": tool_execute_through_runtime,
+        "description": (
+            "Run a governed dispatch through the SELECTED runtime via the "
+            "Runtime Bridge. Required when begin_dispatch returned a "
+            "dispatch_envelope: the selection decides which executor runs, and "
+            "a receipt from another family is refused at advance."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string"},
+                "dispatch_envelope": {"type": "object"},
+            },
+            "required": ["dispatch_envelope"],
+        },
+    },
     "spq_lifecycle": {
         "fn": tool_spq_lifecycle,
         "description": (
-            "Run one guarded SPQ ceremony operation across Discovery, Commit, "
-            "Sync, Checkpoint, Acceptance, or Complete."
+            "Run one guarded SPQ ceremony operation. The lifecycle has four "
+            "stages -- DISCOVERY, CYCLE, ACCEPTANCE, COMPLETE -- and Commit, "
+            "Sync and Checkpoint are recorded events inside them, not stages "
+            "and not gates."
         ),
+        # THE ENUM IS THE DISCOVERY SURFACE, which is why nine operations were
+        # removed from it and not merely from the body above. It is what a
+        # fresh Codex install advertises in `tools/list`, so an operation left
+        # here is a promise the package makes to whichever model reads it --
+        # and all nine resolved through `getattr(spq_state_machine, ...)`
+        # against names the rewrite removed, or imported the deleted
+        # `sync_barrier`. Gone: `enter_sync`, `declare_ready`, `sync_status`,
+        # `evaluate_sync`, `clear_sync` (Sync as a state with a per-lane
+        # quorum), `record_method_signal` (a free-text signal with no schema),
+        # and the three release-composition verbs, whose layer existed only
+        # because integration was deferred.
         "schema": {
             "type": "object",
             "properties": {
@@ -1579,49 +1712,77 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "enum": [
                         "initialize", "approve_baseline", "open_cycle",
-                        "hydrate_cycle", "enter_sync", "declare_ready",
-                        "sync_status", "evaluate_sync", "clear_sync",
-                        "record_method_signal", "close_cycle",
+                        "hydrate_cycle", "record_sync",
+                        # PROMOTE, THEN MERGE, THEN CLOSE. The close requires a
+                        # recorded promotion, so a host that offers only
+                        # `close_cycle` cannot reach a Checkpoint at all --
+                        # every attempt refuses with "no successful promotion
+                        # is recorded" and nothing in the enum can produce one.
+                        "promote_cycle", "close_cycle",
                         "acceptance_status", "complete",
-                        # Per-Work-Unit ceremony mutations. Present because the
+                        # THE TWO STAGE EDGES A CYCLE NEEDS TO REACH A GO-LIVE.
+                        # The enum had `complete` and neither of these, so a
+                        # Codex project could open Cycles and close them and
+                        # never reach ACCEPTANCE at all -- `transition` was
+                        # mapped to three operations and the host implemented
+                        # one. `enter_cycle` also carries `ACCEPTANCE ->
+                        # CYCLE`, which is what makes repeatable Acceptance
+                        # (`C-15`) reachable on this host rather than only in
+                        # the kernel.
+                        "enter_cycle", "enter_acceptance",
+                        # Per-Work-Unit board mutations. Present because the
                         # composed SPQ prompts instruct them and the ceremony
                         # composer fails the build on an unmapped mutation.
                         "request_acceptance", "evaluate_dod", "accept_story",
                         "reject_story", "unblock_story", "record_retry",
                         "set_dod_tier",
-                        # Coordination Cycle mutations (#305). A release is not
-                        # a lifecycle state, but opening, revising and clearing
-                        # one are ceremony acts, gated exactly like opening a
-                        # Cycle. The READS live on the shared `spq_*` tools.
-                        "open_coordination_cycle",
-                        "revise_coordination_manifest",
-                        "clear_release",
                     ],
                 },
                 "approved_by": {"type": "string"},
                 "spec_id": {"type": "string"},
-                "release_goal": {"type": "string"},
-                "children": {"type": "array", "items": {"type": "object"}},
-                "dependency_edges": {"type": "array", "items": {"type": "object"}},
-                "coordination_seq": {"type": "integer"},
-                "coordination_cycle_id": {"type": "string"},
-                "baseline_sha": {"type": "string"},
-                "created_by": {"type": "string"},
-                "drop_child": {"type": "string"},
-                "revised_by": {"type": "string"},
-                "cleared_by": {"type": "string"},
                 "agent_backends": {"type": "object"},
-                "cycle": {"type": "integer", "minimum": 1},
-                "tracker_cycle": {"type": "integer"},
+                # The Cycle DECLARATION. `cycle` (a sequence number),
+                # `tracker_cycle`, `work_units` and the lane id are gone: the
+                # identity is a Cycle id, and the four of them together could
+                # not express what a Cycle commits to.
+                "cycle_id": {"type": "string"},
+                "manifest_hash": {"type": "string"},
                 "goal": {"type": "string"},
-                "work_units": {"type": "array", "items": {"type": "object"}},
-                "workstream": {"type": "string"},
-                "run_regression": {"type": "boolean", "default": True},
-                "use_cache": {"type": "boolean", "default": True},
-                "kind": {"type": "string"},
+                "repository": {"type": "string"},
+                "trunk_ref": {"type": "string"},
+                "baseline_ref": {"type": "string"},
+                "calibration": {"type": "object"},
+                "source_region": {"type": "array", "items": {"type": "string"}},
+                "admitted_units": {"type": "array", "items": {"type": "object"}},
+                "engineering_lead": {"type": "string"},
+                "crew": {"type": "array", "items": {"type": "string"}},
+                "shared_path_owners": {
+                    "type": "array", "items": {"type": "object"},
+                },
+                "specification_refs": {"type": "array", "items": {"type": "string"}},
+                "readmits": {"type": "array", "items": {"type": "string"}},
+                # HOW a condition stronger than `done` is checked, sealed with
+                # what it checks. Without it this host can seal a declaration
+                # naming a digest-verified edge and no script to recompute the
+                # digest with -- which `cycle_records` refuses, so those edges
+                # would be unusable here.
+                "verification": {"type": "object"},
+                # The Sync record, and the close. `proceed_to` is gone with the
+                # close's `force`: whether the next stage is another Cycle or
+                # Acceptance is derived from outstanding commitments and a
+                # recorded handover, not chosen by the caller.
+                "waiting_unit_id": {"type": "string"},
+                "producing_cycle_id": {"type": "string"},
+                "resolution": {"type": "string"},
+                # NEITHER `integrated_sha` NOR `barrier_verdict` is here any
+                # more. Both were caller-supplied facts about work the caller
+                # had not necessarily done: the close derives the verdict from
+                # `run_barrier`, observes the trunk itself, and requires a
+                # recorded promotion. `principal` and `rationale` replace them
+                # because a promotion is somebody's decision (`M-03`).
+                "principal": {"type": "string"},
+                "rationale": {"type": "string"},
                 "summary": {"type": "string"},
-                "data": {"type": "object"},
-                "proceed_to": {"type": "string", "enum": ["COMMIT", "ACCEPTANCE"]},
                 "story_id": {"type": "string"},
                 "accepted_by": {"type": "string"},
                 "rejected_by": {"type": "string"},

@@ -43,9 +43,14 @@ def orch(tmp_path: Path) -> Path:
     seeded = {
         "receipts/FLAT-1-se.json": "flat",
         "specs/platform/receipts/US-1-se.json": "multi-spec",
-        "spq/cycles/1-abcdef12/workstreams/api/receipts/WU-API-1-se.json": "spq workstream",
-        "spq/cycles/1-abcdef12/receipts/CHECKPOINT-1-tw.json": "spq cycle-level",
-        "spq/coordination-cycles/cc-1-abcdef12/receipts/RELEASE-1-qe.json": "spq coordination",
+        "spq/cycles/1-abcdef12/receipts/WU-API-1-se.json": "spq",
+        "spq/cycles/1-abcdef12/receipts/CHECKPOINT-1-tw.json": "spq",
+        # A receipt written under the PRE-ADR-035 depth. Not a layout the
+        # product creates any more, and kept on purpose: those receipts are
+        # immutable evidence a hook still has to count and ship, and this is
+        # the only case that proves the SPQ line is still a `*/receipts/`
+        # sweep rather than one pinned to the current depth.
+        "spq/cycles/0-aaaaaaaa/lanes/api/receipts/WU-LEGACY-1-se.json": "spq, historical depth",
     }
     for rel in seeded:
         p = o / rel
@@ -68,11 +73,11 @@ def test_sweep_sees_every_layout(orch: Path):
     out = _sh(f'synaptory_receipt_files "{orch}"')
     names = sorted(Path(line).name for line in out.split() if line)
     assert names == [
-        "CHECKPOINT-1-tw.json",   # spq cycle-level
+        "CHECKPOINT-1-tw.json",   # spq
         "FLAT-1-se.json",         # flat
-        "RELEASE-1-qe.json",      # spq coordination-cycle
         "US-1-se.json",           # multi-spec
-        "WU-API-1-se.json",       # spq workstream
+        "WU-API-1-se.json",       # spq
+        "WU-LEGACY-1-se.json",       # spq, pre-ADR-035 depth
     ], f"sweep returned {names}"
 
 
@@ -110,7 +115,7 @@ def test_recent_is_newest_first(orch: Path):
 
     now = time.time()
     order = [
-        "spq/cycles/1-abcdef12/workstreams/api/receipts/WU-API-1-se.json",
+        "spq/cycles/1-abcdef12/receipts/WU-API-1-se.json",
         "receipts/FLAT-1-se.json",
         "specs/platform/receipts/US-1-se.json",
     ]
@@ -119,7 +124,7 @@ def test_recent_is_newest_first(orch: Path):
         os.utime(orch / rel, (now - i * 100, now - i * 100))
     for i, rel in enumerate([
         "spq/cycles/1-abcdef12/receipts/CHECKPOINT-1-tw.json",
-        "spq/coordination-cycles/cc-1-abcdef12/receipts/RELEASE-1-qe.json",
+        "spq/cycles/0-aaaaaaaa/lanes/api/receipts/WU-LEGACY-1-se.json",
     ]):
         os.utime(orch / rel, (now - 10_000 - i, now - 10_000 - i))
 

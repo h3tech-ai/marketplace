@@ -174,6 +174,13 @@ class SelectionResult:
     denial: Optional[Rejection] = None
     considered: Tuple[ProfileVerdict, ...] = ()
     required_capabilities: Tuple[str, ...] = ()
+    #: What the CHOSEN profile declares it can do, as certified. Distinct from
+    #: `required_capabilities`, which is the filter the selection ran THROUGH:
+    #: one is what the caller demanded, this is what the winner provides. The
+    #: kernel needs it to bound a dispatch's capability ceiling by what the
+    #: profile actually offers, and #464 read a `capabilities` attribute that
+    #: never existed, so every envelope came out with an empty ceiling.
+    selected_capabilities: Tuple[str, ...] = ()
     routing_order: Tuple[str, ...] = ()
     notes: Tuple[str, ...] = ()
     reroute_out_of_order: bool = False
@@ -204,6 +211,7 @@ class SelectionResult:
             "considered": [v.to_dict() for v in self.considered],
             "eligible": list(self.eligible),
             "required_capabilities": list(self.required_capabilities),
+            "selected_capabilities": list(self.selected_capabilities),
             "routing_order": list(self.routing_order),
             "notes": list(self.notes),
             "reroute_out_of_order": self.reroute_out_of_order,
@@ -602,6 +610,9 @@ def _finish(chosen, request, notes, base, policy, registry):
         selected=chosen,
         placement=str(record.get("placement") or "") or None,
         runtime_family=str(record.get("runtime_family") or "") or None,
+        selected_capabilities=tuple(
+            str(c) for c in (record.get("capabilities") or ())
+        ),
         notes=tuple(notes),
         reroute_out_of_order=out_of_order,
         **base
@@ -1231,3 +1242,226 @@ def _as_bool(raw: Any, default: bool) -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() in ("true", "yes", "on", "1")
+
+
+# ─── Production inputs: profiles and the probe snapshot ──────────────────────
+#
+# `select_runtime` was pure from the first commit, which was right: selection
+# is a decision and a decision should be testable without a filesystem. But it
+# left the kernel with no way to CALL it, which is why the selector had no
+# production caller at all (#396 finding 1). These are the two readers that
+# close that gap, and they are deliberately separate from the decision so the
+# decision stays pure.
+
+#: Where the bridge's probe snapshot lands. `synaptory runtimes doctor` writes
+#: it; the kernel reads it. A snapshot is the only honest basis for saying a
+#: runtime is available, so its ABSENCE makes selection inert rather than
+#: optimistic: EP-12 forbids the silent degradation that assuming availability
+#: would be.
+AVAILABILITY_RELPATH = (
+    ".synaptory", ".orchestrator", "runtime", "availability.json",
+)
+
+#: Same resolution order the Go bridge uses (`cli/internal/cli/runtime_profiles.go`),
+#: most specific first, so the kernel and the bridge cannot hold two different
+#: opinions about what profiles exist.
+PROFILES_ENV = "SYNAPTORY_RUNTIME_PROFILES"
+PROFILES_RELPATH = (".synaptory", "runtime-profiles.json")
+
+
+class InvalidRuntimeInput(Exception):
+    """A governed input is PRESENT and unusable.
+
+    Distinct from absent on purpose (#396). Absent is the unconfigured
+    migration case and leaves the existing dispatch path alone; present and
+    unreadable is a failure to establish the selected authority, and running
+    outside that authority because we could not read it is the silent
+    degradation EP-12 forbids. The kernel denies on this and stays inert on
+    absence.
+    """
+
+
+def load_profiles(project_dir: Any) -> Tuple[Dict[str, Any], ...]:
+    """The certified profile registry, as records.
+
+    Resolution order: `SYNAPTORY_RUNTIME_PROFILES`, then
+    `.synaptory/runtime-profiles.json` in the project, then the shared fixture
+    that is the compiled pilot table.
+
+    A SET environment override is authoritative, including when its target
+    does not exist. Skipping a missing override and selecting from a different
+    registry is worse than refusing: the operator named a registry, and
+    running against another one is the silent substitution EP-12 forbids. The
+    Go loader refuses the same case.
+
+    A project file at the conventional path may be absent, because absence
+    there means "not used" rather than "the operator asked for this". Present
+    and invalid refuses either way, and EVERY record is validated rather than
+    the array being partially loaded: a registry half of whose entries were
+    dropped is not the registry anyone reviewed.
+    """
+    import json
+    import os
+
+    override = os.environ.get(PROFILES_ENV) or ""
+    if override:
+        return _records_from(override, PROFILES_ENV, required=True)
+
+    if project_dir:
+        conventional = Path(project_dir).joinpath(*PROFILES_RELPATH)
+        if conventional.exists():
+            return _records_from(
+                str(conventional), "/".join(PROFILES_RELPATH), required=True
+            )
+
+    fixture = _certified_table_path()
+    if fixture is None:
+        # LOUD. An empty registry does not go inert: `select_runtime` denies
+        # with `no-eligible-profile`, which reads as a policy problem when it
+        # is actually a packaging one. The previous version swallowed this and
+        # returned (), so a composed host package that shipped without the
+        # table denied every governed dispatch and blamed the policy (#396).
+        raise InvalidRuntimeInput(
+            "the certified profile table is not in this installation. Looked "
+            "for runtime-fixtures/profiles.json at: %s"
+            % ", ".join(str(c) for c in _certified_table_candidates())
+        )
+    return _records_from(str(fixture), "the certified profile table", required=True)
+
+
+def _certified_table_candidates() -> Tuple[Path, ...]:
+    """Every place the certified table legitimately lives.
+
+    The module sits at `core/lib/` in the source tree and at `hooks/lib/` in
+    every composed package, so one relative path cannot find it in both. The
+    candidates are ordered source-tree-first because that is the only layout
+    where the fixture directory is a sibling of `lib`.
+    """
+    here = Path(__file__).resolve().parent
+    return (
+        here.parent / "runtime-fixtures" / "profiles.json",
+        here / "runtime-fixtures" / "profiles.json",
+        here.parent.parent / "runtime-fixtures" / "profiles.json",
+    )
+
+
+def _certified_table_path() -> Optional[Path]:
+    for candidate in _certified_table_candidates():
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _records_from(
+    path: str, label: str, *, required: bool
+) -> Tuple[Dict[str, Any], ...]:
+    """Every profile record in one registry file, or `InvalidRuntimeInput`."""
+    import json
+
+    target = Path(path)
+    if not target.exists():
+        raise InvalidRuntimeInput(
+            "%s names %s and there is no such file" % (label, path)
+        )
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise InvalidRuntimeInput(
+            "%s names %s and it cannot be read: %s" % (label, path, exc)
+        )
+    records = raw.get("profiles") if isinstance(raw, dict) else raw
+    if not isinstance(records, list) or not records:
+        raise InvalidRuntimeInput(
+            "%s names %s and it declares no profiles" % (label, path)
+        )
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise InvalidRuntimeInput(
+                "%s names %s and entry %d is not a profile record"
+                % (label, path, index)
+            )
+        # FULL schema, not just "a dict with an id". Deferring the rest to
+        # `_verdict` turned a malformed profile into one ineligible candidate
+        # and loaded the registry anyway, which is partial loading of a source
+        # containing invalid authority (#396). Go's `readProfileFile` refuses
+        # the whole file, and so does this.
+        problems = rc.validate_profile(record)
+        if problems:
+            raise InvalidRuntimeInput(
+                "%s names %s and entry %d (%r) is not a valid profile: %s"
+                % (
+                    label,
+                    path,
+                    index,
+                    record.get("profile_id") or "<no id>",
+                    "; ".join(problems),
+                )
+            )
+    return tuple(records)
+
+
+def load_availability(project_dir: Any) -> Optional[Tuple[Availability, ...]]:
+    """The probe snapshot, or None when there is none.
+
+    Three outcomes, and the caller must not conflate them: `()` is a snapshot
+    that found nothing available, which is a real answer and denies; None is
+    "nobody has probed this machine", which is not an answer at all and leaves
+    the existing dispatch path alone; and `InvalidRuntimeInput` is a snapshot
+    that exists and cannot be read, which is a failure to establish authority
+    and denies.
+    """
+    import json
+
+    if not project_dir:
+        return None
+    path = Path(project_dir).joinpath(*AVAILABILITY_RELPATH)
+    if not path.exists():
+        return None
+    # PRESENT and unreadable is not "nobody probed". Reporting it as absent
+    # made a corrupt snapshot indistinguishable from no snapshot, so a
+    # governed project silently fell back to the legacy path (#396).
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise InvalidRuntimeInput(
+            "the probe snapshot at %s cannot be read: %s" % (path, exc)
+        )
+    reports = raw.get("reports") if isinstance(raw, dict) else raw
+    if not isinstance(reports, list):
+        raise InvalidRuntimeInput(
+            "the probe snapshot at %s carries no `reports` list" % path
+        )
+    # EXACT schema, and `available` must be a real boolean. `bool(...)` made
+    # the JSON string "false" evaluate to True, so a snapshot reporting a
+    # runtime as unavailable selected it anyway. Discarding malformed entries
+    # was the same hazard one level up: a snapshot half of whose reports were
+    # dropped is not the probe anyone ran.
+    out = []
+    for index, report in enumerate(reports):
+        if not isinstance(report, dict):
+            raise InvalidRuntimeInput(
+                "the probe snapshot at %s: report %d is not an object"
+                % (path, index)
+            )
+        profile_id = str(report.get("profile_id") or "").strip()
+        if not profile_id:
+            raise InvalidRuntimeInput(
+                "the probe snapshot at %s: report %d has no profile_id"
+                % (path, index)
+            )
+        available = report.get("available")
+        if not isinstance(available, bool):
+            raise InvalidRuntimeInput(
+                "the probe snapshot at %s: %s reports available=%r, which is "
+                "not a boolean. A non-boolean cannot be coerced safely here: "
+                "the string \"false\" is truthy."
+                % (path, profile_id, available)
+            )
+        out.append(
+            Availability(
+                profile_id=profile_id,
+                available=available,
+                detail=str(report.get("reason") or report.get("detail") or ""),
+            )
+        )
+    return tuple(out)

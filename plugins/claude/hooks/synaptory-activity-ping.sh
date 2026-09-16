@@ -13,6 +13,10 @@
 #   2. Build a one-line summary keyed off tool_name.
 #   3. Call `synaptory telemetry activity` once (the CLI writes one
 #      outbox row).
+# Since #446 the hook also records catalog retrievals locally. That costs a
+# python spawn only on a tool call whose payload mentions `skills get`,
+# `agents/` or `.protocols/`, plus one more on the first tool call of a run
+# directory; every other tool call pays a bash `case` and an `[ -f ]` test.
 # Silent on failure: never block a tool call because telemetry can't
 # ship. The user does real work; telemetry is best-effort.
 
@@ -30,18 +34,62 @@ if [ -z "${CLAUDE_PROJECT_DIR:-}" ] || [ ! -d "$SUITE_DIR" ]; then
   exit 0
 fi
 
+# Read stdin once. PostToolUse stdin shape (per Claude Code):
+#   {"tool_name":"Edit","tool_input":{...},"tool_output":"...",
+#    "session_id":"...","cwd":"...","hook_event_name":"PostToolUse"}
+# Stop stdin is a thinner envelope without tool_input.
+#
+# Read BEFORE the CLI gate below. The local skill_fetch signal (#446) is a
+# file append into this run's own directory and needs no CLI at all, so it
+# must not be skipped just because the control-plane ping cannot ship.
+INPUT="$(cat 2>/dev/null || true)"
+
+# --- #446: local JIT-retrieval signal -------------------------------------
+# #404 and #480 made tech packs, phase guides and five agent bodies fetchable
+# instead of mandatory. That converts a measured cost into an unmeasured one
+# unless the retrieval is recorded, and nothing recorded it: the ping below
+# ships `Bash: <first line>` / `Read: <path>` summaries to the control-plane
+# outbox with no dispatching role and no story, so `pilot_metrics` reported
+# ABSENT for measured JIT volume. This writes the missing producer half into
+# `.synaptory/.orchestrator/skill-fetches.jsonl`, beside the run data every
+# other pilot metric reads.
+#
+# Local-first and CLI-free by construction: one append to one file. An
+# unstamped tree resolves no CLI (#320, #425) and this block never asks for
+# one, so it behaves the same there.
+#
+# Two python spawns are gated so the common tool call pays for neither:
+#   * `arm` runs at most once per run directory, when the log does not exist
+#     yet. It is what keeps ABSENT and zero apart — a run whose producer was
+#     installed and fetched nothing reports a measured 0, while a run on a
+#     tree without this block leaves no file and reports ABSENT.
+#   * `record` runs only when the raw payload mentions one of the three
+#     substrings a real retrieval must contain. The prefilter is a bash
+#     `case` over the untruncated stdin, NOT over the activity summary built
+#     below: that summary is clipped to 120 chars, so filtering on it would
+#     miss a retrieval sitting inside a long compound command. False
+#     positives cost one python spawn and are re-checked properly there.
+SKILL_FETCH_LOG="${_HOOK_ROOT}/hooks/lib/skill_fetch_log.py"
+if [ -f "$SKILL_FETCH_LOG" ]; then
+  _sf_log="${SUITE_DIR}/.orchestrator/skill-fetches.jsonl"
+  if [ ! -f "$_sf_log" ]; then
+    "$_py" "$SKILL_FETCH_LOG" arm "$CLAUDE_PROJECT_DIR" >/dev/null 2>&1 || true
+  fi
+  case "$INPUT" in
+    *"skills get"*|*"agents/"*|*".protocols/"*)
+      printf '%s' "$INPUT" \
+        | "$_py" "$SKILL_FETCH_LOG" record "$CLAUDE_PROJECT_DIR" \
+          >/dev/null 2>&1 || true
+      ;;
+  esac
+fi
+
 # Resolve the CLI; silently bail if unavailable so a missing CLI
 # doesn't break Claude Code itself.
 cli=$("${_HOOK_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
 if [[ -z "$cli" ]] || [[ ! -x "$cli" ]]; then
   exit 0
 fi
-
-# Read stdin once. PostToolUse stdin shape (per Claude Code):
-#   {"tool_name":"Edit","tool_input":{...},"tool_output":"...",
-#    "session_id":"...","cwd":"...","hook_event_name":"PostToolUse"}
-# Stop stdin is a thinner envelope without tool_input.
-INPUT="$(cat 2>/dev/null || true)"
 
 # Extract tool + summary. The summary line is intentionally minimal —
 # we ship file paths and the head of bash commands, not full args.

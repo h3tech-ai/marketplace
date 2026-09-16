@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "kind": "synaptory.dispatch.envelope",
+  "attempt_id": "att_01J6XYZ123",
+  "dispatch_id": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+  "project_id": "taskflow",
+  "cycle_id": "003-9f2c41ab",
+  "manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workstream_id": "platform",
+  "story_id": "WU-003",
+  "stage": "implementation",
+  "stage_profile": "producing",
+  "role": "se",
+  "role_name": "software-engineer",
+  "receipt_required_fields": [
+    "story_id",
+    "role",
+    "backend",
+    "model",
+    "artifacts",
+    "verification_commands",
+    "metrics",
+    "completed_at"
+  ],
+  "capability_profile": "producer",
+  "adapter_profile_id": "claude-managed-standard-v1",
+  "runtime_family": "claude-code",
+  "placement": "managed-laptop",
+  "model_route": {
+    "requested": "policy-default",
+    "resolved_model_id": "claude-runtime-reported-id"
+  },
+  "source_revision": "dddddddddddddddddddddddddddddddddddddddd",
+  "materialization": {
+    "repo_url": "https://github.com/h3tech-ai/taskflow.git",
+    "ref": "refs/heads/cycle/003-9f2c41ab/ws/platform",
+    "revision": "dddddddddddddddddddddddddddddddddddddddd",
+    "worktree_mode": "clean-isolated"
+  },
+  "connector_refs": {
+    "vcs": "cred://runner/github-vcs-read",
+    "tracker": "cred://runner/github-tracker-write",
+    "ci": null,
+    "llm": null
+  },
+  "config_refs": {
+    "synaptory_yaml": "repo://.synaptory.yaml",
+    "preset_base": "claude-managed-standard-v1"
+  },
+  "workspace": {
+    "mode": "clean-isolated",
+    "ref": "opaque-ref",
+    "write": true
+  },
+  "capability_ceiling": [
+    "workspace.write",
+    "process.test",
+    "receipt.v2"
+  ],
+  "network_allowlist": "project-default",
+  "budget": {
+    "wall_clock_seconds": 3600,
+    "max_turns": 40
+  },
+  "receipt_path": ".synaptory/.orchestrator/spq/cycles/003-9f2c41ab/workstreams/platform/receipts/WU-003-se.json",
+  "expires_at": "2026-09-01T14:00:00Z",
+  "fencing_token": "tok_01J6XYZ",
+  "required_evidence": [
+    "build-result",
+    "changed-files",
+    "final-summary"
+  ]
+}

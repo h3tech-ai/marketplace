@@ -328,25 +328,47 @@ def test_an_unpeekable_stream_falls_back_to_the_default():
 
 
 def test_sealed_manifests_have_an_automatic_producer():
-    """`cycle_manifests` and `coordination_cycles` shipped with ingest
-    endpoints, tables and UI pages — and nothing that called them.
+    """`cycle_manifests` shipped with an ingest endpoint, a table and a UI page
+    — and nothing that called them.
 
     That is the defect #303 shipped when it added `cycle_id` columns with no
     field on any request model, repeated one level up: the views could only
     populate if an operator ran a CLI command nothing told them to run. Measured
     on a full 13-clone run: 0 rows before, 3 + 1 after.
+
+    THE PRODUCER IS THE SWEEP NOW, and that is a change of mechanism rather
+    than a loss of one. This asserted `emit_cycle_manifest` appeared inside
+    `spq_state_machine.py`; #644 rewrote that module without the call. The
+    sweep is the stronger arrangement for the reason `manifest_emitter` gives
+    itself -- it "catches losses a queue-at-emission never would", because it
+    ranges over the sealed manifests on disk rather than over emissions
+    somebody remembered to make. The `coordination_cycles` half is gone with
+    the Coordination Cycle (`SPD-194`).
     """
     from pathlib import Path
 
-    core = Path(__file__).resolve().parents[3] / "core" / "lib"
+    repo = Path(__file__).resolve().parents[3]
+    core = repo / "core" / "lib"
     assert (core / "manifest_emitter.py").is_file()
 
-    seal = (core / "spq_state_machine.py").read_text(encoding="utf-8")
-    assert "emit_cycle_manifest" in seal, "seal_manifest must report the seal"
+    # Something must run it WITHOUT an operator. The SessionStart hook does,
+    # detached.
+    hook = (
+        repo / "plugin-claude" / "hooks" / "synaptory-session-start.sh"
+    ).read_text(encoding="utf-8")
+    assert "manifest_emitter.py" in hook, (
+        "nothing invokes the sweep, so `cycle_manifests` has no producer -- "
+        "the #334 silence this test exists to prevent, whichever mechanism is "
+        "meant to produce the rows"
+    )
 
-    coord = (core / "coordination_cycle.py").read_text(encoding="utf-8")
-    assert coord.count("_observe(") >= 3, (
-        "open AND every revision must report: the table is append-only, so a "
-        "dropped child is a new row and the only record of what the release "
-        "held before the drop"
+    emitter = (core / "manifest_emitter.py").read_text(encoding="utf-8")
+    assert "def resend_pending(" in emitter
+    # And it must read the digest the CURRENT seal carries. Reading only the
+    # pre-#644 `manifest_hash` made `_pending` find no digest on any live
+    # Cycle, treat it as unsealed, and ship nothing at all -- a producer that
+    # runs on every session and delivers zero rows.
+    assert "cycle_records.HASH_FIELD" in emitter, (
+        "the sweep reads the seal digest under a hardcoded key, so a rename "
+        "strands every Cycle silently"
     )

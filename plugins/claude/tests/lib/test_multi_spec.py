@@ -275,6 +275,29 @@ def test_transition_story_preserves_envelope(tmp_path: Path) -> None:
         },
     })
 
+    # #403 — the subject here is envelope preservation across the two writes
+    # `→ done` performs, so the story has to actually REACH done. With no
+    # receipts at all, tests_pass and build_succeeds now declare a criteria
+    # gap and the gate redirects to blocked (which writes twice as well, but
+    # not through the branch this test is about). Give the story the executed
+    # proof a story reaching done is supposed to have.
+    spec_receipts = (
+        tmp_path / ".synaptory" / ".orchestrator" / "specs" / "stars" / "receipts"
+    )
+    spec_receipts.mkdir(parents=True, exist_ok=True)
+    for role, abbrev, command in (
+        ("software-engineer", "se", "npm run build"),
+        ("quality-engineer", "qe", "pytest -q"),
+    ):
+        (spec_receipts / f"SA-001-{abbrev}.json").write_text(
+            json.dumps({
+                "agent": role,
+                "verification_commands": [{"command": command, "exit_code": 0}],
+                "metrics": {"findings_critical": 0, "coverage_delta": "+0.5%"},
+            }),
+            encoding="utf-8",
+        )
+
     # active_spec drives resolution; no env needed.
     sm.transition_story(str(tmp_path), "SA-001", "done")
 

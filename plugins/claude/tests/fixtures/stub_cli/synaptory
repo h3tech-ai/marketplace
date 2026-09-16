@@ -36,6 +36,11 @@ case "$cmd" in
           echo "stub synaptory: missing name for 'skills get'" >&2
           exit 2
         fi
+        # Record every fetched name so tests can assert exactly which
+        # bodies a hook requests (dead-fetch regression tests).
+        if [[ -n "${SYNAPTORY_STUB_SKILLS_LOG:-}" ]]; then
+          printf 'get %s\n' "$name" >> "${SYNAPTORY_STUB_SKILLS_LOG}"
+        fi
         # Selective per-name failure (for partial-fallback tests).
         if [[ -n "${SYNAPTORY_STUB_FAIL_NAMES:-}" ]]; then
           for fail in ${SYNAPTORY_STUB_FAIL_NAMES}; do
@@ -90,8 +95,31 @@ case "$cmd" in
     exit 0
     ;;
   whoami)
-    # Used by some hooks for liveness checks; return a minimal sane body.
-    echo "stub@synaptory.test"
+    # Used by hooks for liveness checks and the mid-session auth gate
+    # (`whoami --check`). Log invocations when a test asks (auth-cache
+    # tests assert whether the network check actually ran), and fail on
+    # demand to simulate an expired, non-renewable session.
+    if [[ -n "${SYNAPTORY_STUB_WHOAMI_LOG:-}" ]]; then
+      shift
+      printf 'whoami %s\n' "$*" >> "${SYNAPTORY_STUB_WHOAMI_LOG}"
+    fi
+    if [[ "${SYNAPTORY_STUB_WHOAMI_FAIL:-}" == "1" ]]; then
+      echo "stub synaptory: forced whoami failure" >&2
+      exit 1
+    fi
+    # Fail ONLY the network check, so a test can model a live-but-lapsed
+    # session whose renewal is refused while the local record still reads.
+    if [[ "${SYNAPTORY_STUB_WHOAMI_FAIL_CHECK:-}" == "1" && "$*" == *"--check"* ]]; then
+      echo "stub synaptory: forced renewal failure" >&2
+      exit 1
+    fi
+    # The real `whoami` (no --check) prints a keyed report read locally from
+    # the keychain, and the auth gate parses `upn:` and `time_remaining:` from
+    # it to bind its cache to a session and refuse a lapsed one. The identity
+    # and remaining life are overridable so a test can simulate a different
+    # session, or one that has run out inside the cache window.
+    echo "upn:              ${SYNAPTORY_STUB_WHOAMI_UPN:-stub@synaptory.test}"
+    echo "time_remaining:   ${SYNAPTORY_STUB_WHOAMI_REMAINING:-23h59m0s}"
     ;;
   status)
     # Resolver identity probe. A single fixture backs both channel names, so

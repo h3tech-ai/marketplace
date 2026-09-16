@@ -57,7 +57,27 @@ Read these files before starting (in parallel):
 
 This story's DoD tier is {DOD.TIER}. Your work is gated on these checks:
 {DOD.ACTIVE_CHECKS — paste the story's `dod.active_checks` list from the
- next_action output, one per line}
+ next_action output, one per line. This is the set the gate will ENFORCE on
+ this story, not the tier's static list: it already includes the conditional
+ gates (`ui_acceptance`, `runtime_verified`, `no_critical_findings`,
+ `integration_verified`) that the story's own record and `.synaptory.yaml`
+ promoted. Paste it whole — a check you do not recognize from the tier is
+ still a check you are graded on.}
+
+These checks are NOT YET DETERMINED — they are unmeasured, not inactive:
+{DOD.UNDETERMINED_CHECKS — paste `dod.undetermined_checks` as
+ `- <check> — <why>`, one per line; omit this whole heading only when the
+ list is empty. The evidence that promotes them is the evidence you are
+ about to write, so a receipt that triggers one is graded on it.}
+
+You are dispatched as **{ROLE_NAME}**, which runs under stage profile
+`{PROFILE.STAGE_PROFILE}` and capability profile `{PROFILE.CAPABILITY_PROFILE}`
+— paste the `profile` block from the same next_action output. The advance
+kernel keys this stage on that pair, not on the role name alone (#402): stamp
+the two values verbatim on your receipt and never substitute another pair. A
+receipt whose pair disagrees with the stage is refused, and since #473 so is
+one that omits the pair when your dispatch contract carried a
+`dispatch_envelope` (copy them from there, it is the authoritative source).
 
 Your receipt file is:
 .synaptory/.orchestrator/receipts/{STORY_ID}-{role-abbrev}.json
@@ -71,6 +91,17 @@ it in their own ceremony file instead.
 The SubagentStart hook injects the full Execution Envelope — treat it as
 binding: it defines exactly which evidence fields your receipt must carry
 for each active check.
+
+Since #501 the envelope also carries a **Definition of Done for this story**
+stanza, resolved hook-side from the story the dispatch binding names. Both it
+and the `dod` block above now run the SAME computation the gate runs
+(`story_pipeline.story_gate_promotions`) on the same story, so they agree by
+construction and both report the CONDITIONAL gates. They are two paths to one
+answer rather than a coarse one and a fine one: the hook resolves nothing when
+two stories hold this role at once or during ceremony work, and the
+orchestrator's block covers exactly those cases. Keep stating the tier and both
+lists in the prompt. Where the two disagree, treat it as a signal that the hook
+bound a different story than you dispatched, and re-check before proceeding.
 
 {ROLE-SCOPED COMMANDS — verify-once discipline; see protocols/verification-discipline.md
  § Trust Chain. The orchestrator puts ONLY this role's commands here; it does NOT
@@ -102,6 +133,14 @@ The receipt MUST include:
 - backend: "claude"
 - model: (the model you are running on)
 - story_id: "{STORY_ID}"
+- stage_profile / capability_profile: the pair named in the Evidence Contract above,
+  copied verbatim — from your `dispatch_envelope` when the dispatch contract carries one.
+  REQUIRED whenever it does (#473): omitting either is refused, exactly like a value that
+  disagrees with the stage's pair (#402), so there is no cheaper answer than the true one.
+  A dispatch that carries no envelope had nothing to hand over, and omitting both there is
+  still a warning. Optionally
+  accountable_role: "{ROLE_NAME}" — the Platform-facing accountability label riding
+  alongside `role`; it must project onto the same pair.
 - verification_commands: a list of EXECUTED PROOF OBJECTS, each
   {"command": "...", "exit_code": <int>, "summary": "..."} — record the REAL exit code of
   each command you actually ran. Plain strings/argv arrays are "intent, not proof" and fail
@@ -134,28 +173,79 @@ Model tier mapping:
 | solution_architect | opus | opus |
 | compliance_engineer | opus | opus |
 | research_advisor | opus | opus |
+| code_reviewer | opus | opus |
+| quality_engineer | opus | opus |
 | software_engineer | sonnet | sonnet |
-| quality_engineer | sonnet | sonnet |
 | platform_engineer | sonnet | sonnet |
 | technical_writer | sonnet | sonnet |
-| code_reviewer | sonnet | sonnet |
 
-**Controlled mode** surfaces decisions and enforces human gates for the four strategic roles (PO, SA, CE, RA) — it does not upgrade executor roles (SE, QE, PE, TW, CR), which follow orchestrator direction and don't make autonomous decisions.
+**Controlled mode** surfaces decisions and enforces human gates for the four strategic roles (PO, SA, CE, RA) — it does not upgrade executor roles (SE, PE, TW), which follow orchestrator direction and don't make autonomous decisions. The `opus` rows for CR and QE are therefore not controlled-mode upgrades: each is the same tier in both columns, for the reasons below.
+
+**Why the provers are not on the SE tier (#434 for CR, #483 for QE).** SE, QE and CR all resolved to `sonnet` until #434, so every verification the pipeline performed was same-model verification — a property nobody chose, just what this table happened to say. That matters in proportion to how much a check rests on judgment: `tests_pass` is decided by the machine and is indifferent to weights, while "read this diff and decide whether the logic is right" is decided almost entirely by them, and shared weights mean shared blind spots plus a familiarity effect where code the model would itself have written reads as correct even from a clean context. CR is the judgment-heaviest prover in the pipeline, so it moved first.
+
+**Why QE moved too (#483).** Both halves of the pipeline's verification now sit off the producer's tier. Two things changed after #434 chose to scope itself to CR:
+
+- **#406 made QE's work rest on judgment rather than on an exit code.** The authored acceptance cases sealed at COMMIT are the primary `tests_pass` evidence, and QE must report an outcome *per case id*. Deciding that a case is `blocked` or `not-applicable`, with a reason the gate accepts, is a judgment call that decides whether the story's gate passes. A green suite exit code no longer clears the check on its own. That is #434's own criterion — the layer matters in proportion to how much the check rests on judgment — applied to the role #434 left behind.
+- **#519 established that the tier is the thing that actually binds.** The `Agent()` `model` parameter accepts only the four tier aliases, so moving a role between tiers changes which weights run, while re-pinning a tier does not. It also measured that `opus` resolves to `claude-opus-5`, the same generation as `claude-sonnet-5`, so [#441](https://github.com/h3tech-ai/synaptory-v1/issues/441)'s worry that the premium tier is a generation behind does not apply to the running system: moving QE to `opus` is not moving it to older weights.
+
+What this does **not** establish: nothing here verifies that a QE dispatch ran on the tier this table names, or that its receipt's `model` string is true. The pin drift that used to sit here — both provers recording `claude-opus-5` against a `claude-opus-4-8` pin, so [`model_pin_check.py`](model_pin_check.py) refused their **honest** receipts — was closed by [#441](https://github.com/h3tech-ai/synaptory-v1/issues/441), which rolled the `opus` pin to the id every measured dispatch on that tier actually ran. Read the pinning paragraph below before quoting any of this to an auditor: the checker no longer refuses an honest receipt, and it still cannot refuse a dishonest one.
+
+Read the scope of that honestly: this is **partial decorrelation inside one runtime family**. Different weights, different scale, different blind spots — not independent runtimes, not an independent vendor, and not a basis for claiming independently verified work to an auditor. Role-level runtime choice is pilot 1 territory: `select_runtime` / `build_envelope` exist as component shapes but have no production caller on the dispatch path (#396 finding 1), so nothing in this table can deliver runtime independence today.
+
+Do NOT "simplify" CR or QE back onto the SE tier. Producer and prover sharing exact weights is the thing these two rows exist to prevent, and the cost is two premium dispatches per work unit rather than one (see the #434 PR for the measured per-dispatch delta). #518 added the `claude-opus-5` row to `_DEFAULT_PRICING`, so those dispatches no longer price at zero; before it landed, a dashboard reported both provers as free, which is the shape of a zero that meant "not measured" and read as "measured, and it was zero".
 
 The model tier is INDEPENDENT of backend dispatch — it only applies within the Claude backend.
 
-**Tier → model ID pinning (HC0-F2).** Tier aliases above (`opus`, `sonnet`, `haiku`) are resolved to **exact** model IDs via [model-pins.json](model-pins.json). Do not pass alias strings to `Agent()` — pass the resolved exact ID so regulated customers can reproduce behavior audit-to-audit. Current pins: `opus → claude-opus-4-7`, `sonnet → claude-sonnet-4-6`, `haiku → claude-haiku-4-5-20251001`. Update `model-pins.json` when rolling forward — every change is a reviewable diff rather than silent drift.
+**Tier → model ID pinning (HC0-F2), and what it actually binds (#519).** The pins live in [model-pins.json](model-pins.json): `opus → claude-opus-5`, `sonnet → claude-sonnet-5`, `haiku → claude-haiku-4-5`. Every pinned tier must be `baa_covered: true`, because `healthcare.baa_enforced` projects refuse an uncovered backend. Update `model-pins.json` when rolling forward, so every change is a reviewable diff rather than silent drift, and record the decision per tier in that tier's `decision` block — including the decision to KEEP a pin, so an inherited pin is distinguishable from a reviewed one.
+
+**A tier alias is a routing label, not a capability guarantee (#441).** `opus`, `sonnet` and `haiku` name which pinned weights a role is routed to, and `cost_tier` names what they cost — a published fact. Neither asserts an ordering between the tiers on any measured axis. Nothing in this repository benchmarks one tier against another, and no such benchmark is quoted here or in the pin file. So "premium" must be read as "the more expensive tier", never as "the stronger model": the reason a role sits on a tier is the reason written in that tier's `notes`, and for CR and QE that reason is **decorrelation from the producer's weights**, which needs the tiers to differ and does not need either to be better. #441 opened on the worry that the premium tier was pinned a generation behind the standard one (`claude-4.8` against `claude-5`); #519's measurement removed the worry rather than answering it, because the pin was not what ran, and the roll to `claude-opus-5` puts both tiers on the same generation in the file as well as in the running system.
+
+**The pin does not bind on this dispatch path, and you must not describe it as if it does.** This paragraph used to carry the instruction "Do not pass alias strings to `Agent()`", followed by "pass the resolved exact ID". That instruction is impossible to follow. #519 measured the host: the `Agent()` tool's `model` parameter accepts **only** `sonnet | opus | haiku | fable`, and an exact ID is rejected outright.
+
+```
+InputValidationError: Invalid option: expected one of "sonnet"|"opus"|"haiku"|"fable"
+```
+
+So the tier **alias** is the only value Step 3 can carry, and the alias is resolved by Anthropic's own aliasing to whatever that tier currently points at, not by this file. Measured on Claude Code 2.1.236 on 2026-09-03: `opus` runs `claude-opus-5` and `sonnet` runs `claude-sonnet-5`. Every pin now agrees with its measured alias resolution — but read *why* that is true, because the two tiers got there differently and the difference is the whole lesson. `sonnet` agreed **by coincidence** from the start, which is why nothing surfaced for the four roles on that tier until #434 moved CR to `opus` and #409's receipts started naming a model the pin file did not contain. `opus` agrees only because #441 rolled it there **after** the observation. Agreement is a snapshot, not a mechanism: the next alias move is a server-side decision that can happen on any day and nothing here will notice it until a receipt names the new id.
+
+Read the consequence honestly rather than restating the intent:
+
+- `model-pins.json` is a **declaration of intent shipped in the AI-BOM** (`ai_bom.model_pins` in `build-metadata.json`). It records the IDs H3Tech means each tier to use. It is **not** evidence of the IDs that ran.
+- Nothing in this plugin, the hook chain, or the control plane compares an intended pin against an observed dispatch. `receipt_validator.validate_receipt` requires `model` to be a non-empty string whose family does not contradict `backend`, and nothing more.
+- The `model` a receipt reports is **self-attested** by the dispatched subagent, from the `model: (the model you are running on)` line in the Output block above. The authoritative value lives in the host's own transcript and `modelUsage` accounting, which this plugin never reads. So a receipt can name a pinned model it did not run on and every check passes.
+- Do **not** tell an auditor, or a regulated customer, that a dispatch is reproducible against the pinned ID. What is reproducible is the tier routing. Which weights that tier resolved to on the day is not recorded anywhere the plugin controls.
+
+**What does bind an exact ID**, measured in the same run: a subagent's own `model:` frontmatter. `model: claude-sonnet-4-6` on a plugin subagent ran on exactly that, overriding the session model. Step 3 now dispatches the installed role so the host does consult that role definition, but it also passes the explicit tier alias from Step 2; that explicit routing input remains the product path's model decision. Switching to exact-ID frontmatter would therefore require a deliberate routing change: remove the explicit alias, keep `agents/<role>/agent.md` and `agents/<role>/SKILL.md` aligned (both register the same subagent identifier), and accept that the pin must be rolled manually or the roster silently freezes on ageing weights. Since #441 the pin names the currently observed alias resolution, so such a change would not move weights today; it would change how future alias moves are adopted. Do not make that policy change as a side effect of another fix.
+
+**Verifying, in the meantime.** [`model_pin_check.py`](model_pin_check.py) refuses a receipt whose `model` is named by no tier in the pin file, which is the drift case #409 hit. Run it over a real receipts directory:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/_shared/backends/model_pin_check.py" \
+  .synaptory/.orchestrator/receipts/*.json
+```
+
+It catches drift and mis-tiering. It cannot catch a forged model string, for the reason above. Treat its silence as "no drift detected", never as "these weights are proven".
+
+Since #441 there is **no known outstanding drift** on any routed tier: each pin names the id its alias was measured resolving to. So a finding from this checker is now a NEW observation rather than the old one being re-reported, and the response is to re-measure the alias and record a fresh `decision` block in `model-pins.json` — not to widen the accepted set until the finding goes away.
 
 ### Step 3 — Dispatch via Agent()
 
 ```
 Agent(
   prompt = composed_prompt,
-  subagent_type = "general-purpose",
+  subagent_type = f"synaptory:{ROLE_NAME}",
   model = model,
   description = "{ROLE_NAME}: {STORY_ID} — {STORY_TITLE}"
 )
 ```
+
+`subagent_type` is the installed Synaptory role, not `general-purpose`. The
+`synaptory:` namespace is the lifecycle identity consumed by SubagentStart and
+SubagentStop: it binds the dispatch to its receipt contract and opens both the
+control-plane subagent span and the local OTLP span. A generic worker has no
+such contract and is deliberately excluded from those hooks.
+
+`model` here is the **tier alias** from the Step 2 table (`opus` / `sonnet` / `haiku`). That is the only thing the parameter accepts, and an exact pinned ID is rejected. See the pinning paragraph above for what that means for the AI-BOM claim, and do not "improve" this call by substituting a pinned ID: it will fail with `InputValidationError`.
 
 The `Agent()` call blocks until the subagent completes. The Orchestrator cannot do other work during this time.
 

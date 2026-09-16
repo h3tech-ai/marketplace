@@ -2,7 +2,7 @@
 # Copyright (c) 2024-2026 H3Tech Inc. All rights reserved. PROPRIETARY.
 #
 # Hook: SubagentStart
-# Purpose: Inject the core protocol files into every subagent at startup.
+# Purpose: Inject the compact protocol index into every subagent at dispatch.
 # This eliminates the need for each skill to individually cat protocol files.
 
 _HOOK_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -11,20 +11,33 @@ PLUGIN_ROOT="$_HOOK_ROOT" source "${_HOOK_ROOT}/hooks/_plugin-env.sh"
 # shellcheck source=lib/resolve-python.sh
 source "${_HOOK_ROOT}/hooks/lib/resolve-python.sh"
 _py="${SYNAPTORY_PYTHON:-python3}"
+# The dispatch resolver lives beside the other shared runtime modules.
+# This was referenced below before it was ever assigned, so the test on
+# `$HOOK_LIB_DIR/dispatched_receipts.py` read `/dispatched_receipts.py`,
+# never matched, and the marker's correlation line came out empty on
+# every dispatch. The suite missed it because those tests wrote the
+# marker themselves instead of running this hook (#396).
+HOOK_LIB_DIR="${_HOOK_ROOT}/hooks/lib"
 
-# Telemetry — record the subagent span. Fire before the depth guard so even
-# blocked spawns are visible in the control-plane dashboard.
-cli=$("${_HOOK_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
-if [[ -n "$cli" ]] && [[ -x "$cli" ]]; then
-  SYNAPTORY_STDIN=$(cat)
-  # Claude Code's SubagentStart hook stdin is JSON shaped like:
-  #   {"agent_id": "...", "agent_type": "synaptory:software-engineer",
-  #    "session_id": "...", "transcript_path": "...", "cwd": "...",
-  #    "hook_event_name": "SubagentStart"}
-  # Claude Code passes the plugin-namespaced subagent type, so synaptory's own
-  # agents arrive as "synaptory:<role>". We capture agent_id so SubagentStop
-  # can correlate the start span with the receipt that follows.
-  span_meta=$(printf '%s' "$SYNAPTORY_STDIN" | "$_py" -c "
+# --- Dispatch identity: read stdin ONCE, unconditionally (#512) -------------
+# Claude Code's SubagentStart hook stdin is JSON shaped like:
+#   {"agent_id": "...", "agent_type": "synaptory:software-engineer",
+#    "session_id": "...", "transcript_path": "...", "cwd": "...",
+#    "hook_event_name": "SubagentStart"}
+# Claude Code passes the plugin-namespaced subagent type, so synaptory's own
+# agents arrive as "synaptory:<role>". agent_id is what lets SubagentStop
+# correlate this dispatch with the receipt that follows.
+#
+# This parse used to live inside the CLI gate below, because the first thing
+# built on top of it was telemetry. Everything derived from it inherited that
+# dependency by proximity, not by need: the marker, the `synaptory:` namespace
+# classification, and #163's execution envelope are all local facts about the
+# dispatch and none of them addresses a control plane. An unstamped tree
+# resolves NO CLI by design (#320, #425), so on the source-tree sideload all
+# three silently vanished — and that is exactly the run whose catalog
+# retrieval takes the disk fallback and most needs attribution (#446, #512).
+SYNAPTORY_STDIN=$(cat)
+span_meta=$(printf '%s' "$SYNAPTORY_STDIN" | "$_py" -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -32,44 +45,119 @@ try:
 except Exception:
     print('\tunknown')
 " 2>/dev/null || printf '\tunknown')
-  agent_id="${span_meta%%	*}"
-  agent_type="${span_meta##*	}"
+agent_id="${span_meta%%	*}"
+agent_type="${span_meta##*	}"
 
-  # Issue #130: only synaptory-plugin subagents are pipeline agents that emit a
-  # span + owe a receipt. Other subagents in the session — the Workflow tool's
-  # workers, `Explore`/`general-purpose`, agents from other plugins — never
-  # write a synaptory receipt, so emitting spans for them made SubagentStop mark
-  # every one `receipt_invalid`, drowning the reliability error rate (~97% noise
-  # in prod). Gate span + receipt emission on the `synaptory:` namespace, and
-  # drop a per-agent marker so SubagentStop (whose payload carries no
-  # agent_type) can make the same call.
-  case "$agent_type" in
-    synaptory:*) _synaptory_agent=1 ;;
-    *)           _synaptory_agent=0 ;;
+# Issue #130: only synaptory-plugin subagents are pipeline agents that emit a
+# span + owe a receipt. Other subagents in the session — the Workflow tool's
+# workers, `Explore`/`general-purpose`, agents from other plugins — never
+# write a synaptory receipt, so emitting spans for them made SubagentStop mark
+# every one `receipt_invalid`, drowning the reliability error rate (~97% noise
+# in prod). Gate span + receipt emission on the `synaptory:` namespace, and
+# drop a per-agent marker so SubagentStop (whose payload carries no
+# agent_type) can make the same call. The namespace gate is what #130 bought;
+# hoisting the marker out of the CLI gate does not widen it.
+case "$agent_type" in
+  synaptory:*) _synaptory_agent=1 ;;
+  *)           _synaptory_agent=0 ;;
+esac
+_synaptory_role="${agent_type#synaptory:}"
+
+# Re-feed stdin to the rest of the hook (protocol injection runs for every
+# subagent, synaptory or not).
+printf '%s' "$SYNAPTORY_STDIN" > /tmp/.synaptory-subagent-input.$$
+exec < /tmp/.synaptory-subagent-input.$$
+trap 'rm -f /tmp/.synaptory-subagent-input.$$' EXIT
+
+# --- The per-dispatch marker: local, and never CLI-gated (#512) -------------
+# Two readers, neither of which involves a control plane:
+#   synaptory-verify-receipt.sh  which subagents owe a receipt, for which role,
+#                                bound to which dispatch (#130, #340, #396)
+#   core/lib/skill_fetch_log.py  which role a catalog retrieval belongs to,
+#                                observed rather than inferred (#446)
+# Writing it only when a CLI resolved made receipt enforcement and role
+# attribution a side effect of telemetry reachability. They are not the same
+# question.
+if [ "$_synaptory_agent" = "1" ] \
+   && [ -n "${agent_id:-}" ] && [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  _marker_dir="${CLAUDE_PROJECT_DIR}/.synaptory/.orchestrator/subagent-markers"
+  mkdir -p "$_marker_dir" 2>/dev/null || true
+  _safe_id=$(printf '%s' "$agent_id" | tr -c 'A-Za-z0-9_.-' '_')
+  # The marker carries the ROLE, not just existence (#396). SubagentStop's
+  # payload has no agent_type, and without it selection could only scope to
+  # "the current work across all roles", which let a QE stop that wrote no
+  # receipt be satisfied by the SE receipt sitting beside it. This is the
+  # only place the exact dispatched role is observable, so it is recorded
+  # here and consumed there.
+  # Line 1 is the role. Line 2 is "story<TAB>dispatch_id" when exactly one
+  # story holds an active dispatch for that role RIGHT NOW, which is the
+  # only moment the correlation is unambiguous. Two simultaneous same-role
+  # dispatches record nothing here, and selection falls back to the role.
+  _marker_role="$_synaptory_role"
+  _marker_link=""
+  if [ -f "$HOOK_LIB_DIR/dispatched_receipts.py" ] && [ -n "${_py:-}" ]; then
+    _marker_link=$("$_py" "$HOOK_LIB_DIR/dispatched_receipts.py" \
+      --resolve-dispatch "$CLAUDE_PROJECT_DIR" "$_marker_role" 2>/dev/null || true)
+  fi
+  printf '%s\n%s\n' "$agent_type" "$_marker_link" \
+    > "${_marker_dir}/${_safe_id}" 2>/dev/null || true
+fi
+
+# --- Telemetry: this is the part that genuinely needs a CLI -----------------
+# Fires before the depth guard so even blocked spawns are visible in the
+# control-plane dashboard. An unstamped tree resolves no CLI and ships
+# nothing, which is #320's rule and is left exactly as it was.
+cli=$("${_HOOK_ROOT}/hooks/_resolve-cli.sh" 2>/dev/null || true)
+if [[ -n "$cli" ]] && [[ -x "$cli" ]] && [ "$_synaptory_agent" = "1" ]; then
+  _telemetry_story=""
+  case "${_marker_link:-}" in
+    ""|\?ambiguous*) ;;
+    *) _telemetry_story="${_marker_link%%	*}" ;;
   esac
+  # #577 -- `--model` is OMITTED when SYNAPTORY_AGENT_MODEL is unset, which is
+  # the normal case: nothing on this path observes the model a dispatch
+  # actually ran on. Claude Code's SubagentStart stdin carries no model id, and
+  # the host's `Agent()` tool takes a tier alias rather than an exact id
+  # (#519), so the hook has nothing to report.
+  #
+  # This used to default to the literal `claude-sonnet-4-5`, an id
+  # `model-pins.json` has named under no tier since the pins rolled to
+  # `claude-sonnet-5` / `claude-opus-4-8`. Every span therefore carried a
+  # confident, uniform, wrong model. `model_pin_check` treats an ABSENT model
+  # as "no recorded provenance at all", and #493's finding is that a
+  # confidently wrong provenance value is worse than an absent one: an absent
+  # one is legible as a gap, a wrong one is indistinguishable from a
+  # measurement.
+  #
+  # Absence is carried end to end: the CLI flag defaults to "",
+  # `SubagentStartReq.Model` is `omitempty`, and `subagent_spans.model` is
+  # nullable. `/by-model` reads `Receipt.model` (agent-authored) and already
+  # excludes nulls, so a NULL span model narrows nothing.
+  "$cli" telemetry subagent-start \
+    --role "${_synaptory_role:-unknown}" \
+    ${agent_id:+--subagent-id "$agent_id"} \
+    --backend claude \
+    ${SYNAPTORY_AGENT_MODEL:+--model "$SYNAPTORY_AGENT_MODEL"} \
+    ${_telemetry_story:+--story-id "$_telemetry_story"} \
+    >/dev/null 2>&1 || true
 
-  if [ "$_synaptory_agent" = "1" ]; then
-    if [ -n "${agent_id:-}" ] && [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
-      _marker_dir="${CLAUDE_PROJECT_DIR}/.synaptory/.orchestrator/subagent-markers"
-      mkdir -p "$_marker_dir" 2>/dev/null || true
-      _safe_id=$(printf '%s' "$agent_id" | tr -c 'A-Za-z0-9_.-' '_')
-      : > "${_marker_dir}/${_safe_id}" 2>/dev/null || true
-    fi
-
-    "$cli" telemetry subagent-start \
-      --role "${agent_type:-unknown}" \
-      ${agent_id:+--subagent-id "$agent_id"} \
-      --backend claude \
-      --model "${SYNAPTORY_AGENT_MODEL:-claude-sonnet-4-5}" \
-      >/dev/null 2>&1 || true
-
-    # Phase 5 — open an OTLP span for this subagent. The span_id is
-    # derived deterministically from agent_id, so SubagentStop can close
-    # the same span without state plumbing. Best-effort; telemetry must
-    # never break a hook.
-    # Extract session_id and prompt_id for OTel span correlation.
-    # prompt_id is a per-turn UUID available in Claude Code v2.1.196+ stdin.
-    otel_meta=$(printf '%s' "$SYNAPTORY_STDIN" | "$_py" -c "
+  # Phase 5 — open an OTLP span for this subagent. The span_id is
+  # derived deterministically from agent_id, so SubagentStop can close
+  # the same span without state plumbing. Best-effort; telemetry must
+  # never break a hook.
+  #
+  # Deliberately left inside the CLI gate rather than hoisted with the
+  # marker: a span is telemetry, and the only thing that ever ships
+  # spans-<session>.jsonl is `synaptory telemetry traces`. On an unstamped
+  # tree SubagentStop will now write an `end` with no matching `start`,
+  # which costs one JSONL line and nothing else — `buildOTLPPayload`
+  # (cli/internal/cli/traces.go) builds its span list from `start` events
+  # only, so an unpaired `end` is dropped rather than shipped as a
+  # zero-duration span.
+  #
+  # Extract session_id and prompt_id for OTel span correlation.
+  # prompt_id is a per-turn UUID available in Claude Code v2.1.196+ stdin.
+  otel_meta=$(printf '%s' "$SYNAPTORY_STDIN" | "$_py" -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -77,27 +165,21 @@ try:
 except Exception:
     print('\t')
 " 2>/dev/null || printf '\t')
-    session_id="${otel_meta%%	*}"
-    prompt_id="${otel_meta##*	}"
-    OTEL_WRITER="${_HOOK_ROOT}/hooks/lib/otel_writer.py"
-    if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$OTEL_WRITER" ]; then
-      "$_py" "$OTEL_WRITER" start \
-        --suite-dir "${CLAUDE_PROJECT_DIR}/.synaptory" \
-        --session-id "${session_id}" \
-        --agent-id "${agent_id}" \
-        --role "${agent_type:-unknown}" \
-        --backend claude \
-        --model "${SYNAPTORY_AGENT_MODEL:-claude-sonnet-4-5}" \
-        ${prompt_id:+--prompt-id "$prompt_id"} \
-        >/dev/null 2>&1 || true
-    fi
+  session_id="${otel_meta%%	*}"
+  prompt_id="${otel_meta##*	}"
+  OTEL_WRITER="${_HOOK_ROOT}/hooks/lib/otel_writer.py"
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$OTEL_WRITER" ]; then
+    "$_py" "$OTEL_WRITER" start \
+      --suite-dir "${CLAUDE_PROJECT_DIR}/.synaptory" \
+      --session-id "${session_id}" \
+      --agent-id "${agent_id}" \
+      --role "${agent_type:-synaptory:unknown}" \
+      --backend claude \
+      ${SYNAPTORY_AGENT_MODEL:+--model "$SYNAPTORY_AGENT_MODEL"} \
+      ${_telemetry_story:+--story-id "$_telemetry_story"} \
+      ${prompt_id:+--prompt-id "$prompt_id"} \
+      >/dev/null 2>&1 || true
   fi
-
-  # Re-feed stdin to the rest of the hook (protocol injection runs for every
-  # subagent, synaptory or not) — keep this OUTSIDE the gate above.
-  printf '%s' "$SYNAPTORY_STDIN" > /tmp/.synaptory-subagent-input.$$
-  exec < /tmp/.synaptory-subagent-input.$$
-  trap 'rm -f /tmp/.synaptory-subagent-input.$$' EXIT
 fi
 
 # --- Mid-session auth gate (fail-closed) ---
@@ -107,8 +189,34 @@ fi
 # dispatch — "nothing runs while expired". `whoami --check` renews via the
 # refresh token when possible and never opens a browser. Skippable with
 # SYNAPTORY_AUTH_NO_GATE=1 (CI / offline).
+#
+# There is NO cache. Every dispatch re-runs the check, which is what ADR-011
+# asks for and what the block below costs almost nothing to do.
+#
+# A 300s sentinel used to skip it, justified as "a burst of dispatches costs
+# one network round-trip, not one per dispatch". That justification was wrong:
+# `whoami --check` goes through `clientForSession`, which loads the keychain
+# record and returns. It contacts the control plane ONLY inside the 5 minute
+# expiry skew, when it renews. For a healthy session the check is already a
+# local read, so the sentinel was saving a process spawn while opening a
+# window in which a session that stopped being usable still dispatched agents.
+#
+# Two rounds of #396 review closed narrower versions of that window (binding
+# the sentinel to a UPN, refusing a locally expired session). Removing the
+# cache closes the class instead of the instance, and leaves the gate exactly
+# as strong as the check it runs.
+#
+# What this gate does NOT prove, and no version of it ever did: that the
+# session is still valid SERVER-side. `whoami --check` never asks the control
+# plane about a healthy token, so remote revocation is invisible here and is
+# caught at the next authenticated call instead. Do not read this block as a
+# revocation check.
 if [[ -n "$cli" ]] && [[ -x "$cli" ]] && [[ "${SYNAPTORY_AUTH_NO_GATE:-}" != "1" ]]; then
   if ! "$cli" whoami --check >/dev/null 2>&1; then
+    # A stale sentinel from the cached era must not survive as a live file.
+    if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+      rm -f "${CLAUDE_PROJECT_DIR}/.synaptory/.orchestrator/.auth-check-ok" 2>/dev/null || true
+    fi
     printf '{"additionalContext": "🔒 BLOCKED — synaptory session expired. Your session lapsed mid-session and could not be auto-renewed, so this agent dispatch is refused. Run `synaptory login` in a terminal, then retry. A new Claude Code session will also re-prompt at startup."}\n'
     exit 1
   fi
@@ -130,87 +238,13 @@ if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$LOGGER" ]; then
   "$_py" "$LOGGER" "$CLAUDE_PROJECT_DIR" subagent_start "depth=$NEW_DEPTH" >/dev/null 2>&1 || true
 fi
 
-# Protocol bodies live on the control plane (envelope-encrypted, per-UPN
-# watermarked at fetch). The CLI's local cache — populated by SessionStart's
-# `skills sync` — serves them offline-friendly after the first session of the
-# day. We fall back to the on-disk source tree when the CLI is unavailable
-# so `claude --plugin-dir ./plugin` keeps working in dev without a session.
-#
-# In a distributed build the source tree carries no protocol bodies, so the
-# CLI path is the only one that returns content. That is the design — the
-# previous build encrypted these files and `cat` silently failed.
-PROTOCOLS_DIR="${CLAUDE_PLUGIN_ROOT}/skills/_shared/protocols"
-CONTEXT=""
-
-# Order and membership matter — these shape the system prompt every subagent
-# sees. Keep this list in sync with api/synaptory_api/seed.py's protocol-seeding scope.
-protocol_names=(
-  receipt-protocol
-  input-validation
-  tool-efficiency
-  freshness-protocol
-  iron-laws
-  verification-discipline
-  socratic-gate
-  anti-safe-harbor
-  script-output-handling
-  clean-code-self-check
-  scope-challenge
-  finding-memory
-  tdd-discipline
-  code-review-response
-  subagent-isolation
-  source-attribution
-  open-decision-registry
-)
-
-# Fetch protocols in parallel — 17 sequential CLI calls add visible latency
-# to every SubagentStart even on warm-cache hits (each call is a fresh Go
-# process). Background-fan-out drops the cold path from O(N) to O(1) and the
-# warm path from N×proc-spawn to ~1×proc-spawn. Output files are
-# index-prefixed so we can concatenate in deterministic prompt order — the
-# 17 protocols are NOT order-independent.
-_tmpdir=$(mktemp -d -t synaptory-protocols.XXXXXX)
-# An earlier EXIT trap may already be set (telemetry stdin tee). `bash` traps
-# don't stack — the last `trap` wins — so re-establish a combined cleanup.
-trap 'rm -rf "$_tmpdir"; rm -f /tmp/.synaptory-subagent-input.$$' EXIT
-
-_fetch_one() {
-  local idx="$1" name="$2" out="$3"
-  local body=""
-  if [[ -n "$cli" ]] && [[ -x "$cli" ]]; then
-    body=$("$cli" skills get "protocols/$name" 2>/dev/null || true)
-  fi
-  if [[ -z "$body" ]] && [ -f "$PROTOCOLS_DIR/$name.md" ]; then
-    body=$(cat "$PROTOCOLS_DIR/$name.md" 2>/dev/null || true)
-  fi
-  if [[ -n "$body" ]]; then
-    printf '%s\n\n---\n' "$body" > "$out"
-  fi
-}
-
-idx=0
-for name in "${protocol_names[@]}"; do
-  printf -v padded '%02d' "$idx"
-  _fetch_one "$idx" "$name" "${_tmpdir}/${padded}-${name}" &
-  idx=$((idx + 1))
-done
-wait
-
-# Concatenate in index order. find -print0 + sort -z keeps newlines in bodies
-# safe and gives us a stable order independent of filesystem listing quirks.
-while IFS= read -r -d '' part; do
-  CONTEXT="${CONTEXT}$(cat "$part")
-"
-done < <(find "$_tmpdir" -maxdepth 1 -type f -print0 | sort -z)
-
 # --- #30: project risk-checklist injection ---
 # A healthcare / security project points `risk_checklist:` in .synaptory.yaml at
 # a markdown file of review patterns (PHI in logs/URLs, error_meta redaction,
 # MRN in logger.*, …). Inject it into every subagent so the patterns that catch
 # runtime-only leaks aren't invisible to the delivery agents meant to prevent
-# them. Same delivery model as protocols above; role is unknowable here, so we
-# inject for all (harmless for non-delivery roles).
+# them. Role is unknowable here, so we inject for all (harmless for
+# non-delivery roles).
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "${CLAUDE_PROJECT_DIR}/.synaptory.yaml" ]; then
   _rc_rel=$("$_py" - "${CLAUDE_PROJECT_DIR}/.synaptory.yaml" <<'PYRC' 2>/dev/null || true
 import sys
@@ -232,11 +266,9 @@ PYRC
     if [ -f "$_rc_path" ]; then
       _rc_body=$(cat "$_rc_path" 2>/dev/null || true)
       if [ -n "$_rc_body" ]; then
-        # Held in its OWN variable, NOT appended to CONTEXT: the compact-
-        # protocol load below resets CONTEXT, so anything appended here
-        # would be silently dropped. Re-appended after the compact payload
-        # is selected so healthcare/security projects' mandatory review
-        # patterns actually reach subagents.
+        # Held in its own variable and appended AFTER the compact payload
+        # below, so healthcare/security projects' mandatory review patterns
+        # land behind the protocol index rather than replacing it.
         RISK_CHECKLIST="
 # Project Risk Checklist (${_rc_rel})
 
@@ -253,12 +285,17 @@ ${_rc_body}
   fi
 fi
 
-# Load the compact protocol index for additionalContext emission. CP-seeded
-# as "hooks/data/compacted-protocols" (api/synaptory_api/seed.py), delivered
-# via the same CLI-fetch-then-disk-fallback model as the individual
-# protocols above. The distributed build purges hooks/data/*.md (ADR-016),
-# so the on-disk copy only exists in source-tree dev — a real install MUST
-# get this via the CLI or every subagent dispatch loses protocol content.
+# Load the compact protocol index for additionalContext emission. This is
+# the ONLY protocol body injected here — full per-protocol bodies land in
+# .synaptory/.protocols/ via the SessionStart skills-fetch, not per dispatch.
+# CP-seeded as "hooks/data/compacted-protocols" (api/synaptory_api/seed.py):
+# fetched via the CLI (envelope-encrypted at rest, per-UPN watermarked, and
+# served offline-friendly by the CLI's local cache after SessionStart's
+# `skills sync`), falling back to the on-disk copy so
+# `claude --plugin-dir ./plugin` keeps working in dev without a session.
+# The distributed build purges hooks/data/*.md (ADR-016), so the on-disk
+# copy only exists in source-tree dev — a real install MUST get this via
+# the CLI or every subagent dispatch loses protocol content.
 COMPACT_PROTO="${_HOOK_ROOT}/hooks/data/compacted-protocols.md"
 CONTEXT=""
 if [[ -n "$cli" ]] && [[ -x "$cli" ]]; then
@@ -271,9 +308,9 @@ if [[ -z "$CONTEXT" ]]; then
   CONTEXT="# Synaptory Protocols (unavailable — CLI unreachable and no on-disk fallback; see .synaptory/.protocols/ for full versions)"
 fi
 
-# Re-append the project risk checklist (captured above before the CONTEXT
-# reset) so it survives into additionalContext for healthcare/security
-# projects. Empty for projects without a `risk_checklist:` entry.
+# Append the project risk checklist (captured above) after the compact
+# payload so it reaches additionalContext for healthcare/security projects.
+# Empty for projects without a `risk_checklist:` entry.
 CONTEXT="${CONTEXT}${RISK_CHECKLIST:-}"
 
 # --- #163: Execution Envelope injection ---
@@ -281,23 +318,64 @@ CONTEXT="${CONTEXT}${RISK_CHECKLIST:-}"
 # fields, the two verification_commands forms, replay rules, per-role
 # evidence obligations) so every synaptory delivery agent sees the exact
 # machine-checked contract SubagentStop will enforce. Non-synaptory
-# agent_types (and the CLI-unavailable path, where agent_type is never
-# parsed) render to "" and nothing is appended. Best-effort: the envelope
+# agent_types render to "" and nothing is appended. Best-effort: the envelope
 # must never break a dispatch.
-ENVELOPE=$("$_py" "${_HOOK_ROOT}/hooks/lib/evidence_contract.py" envelope \
-  --agent-type "${agent_type:-}" 2>/dev/null || true)
-if [ -n "$ENVELOPE" ]; then
-  CONTEXT="${CONTEXT}
-
-${ENVELOPE}
-"
+#
+# #501 — the envelope also states the story's DoD tier and active checks, so
+# the contract an agent is GRADED on is the contract it was SHOWN. The
+# renderer used to accept `--active-checks`/`--tier` and nothing ever passed
+# them, because the host tells SubagentStart the ROLE and not the story.
+# `dispatched_receipts.py --resolve-dispatch` is the resolver that closed the
+# same gap for SubagentStop (#396): it reads the kernel's dispatch binding,
+# falls back to the single in-flight story, and returns the literal
+# `?ambiguous` when two stories hold this role at once. Passing that answer
+# through verbatim is deliberate — the envelope then NAMES the ambiguity
+# instead of rendering a check list for the wrong story.
+_ENVELOPE_STORY=""
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  case "${agent_type:-}" in
+    synaptory:*)
+      if [ -n "${_marker_link:-}" ]; then
+        # Already resolved for the SubagentStop marker above; reuse rather
+        # than spawn a second interpreter on every dispatch.
+        _ENVELOPE_STORY="${_marker_link%%	*}"
+      elif [ -f "$HOOK_LIB_DIR/dispatched_receipts.py" ]; then
+        _ENVELOPE_STORY=$("$_py" "$HOOK_LIB_DIR/dispatched_receipts.py" \
+          --resolve-dispatch "$CLAUDE_PROJECT_DIR" "${agent_type#synaptory:}" \
+          2>/dev/null | head -1 || true)
+        _ENVELOPE_STORY="${_ENVELOPE_STORY%%	*}"
+      fi
+      ;;
+  esac
 fi
-
-printf '%s' "$CONTEXT" | SYNAPTORY_HOOK_LIB="${_HOOK_ROOT}/hooks/lib" "$_py" -c "
+# #512: this used to render to "" on the CLI-unavailable path too, because
+# agent_type was parsed inside the telemetry gate and so was empty there. An
+# unstamped tree is precisely where SubagentStop still enforces the contract
+# locally, so withholding the contract text from the agent while enforcing it
+# on the agent was the wrong half to drop. agent_type is parsed above the gate
+# now, and the story resolution below is guarded on CLAUDE_PROJECT_DIR rather
+# than on a CLI, so both halves reach an unstamped tree.
+ENVELOPE=$("$_py" "${_HOOK_ROOT}/hooks/lib/evidence_contract.py" envelope \
+  --agent-type "${agent_type:-}" \
+  --project-dir "${CLAUDE_PROJECT_DIR:-}" \
+  --story-id "${_ENVELOPE_STORY:-}" 2>/dev/null || true)
+# The envelope goes to `emit` as PROTECTED context, not concatenated onto
+# CONTEXT (#501). additionalContext is capped at 10 KB and the cap is a blind
+# head-truncation, so appending the envelope last meant the compacted protocol
+# index plus the envelope overran the cap on a real dispatch and the
+# envelope's TAIL — its per-role evidence obligations, and now the story's DoD
+# contract — was cut off with no signal at all. Reserving the envelope's bytes
+# trims the protocol index instead, and says so where the trim happens: the
+# index names where the full protocols live, while the envelope is the
+# contract SubagentStop mechanically enforces.
+printf '%s' "$CONTEXT" | SYNAPTORY_HOOK_LIB="${_HOOK_ROOT}/hooks/lib" \
+  SYNAPTORY_ENVELOPE="${ENVELOPE:-}" "$_py" -c "
 import sys, os
 sys.path.insert(0, os.environ['SYNAPTORY_HOOK_LIB'])
 from hook_io import emit
-emit('SubagentStart', additional_context=sys.stdin.read())
+envelope = os.environ.get('SYNAPTORY_ENVELOPE') or ''
+emit('SubagentStart', additional_context=sys.stdin.read(),
+     protected_context=('\n\n' + envelope + '\n') if envelope else None)
 " 2>/dev/null || exit 0
 
 exit 0

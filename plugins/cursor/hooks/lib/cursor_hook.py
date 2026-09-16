@@ -438,6 +438,24 @@ def _role_name(kind: str) -> str:
     return raw
 
 
+def _active_dispatch(project: str, role: str, root: Path) -> tuple[str, str]:
+    """Resolve the one dispatch this role can be bound to at start time."""
+    _sys_path_lib(root)
+    try:
+        from dispatched_receipts import active_dispatch_for  # type: ignore
+
+        story_id, dispatch_id = active_dispatch_for(project, role)
+    except Exception:
+        return "", ""
+    if not story_id or str(story_id).startswith("?"):
+        return "", ""
+    return str(story_id), str(dispatch_id or "")
+
+
+def _cursor_session_id(data: dict[str, Any]) -> str:
+    return str(data.get("session_id") or data.get("conversation_id") or "")
+
+
 def _parent_is_roster(data: dict[str, Any], agents: dict[str, Any]) -> bool:
     parent_agent = data.get("parent_subagent_id") or data.get("parent_agent_id")
     if isinstance(parent_agent, str) and parent_agent.strip():
@@ -497,8 +515,12 @@ def subagent_start(data: dict[str, Any], project: str, root: Path) -> dict[str, 
             ),
         }
     if kind in ROSTER or "synaptory:" in kind_raw:
+        story_id, dispatch_id = _active_dispatch(project, kind, root)
         marker = _marker_dir(project) / _safe_id(agent_id)
-        marker.write_text(kind_raw or kind, encoding="utf-8")
+        marker.write_text(
+            "%s\n%s\t%s\n" % (kind_raw or kind, story_id, dispatch_id),
+            encoding="utf-8",
+        )
         agents[agent_id] = {
             "role": kind if kind in ROSTER else kind_raw,
             "conversation_id": str(data.get("conversation_id") or ""),
@@ -506,24 +528,66 @@ def subagent_start(data: dict[str, Any], project: str, root: Path) -> dict[str, 
         }
         nest["agents"] = agents
         _write_nest(project, nest)
-        # Telemetry: best-effort matched to Claude inject-protocols span start.
+        model = _model_id(data)
+        cli = _cli_bin()
+        if cli:
+            command = [
+                cli,
+                "telemetry",
+                "subagent-start",
+                "--role",
+                kind or kind_raw,
+                "--subagent-id",
+                agent_id,
+                "--backend",
+                "cursor",
+            ]
+            if model:
+                command.extend(("--model", model))
+            if story_id:
+                command.extend(("--story-id", story_id))
+            try:
+                subprocess.run(
+                    command,
+                    cwd=project,
+                    check=False,
+                    capture_output=True,
+                    timeout=6,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        # Keep the local OTLP event even when the direct CLI emission had to
+        # queue or failed. Stop/next SessionStart owns the durable flush.
         otel = root / "hooks" / "lib" / "otel_writer.py"
         if otel.is_file():
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(otel),
-                    "start",
-                    "--suite-dir",
-                    str(Path(project) / ".synaptory"),
-                    "--session-id",
-                    str(data.get("conversation_id") or ""),
-                    "--agent-id",
-                    agent_id,
-                ],
-                check=False,
-                capture_output=True,
+            otel_role = (
+                kind_raw
+                if kind_raw.startswith("synaptory:")
+                else f"synaptory:{kind or kind_raw}"
             )
+            command = [
+                sys.executable,
+                str(otel),
+                "start",
+                "--suite-dir",
+                str(Path(project) / ".synaptory"),
+                "--session-id",
+                _cursor_session_id(data),
+                "--agent-id",
+                agent_id,
+                "--role",
+                otel_role,
+                "--backend",
+                "cursor",
+            ]
+            if model:
+                command.extend(("--model", model))
+            if story_id:
+                command.extend(("--story-id", story_id))
+            try:
+                subprocess.run(command, check=False, capture_output=True, timeout=6)
+            except (OSError, subprocess.SubprocessError):
+                pass
     return {"permission": "allow"}
 
 
@@ -542,12 +606,16 @@ def subagent_stop(data: dict[str, Any], project: str, root: Path) -> dict[str, A
         "name": kind,
         "transcript_path": data.get("agent_transcript_path") or data.get("transcript_path") or "",
         "agent_id": agent_id,
-        "session_id": data.get("conversation_id") or data.get("session_id") or "",
+        "session_id": _cursor_session_id(data),
         "model": _model_id(data),
         "model_id": _model_id(data),
     }
     stdin = json.dumps(mapped).encode()
     proc = _run_script(root, "synaptory-verify-receipt.sh", stdin)
+    # The verifier's EXIT trap has now closed the local OTLP span. Ship that
+    # complete pair while the host session is still alive; SessionStart keeps
+    # the recovery sweep for files retained after a missing CLI or queue error.
+    _run_script(root, "synaptory-otel-flush.sh", stdin)
     # Cursor cannot fail-closed via exit 2. Convert a blocking Claude failure
     # into followup_message, and only when status=completed (otherwise Cursor
     # drops the field).

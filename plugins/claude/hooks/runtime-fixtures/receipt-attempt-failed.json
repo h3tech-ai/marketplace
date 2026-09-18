@@ -1,0 +1,23 @@
+{
+  "task": "Verify task CRUD endpoints against the sealed contract",
+  "role": "quality-engineer",
+  "backend": "codex",
+  "model": "codex-runtime-reported-id",
+  "attempt_id": "att_01J6FAIL01",
+  "dispatch_id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+  "adapter_profile_id": "codex-local-v1",
+  "placement": "local",
+  "capability_profile": "prover",
+  "stage_profile": "verifying",
+  "cycle_id": "003-9f2c41ab",
+  "manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workstream_id": "api",
+  "source_revision": "cccccccccccccccccccccccccccccccccccccccc",
+  "fencing_token": "fixture-lease-generation-1",
+  "artifacts": [],
+  "verification_commands": [
+    "pytest tests/test_tasks_api.py -q"
+  ],
+  "completed_at": "2026-09-01T12:10:00Z",
+  "failure_class": "deterministic-check"
+}

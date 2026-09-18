@@ -18,6 +18,8 @@ fire often).
 
 from __future__ import annotations
 
+from state_schema import state_schema
+
 import json
 import os
 from pathlib import Path
@@ -64,6 +66,10 @@ def validate_pipeline_state(state: dict[str, Any]) -> list[str]:
     if not isinstance(state, dict):
         return ["pipeline-state.json is not a JSON object"]
 
+    try:
+        state_schema(state)
+    except ValueError as exc:
+        return [str(exc)]
     problems: list[str] = []
     build_mode = state.get("build_mode")
     if build_mode not in _KNOWN_BUILD_MODES:
@@ -77,7 +83,7 @@ def validate_pipeline_state(state: dict[str, Any]) -> list[str]:
     # first advance into a warning on the first message: SessionStart already
     # registers pipeline-state.json in watchPaths, and the FileChanged hook runs
     # this validator.
-    if build_mode == "spq" and (state.get("version") == "3.0" or isinstance(specs, dict)):
+    if build_mode == "spq" and (state_schema(state) == 3 or isinstance(specs, dict)):
         problems.append(
             "pipeline-state.json is on the retired v3.0 Multi-Spec layout "
             "while build_mode is spq. There is no migrator: `ADR-035` refuses "

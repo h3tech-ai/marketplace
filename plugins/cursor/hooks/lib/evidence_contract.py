@@ -102,6 +102,29 @@ EMBEDDED_DEFAULTS: dict[str, Any] = {
         },
         "story_id_pattern": "^[A-Z][A-Z0-9]*-\\d+$",
         "filename_template": "{story_id}-{role_abbrev}.json",
+        "model_identity": {
+            "version": 1,
+            "typed_required_fields": [
+                "runtime_family",
+                "runtime_version",
+                "model_route"
+            ],
+            "kinds": [
+                "vendor_id",
+                "display_name",
+                "unreported"
+            ],
+            "legacy_string_kind": "legacy_untyped",
+            "source_kinds": {
+                "claude-code.system.init.model": "vendor_id",
+                "cursor-agent.system.init.model": "display_name"
+            },
+            "evidence_classes": {
+                "vendor_id": "runtime-reported-vendor-id",
+                "display_name": "runtime-reported-display-name",
+                "unreported": "runtime-only"
+            }
+        },
     },
     "stages": {
         "valid": [
@@ -784,11 +807,11 @@ def _runtime_identity_lines(contract: dict[str, Any] | None = None) -> list[str]
     # words of headroom (see test_fixed_dispatch_payload_under_4k_words). Every
     # rule below is still stated; none of them is stated twice.
     return [
-        "- Runtime identity — copy VERBATIM from your dispatch contract, never "
-        "derive or invent: `attempt_id`, `dispatch_id`; and when carried, "
+        "- Runtime identity: copy dispatch fields VERBATIM; never derive or invent: "
+        "`attempt_id`, `dispatch_id`; when carried, "
         "`cycle_id`, `manifest_hash`, `workstream_id`, `adapter_profile_id`, "
-        "`placement`, `runtime_family`, `fencing_token`, `source_revision`, and the exact model "
-        "id the runtime reported",
+        "`placement`, `runtime_family`, `fencing_token`, `source_revision`. The bridge "
+        "records typed `model` and measured `runtime_version`; never infer identity from routing",
         "- On a FAILED or cancelled attempt, add `failure_class` from the "
         "versioned vocabulary. Closing unclassified is the one thing the "
         "evidence model does not allow.",

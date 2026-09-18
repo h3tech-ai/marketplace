@@ -174,6 +174,36 @@ _sed_inplace() {
   [[ -f "${arg}.bak" ]] && rm -f "${arg}.bak"
 }
 
+# Project the certified adapter-profile table into a standalone Claude
+# package. `core/runtime-fixtures/` is a monorepo SIBLING of `core/lib`, not
+# a child of `plugin-claude/`, so the `rsync -aL "${PLUGIN_ROOT}/" ...` that
+# builds every Claude package (marketplace dist and `./synaptory dev plugin`
+# staging alike) never touches it — only files reachable by walking
+# plugin-claude/ (including its dereferenced symlinks: hooks/lib,
+# receipt-schema, skills/_shared/scripts) get copied.
+#
+# `runtime_selector._certified_table_candidates()` resolves the table
+# relative to its OWN module, which sits at `hooks/lib/` in every composed
+# package, so the table must land BESIDE hooks/lib rather than at the top of
+# the package: `hooks/runtime-fixtures/profiles.json`. That is the same
+# destination the Codex (`plugin-codex/scripts/compose.py`) and Cursor
+# (`plugin-cursor/scripts/compose.py`) composers already use, so all three
+# hosts agree on where the table lives. Without this, a standalone Claude
+# package denies every governed runtime dispatch with `profile_mismatch`
+# ("the certified profile table is not in this installation") even though
+# the pilot's reservation, seal, and policy are all valid (#739).
+_copy_runtime_fixtures_into_claude_package() {
+  local dest_root="$1"
+  local fixtures_src="${REPO_ROOT}/core/runtime-fixtures"
+  if [[ ! -d "$fixtures_src" ]]; then
+    echo "ERROR: ${fixtures_src} not found — cannot package the certified runtime profile table." >&2
+    exit 1
+  fi
+  mkdir -p "${dest_root}/hooks/runtime-fixtures"
+  rsync -a --exclude='__pycache__' --exclude='*.pyc' \
+    "${fixtures_src}/" "${dest_root}/hooks/runtime-fixtures/"
+}
+
 write_version() {
   local ver="$1"
   echo "$ver" > "$VERSION_FILE"
@@ -411,6 +441,15 @@ INIT
   rsync -aL --exclude='__pycache__' --exclude='*.pyc' --exclude='assets/' "$PLUGIN_ROOT/" "$OUTPUT_DIR/"
 
   echo "  Copied plugin-claude/ → marketplace/${PLUGIN_NAME}/"
+
+  # The certified adapter-profile table (core/runtime-fixtures/) is a sibling
+  # of core/lib, not a child of plugin-claude/, so the rsync above never
+  # copies it. Codex and Cursor already project it into their composed
+  # packages at hooks/runtime-fixtures/ (see their compose.py); do the same
+  # here so a standalone Claude package can authorize a governed runtime
+  # dispatch instead of failing closed with profile_mismatch (#739).
+  _copy_runtime_fixtures_into_claude_package "$OUTPUT_DIR"
+  echo "  Copied core/runtime-fixtures/ → marketplace/${PLUGIN_NAME}/hooks/runtime-fixtures/"
 
   # Authored bodies carry host-neutral {{include:}} / {{read:}} directives.
   # Expand them into Claude's native inline form in the DIST tree only; the
@@ -1580,6 +1619,10 @@ cmd_dev() {
       staging=$(mktemp -d "${TMPDIR:-/tmp}/synaptory-dev-plugin.XXXXXX")
       rsync -aL --exclude='__pycache__' --exclude='*.pyc' --exclude='tests/' \
         "${PLUGIN_ROOT}/" "${staging}/"
+      # Same standalone-package semantics as the marketplace build: project
+      # the certified runtime-profile table beside hooks/lib so governed
+      # runtime dispatch works from this staging copy too (#739).
+      _copy_runtime_fixtures_into_claude_package "$staging"
       if ! python3 "${REPO_ROOT}/core/scripts/expand_claude_directives.py" "$staging"; then
         echo "ERROR: directive expansion failed for ./synaptory dev plugin" >&2
         rm -rf "$staging"

@@ -565,3 +565,94 @@ def test_a_failed_ship_does_not_fail_the_commit(project, tmp_path, monkeypatch):
     monkeypatch.setattr(manifest_emitter, "emit_cycle_manifest", _explode)
     _open(project)
     assert sm.identity(str(project)).cycle_id
+
+
+# ══ 7. The reservation is scoped by THIS repo's project, not the CLI's guess ═
+#
+# #738: `open_cycle` used to call `region_registry.reserve` with no `project`
+# at all, leaning on the CLI's own cwd-based default (`resolveRegionProject`).
+# That default trusted a global session cache stamped for a PREVIOUS, unrelated
+# project ahead of the correctly-configured `.synaptory.yaml`, so a pilot
+# repository whose own project_id was right still reserved (and would have
+# read reservations) under someone else's project. `resolveRegionProject` now
+# guards the cache by repo root, mirroring `resolveShipProject` -- but this
+# suite is the OTHER half: `open_cycle` should not depend solely on getting
+# that CLI-side default right when `.synaptory.yaml` already answers the
+# question directly at the call site.
+
+
+def test_open_cycle_passes_this_repos_project_id_to_the_registry(
+    project, tmp_path, monkeypatch
+):
+    """`.synaptory.yaml` names the real project; the reservation call must be
+    scoped to exactly that slug, explicitly, regardless of what a stale
+    session cache elsewhere on the machine might claim."""
+    (project / ".synaptory.yaml").write_text(
+        "build_mode: spq\nproject_id: synap-pilot-tracker\n", encoding="utf-8"
+    )
+    seen: dict = {}
+
+    def _fake_reserve(_project_dir, **kwargs):
+        seen.update(kwargs)
+        return {"outcome": registry.RESERVED, "registry": "control-plane",
+                 "detail": "ok", "cycle_id": kwargs.get("cycle_id", "")}
+
+    monkeypatch.setattr(registry, "reserve", _fake_reserve)
+    _open(project)
+    assert seen.get("project") == "synap-pilot-tracker"
+
+
+def test_open_cycle_with_no_project_id_still_calls_the_registry(
+    project, tmp_path, monkeypatch
+):
+    """No `project_id:` in `.synaptory.yaml` (this fixture's default) -- the
+    explicit project resolves to "", the same as never passing the argument,
+    so the CLI's own (now repo-guarded) default takes over rather than this
+    layer inventing an identity nobody declared."""
+    seen: dict = {}
+
+    def _fake_reserve(_project_dir, **kwargs):
+        seen.update(kwargs)
+        return {"outcome": registry.RESERVED, "registry": "control-plane",
+                 "detail": "ok", "cycle_id": kwargs.get("cycle_id", "")}
+
+    monkeypatch.setattr(registry, "reserve", _fake_reserve)
+    _open(project)
+    assert seen.get("project") == ""
+
+
+def test_a_compensating_release_uses_the_same_explicit_project_as_the_reserve(
+    project, tmp_path, monkeypatch
+):
+    """A Commit that reserves and then fails to seal releases what it just
+    reserved (see `test_a_declaration_that_would_not_seal_leaves_no_reservation`
+    for the earlier, pre-reservation refusal). That release call must resolve
+    the SAME explicit project as the reserve it is undoing -- a release
+    computed from a different implicit resolution would miss the reservation
+    entirely and leave it held under the real project forever."""
+    (project / ".synaptory.yaml").write_text(
+        "build_mode: spq\nproject_id: synap-pilot-tracker\n", encoding="utf-8"
+    )
+    seen_reserve: dict = {}
+    seen_release: dict = {}
+
+    def _fake_reserve(_project_dir, **kwargs):
+        seen_reserve.update(kwargs)
+        return {"outcome": registry.RESERVED, "registry": "control-plane",
+                 "detail": "ok", "cycle_id": kwargs.get("cycle_id", "")}
+
+    def _fake_release(_project_dir, **kwargs):
+        seen_release.update(kwargs)
+        return {"outcome": "released", "registry": "control-plane"}
+
+    monkeypatch.setattr(registry, "reserve", _fake_reserve)
+    monkeypatch.setattr(registry, "release", _fake_release)
+    # Force the failure AFTER the reservation and BEFORE the seal completes,
+    # so the compensating `except` branch runs.
+    monkeypatch.setattr(
+        sm._records, "seal", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    with pytest.raises(RuntimeError):
+        _open(project)
+    assert seen_reserve.get("project") == "synap-pilot-tracker"
+    assert seen_release.get("project") == "synap-pilot-tracker"

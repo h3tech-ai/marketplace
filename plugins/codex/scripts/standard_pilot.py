@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Fail-closed operational preflight for a standard Codex staff pilot.
 
-This checker is deliberately read-only. It combines the installed plugin's
-doctor result with unauthenticated HTTPS probes of one representative
-deployment. Response bodies, credentials, project receipts, and source content
-are never collected or printed.
+This checker is deliberately read-only. Installation readiness combines the
+installed plugin's doctor result with unauthenticated HTTPS deployment probes.
+Dispatch readiness reports runtime doctor availability and refusal reasons.
+Response bodies, credentials, project receipts, and source content are never
+collected or printed.
 """
 
 from __future__ import annotations
@@ -69,6 +70,14 @@ def _doctor(project: Path) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("Synaptory doctor returned a non-object")
     return result
+
+
+def _dispatch_readiness(project: Path, *, timeout: float) -> dict[str, Any]:
+    # _doctor has loaded the host's shared runtime and channel-aware CLI resolver.
+    from mcp_server import _runtime_cli
+    from staff_pilot import dispatch_readiness
+
+    return dispatch_readiness(project, cli=_runtime_cli(), timeout=timeout)
 
 
 def certification_report(
@@ -154,16 +163,20 @@ def certification_report(
         }
         for parsed, url in zip(protected, protected_urls)
     ]
-    passed = bool(
+    ready_to_install = bool(
         doctor_passed
         and health_probe["passed"]
         and all(item["passed"] for item in protected_probes)
     )
 
+    dispatch = _dispatch_readiness(project, timeout=timeout)
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": "standard-non-regulated",
-        "result": "pass" if passed else "fail",
+        "ready_to_install": ready_to_install,
+        "ready_to_dispatch": dispatch["ready"],
+        "dispatch": dispatch,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "doctor": {
             "passed": doctor_passed,
@@ -223,9 +236,10 @@ def main() -> int:
         )
     except (OSError, ValueError) as exc:
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "standard-non-regulated",
-            "result": "fail",
+            "ready_to_install": False,
+            "ready_to_dispatch": False,
             "error": str(exc),
             "regulated_execution": {
                 "certified": False,
@@ -234,9 +248,10 @@ def main() -> int:
         }
     except Exception as exc:  # noqa: BLE001 - report unexpected failures safely
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "standard-non-regulated",
-            "result": "fail",
+            "ready_to_install": False,
+            "ready_to_dispatch": False,
             "error": f"certification check failed: {type(exc).__name__}",
             "regulated_execution": {
                 "certified": False,
@@ -244,7 +259,7 @@ def main() -> int:
             },
         }
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report.get("result") == "pass" else 1
+    return 0 if report.get("ready_to_install") and report.get("ready_to_dispatch") else 1
 
 
 if __name__ == "__main__":

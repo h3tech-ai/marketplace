@@ -1,0 +1,33 @@
+"""Lifecycle-state layout metadata, independent of the product release.
+
+Only this accessor may interpret legacy `version` strings as layout selectors.
+An explicit key always wins; an invalid key never activates legacy fallback.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from product_version import product_version
+
+
+def state_schema(state: dict[str, Any]) -> int | None:
+    """Resolve layout 2/3, or None for an unrecognized legacy declaration."""
+    if "state_schema" in state:
+        value = state["state_schema"]
+        if type(value) is not int or value not in (2, 3):
+            raise ValueError(f"Unsupported state_schema {value!r}; expected integer 2 or 3")
+        return value
+    legacy = state.get("version")
+    return {"2.0": 2, "3.0": 3}.get(legacy) if isinstance(legacy, str) else None
+
+
+def with_state_metadata(state: dict[str, Any]) -> dict[str, Any]:
+    """Stamp layout and product release without mutating caller dictionaries."""
+    result = dict(state)
+    layout = state_schema(state)
+    if layout is None:
+        # Existing permissive writers also accept undeclared flat/spec envelopes.
+        layout = 3 if isinstance(state.get("specs"), dict) else 2
+    result["state_schema"] = layout
+    result["version"] = product_version()
+    return result

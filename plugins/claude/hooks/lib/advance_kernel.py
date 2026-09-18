@@ -431,8 +431,17 @@ def _region_contradiction(project_dir: str) -> Optional[Dict[str, Any]]:
     ours = [str(x) for x in (sealed.get("source_region") or ())]
     if not ours:
         return None
+    # SAME EXPLICIT PROJECT `open_cycle` RESERVED UNDER (#738). `reserve` and
+    # this recheck must resolve the SAME project or an accurate reservation
+    # reads as vanished: `_project_slug` is the same `SYNAPTORY_PROJECT_ID` ->
+    # `project_id:` reader `open_cycle` now calls before reserving, so a
+    # dispatch recheck asks the registry about the identical scope the Cycle
+    # was granted under, not whatever the CLI's own implicit cwd-based
+    # default separately infers.
     live = region_registry.holder(
-        project_dir, repository=str(sealed.get("repository") or "")
+        project_dir,
+        repository=str(sealed.get("repository") or ""),
+        project=_project_slug(project_dir),
     )
     if not live.get("available"):
         # A RECHECK THAT CANNOT BE ANSWERED REFUSES, and the first cut of this
@@ -844,6 +853,181 @@ def unadvanceable_attempt(story: Any, role: str) -> Optional[Dict[str, Any]]:
         "failure_class": str(binding.get("failure_class") or ""),
         "failure_class_source": str(binding.get("failure_class_source") or ""),
     }
+
+
+def unadvanceable_receipt(
+    project_dir: str, story: Any, role: str
+) -> Optional[Dict[str, Any]]:
+    """This stage's canonical receipt, when it is present but INADMISSIBLE.
+
+    #741. `unadvanceable_attempt` above catches the attempt-liveness reason a
+    fresh receipt cannot advance; this catches the other one it cannot see: a
+    LIVE attempt that produced a receipt which still fails schema validation
+    -- an `evidence` object where a list of typed items is required, for
+    example. A completed producer attempt is not in `_ATTEMPT_NOT_LIVE_STATES`
+    (deliberately: it is the case that SHOULD advance), so
+    `unadvanceable_attempt` returns None for it and the caller is left
+    believing the ordinary transition is safe. `evaluate_advance` refuses it
+    anyway, as `RECEIPT_INVALID`, and `begin_dispatch` refuses a successor
+    because the same (invalid) receipt is still on disk -- #690's deadlock
+    through a different door.
+
+    SCOPED TO A BINDING RECORDED `completed`, not merely to "any dispatch
+    binding" and not to "any state `unadvanceable_attempt` calls live". Two
+    reasons, and both are load-bearing:
+
+    1. A stage with no `mcp_active_dispatches[abbrev]` binding at all was
+       never dispatched through this kernel's governed retry ladder, so
+       there is no successor for `begin_dispatch` to authorize and no
+       predecessor for `execute_dispatch` to archive. Offering a ladder
+       recovery there would only swap a direct, correct `RECEIPT_INVALID`
+       refusal (from `evaluate_advance`'s own step 9) for a
+       `NEXT_ACTION_MISMATCH` that names no route out, because a strict
+       host's `advance` compares against `next_action`'s `transition_to`,
+       which a recovery leaves unset. An ungoverned receipt written straight
+       to disk (no `begin_dispatch` ever called) must keep refusing as
+       `RECEIPT_INVALID`, unchanged from pre-#741 -- exactly what the
+       cross-host conformance contract (`test_invalid_receipt_refused`) and
+       the Cursor/Codex MCP suites already pin down.
+
+    2. A binding recorded `pending` / `claimed` / `running` (or not yet
+       state-stamped at all) names an attempt the real runtime may still be
+       writing to. Archiving its receipt and minting a successor while that
+       runtime is potentially still in flight would race it -- two attempts
+       believing they hold the same work. `completed` is the one state that
+       says the runtime is definitely finished and nothing else will ever
+       correct this receipt, which is exactly the #741 scenario (CP close
+       succeeded, generation reconciled, runtime ended `completed`). This is
+       why the check below is an exact-match on `completed`, not
+       `not in _ATTEMPT_NOT_LIVE_STATES` -- the latter would also admit
+       `pending`/`claimed`/`running`, reopening the same conformance
+       contract this predicate must not relitigate
+       (`test_mixed_actor_producing_stage_attributes_each_actor`, whose
+       negative control writes a forged, still-in-flight receipt against a
+       freshly begun -- not completed -- dispatch and expects a plain
+       `RECEIPT_INVALID`).
+
+    CALLS THE SAME VALIDATOR `evaluate_advance` calls at its own step 9, on
+    the same bytes it would read, via the same `canonical_receipt_path`. This
+    is deliberately not a second, independent shape check: a predicate that
+    disagreed with the gate about what "invalid" means would refuse a receipt
+    the gate accepts, or worse, recommend recovery for one the gate would
+    advance anyway.
+
+    NO AUTO-REPAIR. This never rewrites or coerces the malformed payload --
+    that is a confirmed product decision, not an oversight: an inadmissible
+    receipt always requires a genuinely fresh dispatch, and its bytes are
+    archived, never edited.
+
+    Missing file, unreadable JSON, or a non-dict payload all return None --
+    that is `_fresh_receipt`'s "absent" case already, and not this
+    predicate's job to re-diagnose (a missing receipt already dispatches the
+    stage normally). A path refusal (symlink / escape) also returns None for
+    the same reason: those are `canonical_receipt_path`'s own correctness
+    checks, unrelated to whether an EXISTING receipt's contents validate.
+
+    Returns the receipt's location, its digest (so the caller can name
+    exactly which bytes it is talking about, and the archive step can prove
+    it archived those same bytes), and the validator's error list -- or None
+    when the receipt is absent, unreadable, valid, or ungoverned.
+    """
+    abbrev = role_abbrev(role) or str(role or "").strip().lower()
+    if not abbrev:
+        return None
+    if not isinstance(story, dict):
+        return None
+    dispatches = story.get("mcp_active_dispatches")
+    if not isinstance(dispatches, dict):
+        return None
+    binding = dispatches.get(abbrev)
+    if not isinstance(binding, dict):
+        return None
+    recorded = str(binding.get("state") or binding.get("attempt_state") or "").strip().lower()
+    if recorded != "completed":
+        return None
+    story_id = str(story.get("id") or "")
+    if not story_id:
+        return None
+    try:
+        path = canonical_receipt_path(project_dir, story_id, abbrev)
+    except _Refusal:
+        return None
+    except Exception:  # noqa: BLE001 - an unreadable path names no receipt
+        return None
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        receipt = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(receipt, dict):
+        return None
+
+    from receipt_validator import validate_receipt_payload  # type: ignore
+
+    result = validate_receipt_payload(receipt, project_dir)
+    if result.valid:
+        return None
+    return {
+        "receipt_path": str(path),
+        "receipt_digest": hashlib.sha256(raw).hexdigest(),
+        "errors": list(result.errors or []),
+    }
+
+
+def inadmissible_receipts(
+    project_dir: str, state: Dict[str, Any]
+) -> Dict[str, Dict[str, Any]]:
+    """Every current story whose gating receipt exists, is bound to a
+    recorded dispatch, but fails validation.
+
+    #741. Mirrors `scrum_state_machine.verify_only_units`: an impure wrapper
+    that does the project_dir-dependent work (reading each stage's receipt
+    off disk) ONCE per `next_action` call, so the result can be threaded into
+    the pure `story_pipeline.next_action` as plain data instead of that
+    function reaching onto disk itself.
+
+    Keyed by story id rather than by (story id, role): `BLOCKED_FROM_ROLE`
+    names exactly one role per current stage, so one story has at most one
+    gating receipt to check per call.
+
+    `awaiting_acceptance` is skipped on purpose -- that stage's receipt is a
+    human Project Owner sign-off, not a producer/prover artifact this
+    predicate's retry ladder is built to recover, and is explicitly out of
+    scope for #741.
+
+    UNGOVERNED OR STILL-IN-FLIGHT RECEIPTS ARE NOT HITS HERE, by
+    `unadvanceable_receipt`'s own scoping (see its docstring): a story whose
+    stage was never dispatched through this kernel's `mcp_active_dispatches`
+    ledger, or whose bound attempt has not been recorded `completed`, keeps
+    refusing through `evaluate_advance`'s own `RECEIPT_INVALID` step exactly
+    as it did before #741.
+    """
+    hits: Dict[str, Dict[str, Any]] = {}
+    stories = state.get("current_stories") if isinstance(state, dict) else None
+    if not isinstance(stories, list):
+        return hits
+    for story in stories:
+        if not isinstance(story, dict):
+            continue
+        story_id = str(story.get("id") or "")
+        if not story_id:
+            continue
+        stage = str(story.get("state") or "")
+        if stage == "awaiting_acceptance":
+            continue
+        bound = BLOCKED_FROM_ROLE.get(stage)
+        if not bound:
+            continue
+        _, abbrev = bound
+        hit = unadvanceable_receipt(project_dir, story, abbrev)
+        if hit is not None:
+            hits[story_id] = hit
+    return hits
 
 
 def _history_for_write(story: dict, abbrev: str) -> Optional[List[Dict[str, Any]]]:
@@ -3375,11 +3559,18 @@ def _execute_dispatch_locked(
             archive_dir.mkdir(parents=True, exist_ok=True)
             receipt_digest = hashlib.sha256(failed_path.read_bytes()).hexdigest()
             digest = receipt_digest[:16]
-            archived = archive_dir / f"{failed_path.stem}.failed-{digest}.json"
+            # #741. The tag names WHY the predecessor could not stand, and
+            # "failed" is wrong for this one: the attempt that produced this
+            # receipt is not recorded dead (it may be `completed`), the
+            # receipt's own bytes are what the validator refused. Every other
+            # verdict keeps the existing `.failed-` tag unchanged -- no
+            # existing test asserting that pattern needs to change.
+            archive_tag = "invalid" if recovery.get("verdict") == RECEIPT_INVALID else "failed"
+            archived = archive_dir / f"{failed_path.stem}.{archive_tag}-{digest}.json"
             suffix = 1
             while archived.exists():
                 archived = archive_dir / (
-                    f"{failed_path.stem}.failed-{digest}-{suffix}.json"
+                    f"{failed_path.stem}.{archive_tag}-{digest}-{suffix}.json"
                 )
                 suffix += 1
             shutil.move(str(failed_path), str(archived))

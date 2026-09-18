@@ -1,0 +1,32 @@
+{
+  "task": "Implement task CRUD endpoints against the sealed contract",
+  "role": "software-engineer",
+  "accountable_role": "software-engineer",
+  "backend": "claude",
+  "model": "claude-runtime-reported-id",
+  "attempt_id": "att_01J6EVID01",
+  "dispatch_id": "1a2b3c4d5e6f708192a3b4c5d6e7f809",
+  "adapter_profile_id": "claude-local-v1",
+  "placement": "local",
+  "capability_profile": "producer",
+  "stage_profile": "producing",
+  "cycle_id": "003-9f2c41ab",
+  "manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "workstream_id": "api",
+  "source_revision": "cccccccccccccccccccccccccccccccccccccccc",
+  "fencing_token": "fixture-lease-generation-1",
+  "artifacts": [
+    "api/tasks.py"
+  ],
+  "verification_commands": [
+    "pytest tests/test_tasks_api.py -q"
+  ],
+  "evidence": [
+    {
+      "evidence_class": "replayed",
+      "command": "pytest tests/test_tasks_api.py -q",
+      "exit_code": 0
+    }
+  ],
+  "completed_at": "2026-09-02T09:00:00Z"
+}

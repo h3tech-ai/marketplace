@@ -87,6 +87,8 @@ os.environ.setdefault("SYNAPTORY_IDE", "codex")
 
 # The shared gate. Every advance/dispatch check lives here so all three hosts
 # enforce one contract; this server only supplies Codex-specific policy.
+from state_schema import state_schema  # noqa: E402
+
 import advance_kernel  # noqa: E402
 import runtime_contracts  # noqa: E402
 import mcp_transport  # noqa: E402
@@ -299,7 +301,7 @@ def _next_action(project: Path) -> dict[str, Any]:
 
 
 def _select_state(state: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    if state.get("version") == "3.0" and isinstance(state.get("specs"), dict):
+    if state_schema(state) == 3 and isinstance(state.get("specs"), dict):
         active = state.get("active_spec")
         if isinstance(active, str):
             selected = state["specs"].get(active)
@@ -510,7 +512,9 @@ def tool_get_status(arguments: dict[str, Any]) -> dict[str, Any]:
     selected, active_spec = _select_state(state)
     return {
         "detected": True,
-        "schema_version": state.get("version"),
+        "schema_version": f"{state_schema(state)}.0" if state_schema(state) else None,
+        "version": state.get("version"),
+        "state_schema": state_schema(state),
         "build_mode": state.get("build_mode") or selected.get("build_mode"),
         "active_spec": active_spec,
         "lifecycle_state": selected.get("lifecycle_state"),

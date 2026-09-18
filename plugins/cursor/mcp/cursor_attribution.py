@@ -60,7 +60,7 @@ def attribute_receipt_from_dispatch(
     receipt["ide"] = "cursor"
     receipt["plugin_version"] = plugin_version()
     model = receipt.get("model")
-    if not isinstance(model, str) or not model.strip():
+    if not isinstance(model, dict) and (not isinstance(model, str) or not model.strip()):
         receipt.pop("model", None)
     _atomic_json(path, receipt)
     return {

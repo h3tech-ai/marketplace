@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -283,6 +284,126 @@ def test_codex_package_and_catalog_present(fresh_build: Path, repo_root: Path):
     assert control_plane_url.read_text(encoding="utf-8").strip() == os.environ.get(
         "SYNAPTORY_CP_URL", "http://localhost:8080"
     ).rstrip("/")
+
+
+@pytest.mark.build
+def test_runtime_fixtures_table_ships_in_dist(fresh_build: Path):
+    """#739: the certified adapter-profile table must ship with the Claude
+    package.
+
+    `core/runtime-fixtures/` is a monorepo sibling of `core/lib`, not a child
+    of `plugin-claude/`, so the `rsync -aL "$PLUGIN_ROOT/" ...` that builds
+    this dist tree never touched it on its own. `runtime_selector` resolves
+    the table relative to its OWN module (`hooks/lib/` in every composed
+    package), so it must land beside that at `hooks/runtime-fixtures/` — the
+    same destination the Codex and Cursor composers already use. Without it,
+    a standalone Claude package denies every governed runtime dispatch with
+    `profile_mismatch` ("the certified profile table is not in this
+    installation") even though the pilot's reservation, seal, and policy are
+    all valid.
+    """
+    table = fresh_build / "hooks" / "runtime-fixtures" / "profiles.json"
+    assert table.is_file(), (
+        "the composed Claude package has no certified profile table at "
+        f"{table}, so its selector denies every governed dispatch"
+    )
+    records = json.loads(table.read_text(encoding="utf-8"))
+    records = records.get("profiles") if isinstance(records, dict) else records
+    assert records, table
+
+
+@pytest.mark.build
+def test_packaged_selector_selects_a_builtin_profile_outside_the_monorepo(
+    fresh_build: Path, tmp_path_factory
+):
+    """Package-level: runtime selection must work with NO monorepo checkout
+    nearby — this is the exact reproduction shape from #739 ("prepare the
+    standalone Claude package outside the monorepo").
+
+    Copies the freshly built dist package (already dereferenced by `rsync
+    -aL`, so it carries no symlinks back into `core/`) to a directory under
+    the system temp root — never inside this repo's working tree — and runs
+    `runtime_selector` there with `sys.path` pointing ONLY at the copied
+    `hooks/lib/`. If the module fell back to a path relative to the monorepo
+    (or the table were simply absent), this would fail the same way the real
+    pilot dispatch did: `profile_mismatch` / zero loaded profiles.
+    """
+    standalone_root = tmp_path_factory.mktemp("standalone-claude-package")
+    package = standalone_root / "claude"
+    shutil.copytree(fresh_build, package)
+
+    probe = (
+        "import sys, json;"
+        "sys.path.insert(0, sys.argv[1]);"
+        "import runtime_selector as rs;"
+        "pol = rs.parse_policy('build_mode: spq\\n"
+        "runtimes:\\n  enabled: true\\n  policy_version: 1\\n"
+        "  allowed_profiles:\\n    - claude-local-v1\\n');"
+        "res = rs.select_runtime(build_mode='spq', policy=pol,"
+        " request=rs.SelectionRequest(role='se'),"
+        " profiles=rs.load_profiles(''),"
+        " availability=(rs.Availability('claude-local-v1', True),));"
+        "print(json.dumps({'profiles': len(rs.load_profiles('')),"
+        " 'denied': res.denied, 'selected': res.selected}))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe, str(package / "hooks" / "lib")],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(standalone_root),  # no repo_root, no core/ sibling anywhere nearby
+    )
+    assert out.returncode == 0, out.stderr
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert result["profiles"] > 0, (
+        f"the packaged selector loaded no profiles outside the monorepo: {result!r}"
+    )
+    assert result["denied"] is False, (
+        f"the packaged selector denied an available built-in profile: {result!r}"
+    )
+    assert result["selected"] == "claude-local-v1", result
+
+
+@pytest.mark.build
+def test_packaged_selector_still_fails_closed_without_the_table(
+    fresh_build: Path, tmp_path_factory
+):
+    """The packaging fix is additive; the fail-closed refusal (#396) when the
+    table is genuinely missing must be unchanged.
+
+    Simulates a package built before this fix (or corrupted in transit) by
+    copying dist and deleting the fixtures directory, then asserts loading
+    profiles still raises loudly instead of silently returning zero profiles.
+    """
+    broken_root = tmp_path_factory.mktemp("standalone-claude-package-broken")
+    package = broken_root / "claude"
+    shutil.copytree(fresh_build, package)
+    shutil.rmtree(package / "hooks" / "runtime-fixtures")
+
+    probe = (
+        "import sys, json\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import runtime_selector as rs\n"
+        "try:\n"
+        "    rs.load_profiles('')\n"
+        "    print(json.dumps({'raised': False}))\n"
+        "except rs.InvalidRuntimeInput as exc:\n"
+        "    print(json.dumps({'raised': True, 'message': str(exc)}))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe, str(package / "hooks" / "lib")],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(broken_root),
+    )
+    assert out.returncode == 0, out.stderr
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert result["raised"] is True, (
+        "a package with no certified table must fail closed, not load zero "
+        f"profiles silently: {result!r}"
+    )
+    assert "certified profile table" in result["message"]
 
 
 @pytest.mark.build

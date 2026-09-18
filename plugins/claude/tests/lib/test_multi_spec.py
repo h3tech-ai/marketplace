@@ -83,7 +83,7 @@ def test_single_spec_state_round_trip(tmp_path: Path) -> None:
         "lifecycle_history": [],
     })
     view = sm.read_state(str(tmp_path))
-    assert view["version"] == "2.0"
+    assert view["state_schema"] == 2
     assert view["lifecycle_state"] == "INCEPTION"
     assert "_spec_id" not in view
 
@@ -303,7 +303,7 @@ def test_transition_story_preserves_envelope(tmp_path: Path) -> None:
 
     full = spec_state.read_full_state(str(tmp_path))
     # Envelope intact.
-    assert full.get("version") == "3.0"
+    assert full.get("state_schema") == 3
     assert set(full.get("specs", {})) == {"stars", "venue"}, (
         "inactive spec was deleted — envelope was flattened"
     )

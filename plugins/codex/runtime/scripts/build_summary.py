@@ -2,8 +2,11 @@
 """
 build_summary.py — Assemble pipeline-summary.json from .synaptory/ workspace.
 
-Reads pipeline-state.json, receipts, settings, rework-log, and context packages
-to produce a single canonical JSON that both PIPELINE.md and PIPELINE.html render from.
+Reads the board (through `pipeline_board.read_board`, never `pipeline-state.json`
+directly), receipts from every home, settings, rework-log, and context packages
+to produce a single canonical JSON that both PIPELINE.md and PIPELINE.html render
+from. The `board` block says whether a board was read at all, and from where —
+zeros with no stated reason are what #730 reported.
 
 Output: .synaptory/pipeline-summary.json
 Usage: python3 build_summary.py [project_dir] [--output path]
@@ -14,11 +17,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from summary.helpers import _now_iso, _read, _load_json, _ts_display
+from summary.helpers import _now_iso, _read, _ts_display
 from summary.receipts import normalize_receipt, extract_findings
 from summary.pipeline import (
     build_project, build_pipeline, build_dod_summary, build_verification,
     build_sprint_state, build_context_packages, build_open_items,
+    build_board_report, board_state, load_board,
     load_settings, load_config, load_receipts_raw,
 )
 from summary.sprint_detail import build_sprint_detail
@@ -27,11 +31,22 @@ from summary.sprint_detail import build_sprint_detail
 # ── Main assembler ───────────────────────────────────────────────────────────
 
 def assemble(project_dir: Path) -> dict:
-    """Assemble the canonical pipeline-summary.json."""
+    """Assemble the canonical pipeline-summary.json.
+
+    The board is read through `pipeline_board.read_board`, never by opening
+    `pipeline-state.json` directly. That file is the board only on the flat v2
+    layout: on the v3.0 Multi-Spec envelope the per-spec fields live under
+    `specs.<id>`, and on `build_mode: spq` it is a mode + identity pointer. The
+    raw read this replaces handed the envelope straight to `build_sprint_state`
+    / `build_dod_summary`, whose top-level lookups then found nothing, so a live
+    sprint with eight stories rendered as sprint 0 with zero stories and DoD
+    pending — emptiness reported as a measurement, with nothing saying the shape
+    had not been read (#730).
+    """
     settings = load_settings(project_dir)
     config = load_config(project_dir)
-    state_path = project_dir / ".synaptory" / ".orchestrator" / "pipeline-state.json"
-    state = _load_json(state_path)
+    board = load_board(project_dir)
+    state = board_state(board)
     rework_log = _read(project_dir / ".synaptory" / ".orchestrator" / "rework-log.md")
 
     # Load and normalize receipts
@@ -47,7 +62,8 @@ def assemble(project_dir: Path) -> dict:
         "generated_at": _now_iso(),
         "generated_at_display": _ts_display(_now_iso()),
         "project": build_project(project_dir, settings, config),
-        "pipeline": build_pipeline(state, receipts),
+        "board": build_board_report(board, project_dir),
+        "pipeline": build_pipeline(state, receipts, board),
         "dod_summary": build_dod_summary(state),
         "findings": extract_findings(receipts),
         "verification": build_verification(receipts),

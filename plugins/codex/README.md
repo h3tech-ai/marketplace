@@ -46,7 +46,10 @@ receipts reached Activity and Cost, and pipeline-computed DoD reached Quality.
 Treat this as the SPQ standard-project canary tier. The companion read-only
 `scripts/standard_pilot.py` combines installed-plugin doctor evidence with
 HTTPS health, latency, and fail-closed authentication probes for a
-representative deployment. Regulated/HC0 remains refused.
+representative deployment. Schema version 2 reports `ready_to_install` and
+`ready_to_dispatch` separately, including runtime profiles, capability roles,
+and verbatim refusal reasons from read-only runtime doctor. Exit zero requires
+both verdicts. Regulated/HC0 remains refused.
 
 The runtime target is Codex CLI `0.147.0` or newer.
 

@@ -48,7 +48,30 @@
       "research-advisor": "ra"
     },
     "story_id_pattern": "^[A-Z][A-Z0-9]*-\\d+$",
-    "filename_template": "{story_id}-{role_abbrev}.json"
+    "filename_template": "{story_id}-{role_abbrev}.json",
+    "model_identity": {
+      "version": 1,
+      "typed_required_fields": [
+        "runtime_family",
+        "runtime_version",
+        "model_route"
+      ],
+      "kinds": [
+        "vendor_id",
+        "display_name",
+        "unreported"
+      ],
+      "legacy_string_kind": "legacy_untyped",
+      "source_kinds": {
+        "claude-code.system.init.model": "vendor_id",
+        "cursor-agent.system.init.model": "display_name"
+      },
+      "evidence_classes": {
+        "vendor_id": "runtime-reported-vendor-id",
+        "display_name": "runtime-reported-display-name",
+        "unreported": "runtime-only"
+      }
+    }
   },
   "stages": {
     "valid": [

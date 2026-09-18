@@ -58,6 +58,10 @@ whether deleting the record would change whether a Cycle may close.
 
 from __future__ import annotations
 
+from product_version import product_version
+
+from state_schema import with_state_metadata
+
 import json
 import os
 import subprocess
@@ -68,6 +72,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import advance_kernel  # noqa: E402
 import cycle_lifecycle as _lifecycle  # noqa: E402
 import cycle_records as _records  # noqa: E402
 import host_env  # noqa: E402
@@ -142,7 +147,8 @@ def _write_pointer(project_dir: str, identity_fields: dict[str, Any]) -> None:
     path = _pointer_path(project_dir)
     with _store.transaction(_paths.lock_for(path)):
         pointer = _store.read_json(path)
-        pointer["version"] = "2.0"
+        pointer["version"] = product_version()
+        pointer["state_schema"] = 2
         pointer["build_mode"] = "spq"
         spq = pointer.get("spq")
         if not isinstance(spq, dict):
@@ -169,7 +175,8 @@ def _write_engagement(project_dir: str, fields: dict[str, Any]) -> None:
     path = _pointer_path(project_dir)
     with _store.transaction(_paths.lock_for(path)):
         pointer = _store.read_json(path)
-        pointer["version"] = "2.0"
+        pointer["version"] = product_version()
+        pointer["state_schema"] = 2
         pointer["build_mode"] = "spq"
         engagement = pointer.get("engagement")
         if not isinstance(engagement, dict):
@@ -196,7 +203,7 @@ def _board_path(project_dir: str, cycle_id: str) -> str:
 
 def _default_board() -> dict[str, Any]:
     return {
-        "version": "3.0",
+        "version": product_version(), "state_schema": 3,
         "build_mode": "spq",
         "lifecycle_state": "DISCOVERY",
         "started_at": _now(),
@@ -280,7 +287,7 @@ def _write_state(project_dir: str, state: dict[str, Any]) -> None:
     body = {k: v for k, v in state.items() if not k.startswith("_")}
     path = _board_path(project_dir, cycle_id)
     with _store.transaction(_paths.lock_for(path)):
-        _store.write_json_atomic(path, body)
+        _store.write_json_atomic(path, with_state_metadata({**body, "state_schema": 3}))
     _write_pointer(
         project_dir,
         {"cycle_id": cycle_id, "cycle_seq": _paths.seq_of(cycle_id)},
@@ -702,8 +709,32 @@ def open_cycle(
     _found = _records.problems(declaration)
     if _found:
         raise _records.DeclarationError(_found)
+    import advance_kernel as _ak
     import region_registry as _registry
 
+    # PASS THE PROJECT EXPLICITLY RATHER THAN LEANING ON THE CLI'S OWN
+    # cwd-based DEFAULT (#738). `region_registry.reserve` forwards `project`
+    # as `--project` when it is non-empty, which is authoritative on the CLI
+    # side and skips its implicit resolution (session cache, then
+    # `.synaptory.yaml`) entirely. `_ak._project_slug` is the same
+    # `SYNAPTORY_PROJECT_ID` -> `project_id:` reader `advance_kernel` already
+    # uses to address attempts and receipts at this project, so a Cycle
+    # reserves a region under the identical slug a receipt would ship under.
+    #
+    # This project resolution is a Cycle-scoped concern (`open_cycle` reserves
+    # the region, `_project_slug` names the project the reservation is scoped
+    # to), so it belongs here rather than as a generic default inside
+    # `region_registry.reserve` -- a caller that reserves for a DIFFERENT
+    # project than its own `.synaptory.yaml` (there is none today, but the
+    # signature allows it) must not have that overridden by a default it
+    # never asked for.
+    #
+    # When this resolves to "" (no `project_id:` in `.synaptory.yaml` and no
+    # `SYNAPTORY_PROJECT_ID`), `reserve` falls through to the CLI's own
+    # implicit resolution unchanged, which is exactly the case the CLI-side
+    # fix in `resolveRegionProject` (mirroring `resolveShipProject`'s
+    # same-repo-guarded cache lookup) now also fails closed on rather than
+    # trusting a stale, cross-repository session cache.
     _reservation = _registry.reserve(
         project_dir,
         cycle_id=allocated,
@@ -711,6 +742,7 @@ def open_cycle(
         region=list(declaration["source_region"]),
         engineering_lead=str(declaration["engineering_lead"]),
         path_grammar=_records.path_scope.GRAMMAR_VERSION,
+        project=_ak._project_slug(project_dir),
     )
     _registry.assert_admissible(_reservation)
     # EVERYTHING PAST THE RESERVATION IS COMPENSATED. A Commit that reserves
@@ -844,7 +876,14 @@ def open_cycle(
         _paths.record_cycle(project_dir, allocated, seq=seq, goal=goal)
     except Exception:
         if _reservation.get("outcome") == _registry.RESERVED:
-            _registry.release(project_dir, cycle_id=allocated)
+            # SAME EXPLICIT PROJECT AS THE RESERVE ABOVE (#738). A compensating
+            # release that resolved a DIFFERENT project than the reservation it
+            # is undoing would miss it entirely, leaving this failed Commit's
+            # region held under the real project while emptying nothing under
+            # whatever the CLI's own implicit default separately names.
+            _registry.release(
+                project_dir, cycle_id=allocated, project=_ak._project_slug(project_dir)
+            )
         raise
     _write_state(project_dir, state)
 
@@ -1909,9 +1948,18 @@ def close_cycle(
     # holder by id and can be released by hand, which is the recoverable side
     # of the trade -- the opposite of `open_cycle`, where proceeding without an
     # answer is what cannot be recovered.
+    import advance_kernel as _ak
     import region_registry as _registry
 
-    _released = _registry.release(project_dir, cycle_id=cycle_id)
+    # SAME EXPLICIT PROJECT AS THE RESERVE THAT OPENED THIS CYCLE (#738).
+    # `release` and `reserve` must scope the same claim under the same
+    # project, or a release computed from a DIFFERENT implicit resolution
+    # than the reservation it is meant to give back leaves the original
+    # holder in place under one project while this call empties a different,
+    # unrelated one.
+    _released = _registry.release(
+        project_dir, cycle_id=cycle_id, project=_ak._project_slug(project_dir)
+    )
     return {
         "ok": True,
         "cycle_id": cycle_id,
@@ -2177,6 +2225,14 @@ def next_action(project_dir: str, **kwargs: Any) -> dict[str, Any]:
         # The SAME `state` object `next_action` iterates, so the two cannot
         # disagree about which units are on the board.
         verify_only=_verify_only_units(project_dir, state),
+        # #741 -- a live (or never-bound) attempt whose canonical receipt
+        # still fails schema validation is not advanceable either, and
+        # `_attempt_loop`'s liveness check alone cannot see it (a `completed`
+        # attempt is exactly the one that state records as fine). Threading
+        # the SAME `state` this call already iterates keeps the two from
+        # disagreeing about which units are on the board -- see the parameter
+        # `state=` override two calls up, which this inherits automatically.
+        inadmissible_receipts=advance_kernel.inadmissible_receipts(project_dir, state),
         # #487 -- the compliance obligation, DECLARED on the dispatch contract
         # rather than discovered at the gate. SPQ is the only lifecycle that
         # passes this (`_attach_compliance_declaration` no-ops without it, and

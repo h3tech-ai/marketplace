@@ -326,3 +326,17 @@ def test_the_agent_tool_alias_set_is_recorded_where_a_reader_will_find_it() -> N
     assert "InputValidationError" in text
     for alias in ("sonnet", "opus", "haiku", "fable"):
         assert alias in text
+
+
+def test_typed_vendor_id_is_compared_literally(checker, pins):
+    receipt = _receipt()
+    receipt["model"] = {"kind": "vendor_id", "value": receipt["model"]}
+    assert checker.check_receipt(receipt, pins) == []
+
+
+@pytest.mark.parametrize("kind", ["display_name", "unreported"])
+def test_non_vendor_identity_is_not_pin_drift_or_a_match(checker, pins, kind):
+    receipt = _receipt()
+    receipt["model"] = {"kind": kind, "value": receipt["model"]}
+    problems = checker.check_receipt(receipt, pins)
+    assert len(problems) == 1 and problems[0].startswith("NOT COMPARABLE:")

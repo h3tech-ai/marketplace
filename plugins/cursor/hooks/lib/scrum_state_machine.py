@@ -29,6 +29,10 @@ CLI:
 
 from __future__ import annotations
 
+from product_version import product_version
+
+from state_schema import state_schema
+
 import json
 import os
 import sys
@@ -41,6 +45,7 @@ from typing import Any
 # back to the SYNAPTORY_ACTIVE_SPEC env var, then to the file's `active_spec`.
 import spec_state as _ss
 import host_env
+import advance_kernel
 
 # Import shared story pipeline (same directory).
 from story_pipeline import (
@@ -118,7 +123,7 @@ def _resolve_spec_id(spec_id: str | None) -> str | None:
 
 def _default_state() -> dict[str, Any]:
     return {
-        "version": "2.0",
+        "version": product_version(), "state_schema": 2,
         "build_mode": "scrum",
         "lifecycle_state": "INCEPTION",
         "started_at": _now(),
@@ -140,9 +145,10 @@ def _default_state() -> dict[str, Any]:
 
 
 def _default_spec_substate() -> dict[str, Any]:
-    """Per-spec state slot in a v3 multi-spec file (no `version` / `build_mode`)."""
+    """Per-spec slot without envelope version, state_schema, or build_mode."""
     s = _default_state()
     s.pop("version", None)
+    s.pop("state_schema", None)
     s.pop("build_mode", None)
     return s
 
@@ -176,7 +182,7 @@ def read_state(project_dir: str, spec_id: str | None = None) -> dict[str, Any]:
         return state
 
     # v2 flat layout
-    if full.get("version") != "2.0" or "lifecycle_state" not in full:
+    if state_schema(full) != 2 or "lifecycle_state" not in full:
         raise ValueError(
             "Unrecognized state format — expected v2.0 with lifecycle_state. "
             "Run 'init' to start fresh."
@@ -209,9 +215,9 @@ def initialize(
     if sid:
         # Multi-spec init: upsert this spec's slot.
         if not full:
-            full = {"version": "3.0", "build_mode": "scrum",
+            full = {"version": product_version(), "state_schema": 3, "build_mode": "scrum",
                     "active_spec": sid, "specs": {}}
-        elif full.get("version") == "2.0":
+        elif state_schema(full) == 2:
             # Refuse to silently clobber a v2 file — caller must migrate first.
             raise ValueError(
                 "Cannot initialize a v3 spec slot in a v2 file. Run the "
@@ -851,6 +857,7 @@ def next_action(project_dir: str) -> dict[str, Any]:
         dep_context=dep_context(project_dir, state),
         dependency_gate=dependency_gate_mode(project_dir),
         verify_only=verify_only_units(project_dir, state),
+        inadmissible_receipts=advance_kernel.inadmissible_receipts(project_dir, state),
     )
     # #501 follow-up — swap the tier-only `dod` block for the per-story
     # contract the gate will actually enforce. Lives here, not in
@@ -882,7 +889,7 @@ def transition_to_kanban(project_dir: str) -> dict[str, Any]:
     ) + len(state.get("current_stories", []))
 
     kanban_state: dict[str, Any] = {
-        "version": "2.0",
+        "version": product_version(), "state_schema": 2,
         "build_mode": "kanban",
         "lifecycle_state": "READY",
         "started_at": _now(),

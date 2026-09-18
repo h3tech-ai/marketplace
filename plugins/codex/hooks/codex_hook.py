@@ -34,6 +34,8 @@ if not (HOOK_LIB / "receipt_validator.py").is_file():
 if str(HOOK_LIB) not in sys.path:
     sys.path.insert(0, str(HOOK_LIB))
 
+from state_schema import state_schema  # noqa: E402
+
 from auth_gate import (  # noqa: E402
     _cli_path,
     authentication_block_message,
@@ -123,7 +125,7 @@ def _read_state(project: Path) -> dict[str, Any]:
 
 
 def _select_state(state: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    if state.get("version") == "3.0" and isinstance(state.get("specs"), dict):
+    if state_schema(state) == 3 and isinstance(state.get("specs"), dict):
         active = state.get("active_spec")
         if isinstance(active, str):
             selected = state["specs"].get(active)

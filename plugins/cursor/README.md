@@ -111,3 +111,29 @@ Layer-2 drift tests fail CI if `plugin-claude/` changed and generated files here
 1. Local symlink as above.
 2. `/synaptory status` on a project with `build_mode: spq`.
 3. One SPQ Cycle (hydrate → SE→QE→CR → `declare_sync_ready` → Sync) on a scratch project. Scrum/Kanban is uncertified on Cursor — expect a warning recommending SPQ.
+
+
+## Staff-pilot readiness
+
+Run against a representative HTTPS deployment:
+
+```bash
+python3 <installed-plugin>/scripts/standard_pilot.py \
+  --project-dir <project> \
+  --deployment-health-url https://app.example.test/health \
+  --protected-url https://app.example.test/private
+```
+
+Schema version 2 replaces the single `result` with independent
+`ready_to_install` (existing plugin and deployment checks) and
+`ready_to_dispatch` (at least one runtime profile can serve a capability role).
+`dispatch.profiles` includes each profile's roles, availability and the exact
+probe reason used by the selector; `dispatch.available_roles` identifies the
+roles that can run. Availability does not authorize a particular dispatch or
+certify every lifecycle role. Exit zero requires both verdicts.
+
+Runtime checks use the installation's CLI with `runtimes doctor --read-only`;
+they never register a runner or update the project availability snapshot.
+An older CLI, missing binary, timeout or invalid output leaves dispatch
+readiness false with `dispatch.checked: false` and `dispatch.error`, while
+preserving the installation verdict. Upgrade the CLI together with the plugin.

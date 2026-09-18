@@ -90,7 +90,7 @@ Read `.synaptory.yaml` for project config.
    }])
    ```
 
-5. **Write `.synaptory.yaml`** from template `Shell("synaptory skills get templates/synaptory.yaml.tmpl")`, filling in detected values. Continue with analysis.
+5. **Write `.synaptory.yaml`** from template `Shell("synaptory skills get templates/synaptory.yaml.tmpl")`, filling in detected values. Resolve `{{PRODUCT_VERSION}}` by running `python3 "${PLUGIN_ROOT}/hooks/lib/product_version.py"` from the executing plugin and use its exact output as the top-level `version`. If release metadata is unavailable, report that error before writing config. Continue with analysis.
 
 ### 1b. Detect Existing Context Packages
 

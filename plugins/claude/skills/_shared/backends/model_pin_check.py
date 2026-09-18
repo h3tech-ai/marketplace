@@ -9,8 +9,9 @@ copies the file into ``build-metadata.json`` as an AI bill of materials.
 
 That record is INTENT, not execution provenance, and HC0-F2 is decided NOT
 DELIVERABLE IN V1 (#596). Nothing on a dispatch path reads this file, the Agent
-tool accepts tier aliases only, and a receipt's model field is written by the
-dispatched agent about itself. This header used to describe every pinned id as
+tool accepts tier aliases only, and a legacy receipt's model field is written by the
+dispatched agent about itself. Typed bridge identities instead record runtime
+metadata, which remains a runtime self-report. This header used to describe every pinned id as
 evidence of the weights that ran, and to promise a regulated customer an
 audit-to-audit reproduction guarantee. Both were false in the same way.
 
@@ -35,20 +36,25 @@ does that. A finding from this module is therefore now a NEW observation, and
 the fix is to re-measure the alias and record a fresh decision, never to widen
 the accepted set until the finding stops firing.
 
+TYPED IDENTITY (#705)
+---------------------
+Only vendor_id values are compared against vendor-ID pins. display_name and
+unreported return NOT COMPARABLE, never a matching pin or a drift claim. Legacy
+bare strings keep the historical literal comparison, explicitly untyped; a
+match supplies no new attribution. All values remain runtime self-reports.
+
 WHAT IT REFUSES, AND WHAT IT CANNOT
 -----------------------------------
 It refuses a receipt whose ``model`` is **absent from the pin file** -- the
 drift case, which is exactly what #409's run hit and what nothing caught.
 
-It does **not** refuse a forged model string. The value it reads is written by
-the dispatched subagent itself, from the authored prompt line
-``model: (the model you are running on)``. A receipt that names
-``claude-opus-4-8`` while the dispatch really ran on ``claude-opus-5`` passes
-every check here and every check in ``receipt_validator.validate_receipt``,
-which only requires ``model`` to be a non-empty string whose family does not
-contradict ``backend``. The authoritative value lives in the host's own
-transcript / ``modelUsage`` accounting, which no part of this plugin reads.
-A presence check is not an authorization check (#493).
+It does **not** verify the weights behind a reported model string. Legacy
+strings were written by subagents about themselves; new bridge receipts carry
+source-typed runtime metadata. A literal match here verifies neither source nor
+execution. Structural kind/source/version checks belong to the shared receipt
+validator. Even a valid typed vendor ID is a runtime self-report, not independent
+provider attestation. A presence or equality check is not an authorization check
+(#493).
 
 Variant handling is **data-driven on purpose**: the accepted set is each tier's
 ``model_id`` plus its declared ``runtime_variants``, nothing more. The file's
@@ -86,7 +92,7 @@ _TIER_ROW = re.compile(
 #: Backends whose receipts are governed by this file. ``model-pins.json``
 #: describes itself as pins "for plugin-claude/", so a Codex or Cursor receipt
 #: is out of scope rather than non-conformant.
-GOVERNED_BACKENDS = frozenset({"claude"})
+GOVERNED_BACKENDS = frozenset({"claude", "claude-code"})
 
 
 def load_pins(path: Optional[str] = None) -> Dict[str, dict]:
@@ -178,6 +184,15 @@ def check_receipt(receipt: dict, pins: Optional[Dict[str, dict]] = None) -> List
 
     problems = []
     model = receipt.get("model")
+    if isinstance(model, dict):
+        kind = model.get("kind")
+        if kind in {"display_name", "unreported"}:
+            return [f"NOT COMPARABLE: {kind} cannot be compared against vendor-ID pins; no model-specific claim is supported"]
+        if kind != "vendor_id":
+            return ["NOT COMPARABLE: unknown model identity kind"]
+        model = model.get("value")
+    # A bare string retains the historical literal comparison only. Matching
+    # does not upgrade legacy-untyped attribution or verify execution weights.
     problem = check_model(model if isinstance(model, str) else "", pins)
     if problem:
         problems.append(problem)
@@ -239,7 +254,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             for problem in problems:
                 print(f"{path}: {problem}")
         else:
-            print(f"{path}: ok ({receipt.get('model')})")
+            label = "legacy-untyped literal match" if isinstance(receipt.get("model"), str) else "vendor-id literal match"
+            if receipt.get("backend") not in GOVERNED_BACKENDS:
+                label = "out of scope"
+            print(f"{path}: {label} ({receipt.get('model')})")
     return 1 if failed else 0
 
 

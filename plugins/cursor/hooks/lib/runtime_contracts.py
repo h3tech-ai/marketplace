@@ -1069,6 +1069,9 @@ def validate_receipt_attempt_binding(receipt: Any) -> List[str]:
     problems: List[str] = []
     if not isinstance(receipt, dict):
         return ["receipt: not an object"]
+    if isinstance(receipt.get("model"), dict) or "model_identity_version" in receipt:
+        from model_identity import identity_problems
+        problems.extend(identity_problems(receipt))
     attempt_id = receipt.get("attempt_id")
     if not isinstance(attempt_id, str) or not ATTEMPT_ID_RE.match(attempt_id or ""):
         problems.append("attempt_id: required, matching %s" % ATTEMPT_ID_RE.pattern)

@@ -1,0 +1,625 @@
+[
+  {
+    "name": "claude-code",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "claude-code missing runtime_version",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code missing runtime_family",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code missing model_route",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code missing model_identity_version",
+    "receipt": {
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code invented source",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "agent.prose",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code inflated evidence",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "verified-weights",
+        "value": "claude-opus-5[1m]"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "cursor-agent missing runtime_version",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent missing runtime_family",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent missing model_route",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model": {
+        "kind": "display_name",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent missing model_identity_version",
+    "receipt": {
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent invented source",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "agent.prose",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent inflated evidence",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "verified-weights",
+        "value": "Claude Sonnet 4.6 200K Medium"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "codex missing runtime_version",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex missing runtime_family",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex missing model_route",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex missing model_identity_version",
+    "receipt": {
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex invented source",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "agent.prose",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex inflated evidence",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "verified-weights"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code absence",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "claude-code.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "cursor-agent absence",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "cursor-agent.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "legacy claude-opus-5",
+    "receipt": {
+      "model": "claude-opus-5"
+    },
+    "valid": true
+  },
+  {
+    "name": "legacy Claude Sonnet 4.6 200K Medium",
+    "receipt": {
+      "model": "Claude Sonnet 4.6 200K Medium"
+    },
+    "valid": true
+  },
+  {
+    "name": "legacy codex-runtime-unattributed",
+    "receipt": {
+      "model": "codex-runtime-unattributed"
+    },
+    "valid": true
+  },
+  {
+    "name": "legacy ",
+    "receipt": {
+      "model": ""
+    },
+    "valid": true
+  },
+  {
+    "name": "placeholder unknown",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "unknown"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "placeholder runtime-default",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "runtime-default"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "placeholder claude-runtime-unattributed",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-runtime-unattributed"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "cursor-agent wrong kind",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "cursor-agent",
+      "runtime_version": "2026.09.10-fd3934a",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "cursor-agent.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "claude-code wrong kind",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "display_name",
+        "source": "claude-code.system.init.model",
+        "evidence_class": "runtime-reported-display-name",
+        "value": "claude-opus-5"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "codex wrong kind",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "vendor_id",
+        "source": "codex.system.init.model",
+        "evidence_class": "runtime-reported-vendor-id",
+        "value": "claude-opus-5"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "absence with value gpt-6",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only",
+        "value": "gpt-6"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "absence with value None",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only",
+        "value": null
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "wrong version 2",
+    "receipt": {
+      "model_identity_version": 2,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "wrong version True",
+    "receipt": {
+      "model_identity_version": true,
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "wrong version 1",
+    "receipt": {
+      "model_identity_version": "1",
+      "runtime_family": "codex",
+      "runtime_version": "codex-cli 0.153.4",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": {
+        "kind": "unreported",
+        "source": "codex.stream",
+        "evidence_class": "runtime-only"
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "downgrade versioned object to string",
+    "receipt": {
+      "model_identity_version": 1,
+      "runtime_family": "claude-code",
+      "runtime_version": "2.1.270 (Claude Code)",
+      "model_route": {
+        "requested": "policy-default"
+      },
+      "model": "claude-opus-5"
+    },
+    "valid": false
+  }
+]

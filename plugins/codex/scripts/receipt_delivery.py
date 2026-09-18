@@ -51,6 +51,9 @@ SAFE_SCALAR_FIELDS = (
     # has to be visible.
     "attempt_id",
     "adapter_profile_id",
+    "model_identity_version",
+    "runtime_family",
+    "runtime_version",
 )
 
 
@@ -130,6 +133,13 @@ def analytics_projection(receipt: dict[str, Any], source_digest: str) -> dict[st
         value = receipt.get(key)
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
             projected[key] = value
+
+    # Preserve typed attribution without admitting arbitrary nested content.
+    for field, keys in (("model", ("kind", "value", "source", "evidence_class")),
+                        ("model_route", ("requested", "resolved_model_id"))):
+        value = receipt.get(field)
+        if isinstance(value, dict):
+            projected[field] = {key: value[key] for key in keys if isinstance(value.get(key), str)}
 
     token_usage = receipt.get("token_usage")
     if isinstance(token_usage, dict):

@@ -191,19 +191,31 @@ AWARE = {
     "plugin-claude/hooks/synaptory-session-start.sh": (
         "renders through pipeline_board.py restore (#514)"
     ),
+    "core/scripts/build_summary.py": (
+        "assemble() reads through pipeline_board.read_board, and renders the "
+        "board's own `available` / `problems` into summary['board'] and "
+        "pipeline['state_available'] — so a board that was not read cannot be "
+        "rendered as an empty one (#730). Was BLIND until that fix; probed by "
+        "test_build_summary_sees_the_real_board below, and on the v3 Multi-Spec "
+        "migration path by test_build_summary_multispec.py"
+    ),
+    "core/scripts/summary/pipeline.py": (
+        "load_board/board_state route every builder through the accessor; "
+        "_states_for IMPORTS SPQ_STATES from the state machine that owns them "
+        "instead of falling through to KANBAN_STATES, and reports an unknown "
+        "mode as no stages rather than as Kanban's six; receipt_dirs globs all "
+        "three receipt homes (flat / specs/<id>/receipts / "
+        "spq/cycles/<id>/receipts) (#730).\n"
+        "Multi-Spec scope, stated because it is a choice and not an oversight: "
+        "board_state reports the ACTIVE spec's slot, since a sprint number and "
+        "a sprint goal belong to one spec and merging slots would invent a "
+        "project-wide sprint that does not exist. The other specs are not "
+        "dropped — build_board_report names every one with its own lifecycle "
+        "and counts, which test_build_summary_multispec.py pins"
+    ),
 }
 
 BLIND = {
-    "core/scripts/build_summary.py": (
-        "assemble() loads the pointer, so PIPELINE.md / PIPELINE.html / "
-        "`/synaptory status` render lifecycle_state=UNKNOWN, every Kanban stage "
-        "pending, and sprint=null on a live Cycle"
-    ),
-    "core/scripts/summary/pipeline.py": (
-        "build_pipeline()/build_dod_summary()/build_sprint_state() are handed the "
-        "pointer by build_summary.py; build_mode 'spq' falls through to "
-        "KANBAN_STATES"
-    ),
     "core/lib/update_claude_md.py": (
         "the CLAUDE.md sentinel — whose entire purpose is post-compaction "
         "pipeline awareness — anchors to lifecycle_state='' / current_sprint=0. "
@@ -586,16 +598,109 @@ def test_verify_all_sees_the_real_board(real_spq_project: Path):
     )
 
 
-def test_build_summary_is_still_blind(real_spq_project: Path):
+def test_build_summary_sees_the_real_board(real_spq_project: Path):
+    """Was `test_build_summary_is_still_blind` until #730 closed it.
+
+    The second time this mechanism has done its job (after #529 / verify_all).
+    The declaration asserted `lifecycle_state == "UNKNOWN"` on a live Cycle with
+    two admitted units, and it failed the moment `assemble()` started reading
+    through `pipeline_board.read_board` — which is what forced its removal.
+
+    #730 was filed against the v3.0 Multi-Spec layout, not SPQ. It closes both
+    because the fix is the accessor rather than a second layout branch, and this
+    probe is what proves the SPQ half rather than predicting it.
+    """
     import build_summary
 
     summary = build_summary.assemble(real_spq_project)
-    if summary["pipeline"]["lifecycle_state"] != "UNKNOWN":
-        pytest.fail(
-            "build_summary.assemble now reads the SPQ board — delete its BLIND "
-            "entry (and summary/pipeline.py's) in test_board_reader_census.py. "
-            "Got %r" % (summary["pipeline"]["lifecycle_state"],)
-        )
+    assert summary["pipeline"]["lifecycle_state"] == "CYCLE"
+    assert summary["pipeline"]["build_mode"] == "spq"
+    assert summary["pipeline"]["state_available"] is True
+    assert summary["board"]["layout"] == "spq"
+    assert summary["dod_summary"]["stories_total"] == 2, (
+        "a live Cycle's admitted units must reach the DoD rollup; got %r"
+        % (summary["dod_summary"],)
+    )
+    # A sprint is a scrum object. Reporting one here would be worse than
+    # reporting none.
+    assert "sprint" not in summary
+
+    stage_names = [s["name"] for s in summary["pipeline"]["stages"]]
+    assert "DISCOVERY" in stage_names and "CYCLE" in stage_names, (
+        "SPQ stages must come from SPQ_STATES; falling through to KANBAN_STATES "
+        "drew six Kanban stages, all pending, for a lifecycle with none of "
+        "them. Got %r" % (stage_names,)
+    )
+    assert "EXECUTION" not in stage_names, stage_names
+
+
+def test_build_summary_counts_receipts_in_the_cycle_home(
+    real_spq_project: Path, repo_root: Path, monkeypatch
+):
+    """A receipt in the Cycle's own home is counted, not truncated away.
+
+    The flat `.orchestrator/receipts` glob saw none of them, so everything
+    derived from receipts — findings, verification commands, agent metrics —
+    was silently zero on SPQ, the same truncation #730 measured on Multi-Spec
+    (18 of 116 visible).
+    """
+    for entry in _paths_for(repo_root):
+        if entry not in sys.path:
+            monkeypatch.syspath_prepend(entry)
+    import build_summary
+    import spq_paths
+    import pipeline_board
+
+    board = pipeline_board.read_board(str(real_spq_project))
+    cycle_id = board.identity["cycle_id"]
+    home = Path(spq_paths.receipts_dir(str(real_spq_project), cycle_id))
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "WU-1-se.json").write_text(json.dumps({
+        "task": "index writer", "agent": "software-engineer", "backend": "claude",
+        "model": "sonnet", "artifacts": ["api/wu-1/index.py"],
+        "verification_commands": ["pytest api/wu-1"],
+    }), encoding="utf-8")
+
+    summary = build_summary.assemble(real_spq_project)
+    assert len(summary["receipts_normalized"]) == 1, summary["receipts_normalized"]
+    assert summary["receipts_normalized"][0]["_cycle_id"] == cycle_id
+    assert summary["verification"]["commands"], (
+        "verification commands are derived from receipts; a receipt home the "
+        "reader never opens zeroes them without saying so"
+    )
+
+
+def test_build_summary_reports_an_unreadable_board_instead_of_an_empty_one(
+    tmp_path: Path, repo_root: Path, monkeypatch
+):
+    """The distinction the whole ticket turns on.
+
+    #730's own words: the dashboard "reads as no work in progress rather than
+    cannot read this state shape". An SPQ project still on the retired v3.0
+    envelope has no board to read, and the summary must say so rather than
+    render zeros that look like a measurement.
+    """
+    for entry in _paths_for(repo_root):
+        if entry not in sys.path:
+            monkeypatch.syspath_prepend(entry)
+    import build_summary
+
+    project = tmp_path / "unmigrated"
+    orch = project / ".synaptory" / ".orchestrator"
+    orch.mkdir(parents=True)
+    (orch / "pipeline-state.json").write_text(json.dumps({
+        "version": "3.0", "build_mode": "spq",
+        "lifecycle_state": "CYCLE_EXECUTION", "current_cycle": 1,
+    }), encoding="utf-8")
+
+    summary = build_summary.assemble(project)
+    assert summary["board"]["available"] is False
+    assert summary["pipeline"]["state_available"] is False
+    problems = " ".join(summary["board"]["problems"])
+    assert "retired v3.0" in problems and "ADR-035" in problems, problems
+    assert summary["pipeline"]["state_problems"], (
+        "zeros with no stated reason are exactly what #730 reported"
+    )
 
 
 def test_measure_is_still_blind(real_spq_project: Path):

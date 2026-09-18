@@ -402,3 +402,115 @@ class TestOnePredicateTwoReaders:
         _receipt(project)
         assert ak.unadvanceable_attempt(_story(project), "se") is None
         assert ak.next_action(str(project))["transition_to"] == "testing"
+
+
+class TestInadmissibleReceiptRecovery:
+    """#741 -- a receipt can be unadvanceable for a reason `unadvanceable_attempt`
+    cannot see: its ATTEMPT is perfectly live (state stayed `completed`, which
+    is deliberately excluded from `_ATTEMPT_NOT_LIVE_STATES`), but the receipt's
+    own bytes fail schema validation -- the pilot #714 shape, where `evidence`
+    was filed as an object instead of a list of typed items.
+
+    Same fix shape as #690: one predicate (`unadvanceable_receipt`), one
+    aggregator (`inadmissible_receipts`) threaded as data into the pure
+    `next_action`, and the SAME H3-F1 ladder / `RETRY_ATTEMPT` classification
+    #690 already wired end to end -- confirmed decisions, not a second
+    recovery concept. NO AUTO-REPAIR: the malformed receipt is archived, never
+    rewritten.
+    """
+
+    def test_a_completed_attempt_with_an_invalid_receipt_gets_a_recovery(
+        self, tmp_path
+    ):
+        """The regression the issue asks for, mirroring #690's own shape:
+        `next_action` now recommends a governed recovery instead of the
+        ordinary advance, and `begin_dispatch` authorizes the successor that
+        recovery calls for -- no deadlock, no hand-edited state.
+        """
+        project = _deadlocked(tmp_path, attempt_state="completed")
+        # Overwrite the receipt with the pilot #714 shape: `evidence` present
+        # as an object rather than a list of typed items.
+        _receipt(
+            project,
+            dispatch_id=DISPATCH_ID,
+            attempt_id=DEAD_ATTEMPT,
+            evidence={"note": "not a list"},
+        )
+
+        # The attempt itself is live by #690's own predicate -- this is a
+        # DIFFERENT reason the receipt cannot advance.
+        assert ak.unadvanceable_attempt(_story(project), "se") is None
+
+        selected = ak.next_action(str(project))
+        assert selected["action"] == "dispatch_se"
+        assert selected["receipt_present"] is True
+        assert selected["transition_to"] is None
+        recovery = selected["recovery"]
+        assert recovery is not None
+        assert recovery["verdict"] == sp.RECEIPT_INADMISSIBLE_VERDICT
+        assert recovery["role"] == "se"
+        assert recovery["receipt_digest"]
+        assert any("evidence" in e for e in recovery["errors"])
+
+        # `advance` still refuses the malformed predecessor -- fail-closed,
+        # per the issue's explicit expectation.
+        refused = ak.execute_advance(
+            str(project),
+            "US-001",
+            "testing",
+            policy=_policy(require_next_action_match=False),
+        )
+        assert not refused.allowed
+        assert refused.code == ak.RECEIPT_INVALID
+
+        # `begin_dispatch` authorizes a successor: the waiver is verdict-
+        # agnostic (#690's own machinery), and the successor reuses the SAME
+        # retry-ladder classification a dead-attempt recovery would.
+        granted = ak.execute_dispatch(str(project), "US-001", role="se", policy=_policy())
+        assert granted.allowed, granted.reason
+        contract = granted.extra["receipt_contract"]
+        successor = contract["attempt_id"]
+        assert successor and successor != DEAD_ATTEMPT
+        assert contract["classification"] == ak.RETRY_ATTEMPT
+        assert contract["prior_attempt_id"] == DEAD_ATTEMPT
+
+        # The invalid receipt's bytes are archived -- never edited, never
+        # deleted -- and tagged `.invalid-`, not `.failed-`: its attempt was
+        # never recorded dead, only its evidence was refused.
+        archived = Path(granted.extra["archived_receipt"])
+        assert archived.is_file()
+        assert ".invalid-" in archived.name
+        assert ".failed-" not in archived.name
+        canonical = (
+            project / ".synaptory" / ".orchestrator" / "receipts" / "US-001-se.json"
+        )
+        assert not canonical.exists()
+
+    def test_the_literal_verdict_is_the_kernel_refusal_code(self):
+        """Same duplication discipline as `ATTEMPT_NOT_LIVE_VERDICT` /
+        `ATTEMPT_NOT_LIVE` above -- pinned so the planner's recovery verdict
+        and the kernel's refusal code cannot drift apart and reopen #690's
+        agreement failure through a different pair of names."""
+        assert sp.RECEIPT_INADMISSIBLE_VERDICT == ak.RECEIPT_INVALID
+
+    def test_a_completed_attempt_with_a_valid_receipt_is_unaffected(self, tmp_path):
+        """Non-regression: a normal completed producer attempt with a VALID
+        receipt advances exactly as it did before #741."""
+        project = _deadlocked(tmp_path, attempt_state="completed")
+        story = _story(project)
+        assert ak.unadvanceable_receipt(str(project), story, "se") is None
+        selected = ak.next_action(str(project))
+        assert selected["recovery"] is None
+        assert selected["transition_to"] == "testing"
+
+    def test_awaiting_acceptance_is_excluded_even_with_an_invalid_receipt(
+        self, tmp_path
+    ):
+        """The human PO sign-off stage is explicitly out of #741's scope --
+        `inadmissible_receipts` must not report a hit for it no matter what
+        its receipt contains."""
+        project = _project(tmp_path)
+        _seed(project, state="awaiting_acceptance")
+        _receipt(project, abbrev="po", evidence={"note": "not a list"})
+        state = sp._read_state(str(project))
+        assert ak.inadmissible_receipts(str(project), state) == {}

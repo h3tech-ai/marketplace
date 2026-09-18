@@ -295,18 +295,9 @@ class ValidationResult:
         }
 
 
-#: A model id that names no model. `<backend>-runtime-unattributed` was
-#: fabricated by `sync_barrier.py` for an unset `SYNAPTORY_MODEL`; that module
-#: is deleted (#644), so nothing produces it any more -- but the CLI bridge
-#: refuses the value on a receipt (`runtime_contract.go`), and until this
-#: validator refuses it too, a placeholder is rejected on the governed-dispatch
-#: path and accepted on the plain-session path. `C-14` wants the exact model
-#: identifier, and "the vendor or the family" is what it refuses; a value that
-#: names neither is worse than either.
-#:
-#: Refused here rather than warned, because a receipt is the provenance record
-#: and a regression traced to a model change is unattributable after the fact
-#: without it.
+#: Historical marker inspection retained for compatibility. This helper does
+#: not grade receipt admissibility: bare strings remain readable as legacy
+#: identities, while model_identity validates versioned typed observations.
 UNATTRIBUTED_MODEL_SUFFIX = "-runtime-unattributed"
 
 
@@ -615,22 +606,27 @@ def validate_receipt_payload(receipt: Any, project_dir: str) -> ValidationResult
                 f"Unrecognized backend: '{backend}' (expected one of {sorted(VALID_BACKENDS)})"
             )
 
-    # Validate model
+    # Typed identities carry source semantics and a measured binary version.
+    # Legacy strings remain readable; readers never promote them to vendor IDs.
     if "model" in receipt:
-        model = receipt["model"]
-        if not isinstance(model, str):
-            result.error("'model' must be a string")
-        elif not model.strip():
-            result.warn("'model' is empty — should identify the specific model used")
+        from model_identity import identity_problems
+        for problem in identity_problems(receipt):
+            result.error(problem)
+        if isinstance(receipt["model"], str) and not receipt["model"].strip():
+            result.warn("'model' is empty — legacy identity is unavailable")
 
     # Honest backend↔model mapping (Cursor Router + multi-host receipts).
-    # `backend` identifies the runtime host/router, while `model` is the exact
-    # model the runtime reports. Cursor may route to Claude, Gemini, or OpenAI,
+    # `backend` identifies the runtime host/router. Only a vendor ID (or the
+    # legacy string) supports this inference. Cursor can route to other providers,
     # so a provider-shaped model does not contradict `backend: cursor`.
     # The reverse remains false: `composer-*` / `grok-*` with
     # `backend: claude` is a lie and fails closed.
     backend_val = receipt.get("backend")
     model_val = receipt.get("model")
+    if isinstance(model_val, dict):
+        model_val = model_val.get("value") if model_val.get("kind") == "vendor_id" else None
+    if isinstance(backend_val, str):
+        backend_val = {"claude-code": "claude", "cursor-agent": "cursor"}.get(backend_val, backend_val)
     if isinstance(backend_val, str) and isinstance(model_val, str) and model_val.strip():
         inferred = infer_backend_from_model(model_val)
         if inferred and inferred != backend_val and backend_val != "cursor":

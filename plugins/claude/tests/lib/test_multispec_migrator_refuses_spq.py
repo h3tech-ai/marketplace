@@ -254,7 +254,9 @@ def test_a_scrum_project_still_migrates(tmp_path: Path, repo_root: Path):
     proc = _run(repo_root, project, primary="platform")
     assert proc.returncode == 0, proc.stderr
     full = json.loads(_pointer(project).read_text(encoding="utf-8"))
-    assert full["version"] == "3.0"
+    assert full["state_schema"] == 3
+    from product_version import product_version
+    assert full["version"] == product_version()
     assert full["specs"]["platform"]["current_sprint"] == 3
 
 

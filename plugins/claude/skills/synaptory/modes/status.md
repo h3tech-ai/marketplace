@@ -38,6 +38,33 @@ All dashboard data comes from `pipeline-summary.json`. Parse the JSON to extract
 - `verification.commands[]` — re-runnable checks from receipts
 - `context_packages[]` — brownfield knowledge packages
 - `project.engagement` — engagement mode
+- `board` — whether a board was read at all, and from where (see below)
+
+### An unreadable board is not an empty one
+
+`board.available` is `false` when no board could be read: no state file, an
+unparseable one, or a layout this runtime refuses. **Say so, and do not render
+a zeroed dashboard on top of it.** An empty pipeline and a pipeline nobody
+could read look identical in the numbers, and reporting the second as the first
+is what made an in-flight sprint read as lost state (#730):
+
+```
+  ⚠ Board unreadable — {board.problems joined}
+    Source: {board.source}
+```
+
+`board.layout` names the shape that was found (`flat`, `multi-spec`, `spq`,
+`none`). On `multi-spec` the sprint, DoD and lifecycle sections describe
+`board.active_spec` ONLY — a sprint number belongs to one spec. Name the other
+specs from `board.specs[]` (each carries `id`, `lifecycle_state`,
+`current_sprint`, `stories_total`, `stories_done`) so nothing sits silently
+outside the frame:
+
+```
+  Specs: {active} (active) · {other} — {lifecycle_state}, {stories_done}/{stories_total}
+```
+
+`pipeline.state_problems[]` carries the same warnings for the pipeline section.
 
 ### Engagement mode display
 

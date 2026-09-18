@@ -13,6 +13,7 @@ from .helpers import (
     _parse_markdown_table, _extract_heading, _extract_section, _count_files,
 )
 from .receipts import normalize_receipt, extract_findings
+from .pipeline import receipt_dirs, load_receipts_raw
 
 # Ensure tracker package is importable
 _scripts_dir = str(Path(__file__).resolve().parent.parent)
@@ -140,6 +141,26 @@ def build_requirements_summary(project_dir: Path, version: int = 1) -> dict:
 # ── Technical Summary ─────────────────────────────────────────────────────
 
 
+def _find_receipt_by_filename(project_dir: Path, filename: str) -> dict:
+    """The first receipt named `filename`, searched across every receipt home.
+
+    A receipt keeps its filename when `migrate_to_multispec.py` moves it to
+    `.orchestrator/specs/<id>/receipts/`, or when `build_mode: spq` writes it
+    under `.orchestrator/spq/cycles/<id>/receipts/` — only the directory
+    changes. A literal path built against the flat pre-migration home goes
+    blind the same way an unscoped `receipts_dir.glob()` does (#733, sibling
+    of #730's `load_receipts_raw`), so this resolves through `receipt_dirs`
+    (the same accessor `load_receipts_raw` uses) instead of a hard-coded path.
+    """
+    for d in receipt_dirs(project_dir):
+        candidate = d / filename
+        if candidate.exists():
+            data = _load_json(candidate)
+            if data:
+                return data
+    return {}
+
+
 def build_technical_summary(project_dir: Path, version: int = 1) -> dict:
     """Assemble technical report data from architecture artifacts."""
     # Architecture overview — read SAD from docs/architecture/ (single source of truth)
@@ -233,9 +254,7 @@ def build_technical_summary(project_dir: Path, version: int = 1) -> dict:
                _count_files(project_dir / ".github" / "workflows", "*.yaml")
 
     # SA receipt metrics
-    sa_receipt = _load_json(
-        project_dir / ".synaptory" / ".orchestrator" / "receipts" / "T2-solution-architect.json"
-    )
+    sa_receipt = _find_receipt_by_filename(project_dir, "T2-solution-architect.json")
     sa_metrics = sa_receipt.get("metrics", {})
 
     return {
@@ -274,7 +293,6 @@ def build_sprint_report_data(project_dir: Path, sprint_num: int,
     adapter = get_adapter(project_dir)
     req_dir = adapter.req_dir if hasattr(adapter, "req_dir") else project_dir / ".requirements"
     synaptory_dir = project_dir / ".synaptory"
-    receipts_dir = synaptory_dir / ".orchestrator" / "receipts"
 
     # Sprint goal — handle special sprint types that have non-numeric files
     sprint_goal = f"Sprint {sprint_num}"
@@ -362,14 +380,12 @@ def build_sprint_report_data(project_dir: Path, sprint_num: int,
     qe_report_text = _read(qe_report_path)
 
     # Receipts — v2 story-scoped naming: {story_id}-{role_abbrev}.json
-    # Load all receipts from directory and filter by role abbreviation
-    all_receipts_raw = []
-    if receipts_dir.exists():
-        for rpath in sorted(receipts_dir.glob("*.json")):
-            rdata = _load_json(rpath)
-            if rdata:
-                rdata["_filename"] = rpath.name
-                all_receipts_raw.append(rdata)
+    # Load all receipts across every home (flat / per-spec / per-Cycle) and
+    # filter by role abbreviation. A flat `.orchestrator/receipts` glob only
+    # saw the pre-migration home and silently under-counted a client-facing,
+    # sometimes-immutable sprint report (#733, sibling of #730's
+    # `load_receipts_raw`); `load_receipts_raw` is the one shared accessor.
+    all_receipts_raw = load_receipts_raw(project_dir)
 
     # Find role-specific receipts by role field or filename suffix
     def _find_receipt(role_abbrev: str) -> dict:

@@ -110,7 +110,9 @@ def patch_codex_receipt(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     receipt["ide"] = "codex"
     receipt["plugin_version"] = plugin_version()
     model = payload.get("model_id") or payload.get("model")
-    if isinstance(model, str) and model.strip():
+    if isinstance(receipt.get("model"), dict):
+        pass  # Preserve bridge-owned typed identity; hook payloads cannot replace it.
+    elif isinstance(model, str) and model.strip():
         receipt["model"] = model.strip()
     elif not str(receipt.get("model") or "").strip():
         receipt["model"] = "codex-runtime-unattributed"

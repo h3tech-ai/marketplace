@@ -36,7 +36,7 @@ empty tracker/DoR and the user had to hand-edit generated YAML afterwards.
 1. Detect project structure: language (package.json, go.mod, pyproject.toml), framework (Next.js, NestJS, FastAPI, Gin), infrastructure (Dockerfile, Terraform, K8s, CI/CD), architecture (monolith/microservices/monorepo)
 2. Classify health: greenfield (no code) vs brownfield (existing codebase)
 3. **Run the Configuration Interview (below)** — confirm every high-stakes field with the user, seeding each question's default from detection.
-4. Generate `.synaptory.yaml` from the template at `Shell("synaptory skills get templates/synaptory.yaml.tmpl")`, applying the confirmed answers.
+4. Generate `.synaptory.yaml` from the template at `Shell("synaptory skills get templates/synaptory.yaml.tmpl")`, applying the confirmed answers. Resolve the top-level `{{PRODUCT_VERSION}}` with `python3 "${PLUGIN_ROOT}/hooks/lib/product_version.py"` from the executing plugin. Use its exact output as `version`; never copy the historical config schema or infer it from pipeline state. If release metadata cannot be read, report the error before writing config. The helper also accepts `--template <downloaded-template-path>` to print the template with its release resolved.
 5. Scaffold tracker description templates into `docs/templates/` (if not already present)
 6. Write `.synaptory/.orchestrator/init-answers.md` (decisions + defaults applied) and print a summary of the final configuration.
 

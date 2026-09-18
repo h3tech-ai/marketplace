@@ -49,7 +49,9 @@ SPRINT_INFO=""
 STATE_FILE="$SUITE_DIR/.orchestrator/pipeline-state.json"
 if [ -f "$STATE_FILE" ]; then
   SPRINT_INFO=$("$_py" -c "
-import json
+import json, sys
+sys.path.insert(0, '${_HOOK_ROOT}/hooks/lib')
+from state_schema import state_schema
 def fmt_sub(sub, prefix=''):
     return (
         f\"{prefix}Lifecycle: {sub.get('lifecycle_state', 'INCEPTION')} \"
@@ -58,8 +60,8 @@ def fmt_sub(sub, prefix=''):
     )
 try:
     state = json.load(open('$STATE_FILE'))
-    version = state.get('version')
-    if version == '3.0' and isinstance(state.get('specs'), dict):
+    schema = state_schema(state)
+    if schema == 3 and isinstance(state.get('specs'), dict):
         # Multi-spec rollup
         active = state.get('active_spec', '<none>')
         lines = [f'Active Spec: {active}']
@@ -67,7 +69,7 @@ try:
             marker = ' (active)' if sid == active else ''
             lines.append(f'  {sid}{marker}: ' + fmt_sub(sub, prefix=''))
         print('\n'.join(lines))
-    elif version == '2.0' and 'lifecycle_state' in state:
+    elif schema == 2 and 'lifecycle_state' in state:
         print(fmt_sub(state))
     else:
         print('No sprint loop active')

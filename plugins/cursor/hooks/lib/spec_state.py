@@ -8,7 +8,7 @@ Layouts (see docs/multi-spec-design.md §5.2):
 
   v2.0 — legacy flat:
     {
-      "version": "2.0",
+      "version": "1.3.1", "state_schema": 2,
       "build_mode": "scrum",
       "lifecycle_state": "SPRINT_EXECUTION",
       "current_sprint": 9,
@@ -18,7 +18,7 @@ Layouts (see docs/multi-spec-design.md §5.2):
 
   v3.0 — multi-spec nested:
     {
-      "version": "3.0",
+      "version": "1.3.1", "state_schema": 3,
       "build_mode": "scrum",
       "active_spec": "platform",
       "specs": {
@@ -44,6 +44,10 @@ target different specs).
 """
 
 from __future__ import annotations
+
+from product_version import product_version
+
+from state_schema import state_schema, with_state_metadata
 
 import contextlib
 import json
@@ -113,12 +117,12 @@ def read_full_state(project_dir: str) -> dict:
 
 
 def write_full_state(project_dir: str, state: dict) -> None:
-    """Write the raw file atomically (temp + os.replace)."""
-    _store.write_json_atomic(state_path(project_dir), state)
+    """Stamp layout/release metadata and write atomically (temp + os.replace)."""
+    _store.write_json_atomic(state_path(project_dir), with_state_metadata(state))
 
 
 def is_multispec(full_state: dict) -> bool:
-    return full_state.get("version") == "3.0" and isinstance(full_state.get("specs"), dict)
+    return state_schema(full_state) == 3 and isinstance(full_state.get("specs"), dict)
 
 
 def get_active_spec(project_dir: str) -> Optional[str]:
@@ -211,13 +215,14 @@ def write_state(project_dir: str, state: dict) -> None:
         # would need a higher-level coordination layer.
         with _file_lock(_lock_path(project_dir)):
             full = read_full_state(project_dir) or {
-                "version": "3.0",
+                "version": product_version(), "state_schema": 3,
                 "build_mode": clean.get("build_mode", "scrum"),
                 "specs": {},
             }
             full.setdefault("specs", {})[spec_id] = clean
             if "version" not in full:
-                full["version"] = "3.0"
+                full["version"] = product_version()
+            full["state_schema"] = 3
             write_full_state(project_dir, full)
     else:
         write_full_state(project_dir, clean)
@@ -237,10 +242,10 @@ def upgrade_v2_to_v3(project_dir: str, primary_spec_id: str) -> dict:
 
     # Pull the per-spec fields up into a sub-dict, leave global metadata at top.
     build_mode = full.get("build_mode", "scrum")
-    spec_substate = {k: v for k, v in full.items() if k not in ("version", "build_mode")}
+    spec_substate = {k: v for k, v in full.items() if k not in ("version", "state_schema", "build_mode")}
 
     new_state = {
-        "version": "3.0",
+        "version": product_version(), "state_schema": 3,
         "build_mode": build_mode,
         "active_spec": primary_spec_id,
         "specs": {primary_spec_id: spec_substate},

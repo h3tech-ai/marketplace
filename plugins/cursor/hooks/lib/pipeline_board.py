@@ -45,6 +45,8 @@ Python 3.9 compatible: this file is projected into every host package.
 
 from __future__ import annotations
 
+from state_schema import state_schema
+
 import json
 import os
 import sys
@@ -90,12 +92,12 @@ RETIRED_V3_REFUSAL = (
 def _is_retired_v3_envelope(pointer: Dict[str, Any]) -> bool:
     """Is this SPQ pointer still wrapped in the v3.0 Multi-Spec envelope?
 
-    Two triggers, matching `state_drift`: the declared version, and the `specs`
-    slot map. A live SPQ pointer is written at version `2.0` by
+    Two triggers, matching `state_drift`: the declared layout, and the `specs`
+    slot map. A live SPQ pointer is written at state_schema 2 by
     `spq_state_machine._write_pointer` and carries no `specs` key at all, so
     neither trigger can fire on a healthy project.
     """
-    return pointer.get("version") == "3.0" or isinstance(pointer.get("specs"), dict)
+    return state_schema(pointer) == 3 or isinstance(pointer.get("specs"), dict)
 
 
 def state_path(project_dir: str) -> str:
@@ -437,6 +439,11 @@ def read_board(project_dir: str) -> Board:
             layout="none", available=False, source=path,
             problems=["pipeline-state.json is not a JSON object"],
         )
+
+    try:
+        state_schema(state)
+    except ValueError as exc:
+        return Board(layout="none", available=False, source=path, problems=[str(exc)])
 
     mode = str(state.get("build_mode") or DEFAULT_BUILD_MODE).strip().lower()
 

@@ -21,6 +21,10 @@ CLI:
 
 from __future__ import annotations
 
+from product_version import product_version
+
+from state_schema import state_schema
+
 import json
 import os
 import sys
@@ -31,6 +35,7 @@ from typing import Any
 # Spec-aware state I/O (see docs/multi-spec-design.md, core/lib/spec_state.py).
 import spec_state as _ss
 import host_env
+import advance_kernel
 
 # Import shared story pipeline (same directory).
 from story_pipeline import (
@@ -96,7 +101,7 @@ def _resolve_spec_id(spec_id: str | None) -> str | None:
 
 def _default_state() -> dict[str, Any]:
     return {
-        "version": "2.0",
+        "version": product_version(), "state_schema": 2,
         "build_mode": "kanban",
         "lifecycle_state": "DISCOVER",
         "started_at": _now(),
@@ -117,6 +122,7 @@ def _default_state() -> dict[str, Any]:
 def _default_spec_substate() -> dict[str, Any]:
     s = _default_state()
     s.pop("version", None)
+    s.pop("state_schema", None)
     s.pop("build_mode", None)
     return s
 
@@ -175,9 +181,9 @@ def initialize(
 
     if sid:
         if not full:
-            full = {"version": "3.0", "build_mode": "kanban",
+            full = {"version": product_version(), "state_schema": 3, "build_mode": "kanban",
                     "active_spec": sid, "specs": {}}
-        elif full.get("version") == "2.0":
+        elif state_schema(full) == 2:
             raise ValueError(
                 "Cannot initialize a v3 spec slot in a v2 file. Run the "
                 "migration script (migrate_to_multispec.py) first."
@@ -438,6 +444,7 @@ def next_action(project_dir: str) -> dict[str, Any]:
         dep_context=dep_context(project_dir, state),
         dependency_gate=dependency_gate_mode(project_dir),
         verify_only=verify_only_units(project_dir, state),
+        inadmissible_receipts=advance_kernel.inadmissible_receipts(project_dir, state),
     )
     # #501 follow-up — swap the tier-only `dod` block for the per-story
     # contract the gate will actually enforce. Lives here, not in

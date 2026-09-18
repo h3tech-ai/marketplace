@@ -54,7 +54,15 @@ def normalize_receipt(raw: dict) -> dict:
 
     # Backend + model traceability
     backend = raw.get("backend", "unknown")
-    model = raw.get("model", "unknown")
+    raw_model = raw.get("model", "unknown")
+    identity = dict(raw_model) if isinstance(raw_model, dict) else {
+        "kind": "legacy_untyped", "value": raw_model, "evidence_class": "legacy-untyped"
+    }
+    # Reports also read rejected/incomplete receipts. Preserve their attribution
+    # object while keeping an absent or malformed display value harmless.
+    model = identity.get("value") or identity.get("kind", "invalid")
+    if not isinstance(model, str):
+        model = "invalid"
 
     # Metrics
     metrics = raw.get("metrics", {})
@@ -85,6 +93,9 @@ def normalize_receipt(raw: dict) -> dict:
         "role": role,
         "backend": backend,
         "model": model,
+        "model_identity": identity,
+        "runtime_version": raw.get("runtime_version"),
+        "model_route": raw.get("model_route"),
         "metrics": metrics,
         "artifacts_count": artifacts_count,
         "key_artifacts": key_artifacts,
@@ -94,6 +105,13 @@ def normalize_receipt(raw: dict) -> dict:
         "completed_at": completed_at,
         # Preserve original filename for receipt matching
         "_filename": raw.get("_filename", ""),
+        # Which receipt home this one came from. Receipts are collected across
+        # the flat, per-spec and per-Cycle homes (#730), so a consumer that
+        # wants a narrower scope takes it from here rather than re-deriving the
+        # layout — re-deriving it is how a reader goes blind in the first place.
+        "_receipt_home": raw.get("_receipt_home", ""),
+        "_spec_id": raw.get("_spec_id", ""),
+        "_cycle_id": raw.get("_cycle_id", ""),
         # Preserve structured findings/fixes for extraction
         "_findings": raw.get("findings", {}),
         "_fixes": raw.get("fixes", []),

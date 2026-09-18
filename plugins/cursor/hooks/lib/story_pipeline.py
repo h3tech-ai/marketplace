@@ -2899,6 +2899,17 @@ _ROLE_VERIFY_CHECK = {"se": "build_succeeds", "qe": "tests_pass", "cr": "code_re
 #: still agree.
 ATTEMPT_NOT_LIVE_VERDICT = "attempt_not_live"
 
+#: The verdict `next_action` stamps on a recovery it selected because the
+#: stage's canonical receipt is present -- and its bound attempt may be
+#: perfectly live -- but the receipt itself fails schema validation (#741).
+#: The literal IS `advance_kernel.RECEIPT_INVALID`, deliberately duplicated
+#: for the same reason `ATTEMPT_NOT_LIVE_VERDICT` two lines up duplicates
+#: `advance_kernel.ATTEMPT_NOT_LIVE`: the planner's reason for routing around
+#: the edge and the kernel's reason for refusing it are one fact, and
+#: spelling them differently is how #690 came to be stuck. A parity
+#: assertion in `test_failed_attempt_recovery.py` pins the two together.
+RECEIPT_INADMISSIBLE_VERDICT = "receipt_invalid"
+
 
 def _unadvanceable_attempt(
     story: dict[str, Any], role: str
@@ -3968,6 +3979,7 @@ def next_action(
     dependency_gate: str = "enforce",
     compliance: dict[str, Any] | None = None,
     verify_only: "set[str] | frozenset[str] | None" = None,
+    inadmissible_receipts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Deterministically choose the orchestrator's next pipeline step.
 
@@ -4045,6 +4057,17 @@ def next_action(
     shape, and what an absent result becomes — the `SP-WRK-019` surface the
     pipeline previously had nowhere to state. When absent (Scrum, Kanban, and
     every pre-existing caller) the block is None and nothing changes.
+
+    inadmissible_receipts (#741, default None): the caller's
+    `advance_kernel.inadmissible_receipts(project_dir, state)` output, a
+    `{story_id: hit}` map naming every current story whose gating receipt
+    exists but fails schema validation even though its attempt is live (or
+    never bound). Passed in for the same reason `verify_only` is: this
+    function has no `project_dir` and stays pure, and computing it here would
+    mean reading every stage's receipt off disk a second time. When absent,
+    an inadmissible-but-live receipt is invisible to this function and the
+    pre-#741 selection stands (the ordinary transition, which `advance`
+    refuses -- the deadlock the issue reports).
     """
     stories = state.get("current_stories", [])
     counts = {st: 0 for st in STORY_STATES}
@@ -4300,6 +4323,42 @@ def next_action(
                 **dead,
             }
 
+        # #741. THE THIRD REASON A FRESH RECEIPT IS NOT ADVANCEABLE, and the
+        # one `_attempt_loop` cannot see: the attempt that produced it IS
+        # recorded live (its state stayed `completed`), yet the canonical
+        # receipt itself fails schema validation -- e.g. an `evidence` object
+        # where a list of typed items is required. `completed` is
+        # deliberately absent from `_ATTEMPT_NOT_LIVE_STATES` (it is the case
+        # that SHOULD advance), so `_attempt_loop` returns None for it and,
+        # pre-#741, this function offered the ordinary transition anyway.
+        # `advance_kernel.evaluate_advance` refuses that receipt as
+        # `RECEIPT_INVALID`, and `begin_dispatch` refuses a successor because
+        # the same (invalid) receipt is still on disk -- #690's deadlock
+        # reached through a different door.
+        #
+        # NO AUTO-REPAIR (confirmed decision): the malformed payload is never
+        # rewritten into a valid shape. This routes through the SAME H3-F1
+        # ladder `_attempt_loop` uses -- `evaluate_dispatch` waives
+        # `receipt_already_present` for any recovery and `execute_dispatch`
+        # archives the superseded receipt before minting the next one,
+        # verdict-agnostic -- so a fresh dispatch/retry is the only way out,
+        # and the old receipt's bytes are archived, never edited.
+        #
+        # `inadmissible_receipts` is keyed by story id (one gating receipt per
+        # current stage), so no `role` filter is needed beyond the lookup.
+        def _inadmissible_loop(role: str) -> dict[str, Any] | None:
+            if not inadmissible_receipts:
+                return None
+            hit = inadmissible_receipts.get(sid)
+            if hit is None:
+                return None
+            return {
+                **recommend_recovery_action(state, sid, role),
+                "role": role,
+                "verdict": RECEIPT_INADMISSIBLE_VERDICT,
+                **hit,
+            }
+
         def _verify_action(role: str, vl: dict[str, Any], stage_label: str) -> dict[str, Any]:
             agent = {"se": "software-engineer", "qe": "quality-engineer",
                      "cr": "code-reviewer"}[role]
@@ -4315,6 +4374,13 @@ def next_action(
                     )
                 )
                 loop = "attempt recovery; the failed attempt and this receipt are kept"
+            elif verdict == RECEIPT_INADMISSIBLE_VERDICT:
+                _errors = vl.get("errors") or []
+                problem = (
+                    "failed schema validation (%s), so it cannot be advanced on"
+                    % ("; ".join(_errors) if _errors else "no errors recorded")
+                )
+                loop = "receipt recovery; the invalid receipt is archived, never edited"
             elif verdict == "failed":
                 problem = "failed verification"
                 loop = "verification loop"
@@ -4366,6 +4432,9 @@ def next_action(
                 _al = _attempt_loop("cr")
                 if _al:
                     return _verify_action("cr", _al, "review")
+                _il = _inadmissible_loop("cr")
+                if _il:
+                    return _verify_action("cr", _il, "review")
                 _vl = _verify_loop("cr")
                 if _vl:
                     return _verify_action("cr", _vl, "review")
@@ -4437,6 +4506,13 @@ def next_action(
             _al = _attempt_loop(role)
             if _al:
                 return _verify_action(role, _al, stage)
+            # #741: a live attempt's receipt that still fails schema
+            # validation is asked next, before the verification verdict --
+            # the receipt is not admissible evidence at all, so there is
+            # nothing for a verification verdict to be ABOUT yet.
+            _il = _inadmissible_loop(role)
+            if _il:
+                return _verify_action(role, _il, stage)
             # P5: if the fresh receipt FAILED verification, re-dispatch this
             # stage (ladder permitting) or block it (ladder exhausted) instead
             # of advancing on a bad receipt.

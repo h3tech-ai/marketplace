@@ -17,11 +17,15 @@ are load-bearing and neither is visible from the list itself:
      guard in the same stroke.
 
 This module parses the workflow with a deliberately tiny scanner rather than
-PyYAML: the `test-plugin` job installs pytest and nothing else, and the repo
-keeps it that way on purpose. The scanner understands exactly one shape --
-`paths-ignore:` followed by single-quoted list items -- and asserts it found
-both blocks, so a restructured trigger fails loudly instead of silently
-matching nothing.
+PyYAML. PyYAML is installed in the `test-plugin` job (see the bottom of this
+file), but only because test_product_version.py needs it to validate a
+rendered synaptory.yaml.tmpl -- a real config document, not CI trigger
+config. That does not make PyYAML this scanner's business: the scanner
+understands exactly one shape, `paths-ignore:` followed by single-quoted
+list items, and asserts it found both blocks, so a restructured trigger
+fails loudly instead of silently matching nothing. Migrating a working,
+independently-tested scanner to PyYAML just because the dependency happens
+to be present now would be churn for no behavior change.
 """
 import fnmatch
 import pathlib
@@ -463,11 +467,12 @@ def test_the_plugin_gate_has_time_to_reach_its_own_verdict():
 def _setup_go(job: str) -> dict[str, str]:
     """Return the `actions/setup-go` step's `with:` map for one job.
 
-    A tiny scanner, for the reason this module's docstring gives: `test-plugin`
-    installs pytest and nothing else, so PyYAML is not available here. It
-    understands one shape, a `uses: actions/setup-go@vN` line followed by a `with:`
-    block of `key: value` pairs, and returns {} when the job has no such step
-    so the caller can say which job is missing one.
+    A tiny scanner, for the reason this module's docstring gives: it predates
+    PyYAML being available in this job, and there is no behavior to gain by
+    migrating it now. It understands one shape, a `uses: actions/setup-go@vN`
+    line followed by a `with:` block of `key: value` pairs, and returns {}
+    when the job has no such step so the caller can say which job is missing
+    one.
     """
     lines = _WORKFLOW.read_text(encoding="utf-8").splitlines()
     job_re = re.compile(r"^  (\S+):\s*$")
@@ -497,6 +502,14 @@ def _setup_go(job: str) -> dict[str, str]:
             kv = re.match(r'^\s+([a-z-]+): "?([^"]*?)"?\s*$', line)
             if kv:
                 found[kv.group(1)] = kv.group(2)
+                continue
+            if line.strip().startswith("#"):
+                # A comment inside `with:` is not the end of the block. Ending
+                # here made a key INVISIBLE rather than failing: the scanner
+                # returned a short map and every assertion about a key below
+                # the comment silently read `None`. A guard that reads less
+                # than the file is the failure mode this module exists to
+                # catch, one level up.
                 continue
             if line.strip():
                 in_with = False
@@ -530,8 +543,240 @@ def test_the_plugin_gate_declares_the_go_toolchain_it_now_needs():
         "the two gates that run Go pin different versions: test-plugin %r vs "
         "test-e2e %r" % (plugin.get("go-version"), e2e.get("go-version"))
     )
-    assert plugin.get("cache-dependency-path") == "cli/go.sum", (
-        "without cache-dependency-path the module cache is cold on every run "
-        "and `cli/` has no vendor/, so each run downloads from the proxy: got %r"
-        % plugin.get("cache-dependency-path")
+
+
+def test_every_go_job_makes_the_same_caching_decision():
+    """Caching is one decision for one runner, not a per-job preference.
+
+    This replaces an assertion that `test-plugin` set
+    `cache-dependency-path: cli/go.sum`. That was right while the premise held
+    -- a cold module cache on every run -- and #713 measured the premise false
+    on this runner: it is self-hosted and long-lived, `actions/checkout` cleans
+    the workspace and not `$HOME`, so `~/go/pkg/mod` already survives, and the
+    Actions cache lost both ways (restore reported no cache, save then failed
+    to reserve). So the old assertion is stale rather than the change wrong.
+
+    It is replaced instead of deleted, and by a PARITY check rather than a
+    literal, because deleting it would have left nothing at all watching this
+    and a literal would rot again at the next runner change. What must stay
+    true is that the jobs agree: they share one machine, so a job that opts
+    back in pays a cost its siblings measured and rejected.
+
+    That is not hypothetical. `test-cli` (#729) was written against the old
+    convention and merged in the same hour as #713, which retired it, so `dev`
+    briefly carried three Go jobs on one runner with two different answers.
+    Neither pull request was wrong alone and neither touched the other's
+    lines; the disagreement existed only on the merged tree.
+    """
+    decisions = {
+        job: (_setup_go(job) or {}).get("cache")
+        for job in ("test-plugin", "test-e2e", "test-cli")
+    }
+    assert all(v is not None for v in decisions.values()), (
+        "a Go job states no cache decision, so it silently inherits the "
+        "action's default: %r" % (decisions,)
     )
+    assert len(set(map(str, decisions.values()))) == 1, (
+        "Go jobs on the same runner disagree about caching: %r" % (decisions,)
+    )
+
+
+# ── the Go suite must run in a CHECK, not only in a release (#729) ──────────
+#
+# `./synaptory cli test` used to be invoked in exactly one place in all of CI:
+# release.yml's `Run tests` step, on the prod VM, during a production release.
+# So a Go defect in `cli/` was invisible to every pull request and every push,
+# and the first thing that noticed it was the release it aborted -- which is
+# how #726 stopped v1.3.0 after sitting on dev through an entire release wave
+# with every PR green. These assertions hold the new `test-cli` job open; the
+# thing they are guarding against is the job being deleted or narrowed back to
+# push-only, which would look exactly like the state before it existed.
+
+_CLI_SUITE = "./synaptory cli test"
+
+
+def _job_block(job: str, workflow: pathlib.Path = _WORKFLOW) -> list[str]:
+    """The lines of one job in `workflow` (test.yml by default), excluding the job key itself."""
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.rstrip() == "  %s:" % job), None
+    )
+    assert start is not None, "%s no longer declares a %s job" % (workflow.name, job)
+    end = next(
+        (i for i in range(start + 1, len(lines)) if _JOB_KEY_RE.match(lines[i])),
+        len(lines),
+    )
+    return lines[start + 1 : end]
+
+
+def test_a_check_runs_the_go_suite():
+    """Some job in test.yml must RUN the Go suite, not merely mention it.
+
+    Matched on a `run:` line rather than anywhere in the file, deliberately.
+    The loose version of this assertion passes on a job NAMED
+    `Go CLI tests (./synaptory cli test)` whose only step echoes -- confirmed
+    by replacing the step with `echo skipped` and watching the guard stay
+    green. A check that passes on its own name is the defect, not the guard.
+    """
+    running = [
+        line.strip()
+        for line in _WORKFLOW.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+        and re.match(r"^\s+run:\s", line)
+        and _CLI_SUITE in line
+    ]
+    assert running, (
+        "no job in test.yml has a `run:` step invoking %r. That was the state "
+        "#729 fixed: the Go suite ran only inside `deploy prod`, so every PR "
+        "was green on a tree whose CLI had never been tested." % _CLI_SUITE
+    )
+
+
+def test_the_go_suite_runs_on_pull_requests():
+    """A gate that only runs after the merge catches nothing before it."""
+    block = _job_block("test-cli")
+    gates = [line.strip() for line in block if line.strip().startswith("if:")]
+    for gate in gates:
+        assert "pull_request" not in gate or "!=" in gate, (
+            "test-cli's %r can exclude a pull_request. The whole point of #729 "
+            "is that the Go suite reports BEFORE a merge." % gate
+        )
+    # The one gate its siblings carry, and the only one allowed: skip a push
+    # to dev, because the PR already ran this exact merge ref.
+    for gate in gates:
+        assert gate == (
+            "if: github.event_name != 'push' || github.ref != 'refs/heads/dev'"
+        ), "test-cli carries an unexpected gate: %r" % gate
+
+
+def test_the_go_suite_job_does_not_hardcode_a_hosted_runner():
+    """#724: a job pinned to `ubuntu-latest` failed before step 1, with zero steps.
+
+    While hosted capacity was unavailable, `version-drift` reported a red
+    check having run nothing -- an empty `runner_name` and no steps. Every
+    other job in this workflow resolves through `vars.CI_RUNNER`; a new one
+    that does not would reintroduce that shape on the gate that just closed a
+    two-year blind spot.
+    """
+    block = _job_block("test-cli")
+    runs_on = next(
+        (line.strip() for line in block if line.strip().startswith("runs-on:")), None
+    )
+    assert runs_on == "runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}", (
+        "test-cli declares %r. It must resolve through vars.CI_RUNNER like "
+        "every other job here (#724)." % runs_on
+    )
+
+
+def test_the_go_suite_redirects_the_keychain():
+    """The belt from #726, asserted so it is not quietly dropped.
+
+    keychain_fallback_test.go documents SYNAPTORY_KEYCHAIN_FILE as "the
+    intended CI usage pattern: always set SYNAPTORY_KEYCHAIN_FILE in headless
+    environments so the file backend is used unconditionally", and no workflow
+    set it. This is the outer layer only: a test that needs the redirect still
+    sets it with its own `t.Setenv` (#727), because a test that passes only
+    under CI's environment has stopped asserting what it was written to
+    assert.
+    """
+    block = _job_block("test-cli")
+    assert any(
+        line.strip().startswith("SYNAPTORY_KEYCHAIN_FILE:") for line in block
+    ), (
+        "test-cli does not set SYNAPTORY_KEYCHAIN_FILE, so a Go test that "
+        "calls keychain.Save() before redirecting reaches the runner's real "
+        "credential store (#726)."
+    )
+
+
+def test_the_go_gates_share_one_toolchain_pin():
+    """Three jobs now run Go. They must not drift onto different versions."""
+    cli = _setup_go("test-cli")
+    assert cli, "test-cli runs `go test` and declares no Go toolchain"
+
+    plugin = _setup_go("test-plugin")
+    assert plugin, "test-plugin lost its Go setup; this test compares pins against it"
+
+    assert cli.get("go-version") == plugin.get("go-version"), (
+        "test-cli pins Go %r while test-plugin pins %r"
+        % (cli.get("go-version"), plugin.get("go-version"))
+    )
+
+
+# ── the job must install what the tests it runs actually import ─────────────
+#
+# `pip install --quiet pytest` was the whole story until now: PRs #742 and
+# #743 both failed identically with `ModuleNotFoundError: No module named
+# 'yaml'` despite neither touching test_product_version.py, because that test
+# (added earlier, by an unrelated change) imports PyYAML and the job never
+# grew a line to install it. Every other suite under pytest_dirs passed, so
+# the failure read as one flaky test on an unrelated PR rather than as a job
+# with an undeclared dependency, and it repeated on every PR after because
+# nothing failed the BUILD for it -- only the one test, every time.
+#
+# Scoped to the same trees `./synaptory test` runs inside this job
+# (pytest_dirs in plugin-claude/synaptory's test(), plus conformance/ as its
+# own invocation) and asserted in both directions: a dependency this narrow
+# rots whichever way it drifts, and a stale install is exactly as invisible
+# as a missing one.
+#
+# Checked against BOTH jobs that run this suite, not just test-plugin.
+# release.yml's `release` job runs the identical `./synaptory test` (see the
+# comment at the top of this file's Go-suite section: it used to be the ONLY
+# place that ran the Go suite, and it still independently installs its own
+# Python deps via its own `pip install` step -- a separate line in a separate
+# workflow file, not shared with test-plugin's). #747 fixed test-plugin's
+# install line and added the assertion below scoped to it alone; that left
+# release.yml's copy of the same gap uncaught, and it aborted the v1.3.1
+# release on the prod runner with the identical ModuleNotFoundError, after
+# every pull_request check had already gone green. Parametrizing over both is
+# what closes that -- a single-workflow assertion is exactly the shape that
+# missed it the first time.
+
+_YAML_IMPORT_RE = re.compile(r"^\s*import yaml\s*$", re.MULTILINE)
+#: Mirrors pytest_dirs in plugin-claude/synaptory's test() plus the separate
+#: conformance/ invocation -- everything that shares the test-plugin job's one
+#: `pip install` step, and (via `./synaptory test`) release.yml's `release` job.
+_TEST_PLUGIN_JOB_TREES = (
+    "plugin-claude/tests", "plugin-cursor/tests", "plugin-codex/tests",
+    "scripts/tests", "conformance",
+)
+
+
+@pytest.mark.parametrize(
+    "workflow, job", [(_WORKFLOW, "test-plugin"), (_RELEASE_WORKFLOW, "release")],
+    ids=["test-plugin", "release"],
+)
+def test_the_plugin_job_installs_pyyaml_to_match_what_its_tests_import(workflow, job):
+    """PyYAML must be installed exactly when a suite this job runs needs it."""
+    consumers = sorted(
+        str(path.relative_to(_REPO_ROOT))
+        for tree in _TEST_PLUGIN_JOB_TREES
+        if (_REPO_ROOT / tree).is_dir()
+        for path in (_REPO_ROOT / tree).rglob("*.py")
+        if _YAML_IMPORT_RE.search(path.read_text(encoding="utf-8"))
+    )
+
+    block = _job_block(job, workflow)
+    install_lines = [
+        line.strip() for line in block
+        if re.match(r"^\s*run:\s*pip install\b", line)
+    ]
+    installs_pyyaml = any("pyyaml" in line.lower() for line in install_lines)
+
+    if consumers:
+        assert installs_pyyaml, (
+            "%s imports yaml, but %s's %r job's pip install step (%r) does "
+            "not install pyyaml. This fails as ModuleNotFoundError on every "
+            "run, not just the one that adds the import -- see #742/#743 "
+            "(test-plugin) and the v1.3.1 release abort (release)."
+            % (consumers[0], workflow.name, job, install_lines)
+        )
+    else:
+        assert not installs_pyyaml, (
+            "no test under %s imports yaml any more, but %s's %r job still "
+            "installs pyyaml (%r). Dropping the now-unused install is fine; "
+            "if the consumer moved rather than disappeared, widen "
+            "_TEST_PLUGIN_JOB_TREES instead of deleting this assertion."
+            % (", ".join(_TEST_PLUGIN_JOB_TREES), workflow.name, job, install_lines)
+        )

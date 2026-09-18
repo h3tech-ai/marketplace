@@ -444,7 +444,7 @@ def migrate(
         spec_state.upgrade_v2_to_v3(str(project_dir), primary_spec_id=primary_spec)
     else:
         spec_state.write_full_state(str(project_dir), {
-            "version": "3.0",
+            "state_schema": 3,
             "build_mode": "scrum",
             "active_spec": primary_spec,
             "specs": {},

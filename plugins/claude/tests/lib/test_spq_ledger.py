@@ -699,6 +699,12 @@ def test_reprojection_refreshes_labels_and_ui_classification(cycle):
             labels=["surface:web"],
             acceptance_criteria=["The dashboard screen renders account data"],
             depends_on=[{"unit_id": "WU-UP", "condition": "integrated"}],
+            # #758 — ui_bearing now also asks whether the declared path scope
+            # touches a UI root; the fixture default (`api/<id>/`, purely
+            # mechanical, chosen only to keep units disjoint) would otherwise
+            # preclude UI for a unit this test's own narrative says renders
+            # one. A real "add UI surface" revision declares a real UI path.
+            path_scope=["web/dashboard/"],
         ),
     ])
     sm.hydrate_cycle(str(project), cycle_id=cycle_id)

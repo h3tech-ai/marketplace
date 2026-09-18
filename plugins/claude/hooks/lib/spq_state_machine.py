@@ -1528,16 +1528,40 @@ def _unit_results(project_dir: str, state: dict[str, Any]) -> dict[str, Any]:
     declaration named returned a pass -- and "the unit says done" is not that.
     An absent criterion result is unmet, so a unit that reported `done` while
     proving nothing blocks the barrier rather than sliding through it.
+
+    A CUT UNIT REPORTS NOTHING, AND THE CUT RECORD IS WHAT SAYS SO (#760). The
+    barrier asserts closure by identity -- `_eval_admitted_set_closed`
+    compares this map's keys against `effective_set(declaration, cuts)` and
+    refuses both a missing result and an extra one -- so the two views have to
+    be derived from the SAME authority or they cannot agree. They were not: the
+    effective set came from the committed cut record while this map came from
+    the board, and a cut unit stays on the board as `cancelled` and is
+    re-projected from `admitted_units` on every `hydrate_cycle`. Every Cycle
+    that used a cut therefore reported one result too many and failed
+    `admitted_set_closed` on an `extra` that no honest action could clear --
+    cutting being the only valve the method has, that blocked the close of any
+    Cycle that used it.
+
+    Filtered on `read_cuts`, NEVER on the board's `cancelled` state. The board
+    is agent-writable; the committed record is the authority, and it is the one
+    `effective_set` already reads. A unit marked `cancelled` with no recorded
+    cut behind it therefore still reports here, still fails its criteria, and
+    still blocks -- which is the point: an unauthorized withdrawal must not
+    shrink the barrier's subject by being written onto the board.
     """
     tier = resolve_dod_tier(project_dir, state)
     intensity = str(
         (tier or {}).get("tier") or (tier or {}).get("intensity") or "growing"
     )
-    receipts = _paths.receipts_dir(project_dir, str(state.get("_cycle_id") or ""))
+    cid = str(state.get("_cycle_id") or "")
+    receipts = _paths.receipts_dir(project_dir, cid)
+    cut_ids = {
+        str(cut.get("unit_id") or "") for cut in read_cuts(project_dir, cid)
+    }
     out: dict[str, Any] = {}
     for story in state.get("current_stories") or []:
         uid = str(story.get("id") or "")
-        if not uid:
+        if not uid or uid in cut_ids:
             continue
         dod = evaluate_story_dod(project_dir, uid, intensity, receipts_dir=receipts)
         checks = (dod or {}).get("checks") or {}

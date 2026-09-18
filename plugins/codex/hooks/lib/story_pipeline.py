@@ -1334,6 +1334,44 @@ def story_is_ui_bearing(title: str = "", acceptance_criteria: Any = None) -> boo
     return any(re.search(rf"\b{re.escape(v)}\b", blob) for v in UI_AC_VERBS)
 
 
+#: Path roots this heuristic recognizes as UI-capable. `web/` is the one
+#: convention observed consistently across generated project layouts; extend
+#: this set rather than the keyword list above if another root is adopted.
+UI_PATH_ROOTS = frozenset({"web"})
+
+
+def path_scope_precludes_ui(file_scope: Any) -> bool:
+    """True when a DECLARED path scope is non-empty and touches no UI root.
+
+    A checkable fact, kept separate from `story_is_ui_bearing`'s word match
+    on purpose (#758). `_NON_UI_KINDS` cannot suppress the keyword heuristic
+    for an SPQ Work Unit: `cycle_records.UNIT_KINDS` (`feature`, `story`,
+    `bugfix`, `task`, `release`, `SC-MTH-003`) and `_NON_UI_KINDS`
+    (`enabler`, `infra`, `backend`) share no member, so every SPQ unit falls
+    through to the keyword match regardless of `kind`. That match then fires
+    on domain vocabulary the UI never owned -- "view" is a database view or a
+    read model as often as it is a screen -- with no way to tell the two
+    apart from the word alone.
+
+    `file_scope` is the one fact an SPQ Work Unit always carries that a
+    keyword cannot: `_unit_story` projects it straight from the sealed
+    declaration's `path_scope` (`spq_state_machine.py`), so a unit whose
+    every declared path lives outside every UI root cannot render anything,
+    full stop -- there is no file it could touch to do so. This is
+    ONE-DIRECTIONAL: it only SUPPRESSES a false positive. An empty
+    `file_scope` (Scrum/Kanban stories, which carry none) or a scope that
+    does touch a UI root answers `False` and defers entirely to the keyword
+    heuristic -- this function never manufactures a positive from a path.
+    """
+    paths = [str(p) for p in (file_scope or []) if str(p).strip()]
+    if not paths:
+        return False
+    return not any(
+        p.replace("\\", "/").strip("/").split("/", 1)[0] in UI_PATH_ROOTS
+        for p in paths
+    )
+
+
 # #44 phase 5 — verbs that mark an acceptance criterion as *claiming* an
 # external service is wired/connected/integrated. Deliberately limited to the
 # claim VERBS named in the receipt-protocol "Integration claims" section — not
@@ -1565,6 +1603,11 @@ def create_story(
         "file_scope": list(file_scope or []),
         "ui_bearing": (
             False if kind_norm in _NON_UI_KINDS
+            # #758 — a declared path scope that touches no UI root precludes
+            # rendering regardless of what the title/ACs say; checked before
+            # the keyword match so a backend unit's own domain vocabulary
+            # ("view" as a database view, not a screen) cannot promote it.
+            else False if path_scope_precludes_ui(file_scope)
             else story_is_ui_bearing(title, acceptance_criteria)
         ),
         # Per-role retry counter for the H3-F1 recovery ladder:
@@ -4850,6 +4893,14 @@ def _story_is_ui_bearing_in_state(project_dir: str, story_id: str) -> bool:
     # kind assigned after story creation still wins.
     if str(story.get("kind") or "").strip().lower() in _NON_UI_KINDS:
         return False
+    # #758 — same "fresher signal wins" treatment as `kind` above: a declared
+    # path scope that touches no UI root overrides a stale snapshot too, not
+    # only a keyword re-derivation. Reachable in practice only if `ui_bearing`
+    # is absent (pre-#44) or the flag predates a manifest revision that has
+    # not yet reprojected this record; `create_story` already applies this
+    # check going forward, so a fresh record never needs the override here.
+    if path_scope_precludes_ui(story.get("file_scope")):
+        return False
     if "ui_bearing" in story:
         return bool(story["ui_bearing"])
     return story_is_ui_bearing(
@@ -5252,6 +5303,14 @@ def attach_dispatch_dod_contract(
                 **{k: resolved[k] for k in _DISPATCH_DOD_KEYS if k in resolved},
             }
     return out
+
+
+def _producer_verifier_diversity(
+    producer_receipt: dict | None, verifier_receipt: dict | None
+) -> dict | None:
+    from producer_verifier_diversity import diversity_signal
+
+    return diversity_signal(producer_receipt, verifier_receipt)
 
 
 def evaluate_story_dod(
@@ -5687,6 +5746,19 @@ def evaluate_story_dod(
         # missing-evidence description for a gap, and the evidence class that
         # actually backed the check (never one a payload claimed).
         DOD_CHECK_RESULTS_KEY: typed_results,
+        # #753 — a recorded fact, not a gate: whether the producing (se) and
+        # each verifying (qe, cr) receipt resolved to a distinct backend, and
+        # whether their models are attested to be the same, distinct, or
+        # unattributed (never asserted "same" from a runtime that cannot
+        # report one, e.g. Codex). `None` when a side has no receipt yet.
+        "producer_verifier_diversity": {
+            "se_vs_qe": _producer_verifier_diversity(
+                receipt_by_role.get("se"), receipt_by_role.get("qe")
+            ),
+            "se_vs_cr": _producer_verifier_diversity(
+                receipt_by_role.get("se"), receipt_by_role.get("cr")
+            ),
+        },
         "evaluated_at": _now(),
     }
     _emit_project_event(

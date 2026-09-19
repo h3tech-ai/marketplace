@@ -161,29 +161,51 @@ def _write_pointer(project_dir: str, identity_fields: dict[str, Any]) -> None:
 def read_engagement(project_dir: str) -> dict[str, Any]:
     """Engagement-level facts: the baseline, outstanding commitments, handover.
 
-    On the pointer rather than on a board, because they outlive every Cycle and
-    because at `DISCOVERY` there is no board yet. `cycle_lifecycle` separates
-    engagement state from Cycle state; this is the storage that makes the
-    separation real rather than nominal.
+    COMMITTED, and read from git rather than from the gitignored pointer
+    (#766). They outlive every Cycle AND every checkout, and at `DISCOVERY`
+    there is no board yet. On the pointer they reached exactly one working
+    tree: a fresh `git worktree` of the same commit read `lifecycle_state:
+    DISCOVERY` and `baseline_approved: False`, so `open_cycle` refused there
+    and a Cycle could be neither started nor continued anywhere but the
+    directory that happened to run `approve_baseline`.
+
+    THE POINTER IS STILL READ, as a legacy shim and only when the committed
+    file is absent. That is the same read-only-shim shape this product used for
+    the `product-manager` rename: accept the old form on read, never emit it,
+    remove it once no supported version writes it. A project that approved its
+    baseline before this change keeps working without a migration step.
     """
+    committed = _store.read_json(_paths.engagement_path(project_dir))
+    if isinstance(committed, dict) and committed.get("engagement"):
+        return dict(committed["engagement"])
     pointer = read_pointer(project_dir)
     engagement = pointer.get("engagement")
     return dict(engagement) if isinstance(engagement, dict) else {}
 
 
 def _write_engagement(project_dir: str, fields: dict[str, Any]) -> None:
-    path = _pointer_path(project_dir)
+    """Write engagement facts to the committed file, never to the pointer.
+
+    One writer, one location. The pointer copy is not updated in step: keeping
+    both current is how two stores come to disagree, and the read shim above
+    only consults the pointer when the committed file says nothing at all.
+    """
+    path = _paths.engagement_path(project_dir)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with _store.transaction(_paths.lock_for(path)):
-        pointer = _store.read_json(path)
-        pointer["version"] = product_version()
-        pointer["state_schema"] = 2
-        pointer["build_mode"] = "spq"
-        engagement = pointer.get("engagement")
+        body = _store.read_json(path)
+        engagement = body.get("engagement")
         if not isinstance(engagement, dict):
-            engagement = {}
+            # First write after the move: carry the pointer's facts forward so
+            # the committed file starts complete rather than partial.
+            engagement = read_engagement(project_dir)
         engagement.update(fields)
-        pointer["engagement"] = engagement
-        _store.write_json_atomic(path, pointer)
+        _store.write_json_atomic(path, {
+            "schema_version": "1",
+            "kind": "spq.engagement",
+            "version": product_version(),
+            "engagement": engagement,
+        })
 
 
 def identity(
@@ -225,19 +247,31 @@ def _default_board() -> dict[str, Any]:
     }
 
 
+#: The keys `_engagement_view` merges in at read time. `_write_state` strips
+#: exactly these, so the merged view never lands on a board (#766). One list,
+#: named once: two spellings of "which keys are the engagement's" is how the
+#: merge and the strip would come to disagree.
+_ENGAGEMENT_KEYS = (
+    "discovery", "outstanding_commitments", "handover", "acceptances",
+)
+
+
 def _engagement_view(project_dir: str) -> dict[str, Any]:
     """Engagement facts, shaped for a board reader.
 
     Merged onto every board rather than duplicated into it: a reader asking
     "is the baseline approved" gets one answer, and no Cycle holds a copy that
-    can drift from the engagement's.
+    can drift from the engagement's. `_write_state` strips `_ENGAGEMENT_KEYS`
+    for that reason -- before #766 it wrote the merged dict back and every
+    board carried a copy, which is the drift this docstring claimed not to
+    have.
     """
     engagement = read_engagement(project_dir)
     view: dict[str, Any] = {}
     if engagement.get("discovery"):
         view["discovery"] = dict(engagement["discovery"])
-    for key in ("outstanding_commitments", "handover", "acceptances"):
-        if key in engagement:
+    for key in _ENGAGEMENT_KEYS:
+        if key != "discovery" and key in engagement:
             view[key] = engagement[key]
     return view
 
@@ -274,6 +308,15 @@ def _write_state(project_dir: str, state: dict[str, Any]) -> None:
     exists: leaving the lifecycle fields in the pointer would make it a second,
     stale copy of the board, and four separate readers reported the resulting
     emptiness as a measurement (#505, #509, #514).
+
+    ENGAGEMENT FACTS ARE STRIPPED TOO (#766), and that closes a guarantee this
+    module stated without providing. `_engagement_view` says it merges them
+    "rather than duplicated into it: ... no Cycle holds a copy that can drift
+    from the engagement's" -- but the merge happens at READ time and this
+    function wrote the merged dict straight back, so every board on disk held
+    its own `discovery`, and the engagement's own store held `None`. The reads
+    agreed only because the merge re-ran each time. Now the copy never lands,
+    so the sentence is true of the mechanism rather than of the read path.
     """
     cycle_id = str(state.get("_cycle_id") or "")
     if not cycle_id:
@@ -284,7 +327,10 @@ def _write_state(project_dir: str, state: dict[str, Any]) -> None:
             "cannot write a board before a Cycle exists: open_cycle allocates "
             "the identity the board is stored under"
         )
-    body = {k: v for k, v in state.items() if not k.startswith("_")}
+    body = {
+        k: v for k, v in state.items()
+        if not k.startswith("_") and k not in _ENGAGEMENT_KEYS
+    }
     path = _board_path(project_dir, cycle_id)
     with _store.transaction(_paths.lock_for(path)):
         _store.write_json_atomic(path, with_state_metadata({**body, "state_schema": 3}))
@@ -409,12 +455,29 @@ def approve_baseline(
             "the work before it binds, and a baseline approved without one is "
             "an estimate with a signature on it"
         )
-    # The baseline is ENGAGEMENT state, not Cycle state, so it goes on the
-    # pointer. That is not a storage convenience: at `DISCOVERY` there is no
-    # Cycle and therefore no board to write to, and every later Cycle reads the
-    # same baseline -- one copy per Cycle would let two Cycles be held to two
-    # different commitments. `cycle_lifecycle` draws the same line, and this is
-    # where it costs something to observe.
+    # The baseline is ENGAGEMENT state, not Cycle state. That is not a storage
+    # convenience: at `DISCOVERY` there is no Cycle and therefore no board to
+    # write to, and every later Cycle reads the same baseline -- one copy per
+    # Cycle would let two Cycles be held to two different commitments.
+    # `cycle_lifecycle` draws the same line, and this is where it costs
+    # something to observe.
+    #
+    # REFUSED WHEN THE RECORD WOULD BE INVISIBLE (#766), on the same rule
+    # `open_cycle` applies to a gitignored declaration: an approval that writes
+    # cleanly here and reaches no other checkout is the worst of the available
+    # failures, because nothing looks wrong until somebody tries to open a
+    # Cycle somewhere else and is told Discovery never happened.
+    if transport_ignored(project_dir, _paths.ENGAGEMENT_RELPATH):
+        raise HydrationRefusal(
+            "engagement_ignored",
+            "%s is gitignored, so this baseline approval would reach no other "
+            "checkout: a fresh worktree of the same commit would read "
+            "`baseline_approved: False` and refuse to open a Cycle. It lives "
+            "in the same committed transport `open_cycle` refuses a gitignored "
+            "declaration for, so the two documented lines cover both:\n"
+            "    .synaptory/*\n"
+            "    !.synaptory/cycles/" % _paths.ENGAGEMENT_RELPATH,
+        )
     _write_engagement(project_dir, {
         "discovery": {
             "completed_at": _now(),
@@ -1255,7 +1318,8 @@ def _write_cuts(project_dir: str, cycle_id: str, cuts: list[dict[str, Any]]) -> 
 
 
 def cut_work_unit(
-    project_dir: str, unit_id: str, reason: str, *, cut_by: str = ""
+    project_dir: str, unit_id: str, reason: str, *, cut_by: str = "",
+    cycle_id: str | None = None,
 ) -> dict[str, Any]:
     """The one valve (`SC-MTH-009`), and it needs a reason.
 
@@ -1263,10 +1327,17 @@ def cut_work_unit(
     re-admits it at a later Commit. It never moves the approved baseline, which
     is asserted rather than assumed: the declaration's `baseline_ref` is
     unchanged by this function, and a test pins that.
+
+    `cycle_id` NAMES THE CYCLE, and it is the dangerous one to leave implicit
+    (#765). Without it this followed a single shared pointer that `_write_state`
+    moves on every board write, so with two Cycles open in one checkout a cut
+    landed on whichever wrote last -- silently, with no argument through which
+    the caller could say which one it meant. A cut aimed at the wrong Cycle is
+    hard to undo and #761's deadlock made the recovery worse.
     """
     import cycle_barrier as _barrier
 
-    state = read_state(project_dir)
+    state = read_state(project_dir, cycle_id=cycle_id)
     cycle_id = str(state.get("_cycle_id") or "")
     declaration = read_manifest(project_dir, cycle_id)
     story = next(
@@ -1354,6 +1425,63 @@ def cut_work_unit(
         "readmission_key": record["readmission_key"],
         "backlog_ref": record["backlog_ref"],
         "cut_at": record["cut_at"],
+        "effective_set": _barrier.effective_set(declaration, cuts),
+    }
+
+
+def rebind_cut(
+    project_dir: str, unit_id: str, *, principal: str = "",
+    cycle_id: str | None = None,
+) -> dict[str, Any]:
+    """Re-affirm an existing cut against the current declaration (#761).
+
+    The route out of a supersession taken after a cut. `cut_work_unit` cannot
+    serve here, twice over: it is idempotent on a `readmission_key` derived
+    from the (cycle, unit) pair, so re-running it records nothing, and it ends
+    by calling `effective_set`, which is where the refusal comes from. The
+    remedy needed its own verb rather than a flag on the old one.
+
+    Appends; never edits. The original cut keeps its reason, its timestamp and
+    its authority decision; the new record carries `supersedes` plus a
+    decision naming whoever answers for the cut under the declaration that now
+    governs.
+    """
+    import cycle_barrier as _barrier
+
+    state = read_state(project_dir, cycle_id=cycle_id)
+    cycle_id = str(state.get("_cycle_id") or "")
+    declaration = read_manifest(project_dir, cycle_id)
+    if not declaration:
+        raise ValueError(
+            "Cycle %s has no readable sealed declaration, so there is no "
+            "current binding to re-affirm a cut against." % cycle_id
+        )
+    cuts = read_cuts(project_dir, cycle_id)
+    chain = [c for c in cuts if str(c.get("unit_id")) == str(unit_id)]
+    if not chain:
+        raise ValueError(
+            "no cut of %r is recorded for Cycle %s. This verb re-affirms a cut "
+            "that was already accountably taken; it is not a way to cut "
+            "something." % (unit_id, cycle_id)
+        )
+    latest = chain[-1]
+    record = _barrier.rebind_cut(
+        cut=latest, declaration=declaration, principal=str(principal or "")
+    )
+    already = any(
+        str(c.get("declaration_hash") or "")
+        == str(declaration.get("declaration_hash") or "")
+        for c in chain
+    )
+    if not already:
+        cuts.append(record)
+        _write_cuts(project_dir, cycle_id, cuts)
+    return {
+        "ok": True,
+        "unit_id": str(unit_id),
+        "declaration_hash": str(record.get("declaration_hash") or ""),
+        "supersedes": record.get("supersedes"),
+        "rebound": not already,
         "effective_set": _barrier.effective_set(declaration, cuts),
     }
 
@@ -1993,15 +2121,23 @@ def close_cycle(
 
 
 def record_sync(
-    project_dir: str, *, waiting_unit_id: str, producing_cycle_id: str, resolution: str
+    project_dir: str, *, waiting_unit_id: str, producing_cycle_id: str,
+    resolution: str, cycle_id: str | None = None,
 ) -> dict[str, Any]:
     """Record that a cross-Cycle wait cleared. It unblocks nothing.
 
     The dependency does that. `Sync` happens "several times or not at all"
     (§1.1), and the absence of one blocks nothing -- which is why this returns
     the record and touches no story state.
+
+    `cycle_id` names the WAITING Cycle -- the one whose ledger carries the
+    event -- while `producing_cycle_id` names the other side (#765). Following
+    the shared pointer for the first was the sharpest version of that defect:
+    a Sync is recorded precisely when two Cycles are open at once, so the verb
+    that coordinates concurrent Cycles was the one unable to say which Cycle
+    it meant.
     """
-    state = read_state(project_dir)
+    state = read_state(project_dir, cycle_id=cycle_id)
     state["method_events"] = _events.append(
         state.get("method_events") or [],
         _events.build(
@@ -2073,15 +2209,22 @@ def record_handover(
     return {"ok": True, "handover": handover}
 
 
-def acceptance_readiness(project_dir: str) -> dict[str, Any]:
+def acceptance_readiness(
+    project_dir: str, *, cycle_id: str | None = None
+) -> dict[str, Any]:
     """What an Acceptance still owes, and whether it is the final one.
 
     Repeatable (`SC-MTH-014`): each go-live compiles its own package. Whether
     it CLOSES the engagement is derived from outstanding commitments and a
     recorded handover, not claimed by the caller -- a caller-set flag would let
     a mid-engagement release end the engagement.
+
+    `cycle_id` selects which Cycle's receipts are counted (#765): the readiness
+    answer is read off `ACCEPTANCE-{seq}-{role}.json` under that Cycle's
+    receipts directory, so following the shared pointer reported another
+    Cycle's readiness as this one's.
     """
-    state = read_state(project_dir)
+    state = read_state(project_dir, cycle_id=cycle_id)
     seq = int(state.get("current_cycle") or 0)
     receipts = Path(_paths.receipts_dir(project_dir, str(state.get("_cycle_id") or "")))
     present, missing = [], []
@@ -2437,7 +2580,9 @@ def refresh_ledger(
     }
 
 
-def dep_status(project_dir: str, unit_id: str | None = None) -> dict[str, Any]:
+def dep_status(
+    project_dir: str, unit_id: str | None = None, *, cycle_id: str | None = None
+) -> dict[str, Any]:
     """Operator view of every Work Unit's dependency resolution.
 
     #304's AC asks that an unresolved dependency be observable to the operator.
@@ -2448,9 +2593,13 @@ def dep_status(project_dir: str, unit_id: str | None = None) -> dict[str, Any]:
     import spq_ledger
     import story_pipeline
 
-    state = read_state(project_dir)
+    # #765 — named, not inferred. `dep_status` and `record_sync` ARE the
+    # cross-Cycle dependency machinery, so concurrent Cycles are the case they
+    # exist for; following a shared pointer made them report on whichever
+    # Cycle wrote last.
+    state = read_state(project_dir, cycle_id=cycle_id)
     context = story_pipeline.dep_context(project_dir, state)
-    ident = identity(project_dir)
+    ident = identity(project_dir, cycle_id=cycle_id)
 
     pending_push: list[str] = []
     if ident.cycle_id:
@@ -2545,7 +2694,8 @@ def main(argv: list[str]) -> None:
             "usage: spq_state_machine.py <verb> <project_dir> [flags]\n"
             "verbs: init, read, next_action, transition, approve_baseline, "
             "open_cycle, revise_manifest, hydrate_cycle, cut_work_unit, "
-            "run_barrier, promote_cycle, close_cycle, record_handover, "
+            "rebind_cut, run_barrier, promote_cycle, close_cycle, "
+            "record_handover, "
             "record_sync, acceptance_status, publish_event, refresh_ledger, "
             "dep_status"
         )
@@ -2612,7 +2762,20 @@ def main(argv: list[str]) -> None:
                 _die("cut_work_unit needs a Work Unit id")
             _emit(cut_work_unit(
                 project_dir, args[0], _flag(args, "--reason", "") or "",
-                cut_by=_flag(args, "--cut-by", "") or ""))
+                cut_by=_flag(args, "--cut-by", "") or "",
+                cycle_id=_flag(args, "--cycle-id")))
+        elif verb == "rebind_cut":
+            # The remedy `effective_set`'s refusal names, and it has to be
+            # reachable or that refusal is the unactionable kind (#517).
+            # Accepts the unit id positionally or as `--unit-id`, because the
+            # refusal quotes the flag form.
+            unit = _flag(args, "--unit-id") or (args[0] if args else "")
+            if not unit:
+                _die("rebind_cut needs a Work Unit id (--unit-id)")
+            _emit(rebind_cut(
+                project_dir, unit,
+                principal=_flag(args, "--principal", "") or "",
+                cycle_id=_flag(args, "--cycle-id")))
         elif verb == "run_barrier":
             # THE VERDICT'S ONLY PRODUCER. `close_cycle` requires one and
             # `cycle_barrier.evaluate` was reachable from no CLI verb and no
@@ -2676,9 +2839,11 @@ def main(argv: list[str]) -> None:
                 waiting_unit_id=_flag(args, "--waiting-unit", "") or "",
                 producing_cycle_id=_flag(args, "--producing-cycle", "") or "",
                 resolution=_flag(args, "--resolution", "") or "",
+                cycle_id=_flag(args, "--cycle-id"),
             ))
         elif verb == "acceptance_status":
-            _emit(acceptance_readiness(project_dir))
+            _emit(acceptance_readiness(
+                project_dir, cycle_id=_flag(args, "--cycle-id")))
         elif verb == "publish_event":
             # EVERY ARGUMENT ITS OWN FUNCTION REQUIRES. The CLI passed two of
             # eight, so the shipped verb could not publish a single condition
@@ -2705,9 +2870,12 @@ def main(argv: list[str]) -> None:
                 published_by=_flag(args, "--published-by", "") or "",
             ))
         elif verb == "refresh_ledger":
-            _emit(refresh_ledger(project_dir))
+            _emit(refresh_ledger(
+                project_dir, cycle_id=_flag(args, "--cycle-id")))
         elif verb == "dep_status":
-            _emit(dep_status(project_dir, _flag(args, "--unit-id")))
+            _emit(dep_status(
+                project_dir, _flag(args, "--unit-id"),
+                cycle_id=_flag(args, "--cycle-id")))
         else:
             _die("unknown verb %r" % verb)
     # `LedgerError` is a `RuntimeError`, not a `ValueError`, so every ledger

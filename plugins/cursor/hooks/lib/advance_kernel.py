@@ -131,6 +131,10 @@ PATH_ESCAPE = "path_escape"
 PATH_NOT_CANONICAL = "path_not_canonical"
 NO_RECEIPT = "no_receipt"
 RECEIPT_UNREADABLE = "receipt_unreadable"
+# #755. The receipt fails the SAME strict contract `validate_receipt` applies
+# (`receipt_validator.validate_receipt_payload`, step 9 below). Deliberately
+# NOT in `_EVIDENCE_CODES` -- see the note under that set for why a document
+# that fails its own schema is correctness rather than evidence strength.
 RECEIPT_INVALID = "receipt_invalid"
 STORY_MISMATCH = "story_mismatch"
 ROLE_MISMATCH = "role_mismatch"
@@ -229,7 +233,6 @@ _EVIDENCE_CODES = frozenset(
         PATH_NOT_CANONICAL,
         NO_RECEIPT,
         RECEIPT_UNREADABLE,
-        RECEIPT_INVALID,
         STORY_MISMATCH,
         ROLE_MISMATCH,
         # #402: the same class as ROLE_MISMATCH, which is already here. Both
@@ -250,6 +253,38 @@ _EVIDENCE_CODES = frozenset(
     }
 )
 
+# RECEIPT_INVALID is deliberately NOT in _EVIDENCE_CODES, and #755 is why it
+# stopped being. It was the one member of this set that is not a statement
+# about evidence at all: the others say the evidence is weak, that it names
+# the wrong stage, or that it arrived late, while this one says the DOCUMENT
+# fails the schema every reader downstream assumes it satisfies, which is the
+# premise those other judgements are made under. `receipt_validator` is
+# the same contract `validate_receipt` runs, so warning past it meant one
+# build could advance a Work Unit on a receipt the same build reports invalid.
+#
+# Measured on the #714 pilot Cycle: a producer receipt carrying three bare
+# evidence-class tokens (a `replayed` item naming no command, an `attested`
+# item naming no attempt, a `judged` item naming no principal, digest, verdict
+# or independence) advanced `TRACKER-001` from `in_progress` to `testing`
+# under `enforcement="warn"`. The producer had genuinely run its regression
+# script; that is not the question. Successful task commands do not make a
+# structurally invalid governed receipt valid, and the stage AFTER the
+# producer is the one place nothing can see the defect any more:
+# `inadmissible_receipts` keys the recovery ladder on the CURRENT stage's
+# gating role, so once the unit is in `testing` the invalid producer receipt
+# is behind it and `next_action` asks for a QE dispatch -- downstream proof
+# built on evidence that does not exist, on a Cycle whose producer retries
+# were already spent.
+#
+# The recovery ladder is the route this refusal opens, not a route it closes.
+# #741 already built it: a governed attempt recorded `completed` whose
+# canonical receipt fails validation is reported by `unadvanceable_receipt`,
+# `next_action` offers `dispatch_<role>` carrying
+# `story_pipeline.RECEIPT_INADMISSIBLE_VERDICT` (this very code), and
+# `execute_dispatch` archives the invalid bytes before minting a
+# successor. That path is only reachable while the unit is still AT the
+# producer stage, which is exactly what refusing here preserves.
+#
 # MANIFEST_DISAGREEMENT is deliberately NOT in _EVIDENCE_CODES. Which Cycle a
 # Work Unit belongs to is correctness, in the same class as ILLEGAL_TRANSITION
 # and DEPS_UNMET, so `enforcement="warn"` must not downgrade it: a warned-past
@@ -1882,19 +1917,42 @@ def intended_receipts_dir(project_dir: str) -> Path:
 
 
 def _scoped_path(project_dir: str, raw: str) -> Path:
-    """Resolve a caller-supplied path, refusing anything outside .orchestrator."""
-    root = (Path(str(project_dir)) / ".synaptory" / ".orchestrator").resolve()
+    """Resolve a caller-supplied path, refusing anything outside the two
+    directories the runtime owns.
+
+    TWO ROOTS SINCE #766, and both are named rather than collapsed into their
+    common parent. Receipts moved into the committed transport
+    (`.synaptory/cycles/<id>/receipts`) so a reviewer can see the evidence the
+    barrier credits, and that is outside `.orchestrator` -- which this guard
+    refused, so every advance on the new layout failed `path_escape` until the
+    boundary caught up.
+
+    Widening to `.synaptory` would have been one line and one root, and it
+    would have admitted `tracker/`, `design/`, `.protocols/` and a Cycle's own
+    sealed `manifest.json` as places a caller may name a receipt. The point of
+    this check is that a caller-supplied path cannot wander; two exact roots
+    keep that true while the layout changes underneath it.
+    """
+    base = Path(str(project_dir)) / ".synaptory"
+    roots = [
+        (base / ".orchestrator").resolve(),   # boards, and every pre-#766 layout
+        (base / "cycles").resolve(),          # the committed transport
+    ]
     candidate = Path(raw)
     if not candidate.is_absolute():
         candidate = Path(str(project_dir)) / candidate
     resolved = candidate.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        raise _Refusal(
-            PATH_ESCAPE, "receipt_path escapes the project orchestrator directory"
-        )
-    return resolved
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+    raise _Refusal(
+        PATH_ESCAPE,
+        "receipt_path escapes the directories this project's runtime owns "
+        "(.synaptory/.orchestrator and .synaptory/cycles)",
+    )
 
 
 def parse_timestamp(value: Any) -> Optional[datetime]:

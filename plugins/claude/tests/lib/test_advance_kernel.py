@@ -550,6 +550,139 @@ def test_warn_mode_still_enforces_legality(tmp_path):
     assert decision.code == ak.ILLEGAL_TRANSITION
 
 
+# ── #755: an invalid receipt is never warned past ────────────────────────────
+
+
+#: The exact malformed block the #714 pilot's producer filed on `TRACKER-001`:
+#: three bare class tokens. Each one is a claim with nothing behind it -- a
+#: replay of no command, an attestation bound to no execution, a verdict from
+#: no principal about no candidate -- and together they are the eight errors
+#: `validate_receipt` reported while the same build advanced the Work Unit.
+_PILOT_BARE_EVIDENCE = [
+    {"evidence_class": "replayed"},
+    {"evidence_class": "attested"},
+    {"evidence_class": "judged"},
+]
+
+
+def _governed_se_binding(project: Path, story_id: str = "US-001") -> None:
+    """Record a COMPLETED governed producer attempt on the story's se stage.
+
+    `advance_kernel.unadvanceable_receipt` is scoped to a binding recorded
+    exactly `completed`, so the #741 recovery ladder is only reachable through
+    one. Without this the story would still refuse, and the test would prove
+    the refusal while proving nothing about the route out of it.
+    """
+    path = project / ".synaptory" / ".orchestrator" / "pipeline-state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    for story in state["current_stories"]:
+        if story["id"] == story_id:
+            story["mcp_active_dispatches"] = {
+                "se": {
+                    "dispatch_id": "a" * 32,
+                    "attempt_id": "att_" + "b" * 20,
+                    "fencing_token": "c" * 32,
+                    "state": "completed",
+                    "role": "software-engineer",
+                    "started_at": STAGE_ENTERED,
+                    "runtime_family": "claude",
+                    "placement": "local",
+                    "adapter_profile_id": "claude-local-v1",
+                }
+            }
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def test_receipt_invalid_is_not_downgradable(tmp_path):
+    """#755. A document that fails its own schema is correctness, not evidence
+    strength, so `enforcement="warn"` must not carry the board past it.
+
+    The membership assertion is not decoration. Putting the code back into
+    `_EVIDENCE_CODES` would restore the defect while every behavioural test
+    below still had a refusal to find on some other host, so the set itself is
+    pinned here in the same idiom `test_attempt_liveness.py` uses for the
+    fencing codes.
+    """
+    project = _project(tmp_path)
+    _seed(project, state="in_progress")
+    _receipt(
+        project,
+        role="software-engineer",
+        abbrev="se",
+        evidence=_PILOT_BARE_EVIDENCE,
+    )
+    decision = ak.execute_advance(
+        str(project),
+        "US-001",
+        "testing",
+        policy=_policy(enforcement="warn"),
+    )
+    assert not decision.allowed, decision.reason
+    assert decision.code == ak.RECEIPT_INVALID
+    # The Work Unit stays at the PRODUCER stage. Reaching `testing` is what
+    # made the invalid producer receipt unreachable in the pilot: the recovery
+    # ladder keys on the current stage's gating role, so a unit one stage past
+    # its own bad evidence has nothing left that can see it.
+    story = sp.get_story(sp._read_state(str(project)), "US-001")
+    assert story["state"] == "in_progress"
+    # Pinned last, so the behavioural assertions above are what a regression
+    # reports first: putting the code back into `_EVIDENCE_CODES` must read as
+    # "the board moved", not as a set that changed shape.
+    assert ak.RECEIPT_INVALID not in ak._EVIDENCE_CODES
+
+
+def test_invalid_producer_receipt_keeps_the_recovery_ladder_reachable(tmp_path):
+    """#755. Refusing is half the contract; the other half is the route out.
+
+    `next_action` must offer producer recovery rather than downstream proof --
+    the pilot's `next_action` answered `dispatch_qe` on a Work Unit whose
+    producer receipt had never been valid.
+    """
+    project = _project(tmp_path)
+    _seed(project, state="in_progress")
+    # Carries the binding's own identity, so the ONLY thing wrong with this
+    # receipt is its evidence. Without the attempt id, the dispatch id and the
+    # generation, the kernel refuses on `fencing_token_missing` -- which is
+    # already non-downgradable -- and the test would pass on a fence that has
+    # nothing to do with the evidence contract under test.
+    _receipt(
+        project,
+        role="software-engineer",
+        abbrev="se",
+        evidence=_PILOT_BARE_EVIDENCE,
+        attempt_id="att_" + "b" * 20,
+        dispatch_id="a" * 32,
+        fencing_token="c" * 32,
+        adapter_profile_id="claude-local-v1",
+        placement="local",
+        source_revision="deadbeef",
+        stage_profile="producing",
+        capability_profile="producer",
+    )
+    _governed_se_binding(project)
+
+    # The pilot's own sequence: the host tries to advance first. Whether that
+    # call refuses is `test_receipt_invalid_is_not_downgradable`'s subject;
+    # what this test measures is the board AFTER it, because a board carried
+    # one stage forward is where the recovery stops being reachable.
+    ak.execute_advance(
+        str(project),
+        "US-001",
+        "testing",
+        policy=_policy(enforcement="warn"),
+    )
+
+    state = sp._read_state(str(project))
+    hits = ak.inadmissible_receipts(str(project), state)
+    assert "US-001" in hits
+    assert any("evidence[0]" in e for e in hits["US-001"]["errors"])
+
+    action = ak.next_action(str(project))
+    assert action["action"] == "dispatch_se", action
+    assert action["role"] == "se"
+    assert action["recovery"]["verdict"] == ak.RECEIPT_INVALID
+
+
 def test_blocked_edge_ungated_for_claude(tmp_path):
     project = _project(tmp_path)
     _seed(project, state="testing")

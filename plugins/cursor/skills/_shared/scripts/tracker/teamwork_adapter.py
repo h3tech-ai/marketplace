@@ -20,6 +20,7 @@ ID convention:
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,11 @@ from .base import (
     AdapterError, AdapterAuthError, AdapterOfflineError,
 )
 from .transport.teamwork_transport import TeamworkTransport
+
+
+def _warn(message: str) -> None:
+    """Report a degraded parse on stderr without failing the read."""
+    print(f"tracker(teamwork): {message}", file=sys.stderr)
 
 
 # ── Teamwork Mappings ───────────────────────────────────────────────────
@@ -1285,6 +1291,20 @@ class TeamworkAdapter(ArtifactAdapter):
         - ``- ✅ **AC-01: Title**``   (emoji dash variant)
 
         Also parses Given/When/Then sub-bullets following each AC.
+
+        Both checkbox and emoji formats match the title non-greedily, so
+        they stop at the first ``**`` they find. A title with its own
+        internal bold (e.g. emphasising a negation) has a second ``**``
+        pair later on the line that the non-greedy match never reaches —
+        silently truncating the title instead of raising. Reject and
+        report that case rather than guess (#778).
+
+        Only the character right after the matched ``**`` decides this.
+        Trailing content after a clean close — e.g. the ``**Title** —
+        {{AC_SUMMARY}}`` shape templates use — starts with whitespace and
+        is legitimate even when that summary itself contains unrelated
+        bold; a ``**`` butted straight up against more text is the
+        signature of a nested-bold title that was cut mid-word.
         """
         acs = []
         if not description:
@@ -1306,6 +1326,14 @@ class TeamworkAdapter(ArtifactAdapter):
             # Checkbox format: * [x] or - [x] or * [ ] or - [ ]
             m = re.match(r"[*\-] \[([xX ])\] \*\*(AC-\w+):\s*(.*?)\*\*", stripped)
             if m:
+                tail = stripped[m.end():]
+                if tail and not tail[0].isspace():
+                    _warn(
+                        f"acceptance criterion {m.group(2)} was not parsed: its title "
+                        "contains markdown bold ('**') that makes the closing delimiter "
+                        f"ambiguous — rewrite the title without nested bold. Line: {stripped!r}"
+                    )
+                    continue
                 acs.append(AcceptanceCriterion(
                     id=m.group(2), text=m.group(3).strip(), met=m.group(1).lower() == "x",
                 ))
@@ -1313,6 +1341,14 @@ class TeamworkAdapter(ArtifactAdapter):
             # Emoji format: * ✅ or - ✅ or * ⬜ or - ⬜
             m = re.match(r"[*\-] ([✅⬜]) \*\*(AC-\w+):\s*(.*?)\*\*", stripped)
             if m:
+                tail = stripped[m.end():]
+                if tail and not tail[0].isspace():
+                    _warn(
+                        f"acceptance criterion {m.group(2)} was not parsed: its title "
+                        "contains markdown bold ('**') that makes the closing delimiter "
+                        f"ambiguous — rewrite the title without nested bold. Line: {stripped!r}"
+                    )
+                    continue
                 acs.append(AcceptanceCriterion(
                     id=m.group(2), text=m.group(3).strip(), met=m.group(1) == "✅",
                 ))

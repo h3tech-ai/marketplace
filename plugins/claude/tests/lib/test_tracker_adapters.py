@@ -411,3 +411,77 @@ def test_linear_backend_dispatches_to_linear_adapter(tmp_path: Path, monkeypatch
         assert adapter.health_check()["status"] == "offline"
     finally:
         clear_cache()
+
+
+@pytest.mark.unit
+def test_github_parse_checklist_acs_rejects_nested_bold_title(capsys):
+    """#778 — a title with its own internal ``**`` (bolding a negation, as
+    both real BRD examples from the issue do) must not be silently
+    truncated at the first ``**``. It is dropped and reported on stderr
+    instead, and a clean line still parses normally."""
+    from tracker.github_adapter import GitHubAdapter
+
+    body = "\n".join([
+        "- [ ] **AC-01: A cached value does **not** establish fresh recalculation**",
+        "- [ ] **AC-02: Unknown is **not** zero or a midpoint**",
+        "- [x] **AC-03: A perfectly ordinary title**",
+    ])
+
+    acs = GitHubAdapter._parse_checklist_acs(body)
+
+    assert [(ac.id, ac.text, ac.met) for ac in acs] == [
+        ("AC-03", "A perfectly ordinary title", True),
+    ]
+    err = capsys.readouterr().err
+    assert "AC-01" in err and "AC-02" in err
+    assert "AC-03" not in err
+
+
+@pytest.mark.unit
+def test_teamwork_parse_checklist_acs_rejects_nested_bold_title(capsys):
+    """#778 sibling — teamwork_adapter.py has the identical non-greedy
+    regex bug in both its checkbox and emoji checklist formats."""
+    from tracker.teamwork_adapter import TeamworkAdapter
+
+    description = "\n".join([
+        "* [ ] **AC-01: A cached value does **not** establish fresh recalculation**",
+        "* [x] **AC-02: A perfectly ordinary title**",
+        "- ✅ **AC-03: Unknown is **not** zero or a midpoint**",
+        "- ⬜ **AC-04: Another ordinary title**",
+    ])
+
+    acs = TeamworkAdapter._parse_checklist_acs(description)
+
+    assert [(ac.id, ac.text, ac.met) for ac in acs] == [
+        ("AC-02", "A perfectly ordinary title", True),
+        ("AC-04", "Another ordinary title", False),
+    ]
+    err = capsys.readouterr().err
+    assert "AC-01" in err and "AC-03" in err
+
+
+@pytest.mark.unit
+def test_github_parse_checklist_acs_keeps_clean_title_with_bold_trailer(capsys):
+    """#778 follow-up — bold *after* a title's own closing ``**`` is not the
+    same ambiguity as bold *inside* the title. The shipped AC-authoring
+    templates (plugin-claude/skills/synaptory/modes/init.md:302 and
+    skills/_shared/templates/tracker/user-story.md:11) both write
+    ``**Title** — Summary``, and the summary may itself contain bold (e.g.
+    naming a key term). That must still parse the title correctly instead
+    of being rejected as ambiguous — rejecting on ANY later ``**`` on the
+    line, rather than on the character immediately after the title's own
+    close, would silently drop these real, correctly-formed criteria."""
+    from tracker.github_adapter import GitHubAdapter
+
+    body = "\n".join([
+        "- [ ] **AC-01: Fix verified** — the retried request uses the **cached** token",
+        "- [ ] **AC-02: Title parses fine** (see also **AC-03**)",
+    ])
+
+    acs = GitHubAdapter._parse_checklist_acs(body)
+
+    assert [(ac.id, ac.text, ac.met) for ac in acs] == [
+        ("AC-01", "Fix verified", False),
+        ("AC-02", "Title parses fine", False),
+    ]
+    assert capsys.readouterr().err == ""

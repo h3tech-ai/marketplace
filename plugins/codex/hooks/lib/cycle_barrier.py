@@ -294,6 +294,87 @@ def link_readmission(
     return linked
 
 
+def rebind_cut(
+    *,
+    cut: Mapping[str, Any],
+    declaration: Mapping[str, Any],
+    principal: str,
+    produced_by: Optional[str] = None,
+    outcome: str = "continue",
+) -> Dict[str, Any]:
+    """Re-affirm an existing cut against the CURRENT declaration (#761).
+
+    The missing verb. A supersession taken after a cut left the cut bound to a
+    declaration that no longer governs, and nothing could add the binding:
+    `cut_work_unit` is idempotent on a `readmission_key` derived from the
+    (cycle, unit) pair, so re-running it recorded nothing, and it calls
+    `effective_set` anyway. Outside the window where reverting the supersession
+    is still available -- which closes the moment anything is bound to the new
+    revision -- the Cycle was terminal.
+
+    A NEW RECORD, NEVER AN EDIT, for the reason `link_readmission` gives: a
+    mutable cut is a rewritable reason. The original stays exactly as it was
+    written; this one carries `supersedes` and its own authority decision, so
+    the chain answers the accountability question a supersession raises --
+    **who answers for this cut now that the declaration authorizing it is
+    gone** -- with a named principal rather than with silence.
+
+    What it deliberately does NOT do: re-open the four refusals `record_cut`
+    owns. This re-affirms a cut that was already accountably taken; it is not
+    a second chance to cut something. The unit must still be admitted by the
+    declaration being bound to, and the baseline must not have moved.
+
+    Idempotent: a chain already carrying a record bound to this declaration
+    returns that record rather than appending a second identical one, so a
+    retry after a crash does not grow the chain.
+    """
+    unit_id = str(cut.get("unit_id") or "")
+    declaration_hash = str(declaration.get("declaration_hash") or "")
+    if unit_id not in _admitted_index(declaration):
+        raise BarrierError(
+            "declaration %s does not admit %s, so there is no cut of it here "
+            "to re-affirm. A cut re-bound to a declaration that never admitted "
+            "the unit would shrink a set the unit was never in."
+            % (declaration_hash[:19], unit_id or "<none>")
+        )
+    if str(cut.get("declaration_hash") or "") == declaration_hash:
+        return dict(cut)
+    assert_baseline_unchanged(
+        cut.get("baseline_digest"), str(declaration.get("baseline_ref") or "")
+    )
+    decision = cycle_authority.decide(
+        action="rebind-cut",
+        principal=principal,
+        outcome=outcome,
+        subject="%s/%s" % (str(declaration.get("cycle_id") or ""), unit_id),
+        subject_digest=declaration_hash,
+        produced_by=produced_by,
+        rationale=(
+            "re-affirming the cut of %s, taken against declaration %s, against "
+            "the superseding declaration %s. Reason unchanged: %s"
+            % (
+                unit_id,
+                str(cut.get("declaration_hash") or "")[:19],
+                declaration_hash[:19],
+                str(cut.get("reason") or ""),
+            )
+        ),
+    )
+    record = dict(cut)
+    record.update({
+        "declaration_hash": declaration_hash,
+        # The chain, so a reader can see which declaration each link answered
+        # to rather than only the latest one.
+        "supersedes": {
+            "declaration_hash": str(cut.get("declaration_hash") or ""),
+            "cut_at": str(cut.get("cut_at") or ""),
+        },
+        "rebound_at": _now(),
+        "decision": decision,
+    })
+    return record
+
+
 def effective_set(
     declaration: Mapping[str, Any], cuts: Sequence[Mapping[str, Any]] = ()
 ) -> List[str]:
@@ -303,10 +384,33 @@ def effective_set(
     effective set is the only thing that shrinks -- the ORIGINAL admitted set
     and the cut history both stay immutable, which is what keeps the cut-rate
     denominator from moving under the metric.
+
+    BINDING IS RESOLVED PER UNIT, ACROSS THE UNIT'S WHOLE CHAIN (#761). A cut
+    stays bound to the declaration it was authorized under, and that check is
+    the point: a cut authorized against one commitment must not silently
+    shrink a different one. But the check was applied per RECORD with no way
+    to add a record, so a `revise_manifest` taken after a `cut_work_unit` left
+    the Cycle unassessable -- `run_barrier` raised here before evaluating any
+    criterion, `cut_work_unit` could not re-take the cut because it calls this
+    function too, `close_cycle` re-derives its own verdict so there was no
+    exception path, and `readmits` belongs to a LATER Cycle's `open_cycle`.
+    A dependency event bound to a superseded revision can be re-published and
+    `spq_ledger.satisfied_map` expects exactly that; a cut bound the same way
+    could not be re-issued. That asymmetry was a missing verb, not a bad check.
+
+    So a unit's cut is in force when ANY record in its chain is bound to the
+    CURRENT declaration -- which `rebind_cut` adds, append-only, under a named
+    principal. Resolved per unit rather than per record for two reasons: the
+    re-affirmation is a new record beside the original rather than an edit of
+    it (`link_readmission`'s rule -- a mutable cut is a rewritable reason), and
+    reverting a supersession restores the original binding, which is then
+    valid again for the same reason it was valid before, rather than by
+    accident.
     """
     admitted = _admitted_index(declaration)
     cut_ids: Set[str] = set()
     declaration_hash = str(declaration.get("declaration_hash") or "")
+    bound_elsewhere: Dict[str, str] = {}
     for cut in cuts:
         unit_id = str(cut.get("unit_id") or "")
         if unit_id not in admitted:
@@ -317,12 +421,24 @@ def effective_set(
             )
         cut_hash = str(cut.get("declaration_hash") or "")
         if declaration_hash and cut_hash and cut_hash != declaration_hash:
-            raise BarrierError(
-                "cut record for %s was taken against declaration %s, not %s. A "
-                "cut is bound to the declaration it was authorized under."
-                % (unit_id, cut_hash[:19], declaration_hash[:19])
-            )
+            bound_elsewhere.setdefault(unit_id, cut_hash)
+            continue
+        bound_elsewhere.pop(unit_id, None)
         cut_ids.add(unit_id)
+    for unit_id, cut_hash in sorted(bound_elsewhere.items()):
+        if unit_id in cut_ids:
+            continue
+        raise BarrierError(
+            "cut record for %s was taken against declaration %s, not %s. A "
+            "cut is bound to the declaration it was authorized under, and no "
+            "record in this cut's chain names the current one -- which is "
+            "what a supersession taken after the cut leaves behind. Re-affirm "
+            "it against this declaration: `rebind_cut --unit-id %s "
+            "--principal <who answers for it>`. That appends a record rather "
+            "than editing the cut, so the original reason and its "
+            "accountability survive."
+            % (unit_id, cut_hash[:19], declaration_hash[:19], unit_id)
+        )
     remaining = [uid for uid in _admitted_order(declaration) if uid not in cut_ids]
     if not remaining:
         raise BarrierError(

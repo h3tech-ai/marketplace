@@ -103,6 +103,12 @@ ACTION_OWNER: Dict[str, str] = {
     "declare-source-region": "engineering-lead",
     "admit-work-unit": "engineering-lead",
     "cut-work-unit": "engineering-lead",
+    # Re-affirming an existing cut against a superseding declaration (#761).
+    # The same owner as the cut itself: it answers the question a supersession
+    # raises -- who answers for this cut now that the declaration authorizing
+    # it no longer governs -- and that is the Engineering Lead's scheduling
+    # act, not a fresh admission decision.
+    "rebind-cut": "engineering-lead",
     "integrate-to-trunk": "engineering-lead",
     "close-cycle": "engineering-lead",
     # Proof and release

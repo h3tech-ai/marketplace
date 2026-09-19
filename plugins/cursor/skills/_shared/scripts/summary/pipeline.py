@@ -562,7 +562,8 @@ def receipt_dirs(project_dir: Path) -> list:
 
         flat        `.orchestrator/receipts`
         Multi-Spec  `.orchestrator/specs/<spec-id>/receipts`
-        SPQ         `.orchestrator/spq/cycles/<cycle-id>/receipts`
+        SPQ         `.synaptory/cycles/<cycle-id>/receipts` (committed, #766)
+        SPQ legacy  `.orchestrator/spq/cycles/<cycle-id>/receipts`
 
     Globbing ALL of them, rather than resolving the one the active spec or the
     open Cycle points at, is deliberate for a summary: `pipeline-summary.json`
@@ -576,6 +577,13 @@ def receipt_dirs(project_dir: Path) -> list:
     orch = project_dir / ".synaptory" / ".orchestrator"
     candidates = [orch / "receipts"]
     candidates.extend(sorted((orch / "specs").glob("*/receipts")))
+    # #766 moved SPQ receipts into the committed tree. Both roots are globbed
+    # for the reason this docstring already gives: a summary that silently
+    # drops the receipts on the other side of a layout change is #730 again,
+    # and a Cycle's evidence does not move when the layout does.
+    candidates.extend(
+        sorted((project_dir / ".synaptory" / "cycles").glob("*/receipts"))
+    )
     candidates.extend(sorted((orch / "spq" / "cycles").glob("*/receipts")))
     seen = set()
     dirs = []

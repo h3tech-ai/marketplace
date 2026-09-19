@@ -5859,23 +5859,36 @@ def companion_receipt_dirs(receipts_dir: str) -> list[str]:
     `.orchestrator/receipts/` path. If the scoped dir exists (even empty),
     `receipts_dir_for` returns it and a flat file would be invisible.
     Both locations count.
+
+    ANCHORED ON `.synaptory`, NOT `.orchestrator`, SINCE #766. The walk used
+    to climb until it saw `.orchestrator` and return the primary directory
+    alone when it never did. A committed receipts directory
+    (`.synaptory/cycles/<id>/receipts`) has no `.orchestrator` ancestor, so
+    that guard fired on every SPQ project the moment receipts moved: the
+    function silently degraded to "no companions", and with it every caller
+    that depends on this being the one place that knows all the layouts --
+    `collect_story_receipts`, `_fresh_receipt`, and so the DoD gate and
+    `next_action` behind them. The gate did not refuse the unit; it stopped
+    seeing the evidence and asked for a stage that had already run.
     """
     if not receipts_dir:
         return []
     dirs = [receipts_dir]
     abs_dir = os.path.abspath(receipts_dir)
     cur = abs_dir
-    orch = None
+    syn = None
     for _ in range(8):
-        if os.path.basename(cur) == ".orchestrator":
-            orch = cur
+        if os.path.basename(cur) == ".synaptory":
+            syn = cur
             break
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
-    if orch is None:
+    if syn is None:
         return dirs
+    orch = os.path.join(syn, ".orchestrator")
+    committed_cycles = os.path.join(syn, "cycles")
     flat = os.path.join(orch, "receipts")
     if flat not in dirs:
         dirs.append(flat)
@@ -5911,6 +5924,36 @@ def companion_receipt_dirs(receipts_dir: str) -> list[str]:
                     cand = os.path.join(ws_root, ws, "receipts")
                     if cand not in dirs:
                         dirs.append(cand)
+        # The committed home receipts moved to in #766, enumerated from the
+        # flat directory on the same terms as the two above it.
+        if os.path.isdir(committed_cycles):
+            try:
+                committed_names = os.listdir(committed_cycles)
+            except OSError:
+                committed_names = []
+            for cycle in committed_names:
+                cand = os.path.join(committed_cycles, cycle, "receipts")
+                if cand not in dirs:
+                    dirs.append(cand)
+    else:
+        # Naming ONE Cycle's receipts searches that Cycle's other home too, and
+        # only that one. A Cycle keeps whatever it filed under the old layout
+        # (`legacy_receipts_dir`) because a recorded verdict may already cite
+        # it by path; pairing the two homes is what lets the gate read one
+        # Cycle's evidence without widening the search to every Cycle's.
+        parent = os.path.dirname(abs_dir)
+        cycle_id = os.path.basename(parent)
+        if os.path.dirname(parent) in (
+            os.path.abspath(committed_cycles), os.path.abspath(
+                os.path.join(orch, "spq", "cycles")
+            ),
+        ) and os.path.basename(abs_dir) == "receipts":
+            for twin in (
+                os.path.join(committed_cycles, cycle_id, "receipts"),
+                os.path.join(orch, "spq", "cycles", cycle_id, "receipts"),
+            ):
+                if os.path.abspath(twin) != abs_dir and twin not in dirs:
+                    dirs.append(twin)
     return dirs
 
 
@@ -6004,6 +6047,15 @@ def receipts_dir_for(project_dir: str, *, intended: bool = False) -> str:
             candidate = spq_paths.receipts_dir(project_dir, ident.cycle_id)
             if intended or os.path.isdir(candidate):
                 return candidate
+            # #766 -- receipts moved into the committed tree. A Cycle that
+            # produced receipts under the old layout keeps resolving to them: a
+            # receipt is immutable evidence a recorded verdict may already cite
+            # by path, so the read falls back rather than a migration moving
+            # files out from under it. Unreachable when `intended=True`,
+            # because nothing new is ever written to the old home.
+            legacy = spq_paths.legacy_receipts_dir(project_dir, ident.cycle_id)
+            if os.path.isdir(legacy):
+                return legacy
         return os.path.join(orch, "receipts")
 
     # Multi-spec, for scrum and kanban. Retained: #303/#304/#305 scope the

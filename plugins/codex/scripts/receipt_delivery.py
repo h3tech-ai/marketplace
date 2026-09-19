@@ -64,6 +64,22 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _within(path: Path, root: Path) -> bool:
+    """Containment by `relative_to`, not `str.startswith`.
+
+    Spelled out because this package is the one that still runs on Python 3.9
+    and the obvious alternatives are each wrong in a different way: prefix
+    comparison admits a sibling named `cyclesX`, and `is_relative_to` is a
+    3.9 addition whose absence would surface here as an AttributeError inside
+    an `except (OSError, ValueError)`.
+    """
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 #: The receipt vocabulary (`core/receipt-schema/evidence-contract.json`). A
 #: backend outside it is not canonicalized into the projection, because the
 #: analytics row is what the control plane groups on.
@@ -369,12 +385,25 @@ def ship_validated_receipt(
             "data_scope": status["data_scope"],
         }
 
-    orchestrator = (project / ".synaptory" / ".orchestrator").resolve()
+    # The same two roots the kernel and the MCP boundary allow (#766). This
+    # one is the quietest of the three: a refusal here is reported as
+    # `preflight failed: ValueError` with `handed_off: False`, so leaving it
+    # behind would not have failed a test -- delivery runs in test-bypass --
+    # it would have stopped every committed receipt from reaching the control
+    # plane in the field, which is where receipts are the evidence a barrier
+    # credits.
+    _base = project / ".synaptory"
+    orchestrator = (_base / ".orchestrator").resolve()
+    # Only the READ side gained a root. The delivery scratch directory below
+    # stays under `.orchestrator` deliberately: it is working state, and the
+    # committed tree is the one a reviewer reads in a diff.
+    _roots = [orchestrator, (_base / "cycles").resolve()]
     if receipt_path.is_symlink():
         return {"handed_off": False, "error": "receipt delivery refuses symlinks"}
     try:
         path = receipt_path.resolve(strict=True)
-        path.relative_to(orchestrator)
+        if not any(_within(path, root) for root in _roots):
+            raise ValueError("receipt path is outside the directories the runtime owns")
         raw = path.read_bytes()
         receipt = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:

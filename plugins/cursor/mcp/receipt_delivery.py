@@ -62,6 +62,16 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _within(path: Path, root: Path) -> bool:
+    """Containment by `relative_to`, not `str.startswith` -- prefix comparison
+    would admit a sibling named `cyclesX`."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 #: The receipt vocabulary (`core/receipt-schema/evidence-contract.json`). A
 #: backend outside it is not canonicalized into the projection, because the
 #: analytics row is what the control plane groups on.
@@ -350,12 +360,22 @@ def ship_validated_receipt(
             "data_scope": status["data_scope"],
         }
 
-    orchestrator = (project / ".synaptory" / ".orchestrator").resolve()
+    # The same two roots the kernel, the Codex MCP boundary and the Codex
+    # delivery preflight allow (#766). This file is an AUTHORED per-host copy
+    # of that module rather than a composed one, so fixing the Codex copy did
+    # not reach it -- which is exactly how the identical defect survived here
+    # and kept the e2e product leg refusing with `preflight failed: ValueError`.
+    _base = project / ".synaptory"
+    orchestrator = (_base / ".orchestrator").resolve()
+    # Only the READ side gains a root. `temp_dir` below stays under
+    # `.orchestrator`: it is working state, not a record.
+    _roots = [orchestrator, (_base / "cycles").resolve()]
     if receipt_path.is_symlink():
         return {"handed_off": False, "error": "receipt delivery refuses symlinks"}
     try:
         path = receipt_path.resolve(strict=True)
-        path.relative_to(orchestrator)
+        if not any(_within(path, root) for root in _roots):
+            raise ValueError("receipt path is outside the directories the runtime owns")
         raw = path.read_bytes()
         receipt = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:

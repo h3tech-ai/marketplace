@@ -39,6 +39,18 @@
 synaptory_receipt_files() {
   _orch_dir="$1"
   [ -n "$_orch_dir" ] || return 0
+  # #766 moved SPQ receipts into the COMMITTED tree, which is a SIBLING of the
+  # orchestrator directory rather than a path under it. Derived from `$1` so
+  # the function keeps its one parameter and its one definition:
+  # `.synaptory/.orchestrator` -> `.synaptory` -> `.synaptory/cycles`.
+  #
+  # Both roots are swept, for the reason this file already gives about the two
+  # depths under `spq/`: receipts written before a layout change are immutable
+  # evidence a hook still has to count and ship. Missing this line is exactly
+  # #326 and #336 again -- receipts shipped from no host, every SPQ session
+  # reporting `0 receipts` -- with the new layout in the blind spot the old one
+  # used to occupy.
+  _cycles_dir="$(dirname "$_orch_dir")/cycles"
   {
     [ -d "$_orch_dir/receipts" ] \
       && find "$_orch_dir/receipts" -maxdepth 1 -name "*.json" -type f
@@ -46,6 +58,8 @@ synaptory_receipt_files() {
       && find "$_orch_dir/specs" -path "*/receipts/*.json" -type f
     [ -d "$_orch_dir/spq" ] \
       && find "$_orch_dir/spq" -path "*/receipts/*.json" -type f
+    [ -d "$_cycles_dir" ] \
+      && find "$_cycles_dir" -path "*/receipts/*.json" -type f
   } 2>/dev/null
   # "No receipts" is a normal answer, not a failure. Without this the exit
   # status is the last `[ -d ... ]` test, so a project with no SPQ tree made

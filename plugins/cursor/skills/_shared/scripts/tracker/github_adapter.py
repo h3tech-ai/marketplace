@@ -1329,16 +1329,42 @@ class GitHubAdapter(ArtifactAdapter):
 
     @staticmethod
     def _parse_checklist_acs(body: str) -> list[AcceptanceCriterion]:
-        """Parse acceptance criteria from GitHub issue body checklist."""
+        """Parse acceptance criteria from GitHub issue body checklist.
+
+        The title match is non-greedy so it stops at the first ``**`` it
+        finds. A title with its own internal bold (e.g. emphasising a
+        negation) has a second ``**`` pair later on the line, which the
+        non-greedy match never reaches — silently truncating the title
+        instead of raising. Reject and report that case rather than
+        guess: an absent criterion must stay distinguishable from one
+        whose text was quietly cut (#778).
+
+        Only the character right after the matched ``**`` decides this.
+        Trailing content after a clean close — e.g. the ``**Title** —
+        {{AC_SUMMARY}}`` shape templates use — starts with whitespace and
+        is legitimate even when that summary itself contains unrelated
+        bold; a ``**`` butted straight up against more text is the
+        signature of a nested-bold title that was cut mid-word.
+        """
         acs = []
         if not body:
             return acs
         for line in body.splitlines():
-            m = re.match(r"- \[([xX ])\] \*\*(AC-\w+):\s*(.*?)\*\*", line.strip())
-            if m:
-                acs.append(AcceptanceCriterion(
-                    id=m.group(2), text=m.group(3).strip(), met=m.group(1).lower() == "x",
-                ))
+            stripped = line.strip()
+            m = re.match(r"- \[([xX ])\] \*\*(AC-\w+):\s*(.*?)\*\*", stripped)
+            if not m:
+                continue
+            tail = stripped[m.end():]
+            if tail and not tail[0].isspace():
+                _warn(
+                    f"acceptance criterion {m.group(2)} was not parsed: its title "
+                    "contains markdown bold ('**') that makes the closing delimiter "
+                    f"ambiguous — rewrite the title without nested bold. Line: {stripped!r}"
+                )
+                continue
+            acs.append(AcceptanceCriterion(
+                id=m.group(2), text=m.group(3).strip(), met=m.group(1).lower() == "x",
+            ))
         return acs
 
     def _load_backlog_order(self) -> list[str]:

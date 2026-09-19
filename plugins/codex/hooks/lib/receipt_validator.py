@@ -350,12 +350,21 @@ def _validate_typed_evidence(receipt: dict, result: "ValidationResult") -> None:
     own `evidence_class` (or its `result` value) names, because the claim is
     what a reader would otherwise credit.
 
-    Severity is `error`, not `warn`, and that is what implements the original
-    ticket's "refused in strict mode, warned in the migration window" without
-    a new flag: `advance_kernel.RECEIPT_INVALID` is already in
-    `_EVIDENCE_CODES`, so a host running `enforcement="warn"` downgrades this
-    refusal to a warning while a structured-mode host refuses. The migration
-    window already exists; it did not need reinventing here.
+    Severity is `error`, not `warn`.
+
+    #403 landed that severity leaning on a migration window it did not own:
+    `advance_kernel.RECEIPT_INVALID` was a member of `_EVIDENCE_CODES`, so a
+    host running `enforcement="warn"` downgraded this refusal to a warning
+    while a structured-mode host refused. #755 closed that window, because the
+    window is what the defect travelled through: on the #714 pilot Cycle a
+    receipt carrying three bare class tokens -- a `replayed` item naming no
+    command, an `attested` item naming no attempt, a `judged` item naming no
+    principal -- advanced a Work Unit past its producer stage while this
+    validator, in the same build, reported the same document invalid.
+
+    So an error here is now an error at the gate on every host. The route out
+    of an inadmissible receipt is #741's recovery ladder (a fresh dispatch,
+    with the invalid bytes archived and never edited), not a warning.
     """
     has_evidence = EVIDENCE_KEY in receipt
     has_typed_results = DOD_CHECK_RESULTS_KEY in receipt

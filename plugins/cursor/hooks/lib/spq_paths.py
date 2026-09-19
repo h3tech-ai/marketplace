@@ -196,14 +196,67 @@ def tracker_data_path(project_dir: str, cycle_id: str) -> str:
 
 
 def receipts_dir(project_dir: str, cycle_id: str) -> str:
-    """Where this Cycle's receipts live.
+    """Where this Cycle's receipts live: the COMMITTED transport (#766).
 
     One home, where there were three (per-lane, Cycle-level, and the
     Coordination Cycle's). `core/lib/receipt-paths.sh` mirrors this for the
     hooks and exists because the glob was once duplicated in six places with
     the SPQ layout missing from every copy.
+
+    COMMITTED, because the barrier credits a declared criterion from the DoD
+    gate and the DoD gate reads these files. Gitignored, they were evidence a
+    reviewer could not see: the pull request carried the code and the verdict
+    and not the proof either rested on. For a method whose first rule is that
+    nothing certifies itself, evidence outside review is a gap rather than an
+    inconvenience. A whole Cycle measured 696K across 18 files on a real
+    project, so size was never what kept them out.
+
+    `legacy_receipts_dir` is where they used to sit. Both are READ; only this
+    one is ever written, which is how a project mid-migration keeps finding
+    the receipts an earlier Cycle already produced.
+    """
+    return os.path.join(committed_cycle_dir(project_dir, cycle_id), "receipts")
+
+
+def legacy_receipts_dir(project_dir: str, cycle_id: str) -> str:
+    """Where receipts sat before #766 moved them into the committed tree.
+
+    Read-only, and never resolved for a write. A receipt is immutable evidence:
+    one written under the old layout stays valid and stays where it is, so the
+    resolver falls back here rather than a migration moving files that a
+    recorded verdict already cited by path.
     """
     return os.path.join(cycle_root(project_dir, cycle_id), "receipts")
+
+
+#: Engagement facts, COMMITTED (#766). The baseline approval, the handover and
+#: the outstanding commitments outlive every Cycle and every checkout, and they
+#: are decisions rather than working state -- a decision belongs in a diff.
+#:
+#: Living in the gitignored pointer, it made a fresh `git worktree` of the same
+#: commit look like a project that never ran Discovery -- `open_cycle` refused
+#: there for want of an approved baseline, so a Cycle could be run in exactly
+#: one checkout and handed to nobody.
+#:
+#: IT SITS IN THE COMMITTED TRANSPORT ROOT, not beside it, and the reason is
+#: migration rather than taxonomy. A dedicated `.synaptory/engagement.json`
+#: would need its own `!` line, so every project that followed the documented
+#: recipe -- `.synaptory/*` then `!.synaptory/cycles/` -- would have had its
+#: next `approve_baseline` refused until somebody hand-edited `.gitignore`.
+#: The existing rule already tracks this directory, so there is no migration
+#: step and no new line to forget.
+#:
+#: It is not a Cycle's record, and this root is not only Cycles': `spq_paths`
+#: calls it "the runtime's own committed transport" and `cycle_barrier` exempts
+#: the whole prefix from the declaration check for exactly that reason -- these
+#: are the runtime's records, like the cut record and the barrier ledger, kept
+#: beside the work rather than claimed by it. A file at the root is one more
+#: of those, and `valid_cycle_id` keeps it from ever being read as a Cycle.
+ENGAGEMENT_RELPATH = os.path.join(COMMITTED_RELDIR, "engagement.json")
+
+
+def engagement_path(project_dir: str) -> str:
+    return os.path.join(str(project_dir), ENGAGEMENT_RELPATH)
 
 
 def lock_for(path: str) -> str:

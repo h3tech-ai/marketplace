@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Synaptory User Guide</title>
-  <meta name="synaptory-version" content="v1.3.2">
-  <meta name="synaptory-built-at" content="2026-09-18T15:25:29Z">
+  <meta name="synaptory-version" content="v1.3.3">
+  <meta name="synaptory-built-at" content="2026-09-19T11:51:54Z">
   
   <style>
     :root {
@@ -381,7 +381,7 @@
             <p>SPQ-first delivery guidance for Claude Code, Codex, and Cursor.</p>
             <div class="hero-meta">
               <div class="hero-chip">36 chapters</div>
-              <div class="hero-chip" data-stamp="version">v1.3.2</div><div class="hero-chip" data-stamp="built-at">built 2026-09-18T15:25:29Z</div>
+              <div class="hero-chip" data-stamp="version">v1.3.3</div><div class="hero-chip" data-stamp="built-at">built 2026-09-19T11:51:54Z</div>
             </div>
           </div>
         </div>
@@ -3056,6 +3056,24 @@ synaptory outbox flush</code></pre>
 <li>host and version;</li><li><code>synaptory version</code> and <code>synaptory status</code> output with secrets removed;</li><li>project and Cycle/Work Unit/attempt identifiers;</li><li>the exact failed operation;</li><li>the displayed error and whether canonical state changed;</li><li><code>synaptory runtimes doctor</code> output when runtime federation is involved.</li>
 </ul>
 <p>Then ask Synaptory to submit a support report or use <code>synaptory report submit</code>. Do not attach tokens, runtime credentials, or sensitive source content.</p>
+<h3 id="troubleshooting-if-the-report-fails-to-send">If the report fails to send</h3>
+<p>The control plane relays the report to GitHub, so a submit can fail for reasons on our side: an expired credential, a GitHub incident, an unreachable control plane, or a session that needs <code>synaptory login</code>. <strong>Your text is not lost.</strong> A failed submit writes it to <code>~/.synaptory/.failed-reports/</code> (or <code>~/.synaptory-local/.failed-reports/</code> for the local build) and the error names the two files it wrote:</p>
+<ul>
+<li><code>&lt;timestamp&gt;-&lt;project&gt;-&lt;title&gt;.md</code> is the report body on its own, ready to</li>
+</ul>
+<p>open or attach to an email;</p>
+<ul>
+<li><code>&lt;timestamp&gt;-&lt;project&gt;-&lt;title&gt;.json</code> is the whole request, which you can</li>
+</ul>
+<p>replay once the relay is back:</p>
+<pre class="code-block" data-lang="bash"><code>synaptory report submit --json ~/.synaptory/.failed-reports/&lt;file&gt;.json</code></pre>
+<p>Nothing deletes these files, and nothing retries them in the background. They stay until you file the report or remove them yourself. If the error says the report could <strong>not</strong> be preserved, copy it out of your terminal before closing the session.</p>
+<p>If retrying keeps failing, send the <code>.md</code> file to support@h3t.co. Do not try to file the issue on GitHub yourself: the issues repository is private, which is the reason the control plane relays reports in the first place.</p>
+<blockquote><p><strong>H3T staff only.</strong> You do have filing rights, but not through a bare <code>gh</code>. The local identity guard refuses a mutation on an <code>h3tech-ai</code> repository with exit status 13. Filing a defect is the &quot;Prove&quot; authority class, so hand the saved body to the role-bound wrapper:</p>
+<pre class="code-block" data-lang="bash"><code>h3t-gh-tester issue create --repo h3tech-ai/synaptory-v1 \
+--title &quot;&lt;title from the .json&gt;&quot; \
+--body-file ~/.synaptory/.failed-reports/&lt;file&gt;.md</code></pre>
+<p>Note this loses the server-side UPN / project / session stamp the relay adds, so say in the body who hit it and on which project.</p></blockquote>
   </div>
 </section>
 

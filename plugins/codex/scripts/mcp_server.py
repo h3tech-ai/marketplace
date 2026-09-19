@@ -327,16 +327,33 @@ def _story_summary(selected: dict[str, Any]) -> dict[str, Any]:
 
 
 def _scoped_receipt_path(project: Path, raw: str | os.PathLike[str]) -> Path:
+    """The same two roots `advance_kernel._scoped_path` allows, and for the
+    same reason.
+
+    This is the server-side half of one rule, restated because the MCP
+    boundary re-checks everything a hook could be made to skip. #766 moved
+    receipts into the committed transport (`.synaptory/cycles/<id>/receipts`)
+    and this guard still named only `.orchestrator`, so the boundary refused
+    the very path the kernel had just issued in the dispatch contract.
+
+    Both roots are named rather than collapsed into `.synaptory`: that one
+    line would also admit `tracker/`, `design/`, `.protocols/` and a Cycle's
+    own sealed `manifest.json` as places a caller may point at.
+    """
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         candidate = project / candidate
     candidate = candidate.resolve()
-    orchestrator = (project / ".synaptory" / ".orchestrator").resolve()
-    try:
-        candidate.relative_to(orchestrator)
-    except ValueError as exc:
-        raise ValueError("receipt_path must be inside .synaptory/.orchestrator") from exc
-    return candidate
+    base = project / ".synaptory"
+    for root in ((base / ".orchestrator").resolve(), (base / "cycles").resolve()):
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        return candidate
+    raise ValueError(
+        "receipt_path must be inside .synaptory/.orchestrator or .synaptory/cycles"
+    )
 
 
 def _read_receipt(path: Path) -> dict[str, Any]:

@@ -758,9 +758,23 @@ def test_the_plugin_job_installs_pyyaml_to_match_what_its_tests_import(workflow,
     )
 
     block = _job_block(job, workflow)
+    # `pip install`, however it is spelled. test.yml installs through
+    # `uv pip install`, release.yml through plain `pip install`, and matching
+    # only the latter made this guard BLIND rather than wrong: pyyaml was
+    # installed, the scanner could not see it, and the assertion below fired
+    # with an empty install list -- the same message it gives when pyyaml is
+    # genuinely absent. A guard that cannot tell "missing" from "spelled
+    # differently" is worse than one that fails, because the next person
+    # reading it looks for a missing dependency that is already there.
+    #
+    # Still anchored to `run:`. This workflow carries comments that quote
+    # `uv pip install pytest` in prose, and an unanchored search would read
+    # one of those as an install step -- turning a blind guard into a
+    # falsely-passing one, which is the failure direction that actually
+    # lets a broken install reach a release.
     install_lines = [
         line.strip() for line in block
-        if re.match(r"^\s*run:\s*pip install\b", line)
+        if re.match(r"^\s*run:\s*(?:uv\s+|python[0-9.]*\s+-m\s+)?pip install\b", line)
     ]
     installs_pyyaml = any("pyyaml" in line.lower() for line in install_lines)
 

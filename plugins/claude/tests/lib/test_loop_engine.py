@@ -235,3 +235,187 @@ def test_continuation_reason_names_deps_blocked():
     import loop_engine as le
 
     assert "deps_blocked" in inspect.getsource(le)
+
+
+# ── #791: the loop's AUDIENCE — only the session that holds the Cycle ────────
+#
+# Before this, `should_continue` instructed whatever session the Stop hook
+# fired in, which is a property of where a terminal is pointed. On
+# `ptb-assistant` that told a coordination-only session to dispatch WU-1101
+# for a Cycle held by a different session, against a sealed declaration that
+# names exactly one Engineering Lead — and then refused to let it stop.
+
+
+def test_unclaimed_cycle_still_continues(tmp_path: Path):
+    """No claim → the single-session default is untouched. The loop must not
+    go mute on every project that never dispatched through the new hook."""
+    out = _cont(_project(tmp_path), session_id="s-only")
+    assert out["continue"] is True
+
+
+def test_the_holder_is_driven(tmp_path: Path):
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    cycle_holder.claim(str(p), le.cycle_scope(str(p)), "s-delivery")
+    assert _cont(p, session_id="s-delivery")["continue"] is True
+
+
+def test_a_session_that_does_not_hold_the_cycle_is_not_instructed(tmp_path: Path):
+    """THE REGRESSION. The coordination session dispatched nothing, so it
+    holds nothing, so the loop has nothing to say to it."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    cycle_holder.claim(str(p), le.cycle_scope(str(p)), "s-delivery")
+
+    out = _cont(p, session_id="s-orchestration")
+    assert out["continue"] is False
+    assert out["reason"] is None
+    assert out["stop_reason"] == "held_by_other_session"
+    assert out["holder_session_id"] == "s-delivery"
+
+
+def test_the_mismatch_leaves_a_breadcrumb_naming_the_holder(tmp_path: Path):
+    """Silence in the wrong session, but never silence in the record: a
+    coordinator's operator must be able to see whose Cycle it was."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    cycle_holder.claim(str(p), le.cycle_scope(str(p)), "s-delivery")
+    _cont(p, session_id="s-orchestration")
+
+    events = (p / ".synaptory" / ".orchestrator" / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    record = [json.loads(line) for line in events.splitlines() if line.strip()]
+    mismatch = [e for e in record if e.get("event") == "loop_holder_mismatch"]
+    assert mismatch, record
+    assert mismatch[-1]["holder_session_id"] == "s-delivery"
+    assert mismatch[-1]["session_id"] == "s-orchestration"
+
+
+def test_the_muted_session_does_not_consume_the_runaway_guard(tmp_path: Path):
+    """The guard file is one per project keyed on session id, so two sessions
+    reaching it alternately reset each other's counters and the runaway cap
+    never trips. The audience check runs first, which is why it cannot."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    cycle_holder.claim(str(p), le.cycle_scope(str(p)), "s-delivery")
+    _cont(p, session_id="s-delivery")
+    before = json.loads(
+        (p / ".synaptory" / ".orchestrator" / "loop-guard.json").read_text("utf-8")
+    )
+    _cont(p, session_id="s-orchestration")
+    after = json.loads(
+        (p / ".synaptory" / ".orchestrator" / "loop-guard.json").read_text("utf-8")
+    )
+    assert after == before
+    assert after["session_id"] == "s-delivery"
+
+
+def test_a_stale_claim_stops_muting(tmp_path: Path):
+    """A crashed holder must not mute its project forever. Expiry only ever
+    PERMITS continuation; it takes nothing from a session still working."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path, yaml_extra="resilience:\n  cycle_holder_ttl_minutes: 1\n")
+    from datetime import datetime, timedelta, timezone
+
+    long_ago = datetime.now(timezone.utc) - timedelta(minutes=30)
+    cycle_holder.claim(str(p), le.cycle_scope(str(p)), "s-dead", now=long_ago)
+    assert _cont(p, session_id="s-fresh")["continue"] is True
+
+
+def test_holder_ttl_is_configurable(tmp_path: Path):
+    import loop_engine as le
+
+    p = _project(tmp_path, yaml_extra="resilience:\n  cycle_holder_ttl_minutes: 5\n")
+    assert le._holder_ttl_seconds(str(p)) == 300
+    assert le._holder_ttl_seconds(str(_project(tmp_path / "plain"))) == 7200
+
+
+def test_a_dispatch_reclaims_after_a_restart(tmp_path: Path):
+    """The restarted Engineering Lead has a new session id and is muted until
+    it acts — and its first dispatch is the act that reclaims."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    cycle_holder.claim(str(p), le.cycle_scope(str(p)), "s-before")
+    assert _cont(p, session_id="s-after")["continue"] is False
+
+    le.claim_dispatch(str(p), "s-after")
+    assert _cont(p, session_id="s-after")["continue"] is True
+
+
+def test_claim_dispatch_and_should_continue_agree_on_the_scope(tmp_path: Path):
+    """The claim written at dispatch and the claim read at Stop must be one
+    key. Two derivations of it is how this fix would silently do nothing."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    le.claim_dispatch(str(p), "s-delivery")
+    assert le.cycle_scope(str(p)) in cycle_holder.read_holders(str(p))
+    assert _cont(p, session_id="s-elsewhere")["stop_reason"] == "held_by_other_session"
+
+
+# ── #791 on the lifecycle that reported it: SPQ, a real opened Cycle ─────────
+
+
+def _spq_project(tmp_path: Path) -> Path:
+    import _spq_fixture
+
+    project, _ = _spq_fixture.open_project(tmp_path / "spq")
+    orch = project / ".synaptory" / ".orchestrator"
+    orch.mkdir(parents=True, exist_ok=True)
+    (orch / "settings.md").write_text("Engagement: structured\n", encoding="utf-8")
+    return project
+
+
+def test_spq_scope_is_the_cycle(tmp_path: Path):
+    import loop_engine as le
+
+    scope = le.cycle_scope(str(_spq_project(tmp_path)))
+    assert scope.startswith("cycle:") and scope != "cycle:unresolved"
+
+
+def test_spq_coordination_session_is_not_told_to_dispatch(tmp_path: Path):
+    """The reported failure, end to end: the delivery session holds the Cycle
+    and is driven; the coordination session sharing the directory is not."""
+    import loop_engine as le
+
+    p = _spq_project(tmp_path)
+    lead = _cont(p, session_id="s-delivery")
+    assert lead["continue"] is True, lead
+    assert "dispatch_" in lead["reason"]
+
+    le.claim_dispatch(str(p), "s-delivery")
+
+    out = _cont(p, session_id="s-orchestration")
+    assert out["continue"] is False
+    assert out["stop_reason"] == "held_by_other_session"
+    assert _cont(p, session_id="s-delivery")["continue"] is True
+
+
+def test_an_advisory_dispatch_does_not_move_the_claim(tmp_path: Path):
+    """The coordination session in #791 must not be able to take the Cycle by
+    asking a question. Only the roles the loop instructs move the claim."""
+    import cycle_holder
+    import loop_engine as le
+
+    p = _project(tmp_path)
+    le.claim_dispatch(str(p), "s-delivery", "software-engineer")
+    out = le.claim_dispatch(str(p), "s-orchestration", "research-advisor")
+    assert out["claimed"] is False
+
+    holder = cycle_holder.read_holders(str(p))[le.cycle_scope(str(p))]
+    assert holder["session_id"] == "s-delivery"
+    assert _cont(p, session_id="s-orchestration")["stop_reason"] == "held_by_other_session"

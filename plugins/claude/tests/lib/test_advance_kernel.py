@@ -1863,3 +1863,165 @@ def test_a_genuinely_blocked_story_is_still_unblocked_on_recovery(tmp_path):
         "a genuinely blocked story was dispatched without being unblocked: %r"
         % after
     )
+
+
+# ── #802: leaving `blocked` ──────────────────────────────────────────────────
+#
+# `story_pipeline.VALID_TRANSITIONS` permitted five exits from `blocked` and
+# the kernel bound a receipt role to none of them, so `expected_receipt_role`
+# answered None and every exit was refused as `no_bound_role`. A unit rejected
+# at review could never be re-verified by QE: the route back to `testing` was
+# legal and unreachable at the same time.
+
+
+def test_every_blocked_exit_is_routable():
+    """No exit from `blocked` may be silently unreachable.
+
+    The regression itself: a legal transition that the kernel refuses because
+    no table mentions it. An exit must be bound to a receipt role OR declared
+    ungated on purpose -- absence is what made this a dead end for two Cycles.
+    """
+    for target in sp.VALID_TRANSITIONS["blocked"]:
+        bound = ak.expected_receipt_role("blocked", target)
+        declared_ungated = ("blocked", target) in ak.UNGATED_EDGES
+        assert bound is not None or declared_ungated, (
+            "blocked -> %s is a legal transition with no receipt binding and "
+            "no UNGATED_EDGES entry, so advance refuses it as no_bound_role"
+            % target
+        )
+
+
+def test_blocked_exit_mirrors_inbound_edge():
+    """Each blocked exit costs what entry to that stage normally costs.
+
+    This is what keeps the two tables agreeing without a second hand-kept
+    list. It also fails loudly if a future `TRANSITION_RECEIPT` row gives a
+    destination a second inbound edge, because the mirror stops being
+    well-defined at that moment and someone has to choose deliberately.
+    """
+    for target, bound in ak.BLOCKED_EXIT_ROLE.items():
+        inbound = {
+            role
+            for (_frm, _to), role in ak.TRANSITION_RECEIPT.items()
+            if _to == target
+        }
+        assert len(inbound) == 1, (
+            "%s has %d inbound edges, so 'mirror the inbound edge' no longer "
+            "defines what leaving blocked into it should cost" % (target, len(inbound))
+        )
+        assert bound == inbound.pop(), (
+            "blocked -> %s must cost the same receipt as entering %s normally"
+            % (target, target)
+        )
+
+
+def test_blocked_exits_do_not_disturb_the_inbound_edges():
+    """Binding the exits must not change what BLOCKING a story costs."""
+    assert ak.expected_receipt_role("reviewing", "blocked") == (
+        "code-reviewer",
+        "cr",
+    )
+    assert ak.expected_receipt_role("testing", "blocked") == (
+        "quality-engineer",
+        "qe",
+    )
+    assert ak.expected_receipt_role("in_progress", "testing") == (
+        "software-engineer",
+        "se",
+    )
+
+
+def test_static_bound_role_sees_all_three_tables():
+    """The pre-waiver lookup must not miss the blocked tables.
+
+    The gate uses it to tell "never bound" from "bound, and the DoD tier
+    waived it". Reading `TRANSITION_RECEIPT` alone -- which is what the gate
+    did -- reports a bound blocked exit as unbound and refuses it.
+    """
+    assert ak.static_bound_role("blocked", "awaiting_acceptance") == (
+        "code-reviewer",
+        "cr",
+    )
+    assert ak.static_bound_role("in_progress", "blocked") == (
+        "software-engineer",
+        "se",
+    )
+    assert ak.static_bound_role("queued", "in_progress") == (
+        "software-engineer",
+        "se",
+    )
+    assert ak.static_bound_role("blocked", "queued") is None
+
+
+def test_early_intensity_waives_the_cr_bound_blocked_exit():
+    """`blocked -> awaiting_acceptance` follows the same CR waiver as
+    `reviewing -> done`: at a tier with no `code_reviewed` check, demanding a
+    CR receipt would demand evidence the planner never dispatches."""
+    assert ak.expected_receipt_role(
+        "blocked", "awaiting_acceptance", intensity="early"
+    ) is None
+    # ...but the edge is still DECLARED bound, which is how the gate knows to
+    # record a waiver instead of refusing it as unbound.
+    assert ak.static_bound_role("blocked", "awaiting_acceptance") is not None
+
+
+# Edges `story_pipeline` permits that `advance` deliberately does not route,
+# because another verb owns them. #802 asked for exactly this: the two tables
+# should agree, OR the disagreement should be explicit and documented, because
+# an operator otherwise has to read both to discover a legal transition is
+# unreachable. `blocked`'s exits were the undocumented kind; these are not.
+#
+# The PO acceptance fork (#116) is driven by `reject_story`, which validates
+# the reason class, records `rejection_feedback` the next dispatch reads, and
+# maps the class to its target via `_REJECTION_NEXT_STATE`. An `advance`
+# straight to one of these would skip the feedback record, so the refusal is
+# the design rather than the gap #802 found.
+_ADVANCE_DOES_NOT_ROUTE = {
+    ("awaiting_acceptance", "in_progress"): "reject_story('needs-fix')",
+    ("awaiting_acceptance", "queued"): "reject_story('redo'/'defer')",
+    ("awaiting_acceptance", "cancelled"): "reject_story('cancel')",
+}
+
+
+def test_no_legal_transition_is_silently_unreachable():
+    """Every edge is routable, declared ungated, or declared owned elsewhere.
+
+    The #802 class in general form: a legal transition the kernel refuses
+    because no table mentions it. A new one cannot be added without either
+    binding it or saying, here, which verb owns it instead.
+    """
+    orphans = []
+    for from_state, targets in sp.VALID_TRANSITIONS.items():
+        for to_state in targets:
+            if to_state == "blocked":
+                continue  # inbound edges are bound by BLOCKED_FROM_ROLE
+            if (from_state, to_state) in ak.UNGATED_EDGES:
+                continue
+            if (from_state, to_state) in _ADVANCE_DOES_NOT_ROUTE:
+                continue
+            if ak.expected_receipt_role(from_state, to_state) is None:
+                orphans.append((from_state, to_state))
+    assert not orphans, (
+        "these legal transitions have no receipt binding, so advance refuses "
+        "them as no_bound_role: %s. Bind them, declare them ungated, or name "
+        "the verb that owns them in _ADVANCE_DOES_NOT_ROUTE." % orphans
+    )
+
+
+def test_declared_unroutable_edges_are_still_legal_and_still_unroutable():
+    """Keeps the declaration honest in both directions.
+
+    If one of these gains a binding the declaration is stale and must go; if
+    one stops being a legal transition the entry is dead weight. Either way
+    someone should notice, which is the failure mode #802's own tables had.
+    """
+    for (from_state, to_state), owner in _ADVANCE_DOES_NOT_ROUTE.items():
+        assert to_state in sp.VALID_TRANSITIONS[from_state], (
+            "%s -> %s is declared unroutable but is no longer a legal "
+            "transition; drop the entry" % (from_state, to_state)
+        )
+        assert ak.expected_receipt_role(from_state, to_state) is None, (
+            "%s -> %s now has a receipt binding, so advance routes it and the "
+            "declaration naming %s as its owner is stale"
+            % (from_state, to_state, owner)
+        )

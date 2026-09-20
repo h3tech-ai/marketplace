@@ -521,17 +521,32 @@ RECORD_SYNC_SCHEMA = schema(
 # which remains the Multi-Spec variable SPQ ignores.
 
 SPQ_CYCLE_SCHEMA = schema("cycle_id")
+#: `published_by` for the same reason `cut_by` is on the cut schema: the Sync
+#: prompt instructs `--published-by` and `publish_event` takes it, but no
+#: schema declared it and `_publish_event` did not forward it, so every event
+#: published through an MCP host recorded an empty publisher. A dependency
+#: another Cycle waits on is a claim about someone's work; an anonymous one is
+#: a claim nobody made.
 SPQ_LEDGER_APPEND_SCHEMA = schema(
     "cycle_id", "work_unit_id", "condition", "manifest_hash", "commit_sha",
-    "output", "evaluation",
+    "output", "evaluation", "published_by",
     required=("cycle_id", "work_unit_id", "condition", "manifest_hash"),
 )
 # The whole-Cycle report is the default; `work_unit_id` narrows it. Borrowing
 # the cut schema here would have made the unit id REQUIRED, so an operator could
 # not ask "why is anything blocked" without already knowing the answer.
 SPQ_DEP_STATUS_SCHEMA = schema("cycle_id", "work_unit_id")
+#: `cut_by` is here because the ceremony already instructs it. The Checkpoint
+#: prompt spells `--cut-by "<the Engineering Lead's identity>"` and every host
+#: composed that into a call the schema did not declare and `_cut_work_unit`
+#: did not forward, so `record_cut` stored `principal: ""` -- a §8.6 release
+#: valve pulled by nobody, on both MCP hosts, while the prompt read as though
+#: it were attributed. Not `required`: `cut_work_unit` defaults it and the
+#: module CLI has always allowed an unattributed cut, so requiring it here
+#: would make the MCP hosts stricter than the runtime rather than faithful to
+#: it. Tightening that is a runtime decision, not a transport one.
 SPQ_CUT_SCHEMA = schema(
-    "cycle_id", "manifest_hash", "work_unit_id", "reason",
+    "cycle_id", "manifest_hash", "work_unit_id", "reason", "cut_by",
     required=("cycle_id", "manifest_hash", "work_unit_id"),
 )
 

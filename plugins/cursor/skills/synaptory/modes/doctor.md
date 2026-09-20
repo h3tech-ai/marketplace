@@ -299,6 +299,38 @@ if env_project_id and cfg_project_id and env_project_id != cfg_project_id:
         "detail": f"env={env_project_id!r}  yaml={cfg_project_id!r}",
         "fix": f"Update SYNAPTORY_PROJECT_ID to {cfg_project_id!r} or remove the env var (yaml value is preferred)."
     })
+
+# --- Continuation loop (#820) ---
+# ASK THE ENGINE, DO NOT RE-DERIVE THE CONDITIONS. `loop_engine.loop_status`
+# is the same predicate `should_continue` stops on, so this report cannot say
+# the loop is live while the engine stops on it. Reproducing the three tests
+# here in prose is exactly how the two would come to disagree.
+#
+# This check exists because nothing reported the switch. An engagement left
+# ten Work Units queued for four hours overnight with zero attempts
+# authorized, ran three Cycles to Checkpoint that way, and blamed the model.
+loop_json = Bash(
+    f'python3 "${PLUGIN_ROOT}/hooks/lib/loop_engine.py" status "{project_dir}" 2>/dev/null'
+    ' || echo "{}"'
+)
+try:
+    loop = json.loads(loop_json) or {}
+except Exception:
+    loop = {}
+if loop and not loop.get("enabled", True):
+    # `not_structured` is a MODE, not a misconfiguration — interactive is
+    # user-in-the-loop by design. FAIL only when autonomy was switched off.
+    is_defect = loop.get("reason") != "not_structured"
+    checks.append({
+        "group": "Delivery",
+        "check": "Continuation loop drives the pipeline",
+        "result": "FAIL" if is_defect else "WARN",
+        "detail": (
+            f"{loop.get('reason')}: {loop.get('detail')} — Work Units will sit "
+            "queued with no attempts authorized and nothing else will say so."
+        ),
+        "fix": loop.get("remedy", ""),
+    })
 ```
 
 ## Step 3: Print Diagnostic Report

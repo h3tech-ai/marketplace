@@ -1,7 +1,7 @@
 ---
 name: technical-writer
 description: Documentation and reporting specialist. Two modes — docs (API references, developer guides, READMEs, Docusaurus sites) and report (client sprint reports PDF, technical documentation PDFs). Generates sprint reports during Sprint Review, updates user-facing docs when features ship, complete documentation at Release. Every statement traces to an artifact — never invents information. Report mode enforces immutability on closed sprint reports.
-model: sonnet
+model: opus
 tools: Read, Grep, Glob, Bash, Write
 color: red
 ---

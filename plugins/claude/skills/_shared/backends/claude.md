@@ -176,10 +176,10 @@ Model tier mapping:
 | code_reviewer | opus | opus |
 | quality_engineer | opus | opus |
 | software_engineer | sonnet | sonnet |
-| platform_engineer | sonnet | sonnet |
-| technical_writer | sonnet | sonnet |
+| platform_engineer | opus | opus |
+| technical_writer | opus | opus |
 
-**Controlled mode** surfaces decisions and enforces human gates for the four strategic roles (PO, SA, CE, RA) — it does not upgrade executor roles (SE, PE, TW), which follow orchestrator direction and don't make autonomous decisions. The `opus` rows for CR and QE are therefore not controlled-mode upgrades: each is the same tier in both columns, for the reasons below.
+**Controlled mode** surfaces decisions and enforces human gates for the four strategic roles (PO, SA, CE, RA) — it does not upgrade any role's tier, because no role's two columns differ. Every `opus` row outside the strategic four (CR, QE, PE, TW) is therefore a routing choice made for its own recorded reason, not a controlled-mode upgrade. `software_engineer` is the one role left on `sonnet`, and that is load-bearing rather than leftover — see the two paragraphs below.
 
 **Why the provers are not on the SE tier (#434 for CR, #483 for QE).** SE, QE and CR all resolved to `sonnet` until #434, so every verification the pipeline performed was same-model verification — a property nobody chose, just what this table happened to say. That matters in proportion to how much a check rests on judgment: `tests_pass` is decided by the machine and is indifferent to weights, while "read this diff and decide whether the logic is right" is decided almost entirely by them, and shared weights mean shared blind spots plus a familiarity effect where code the model would itself have written reads as correct even from a clean context. CR is the judgment-heaviest prover in the pipeline, so it moved first.
 
@@ -193,6 +193,10 @@ What this does **not** establish: nothing here verifies that a QE dispatch ran o
 Read the scope of that honestly: this is **partial decorrelation inside one runtime family**. Different weights, different scale, different blind spots — not independent runtimes, not an independent vendor, and not a basis for claiming independently verified work to an auditor. Role-level runtime choice is pilot 1 territory: `select_runtime` / `build_envelope` exist as component shapes but have no production caller on the dispatch path (#396 finding 1), so nothing in this table can deliver runtime independence today.
 
 Do NOT "simplify" CR or QE back onto the SE tier. Producer and prover sharing exact weights is the thing these two rows exist to prevent, and the cost is two premium dispatches per work unit rather than one (see the #434 PR for the measured per-dispatch delta). #518 added the `claude-opus-5` row to `_DEFAULT_PRICING`, so those dispatches no longer price at zero; before it landed, a dashboard reported both provers as free, which is the shape of a zero that meant "not measured" and read as "measured, and it was zero".
+
+**Why PE and TW moved off `sonnet`, and what that reason is not.** The three executor rows were never a measured choice; they were the roster's cost default, and SE is the only one of the three that decorrelation has anything to say about. Neither PE nor TW produces or proves a work unit, so moving them does not touch the property the CR and QE rows exist to protect: SE remains alone on `sonnet`, and both provers still resolve to weights the producer does not. Read the reason as exactly what it is — a maintainer's routing decision to spend the premium tier on these two roles. No benchmark in this repository compares the tiers, so this is not a claim that their output improves, and it must not be quoted as one. What it does change is cost, and not by a fixed amount: PE fires at Inception and on every infra work unit, TW at every Sprint Review and at Release, so the delta scales with how infra-heavy and how many sprints a run is. Both now price at the premium rate in `_DEFAULT_PRICING` (#518), so the increase shows up on the Cost page rather than hiding as a zero.
+
+The one row that must not follow them is `software_engineer`. Putting the producer on the provers' tier collapses CR and QE back into same-model verification just as surely as moving the provers down would, and [test_model_tier_decorrelation.py](../../../tests/lib/test_model_tier_decorrelation.py) fails on it from either direction.
 
 The model tier is INDEPENDENT of backend dispatch — it only applies within the Claude backend.
 

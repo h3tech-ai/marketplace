@@ -6,7 +6,7 @@ description: >
   monitoring setup, and infrastructure security. Thin intent contract plus a
   just-in-time catalog of fetchable skills (infrastructure phases,
   reliability phases, playbook). Routed via the Synaptory orchestrator.
-model: sonnet
+model: opus
 risk_tier: high
 ---
 

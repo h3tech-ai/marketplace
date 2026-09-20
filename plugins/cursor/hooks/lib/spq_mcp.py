@@ -320,6 +320,11 @@ def _publish_event(args: Dict[str, Any]) -> Dict[str, Any]:
             commit_sha=str(args.get("commit_sha") or ""),
             output=output,
             evaluation=evaluation,
+            # FORWARDED, not dropped -- same defect as `cut_by` above. The Sync
+            # prompt instructs `--published-by` and every event published
+            # through an MCP host recorded an empty publisher, so a dependency
+            # another Cycle waits on was a claim nobody had made.
+            published_by=str(args.get("published_by") or ""),
         )
     except spq_ledger.LedgerError as exc:
         return _refused("event_refused", str(exc))
@@ -358,6 +363,13 @@ def _cut_work_unit(args: Dict[str, Any]) -> Dict[str, Any]:
             _project(args),
             str(args.get("work_unit_id") or ""),
             str(args.get("reason") or ""),
+            # FORWARDED, not dropped. The Checkpoint prompt instructs
+            # `--cut-by "<the Engineering Lead's identity>"`, and both MCP
+            # hosts composed it into a call that never carried it: every cut
+            # taken through this surface recorded `principal: ""`, so the one
+            # release valve the method has looked unattributed in the ledger
+            # while the operator had in fact named themselves.
+            cut_by=str(args.get("cut_by") or ""),
         )
     except Exception as exc:  # noqa: BLE001
         return _refused("cut_refused", str(exc))

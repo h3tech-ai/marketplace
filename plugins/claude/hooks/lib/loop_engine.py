@@ -22,6 +22,17 @@ state. It never continues past a human gate — `await_acceptance`,
 interactive mode, review/close lifecycle states, or an exhausted board all
 allow the session to stop. Kill switches: env ``SYNAPTORY_LOOP_DISABLE=1``
 and config ``resilience.loop_continuation: disabled``.
+
+AUDIENCE (#791): "the session this hook fired in" is not an audience. It is
+where a terminal happens to be pointed, and on `ptb-assistant` it made this
+engine instruct a coordination-only session to become a second Engineering
+Lead on a Cycle it did not hold. The engine now speaks only to the session
+that HOLDS the Cycle — see `cycle_holder`, which defines the holder as the
+session that most recently dispatched a delivery agent into it. Claims are
+established at dispatch (SubagentStart), never here: a Stop-established claim
+is "first session to stop wins" and can mute the real lead. This engine may
+refresh a claim it already holds (`cycle_holder.touch`) and may never create
+or steal one.
 """
 
 from __future__ import annotations
@@ -79,53 +90,71 @@ def _write_guard(project_dir: str, guard: dict[str, Any]) -> None:
         pass  # guard persistence is best-effort; a lost write just re-evaluates next stop
 
 
+def _resilience_scalar(project_dir: str, key: str) -> str | None:
+    """The raw value of `resilience.<key>` in `.synaptory.yaml`, or None.
+
+    One scanner for the three keys this module reads. It was three copies of
+    the same fifteen lines, which is how a fourth key comes to parse subtly
+    differently from the first three.
+    """
+    cfg = Path(project_dir) / ".synaptory.yaml"
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    prefix = key + ":"
+    in_resilience = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line:
+            continue
+        indent = len(line) - len(line.lstrip())
+        s = line.strip()
+        if indent == 0:
+            in_resilience = s.startswith("resilience:")
+            continue
+        if in_resilience and s.startswith(prefix):
+            return s.split(":", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
 def _config_disabled(project_dir: str) -> bool:
     """True when `.synaptory.yaml` sets `resilience.loop_continuation: disabled`
     (or false/off/no). Absent key → not disabled (loop-continuation is on by
     default in structured mode)."""
-    cfg = Path(project_dir) / ".synaptory.yaml"
-    try:
-        text = cfg.read_text(encoding="utf-8")
-    except OSError:
+    val = _resilience_scalar(project_dir, "loop_continuation")
+    if val is None:
         return False
-    in_resilience = False
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line:
-            continue
-        indent = len(line) - len(line.lstrip())
-        s = line.strip()
-        if indent == 0:
-            in_resilience = s.startswith("resilience:")
-            continue
-        if in_resilience and s.startswith("loop_continuation:"):
-            val = s.split(":", 1)[1].strip().strip('"').strip("'").lower()
-            return val in ("disabled", "false", "off", "no", "0")
-    return False
+    return val.lower() in ("disabled", "false", "off", "no", "0")
 
 
 def _no_progress_cap(project_dir: str) -> int:
-    cfg = Path(project_dir) / ".synaptory.yaml"
-    try:
-        text = cfg.read_text(encoding="utf-8")
-    except OSError:
+    val = _resilience_scalar(project_dir, "loop_no_progress_cap")
+    if val is None:
         return DEFAULT_NO_PROGRESS_CAP
-    in_resilience = False
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line:
-            continue
-        indent = len(line) - len(line.lstrip())
-        s = line.strip()
-        if indent == 0:
-            in_resilience = s.startswith("resilience:")
-            continue
-        if in_resilience and s.startswith("loop_no_progress_cap:"):
-            try:
-                return max(1, int(s.split(":", 1)[1].strip()))
-            except ValueError:
-                return DEFAULT_NO_PROGRESS_CAP
-    return DEFAULT_NO_PROGRESS_CAP
+    try:
+        return max(1, int(val))
+    except ValueError:
+        return DEFAULT_NO_PROGRESS_CAP
+
+
+def _holder_ttl_seconds(project_dir: str) -> int:
+    """`resilience.cycle_holder_ttl_minutes`, in seconds.
+
+    Raised, not lowered, when a project's dispatches are long: expiry only
+    ever stops the record muting another session, so a value that is too SHORT
+    re-admits #791 while one that is too long merely delays the loop resuming
+    for a restarted session that has not dispatched yet.
+    """
+    import cycle_holder
+
+    val = _resilience_scalar(project_dir, "cycle_holder_ttl_minutes")
+    if val is None:
+        return cycle_holder.DEFAULT_TTL_SECONDS
+    try:
+        return max(60, int(float(val)) * 60)
+    except ValueError:
+        return cycle_holder.DEFAULT_TTL_SECONDS
 
 
 def _engagement_is_structured(project_dir: str) -> bool:
@@ -174,6 +203,46 @@ def _lifecycle_next_action(project_dir: str) -> dict[str, Any] | None:
         return None
 
 
+def cycle_scope(project_dir: str) -> str:
+    """The key a holder claim is recorded under — one Cycle, one holder.
+
+    Both callers must derive this identically or the claim written at dispatch
+    is not the claim read at Stop, so there is ONE function and both use it:
+    `should_continue` here, and `claim_dispatch` for the SubagentStart hook.
+
+    Under SPQ the key is the Cycle, resolved through `spq_state_machine`'s own
+    identity resolver rather than by opening state directly — `SC-MTH-012` has
+    N Engineering Leads meaning N concurrent Cycles, so the Cycle is the unit
+    ownership attaches to. Elsewhere the active spec stands in for it, which is
+    the closest thing those lifecycles have to a unit of parallelism.
+    """
+    build_mode = "scrum"
+    active_spec = ""
+    try:
+        from spec_state import read_full_state
+
+        full = read_full_state(project_dir) or {}
+        build_mode = str(full.get("build_mode") or "scrum").lower()
+        active_spec = str(full.get("active_spec") or "")
+    except Exception:
+        pass
+
+    if build_mode == "spq":
+        try:
+            import spq_state_machine
+
+            cycle_id = spq_state_machine.identity(project_dir).cycle_id
+        except Exception:
+            cycle_id = ""
+        # An unresolved Cycle still gets a stable key. Two sessions in one
+        # checkout resolve the same "unresolved", so the mute still works;
+        # it just cannot say which Cycle it protected.
+        return "cycle:%s" % (cycle_id or "unresolved")
+    if active_spec:
+        return "spec:%s" % active_spec
+    return "project"
+
+
 def _spec_state(project_dir: str) -> dict[str, Any]:
     """The active-spec story board next_action evaluated — same spec-aware
     read, so the progress digest matches what drove the decision."""
@@ -191,6 +260,105 @@ def _stop(reason_code: str, **extra: Any) -> dict[str, Any]:
     return out
 
 
+#: Why the loop is not driving, and what an operator does about it. Keyed by
+#: the same `stop_reason` codes `should_continue` returns, so a reader of a
+#: telemetry event and a reader of `doctor` are told the same thing.
+LOOP_DISABLED_REASONS = {
+    "disabled_env": (
+        "the %s=1 environment variable is set" % LOOP_DISABLE_ENV,
+        "Unset it. It is commonly left behind in an untracked "
+        "`.claude/settings.local.json`, which carries no history of who set "
+        "it, and is copied into every worktree cloned from that project.",
+    ),
+    "disabled_config": (
+        "`.synaptory.yaml` sets `resilience.loop_continuation` to a disabled "
+        "value",
+        "Remove the key or set it to `auto` to restore continuation.",
+    ),
+    "not_structured": (
+        "the engagement mode is not `structured` (or could not be read, which "
+        "fails safe toward stopping)",
+        "Set `engagement_mode: structured` in `.synaptory.yaml`. Interactive "
+        "mode is user-in-the-loop BY DESIGN, so this is only a defect when "
+        "the project believed it was autonomous.",
+    ),
+}
+
+
+def loop_status(project_dir: str) -> dict[str, Any]:
+    """Is the continuation loop able to drive this project? Pure, no logging.
+
+    `#820`. The kill switches work exactly as designed and NOTHING reported
+    that they were engaged. An engagement sealed two Cycles and left ten Work
+    Units `queued` for four hours overnight with zero attempts authorized,
+    because `SYNAPTORY_LOOP_DISABLE=1` sat in an untracked
+    `.claude/settings.local.json` that had been copied into more than ten
+    worktrees. Three Cycles reached Checkpoint in that state, and the idling
+    was attributed to the model.
+
+    THIS IS THE ONE PREDICATE, and `should_continue` calls it rather than
+    repeating the three tests. A `doctor` that re-derived them is precisely
+    how a report comes to say "loop enabled" about an engine that stopped --
+    the failure this exists to end, one level up.
+
+    ONLY THE STANDING GATES. Everything after them in `should_continue` --
+    an unreadable board, a terminal action, the runaway guard, the audience
+    check -- is a fact about THIS turn, and a status a caller can ask ahead of
+    time must not pretend to answer for turns that have not happened.
+
+    `not_structured` IS REPORTED, though the field report named only the
+    environment switch. Its consequence is identical: the loop does not drive
+    and nothing says so. It is deliberately not called a defect on its own --
+    interactive mode is user-in-the-loop by design -- but a project that
+    believes it is autonomous and reads `interactive` here has found the same
+    four hours.
+    """
+    if os.environ.get(LOOP_DISABLE_ENV) == "1":
+        code = "disabled_env"
+    elif _config_disabled(project_dir):
+        code = "disabled_config"
+    elif not _engagement_is_structured(project_dir):
+        code = "not_structured"
+    else:
+        return {"enabled": True, "reason": None, "detail": "", "remedy": ""}
+    detail, remedy = LOOP_DISABLED_REASONS[code]
+    return {"enabled": False, "reason": code, "detail": detail, "remedy": remedy}
+
+
+def attach_loop_status(action: dict[str, Any], project_dir: str) -> None:
+    """Put a disabled loop on the dispatch contract, so a prompt can state it.
+
+    `#820`. `next_action`'s output was identical whether the loop was live or
+    dead, so an orchestrator had nothing to report and a Checkpoint report
+    carried nothing either. `loop_engine` knew -- it returned
+    `stop_reason: "disabled_env"` -- and that string reached telemetry and no
+    human.
+
+    ATTACHED ONLY WHEN DISABLED, deliberately. A block present on every action
+    is a block nobody reads, and an absent key is already the common case; what
+    has to be impossible to miss is the uncommon one.
+
+    Best effort: a status this cannot compute must not break the dispatch that
+    was about to happen.
+    """
+    try:
+        status = loop_status(project_dir)
+    except Exception:  # noqa: BLE001 - reporting must not break dispatching
+        return
+    if status.get("enabled"):
+        return
+    action["loop"] = {
+        "enabled": False,
+        "reason": status["reason"],
+        "detail": status["detail"],
+        "remedy": status["remedy"],
+        "consequence": (
+            "sessions will NOT keep driving this board: the next action below "
+            "happens only if a human asks for it"
+        ),
+    }
+
+
 def should_continue(project_dir: str, session_id: str) -> dict[str, Any]:
     """Decide whether the Stop hook should refuse to stop.
 
@@ -203,15 +371,12 @@ def should_continue(project_dir: str, session_id: str) -> dict[str, Any]:
     """
     from synaptory_logger import emit as _log_emit
 
-    # Kill switches first (cheapest, and must always win).
-    if os.environ.get(LOOP_DISABLE_ENV) == "1":
-        return _stop("disabled_env")
-    if _config_disabled(project_dir):
-        return _stop("disabled_config")
-
-    # Structured mode only — interactive mode is user-in-the-loop by design.
-    if not _engagement_is_structured(project_dir):
-        return _stop("not_structured")
+    # Kill switches and the structured gate, asked ONCE (#820). `loop_status`
+    # is the same predicate `doctor` and `next_action` report, so a surface
+    # cannot say the loop is live while this function stops on it.
+    standing = loop_status(project_dir)
+    if not standing["enabled"]:
+        return _stop(str(standing["reason"]))
 
     na = _lifecycle_next_action(project_dir)
     if na is None:
@@ -225,6 +390,43 @@ def should_continue(project_dir: str, session_id: str) -> dict[str, Any]:
         # not_in_execution / await_acceptance / sprint_complete / all_blocked /
         # no_stories — every human gate and terminal outcome lands here.
         return _stop("action_not_continue_eligible", action=action)
+
+    # ── Audience (#791) ──────────────────────────────────────────────────────
+    # Deliberately BEFORE the runaway guard, for two reasons. A session that
+    # must not be instructed must also not consume the guard's counters — and
+    # the guard file is one per project keyed on `session_id`, so two sessions
+    # reaching it alternately reset each other's counters forever and the
+    # runaway cap never trips for either.
+    import cycle_holder
+
+    scope = cycle_scope(project_dir)
+    ownership = cycle_holder.evaluate(
+        project_dir, scope, session_id, ttl_seconds=_holder_ttl_seconds(project_dir)
+    )
+    if ownership["verdict"] == cycle_holder.HELD_BY_OTHER:
+        holder = ownership.get("holder") or {}
+        _log_emit(
+            "loop_holder_mismatch",
+            project_dir=project_dir,
+            session_id=session_id,
+            scope=scope,
+            holder_session_id=holder.get("session_id"),
+            holder_last_seen=holder.get("last_seen"),
+            action=action,
+        )
+        # Silent. The session that is standing down asked to stand down; the
+        # breadcrumb above is where a reviewer sees that the loop had something
+        # to say and to whom it belonged.
+        return _stop(
+            "held_by_other_session",
+            action=action,
+            scope=scope,
+            holder_session_id=holder.get("session_id"),
+        )
+    if ownership["verdict"] == cycle_holder.HELD_BY_SELF:
+        # Keep an actively looping holder's claim fresh between dispatches.
+        # `touch` cannot create or steal a claim; see `cycle_holder`.
+        cycle_holder.touch(project_dir, scope, session_id)
 
     # Runaway guard. Compare the story-board progress digest across stops.
     cap = _no_progress_cap(project_dir)
@@ -313,23 +515,87 @@ def should_continue(project_dir: str, session_id: str) -> dict[str, Any]:
     }
 
 
-def main() -> int:
-    """CLI surface for the shell hook.
+def claim_dispatch(project_dir: str, session_id: str, role: str = "") -> dict[str, Any]:
+    """Record this session as the holder of the current Cycle (#791).
 
-    Usage: loop_engine.py <project_dir> <session_id>
-    Prints a JSON line with the decision. Exit 0 always (a broken loop engine
-    must never block the session from stopping)."""
+    Called from SubagentStart, the one event that carries the host session id
+    AND proves the session writes into the Cycle. This is the ONLY way a claim
+    comes into existence: see `cycle_holder` for why a Stop-established claim
+    would be worse than none.
+
+    `role` narrows it to the roles the loop itself instructs, so a coordinator
+    asking a research-advisor a question does not take the Cycle.
+    """
+    import cycle_holder
+    from synaptory_logger import emit as _log_emit
+
+    if not cycle_holder.drives_a_cycle(role):
+        return {"claimed": False, "reason": "role %r does not drive a Cycle" % role}
+
+    runner_id = ""
+    try:
+        import spq_paths
+
+        runner_id = spq_paths.default_runner_id()
+    except Exception:
+        pass
+
+    scope = cycle_scope(project_dir)
+    result = cycle_holder.claim(project_dir, scope, session_id, runner_id=runner_id)
+    if result.get("took_over"):
+        # The observable trace of "a second session is dispatching into one
+        # Cycle" — the condition the sealed declaration and `begin_dispatch`
+        # scope intersection exist to refuse. Recorded, never refused here:
+        # this module decides who the loop speaks to, not who may write.
+        _log_emit(
+            "cycle_holder_takeover",
+            project_dir=project_dir,
+            session_id=session_id,
+            scope=scope,
+            previous_session_id=result.get("previous_session_id"),
+        )
+    return result
+
+
+def main() -> int:
+    """CLI surface for the shell hooks.
+
+    Usage: loop_engine.py <project_dir> <session_id>                   (Stop)
+           loop_engine.py --claim <project_dir> <session_id> [role]
+                                                             (SubagentStart)
+           loop_engine.py status <project_dir>                       (doctor)
+
+    `status` is READ-ONLY and asks nothing about this turn (#820): it reports
+    the standing gates, so `doctor` can tell an operator the loop is off
+    without driving the loop to find out.
+
+    Prints a JSON line. Exit 0 always (a broken loop engine must never block
+    the session from stopping, and must never fail a dispatch)."""
     import json
     import sys
 
-    if len(sys.argv) < 2:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "status":
+        try:
+            print(json.dumps(loop_status(argv[1] if len(argv) > 1 else ".")))
+        except Exception as exc:  # noqa: BLE001 - a report never breaks a hook
+            print(json.dumps({"enabled": None, "reason": f"engine_error:{exc}"}))
+        return 0
+    claiming = bool(argv) and argv[0] == "--claim"
+    if claiming:
+        argv = argv[1:]
+    if not argv:
         print("{}")
         return 0
-    project_dir = sys.argv[1]
-    session_id = sys.argv[2] if len(sys.argv) > 2 else ""
+    project_dir = argv[0]
+    session_id = argv[1] if len(argv) > 1 else ""
     try:
-        print(json.dumps(should_continue(project_dir, session_id)))
-    except Exception as exc:  # never let the engine break the Stop hook
+        if claiming:
+            role = argv[2] if len(argv) > 2 else ""
+            print(json.dumps(claim_dispatch(project_dir, session_id, role)))
+        else:
+            print(json.dumps(should_continue(project_dir, session_id)))
+    except Exception as exc:  # never let the engine break a hook
         print(json.dumps({"continue": False, "stop_reason": f"engine_error:{exc}"}))
     return 0
 

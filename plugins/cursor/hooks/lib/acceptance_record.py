@@ -385,9 +385,18 @@ def assert_close_permitted(
             "Handover missing: %s. Only the FINAL Acceptance ends the "
             "engagement, and `final` is a property of the engagement's state "
             "rather than a flag a release may set."
-            % (", ".join(str(c) for c in outstanding_commitments) or "none",
+            % (", ".join(_commitment_label(c) for c in outstanding_commitments) or "none",
                ", ".join(missing) or "nothing")
         )
+
+
+def _commitment_label(commitment: Any) -> str:
+    """A commitment's description if it is `record_commitment`'s shape, its
+    plain value otherwise -- so this refusal names what is owed rather than
+    dumping a record's internal fields."""
+    if isinstance(commitment, Mapping):
+        return str(commitment.get("description") or commitment.get("id") or commitment)
+    return str(commitment)
 
 
 # ─── The four change dispositions ───────────────────────────────────────────

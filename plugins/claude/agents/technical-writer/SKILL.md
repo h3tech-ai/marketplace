@@ -7,7 +7,7 @@ description: >
   just-in-time catalog of fetchable skills (mode guides, documentation
   phases, playbook). Routed via the synaptory orchestrator. Report mode
   enforces immutability on closed sprint reports.
-model: sonnet
+model: opus
 risk_tier: medium
 ---
 

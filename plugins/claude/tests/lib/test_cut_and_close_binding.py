@@ -744,6 +744,123 @@ def test_the_handover_lives_on_the_engagement_not_a_cycle_board(at_acceptance):
     )
 
 
+# ══ 5b. An outstanding commitment blocks the final close too (#776) ═════════
+#
+# `is_final_acceptance` reads `outstanding_commitments` and a recorded
+# handover, but nothing wrote the first half: `_write_engagement` had exactly
+# two callers (`approve_baseline`, `record_handover`) and neither touched it.
+# So a real, owner-accepted debt -- exactly what `ptb-assistant` Cycle
+# `1-bdafd7e0` hit -- was invisible to this gate no matter how it was tracked
+# elsewhere, because there was nowhere on the engagement to put it.
+# `record_commitment` / `discharge_commitment` are the writer, symmetric with
+# `record_handover`.
+
+
+def test_an_outstanding_commitment_blocks_the_final_close(at_acceptance):
+    """A handover alone used to be enough to reach `final: true`. It must not
+    be, once a real commitment is recorded."""
+    project, cycle_id = at_acceptance
+    sm.record_commitment(
+        str(project), description="migrate the legacy importer",
+        recorded_by="lead@h3t.co",
+    )
+    _record_handover(project)
+    _checkpoint_the_region(project, cycle_id)
+    import acceptance_record
+
+    with pytest.raises(acceptance_record.AcceptanceError, match="migrate the legacy importer"):
+        sm.transition(str(project), "COMPLETE")
+
+
+def test_discharging_the_commitment_makes_the_close_reachable(at_acceptance):
+    """The other direction: pay the debt, and the same Acceptance can close."""
+    project, cycle_id = at_acceptance
+    recorded = sm.record_commitment(
+        str(project), description="migrate the legacy importer",
+        recorded_by="lead@h3t.co",
+    )["commitment"]
+    _record_handover(project)
+    sm.discharge_commitment(
+        str(project), commitment_id=recorded["id"], discharged_by="lead@h3t.co",
+    )
+    _checkpoint_the_region(project, cycle_id)
+    assert sm.transition(str(project), "COMPLETE")["lifecycle_state"] == "COMPLETE"
+
+
+def test_a_commitment_needs_a_description(at_acceptance):
+    project, _ = at_acceptance
+    with pytest.raises(ValueError, match="description"):
+        sm.record_commitment(str(project), description="   ", recorded_by="lead@h3t.co")
+
+
+def test_a_commitment_names_the_human_who_accepted_it(at_acceptance):
+    project, _ = at_acceptance
+    with pytest.raises(ValueError, match="attributable to nobody"):
+        sm.record_commitment(
+            str(project), description="migrate the legacy importer", recorded_by="",
+        )
+
+
+def test_a_discharge_names_the_human_who_confirmed_it(at_acceptance):
+    project, _ = at_acceptance
+    recorded = sm.record_commitment(
+        str(project), description="migrate the legacy importer",
+        recorded_by="lead@h3t.co",
+    )["commitment"]
+    with pytest.raises(ValueError, match="attributable to nobody"):
+        sm.discharge_commitment(
+            str(project), commitment_id=recorded["id"], discharged_by="",
+        )
+
+
+def test_discharging_an_unrecorded_commitment_is_refused(at_acceptance):
+    project, _ = at_acceptance
+    with pytest.raises(ValueError, match="no outstanding commitment"):
+        sm.discharge_commitment(
+            str(project), commitment_id="commit_deadbeef", discharged_by="lead@h3t.co",
+        )
+
+
+def test_a_discharged_commitment_is_kept_not_erased(at_acceptance):
+    """Paying a commitment must not make it look like it was never owed --
+    the same reason a cut is a record rather than a deletion."""
+    project, _ = at_acceptance
+    recorded = sm.record_commitment(
+        str(project), description="migrate the legacy importer",
+        recorded_by="lead@h3t.co",
+    )["commitment"]
+    sm.discharge_commitment(
+        str(project), commitment_id=recorded["id"], discharged_by="lead@h3t.co",
+    )
+    engagement = sm.read_engagement(str(project))
+    assert engagement["outstanding_commitments"] == []
+    assert len(engagement["discharged_commitments"]) == 1
+    assert engagement["discharged_commitments"][0]["id"] == recorded["id"]
+    assert engagement["discharged_commitments"][0]["discharged_by"] == "lead@h3t.co"
+
+
+def test_a_commitment_lives_on_the_engagement_not_a_cycle_board(at_acceptance):
+    """Same reason as the handover: it outlives every Cycle, and `open_cycle`
+    replaces a board."""
+    project, cycle_id = at_acceptance
+    sm.record_commitment(
+        str(project), description="migrate the legacy importer",
+        recorded_by="lead@h3t.co",
+    )
+    _checkpoint_the_region(project, cycle_id)
+    sm.open_cycle(
+        str(project), goal="cycle 2", admitted_units=[_fx_unit("WU-09")],
+        **CYCLE_KWARGS,
+    )
+    outstanding = sm.read_engagement(str(project))["outstanding_commitments"]
+    assert len(outstanding) == 1 and outstanding[0]["description"] == (
+        "migrate the legacy importer"
+    ), (
+        "opening a Cycle lost the commitment, so a known debt disappears the "
+        "moment delivery continues"
+    )
+
+
 # ══ 6. A condition stronger than `done` has a verifier, or is not sealed ════
 #
 # `spq_ledger.verify_condition` recomputes a `contract_published` /

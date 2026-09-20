@@ -1706,6 +1706,7 @@ def unblock_story(
     state: dict[str, Any],
     story_id: str,
     project_dir: str | None = None,
+    restore_to: str | None = None,
 ) -> dict[str, Any]:
     """Unblock a story, restoring it to its blocked_from state.
 
@@ -1713,6 +1714,12 @@ def unblock_story(
         state: Full pipeline state dict.
         story_id: Story to unblock.
         project_dir: If provided, syncs the transition to the tracker backend.
+        restore_to: Resume state, overriding `blocked_from`. Supplied by
+            `next_action` via `blocked_resume_state` so a CR-rejected unit
+            whose code has since moved resumes at `testing` and can be
+            re-verified (#802). Must be a legal target of `blocked`; an
+            illegal one raises rather than moving the unit somewhere the
+            transition table does not allow.
 
     Returns:
         Updated state dict.
@@ -1727,7 +1734,13 @@ def unblock_story(
     if story["state"] != "blocked":
         raise ValueError(f"Story {story_id} is not blocked (state: {story['state']})")
 
-    restore_to = story.get("blocked_from") or "queued"
+    if restore_to is None:
+        restore_to = story.get("blocked_from") or "queued"
+    elif restore_to not in VALID_TRANSITIONS["blocked"]:
+        raise ValueError(
+            f"cannot unblock {story_id} to {restore_to!r}: not a legal target "
+            f"of 'blocked' ({', '.join(VALID_TRANSITIONS['blocked'])})"
+        )
     now = _now()
 
     if story["pipeline_log"]:
@@ -2813,6 +2826,65 @@ def _fresh_receipt(
     if completed_dt is None:
         return False
     return receipt_timestamp_is_fresh(completed_dt, entered_dt)
+
+
+def _receipt_completed_at(
+    receipts_dir: str | None, story_id: str, role: str
+) -> Any:
+    """Parsed `completed_at` of {story_id}-{role}.json, or None.
+
+    Same lookup `_fresh_receipt` uses, minus the staleness verdict: callers
+    here compare two receipts against EACH OTHER rather than against a stage
+    timestamp.
+    """
+    if not receipts_dir:
+        return None
+    for directory in companion_receipt_dirs(receipts_dir):
+        path = os.path.join(directory, get_story_receipt_path(story_id, role))
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(loaded, dict):
+            return _parse_iso_timestamp(loaded.get("completed_at"))
+    return None
+
+
+def blocked_resume_state(
+    story: dict[str, Any], receipts_dir: str | None
+) -> str:
+    """Where `unblock_story` should put this unit -- usually `blocked_from`.
+
+    THE ONE EXCEPTION (#802). A unit rejected at review blocks with
+    `blocked_from: "reviewing"`, and restoring it there sends the repaired
+    code straight back to the reviewer: `reviewing` has no edge to `testing`,
+    so QE is unreachable for the rest of the unit's life and its DoD fails on
+    `tests_pass` with no route to the evidence that would clear it. That is
+    the defect measured in #802 -- a unit that was correct, re-reviewed to a
+    PASS, and could not be closed.
+
+    So when the builder's receipt is NEWER than the verifier's, the code moved
+    after QE last saw it and the unit resumes at `testing` instead, which is
+    a legal edge from `blocked` and puts QE back in the pipeline.
+
+    Deliberately conditional rather than always-from-reviewing: a reject that
+    needed no code change leaves SE's receipt older than QE's and resumes at
+    `reviewing`, so a trivial re-review is not forced through a pointless QE
+    pass. With either receipt missing or unparseable the answer is
+    `blocked_from`, unchanged -- a resume target is not the place to guess.
+    """
+    restore_to = str(story.get("blocked_from") or "queued")
+    if restore_to != "reviewing":
+        return restore_to
+    story_id = str(story.get("id") or "")
+    if not story_id:
+        return restore_to
+    se_at = _receipt_completed_at(receipts_dir, story_id, "se")
+    qe_at = _receipt_completed_at(receipts_dir, story_id, "qe")
+    if se_at is None or qe_at is None:
+        return restore_to
+    return "testing" if se_at > qe_at else restore_to
 
 
 def _blocked_recovery_role(story: dict[str, Any]) -> str:
@@ -4619,31 +4691,88 @@ def next_action(
         # 2. Retry-ladder-blocked stories the H3-F1 ladder can still recover.
         recoverable = []
         for s in blocked:
-            role = _blocked_recovery_role(s)
+            resume = blocked_resume_state(s, receipts_dir)
+            # THE ROLE FOLLOWS THE RESUME TARGET (#802). Rerouting a unit to
+            # `testing` while still dispatching SE would put the builder on a
+            # unit the board says is being verified, and would spend the
+            # BUILDER's retry ladder on a verification the builder cannot
+            # perform. `testing` is QE's stage, so QE is who gets dispatched
+            # and whose ladder is consulted -- which is what "offer qe when
+            # the code has changed since the last QE receipt" means.
+            # Scoped to the REROUTE. A unit blocked from `testing` already
+            # resumes there and keeps whatever role its ladder names: that
+            # path predates #802 and changing it is not this fix's business.
+            _rerouted = resume != (s.get("blocked_from") or "queued")
+            role = "qe" if _rerouted and resume == "testing" else _blocked_recovery_role(s)
             rec = recommend_recovery_action(state, str(s.get("id", "")), role)
             if rec["tier"] != RETRY_TIER_BLOCK:
-                recoverable.append((s, role, rec))
+                recoverable.append((s, role, rec, resume))
         if recoverable:
-            story, role, rec = recoverable[0]
+            story, role, rec, resume_to = recoverable[0]
+            # #802: say WHERE the unit resumes, not just that it resumes. A
+            # CR-rejected unit whose code has since moved goes back to
+            # `testing` so QE can re-verify it; every other unit resumes at
+            # `blocked_from` exactly as before.
+            #
+            # Carried ONLY when it overrides `blocked_from`, so the unchanged
+            # path stays byte-identical: `unblock_story` validates a resume
+            # target it is handed, and a board with a hand-corrupted
+            # `blocked_from` would otherwise start raising inside a dispatch
+            # where it used to restore silently. Widening a failure mode is
+            # not this fix's business.
+            _requeued = resume_to != (story.get("blocked_from") or "queued")
+            _recovery = {**rec, "role": role}
+            if _requeued:
+                _recovery["resume_to"] = resume_to
             return _fill(
                 story,
                 action="recover_blocked",
                 role=role,
-                recovery={**rec, "role": role},
+                recovery=_recovery,
                 reason=(
                     f"{story.get('id')} is blocked and the recovery ladder allows "
                     f"{rec['tier']} for role '{role}' — unblock and re-dispatch"
+                    + (
+                        f" (resuming at '{resume_to}': the builder's receipt "
+                        "post-dates the verifier's, so QE must see the repaired "
+                        "code before review can stand)"
+                        if _requeued
+                        else ""
+                    )
                 ),
             )
         if counts["awaiting_acceptance"] == 0 and (
             counts["done"] + counts["cancelled"] + counts["blocked"] == len(stories)
         ):
+            # #802 — NAME THE EXIT THAT EXISTS. A unit whose ladder is
+            # exhausted has one correct move in SPQ, and it is not another
+            # retry: `cut_work_unit` is the §8.6 release valve, it records a
+            # reason, `admitted_set_closed` reads it at the barrier so nothing
+            # disappears quietly, and the unit returns to the backlog for a
+            # later Cycle. It was available, correct and never suggested,
+            # which left `story_retry_cap` as the only thing that could move a
+            # blocked unit -- merging a runaway-loop guard with the budget for
+            # finishing normal work into one dial, where raising either lowers
+            # the other.
+            #
+            # SPQ-gated because the cut is SPQ's own method event and
+            # `next_action` is shared: naming it on a scrum or kanban board
+            # would recommend an action those modes cannot perform.
+            _exit_hint = ""
+            if str(state.get("build_mode") or "").lower() == "spq":
+                _exit_hint = (
+                    " — the recorded exit is a cut (`spq_cut_work_unit`), which "
+                    "returns the unit to the backlog for a later Cycle; do NOT "
+                    "raise `resilience.story_retry_cap` to get past this, that "
+                    "dial is the runaway-loop guard, not the completion budget"
+                )
+                out["recommended_exit"] = "cut_work_unit"
             out.update(
                 action="all_blocked",
                 reason=(
                     f"{counts['blocked']} blocked stor"
                     f"{'y has' if counts['blocked'] == 1 else 'ies have'} exhausted "
-                    "the recovery ladder — human decision needed"
+                    "the recovery ladder — human decision needed" + _exit_hint
                 ),
                 human_gate_pending=True,
                 # #179 E5 — human gates carry the run data behind the verdict.

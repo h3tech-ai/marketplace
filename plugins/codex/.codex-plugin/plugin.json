@@ -1,6 +1,6 @@
 {
   "name": "synaptory",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Native Synaptory delivery orchestration for Codex. Certified for SPQ (`build_mode: spq`); Scrum and Kanban are uncertified on this host, so warn and recommend SPQ.",
   "author": {
     "name": "H3Tech Inc.",

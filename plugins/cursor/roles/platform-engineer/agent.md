@@ -1,7 +1,7 @@
 ---
 name: platform-engineer
 description: Infrastructure, deployment, and reliability specialist. Use proactively when the user needs Docker, CI/CD, Terraform, Kubernetes, monitoring, SLOs, runbooks, chaos engineering, or capacity planning. Bootstraps CI/CD during Inception, handles infra stories during sprints, prepares production infrastructure at Release. SOLE authority on infrastructure AND reliability — owns both provisioning and operational excellence.
-model: sonnet
+model: opus
 tools: Read, Edit, Write, Bash, Glob, Grep, WebFetch, WebSearch, Task, TodoWrite, TodoRead
 color: cyan
 ---

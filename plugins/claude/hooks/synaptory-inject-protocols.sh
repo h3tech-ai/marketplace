@@ -48,6 +48,24 @@ except Exception:
 agent_id="${span_meta%%	*}"
 agent_type="${span_meta##*	}"
 
+# The dispatching SESSION, read once here rather than inside the CLI gate
+# below. It is split separately from span_meta above because that value is cut
+# with ${..%%} / ${..##}, which a third field would silently break.
+#
+# Two consumers, and only one of them is telemetry: the OTel span correlation
+# (CLI-gated, further down) and the Cycle-ownership claim (#791, never gated).
+# prompt_id is a per-turn UUID available in Claude Code v2.1.196+ stdin.
+otel_meta=$(printf '%s' "$SYNAPTORY_STDIN" | "$_py" -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print((d.get('session_id') or '') + '\t' + (d.get('prompt_id') or ''))
+except Exception:
+    print('\t')
+" 2>/dev/null || printf '\t')
+session_id="${otel_meta%%	*}"
+prompt_id="${otel_meta##*	}"
+
 # Issue #130: only synaptory-plugin subagents are pipeline agents that emit a
 # span + owe a receipt. Other subagents in the session — the Workflow tool's
 # workers, `Explore`/`general-purpose`, agents from other plugins — never
@@ -101,6 +119,22 @@ if [ "$_synaptory_agent" = "1" ] \
   fi
   printf '%s\n%s\n' "$agent_type" "$_marker_link" \
     > "${_marker_dir}/${_safe_id}" 2>/dev/null || true
+
+  # --- Cycle ownership: this session is the one driving the Cycle (#791) ----
+  # Dispatching a delivery agent is the ACT that makes a session the holder,
+  # and this is the only event that carries both the host session id and the
+  # proof that the session writes into the Cycle. The Stop-hook loop then
+  # speaks only to the holder, instead of to whatever session happens to be
+  # pointed at the project directory.
+  #
+  # Ungated by the CLI for the same reason as the marker above (#512): who
+  # holds a Cycle is a local fact about this checkout and addresses no control
+  # plane. Best-effort — a failure here must never fail a dispatch.
+  if [ -f "$HOOK_LIB_DIR/loop_engine.py" ] && [ -n "${session_id:-}" ]; then
+    "$_py" "$HOOK_LIB_DIR/loop_engine.py" --claim \
+      "$CLAUDE_PROJECT_DIR" "$session_id" "$_synaptory_role" \
+      >/dev/null 2>&1 || true
+  fi
 fi
 
 # --- Telemetry: this is the part that genuinely needs a CLI -----------------
@@ -155,18 +189,10 @@ if [[ -n "$cli" ]] && [[ -x "$cli" ]] && [ "$_synaptory_agent" = "1" ]; then
   # only, so an unpaired `end` is dropped rather than shipped as a
   # zero-duration span.
   #
-  # Extract session_id and prompt_id for OTel span correlation.
-  # prompt_id is a per-turn UUID available in Claude Code v2.1.196+ stdin.
-  otel_meta=$(printf '%s' "$SYNAPTORY_STDIN" | "$_py" -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print((d.get('session_id') or '') + '\t' + (d.get('prompt_id') or ''))
-except Exception:
-    print('\t')
-" 2>/dev/null || printf '\t')
-  session_id="${otel_meta%%	*}"
-  prompt_id="${otel_meta##*	}"
+  # session_id / prompt_id come from the single hoisted parse near the top.
+  # They used to be re-read here, which was the only place that needed them
+  # until the Cycle-ownership claim did too (#791) — and a second copy of the
+  # same parse is how two readers of one stdin come to disagree.
   OTEL_WRITER="${_HOOK_ROOT}/hooks/lib/otel_writer.py"
   if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$OTEL_WRITER" ]; then
     "$_py" "$OTEL_WRITER" start \

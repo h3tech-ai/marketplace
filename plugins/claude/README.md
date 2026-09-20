@@ -2,7 +2,7 @@
 
 **Governed multi-agent SPQ delivery for Claude Code.** Synaptory coordinates role-based work through SPQ Cycles, validates dispatch-bound receipts and verification evidence, and stops at human decisions instead of treating agent completion as delivery acceptance.
 
-> **Version:** 1.3.3 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
+> **Version:** 1.3.4 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
 
 ## Requirements
 

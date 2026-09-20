@@ -653,7 +653,7 @@ from datetime import datetime, timezone
 # caveat is written INTO the emitted object below rather than left in this
 # comment, because an auditor reads build-metadata.json and never reads this
 # file. (Per-model USD rates are not pinned here: they live in the control
-# plane's signed `pricing_versions` table, maintained at /pricing.)
+# plane's signed pricing_versions table, maintained at /pricing.)
 try:
     with open('${model_pins_src}', 'r') as f:
         model_pins = json.load(f)

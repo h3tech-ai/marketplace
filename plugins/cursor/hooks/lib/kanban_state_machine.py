@@ -456,6 +456,13 @@ def next_action(project_dir: str) -> dict[str, Any]:
         state=state,
         receipts_dir=_resolve_receipts_dir(project_dir),
     )
+    # #820 -- a disabled continuation loop is named on the dispatch contract.
+    # `loop_engine.attach_loop_status` is the one predicate; re-deriving the
+    # kill switches per lifecycle is how one of the three would come to
+    # disagree with the engine that actually stops.
+    import loop_engine as _loop
+
+    _loop.attach_loop_status(result, project_dir)
     result.update(base)
     return result
 

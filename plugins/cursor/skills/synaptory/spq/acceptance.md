@@ -204,7 +204,21 @@ PY
 
 The handover is an **AND of three items**, not a count -- `codebase`, `documentation`, `operating_knowledge`. An engagement closed without the operating knowledge has handed over a codebase nobody can run.
 
-> **There is no verb that records the handover or the outstanding commitments.** Both live on the engagement, and only `approve_baseline` writes there today, so `acceptance_status` reports `final: false` on every Acceptance and `next_stage: CYCLE`. That makes the check above a **prompt-level** guard: `transition COMPLETE` is a legal edge and does not consult it. So run `assert_close_permitted` yourself before taking that edge, and do not tell the user the lifecycle refused a premature close -- it would not have.
+**Both halves have a verb now.** Record a handover, and record or discharge a commitment, as they actually happen -- not just before this Acceptance:
+
+```bash
+python3 "${PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" record_handover "$(pwd)" \
+  --recorded-by "<name>" --codebase "<rev>" \
+  --documentation "<doc ref>" --operating-knowledge "<runbook ref>"
+
+python3 "${PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" record_commitment "$(pwd)" \
+  --description "<what is still owed>" --recorded-by "<name>"
+
+python3 "${PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" discharge_commitment "$(pwd)" \
+  --commitment-id "<the id record_commitment returned>" --discharged-by "<name>"
+```
+
+> `transition COMPLETE` consults `assert_close_permitted` directly (`check_transition` at `core/lib/spq_state_machine.py`), so this is a real gate, not prompt-level advice -- but until `record_commitment`/`discharge_commitment` existed, `outstanding_commitments` had no writer at all, and `is_final_acceptance` silently reduced to `handover_recorded` alone (#776): an Acceptance could close the engagement with a real, owner-accepted debt outstanding, because there was nowhere to put it. Record every commitment the team is knowingly deferring past this go-live, and discharge one only once it is actually paid -- an unrecorded commitment is invisible to this gate, and a commitment discharged early is a false final.
 
 ```bash
 SPQ_LIB="${PLUGIN_ROOT}/hooks/lib" python3 - <<'PY'

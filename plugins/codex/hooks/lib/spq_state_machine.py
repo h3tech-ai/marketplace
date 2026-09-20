@@ -64,6 +64,7 @@ from state_schema import with_state_metadata
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -674,6 +675,82 @@ def _test_first_block(
     }
 
 
+def _resolve_ref(project_dir: str, ref: str) -> str:
+    """`ref` as a commit SHA, or "" when git cannot answer.
+
+    Deliberately total: sealing a Cycle must not fail because the checkout is
+    odd, so every failure is the empty string and the consumer treats that as
+    unknown.
+    """
+    if not ref:
+        return ""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", ref], cwd=str(project_dir),
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+
+def trunk_drift(project_dir: str, declaration: dict[str, Any]) -> dict[str, Any] | None:
+    """Has the trunk moved since this Cycle was admitted against it?
+
+    `#807` S6. Returns None when the declaration predates `#807` and carries
+    no sealed SHA -- an older Cycle is not retro-fitted with a claim its seal
+    never made.
+
+    `drifted` is TRI-STATE. None means the current trunk could not be
+    resolved, and reporting False there would say "checked, and unchanged"
+    about a check that did not run. `commits_ahead` is present only alongside
+    `drifted: True`, and is best-effort: a trunk that was force-pushed, or one
+    whose sealed commit is no longer reachable, yields no count rather than a
+    wrong one.
+
+    THIS WARNS; IT REFUSES NOTHING. Inheriting trunk movement is ordinary and
+    usually correct -- what cost the reporting engagement three hours was not
+    the merge but its invisibility, the failure surfacing as a defect in the
+    unit under review. A notice on the dispatch that precedes the regression
+    is the whole remedy.
+    """
+    sealed_sha = str((declaration or {}).get("trunk_sha_at_commit") or "")
+    if not sealed_sha:
+        return None
+    trunk_ref = str((declaration or {}).get("trunk_ref") or "")
+    current = _resolve_ref(project_dir, trunk_ref)
+    out: dict[str, Any] = {
+        "trunk_ref": trunk_ref,
+        "sealed_sha": sealed_sha,
+        "current_sha": current,
+        "drifted": None if not current else current != sealed_sha,
+    }
+    if out["drifted"]:
+        try:
+            r = subprocess.run(
+                ["git", "rev-list", "--count", "%s..%s" % (sealed_sha, current)],
+                cwd=str(project_dir), capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip().isdigit():
+                out["commits_ahead"] = int(r.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+        out["notice"] = (
+            "the trunk %s moved since this Cycle was admitted against it "
+            "(%s -> %s)%s. Work merged to the trunk while a Cycle is open is "
+            "inherited by an ordinary merge and is NOT this unit's change -- "
+            "a regression that appears here may belong to the trunk"
+            % (
+                trunk_ref or "(unnamed)",
+                sealed_sha[:12],
+                current[:12],
+                " -- %d commit(s) ahead" % out["commits_ahead"]
+                if "commits_ahead" in out else "",
+            )
+        )
+    return out
+
+
 def open_cycle(
     project_dir: str,
     *,
@@ -732,11 +809,35 @@ def open_cycle(
     # regions by definition, so a default that could override one would make
     # every Cycle overlap with every other.
     _defaults = spq_defaults(project_dir)
+    _trunk_ref = trunk_ref or str(_defaults.get("trunk_ref") or "")
     declaration = {
         "cycle_id": allocated,
         "cycle_seq": seq,
         "repository": repository,
-        "trunk_ref": trunk_ref or str(_defaults.get("trunk_ref") or ""),
+        "trunk_ref": _trunk_ref,
+        # #807 S6 -- WHERE THE TRUNK WAS WHEN THIS CYCLE WAS ADMITTED.
+        #
+        # `trunk_ref` names a moving target; this pins the commit it named at
+        # Commit, so "the trunk moved under an open Cycle" becomes a
+        # comparison rather than a discovery. The engagement that reported
+        # this lost roughly three hours and a review round to a PR that merged
+        # to trunk while a Cycle was open against it and edited a file one of
+        # the Cycle's tests pins byte-for-byte: the open Cycle inherited it
+        # through an ordinary `git merge <trunk>`, and it surfaced only when
+        # the reviewer ran the regression and attributed the failure to the
+        # unit under review.
+        #
+        # The barrier already observes the trunk (`_trunk_observation`), but
+        # it runs at close -- after every dispatch that could have been warned.
+        # Sealed here, `trunk_drift` can answer the same question on any
+        # dispatch, at the cost of one `git rev-parse`.
+        #
+        # EMPTY IS UNKNOWN, NOT UNCHANGED. A Cycle opened outside a git
+        # checkout, or against a ref git cannot resolve, seals "" and
+        # `trunk_drift` then reports `drifted: None` rather than False --
+        # the same honesty rule `candidate_is_ancestor_of_trunk` follows one
+        # function up.
+        "trunk_sha_at_commit": _resolve_ref(project_dir, _trunk_ref),
         "baseline_ref": baseline_ref or str(
             (state.get("discovery") or {}).get("baseline_ref") or ""
         ),
@@ -2138,6 +2239,15 @@ def record_sync(
     it meant.
     """
     state = read_state(project_dir, cycle_id=cycle_id)
+    # #807 S6 -- a Sync is recorded precisely when two Cycles are open at once,
+    # which is exactly when one of them is most likely to have merged to the
+    # trunk this one is open against. Recording the drift on the event makes
+    # that visible in the ledger rather than at the reviewer's regression.
+    try:
+        _decl = read_manifest(project_dir, str(state.get("_cycle_id") or ""))
+    except (OSError, ValueError):
+        _decl = {}
+    _drift = trunk_drift(project_dir, _decl) if _decl else None
     state["method_events"] = _events.append(
         state.get("method_events") or [],
         _events.build(
@@ -2145,6 +2255,7 @@ def record_sync(
             waiting_unit_id=waiting_unit_id,
             producing_cycle_id=producing_cycle_id,
             resolution=resolution,
+            trunk_drift=_drift,
         ),
     )
     _write_state(project_dir, state)
@@ -2207,6 +2318,88 @@ def record_handover(
     # `open_cycle` replaces.
     _write_engagement(project_dir, {"handover": handover})
     return {"ok": True, "handover": handover}
+
+
+def record_commitment(
+    project_dir: str, *, description: str, recorded_by: str
+) -> dict[str, Any]:
+    """Record a known, owner-accepted debt the engagement still owes.
+
+    WITHOUT THIS VERB, `outstanding_commitments` had no writer at all (#776):
+    `is_final_acceptance` reads it in five places and nothing anywhere wrote
+    it, so the list was permanently empty and the predicate silently reduced
+    to `handover_recorded` alone -- an engagement could be declared final with
+    real, owner-accepted debt still outstanding, because there was nowhere to
+    put it. Symmetric with `record_handover`: writes the engagement, names the
+    accountable human, and refuses an unnamed one for the same reason.
+    """
+    description = str(description or "").strip()
+    if not description:
+        raise ValueError("a commitment needs a description of what is owed")
+    if not str(recorded_by or "").strip():
+        raise ValueError(
+            "a commitment is an accountable act and names the human who "
+            "accepted it. `SC-MTH-004`: a role decides who may be named, and "
+            "an unnamed commitment is attributable to nobody."
+        )
+    engagement = read_engagement(project_dir)
+    outstanding = list(engagement.get("outstanding_commitments") or [])
+    commitment = {
+        "id": "commit_" + secrets.token_hex(8),
+        "description": description,
+        "recorded_by": str(recorded_by).strip(),
+        "recorded_at": _now(),
+    }
+    outstanding.append(commitment)
+    _write_engagement(project_dir, {"outstanding_commitments": outstanding})
+    return {"ok": True, "commitment": commitment}
+
+
+def discharge_commitment(
+    project_dir: str, *, commitment_id: str, discharged_by: str
+) -> dict[str, Any]:
+    """Discharge a previously recorded commitment. Symmetric with `record_commitment`.
+
+    Removes it from `outstanding_commitments` -- the list `is_final_acceptance`
+    reads -- and keeps it, with who discharged it and when, on
+    `discharged_commitments` so paying a commitment does not erase that it was
+    ever owed.
+    """
+    commitment_id = str(commitment_id or "").strip()
+    if not commitment_id:
+        raise ValueError("discharging a commitment needs its id (--commitment-id)")
+    if not str(discharged_by or "").strip():
+        raise ValueError(
+            "discharging a commitment is an accountable act and names the "
+            "human who confirms it is paid. An unnamed discharge is "
+            "attributable to nobody."
+        )
+    engagement = read_engagement(project_dir)
+    outstanding = list(engagement.get("outstanding_commitments") or [])
+    remaining: list[Any] = []
+    discharged: dict[str, Any] | None = None
+    for item in outstanding:
+        if discharged is None and isinstance(item, dict) and item.get("id") == commitment_id:
+            discharged = dict(item)
+            continue
+        remaining.append(item)
+    if discharged is None:
+        known = ", ".join(
+            str(item.get("id")) for item in outstanding if isinstance(item, dict)
+        )
+        raise ValueError(
+            "no outstanding commitment with id %r. Outstanding: %s"
+            % (commitment_id, known or "none")
+        )
+    discharged["discharged_by"] = str(discharged_by).strip()
+    discharged["discharged_at"] = _now()
+    history = list(engagement.get("discharged_commitments") or [])
+    history.append(discharged)
+    _write_engagement(project_dir, {
+        "outstanding_commitments": remaining,
+        "discharged_commitments": history,
+    })
+    return {"ok": True, "commitment": discharged}
 
 
 def acceptance_readiness(
@@ -2435,6 +2628,45 @@ def next_action(project_dir: str, **kwargs: Any) -> dict[str, Any]:
     attach_dispatch_dod_contract(
         action, project_dir, state=state, receipts_dir=receipts
     )
+    # #807 S1 -- NAME the other Work Units that may run alongside this one.
+    #
+    # `parallelism` stays absent above and that has not changed: the retired
+    # switch decided WHETHER collisions were looked for, and this decides
+    # nothing -- `advance_kernel.concurrent_dispatch_batch` re-derives each
+    # member through the same three checks `begin_dispatch` runs, so every
+    # unit it names is one the kernel would authorize today.
+    #
+    # ONLY ON A FULL-BOARD READ. `advance_kernel._spq_independently_
+    # dispatchable` asks this function what ONE unit would dispatch by handing
+    # in a board narrowed to it, and the batch builder calls that helper --
+    # so attaching on the narrowed board would recurse. The `state=` override
+    # is exactly the signal that this is the inner call.
+    if override is None:
+        batch = advance_kernel.concurrent_dispatch_batch(
+            project_dir, state, action
+        )
+        if batch is not None:
+            action["parallel"] = batch
+        # #807 S6 -- attached ONLY when the trunk actually moved, so a quiet
+        # Cycle carries no extra field and the notice cannot become wallpaper.
+        # The most valuable dispatch to carry it is `dispatch_cr`, whose
+        # regression run is where the inherited change surfaced as a defect in
+        # the unit under review -- but any dispatch may inherit it, so it is
+        # not scoped to one role.
+        try:
+            _decl = read_manifest(project_dir, str(state.get("_cycle_id") or ""))
+        except (OSError, ValueError):
+            _decl = {}
+        _drift = trunk_drift(project_dir, _decl) if _decl else None
+        if _drift and _drift.get("drifted"):
+            action["trunk_drift"] = _drift
+        # #820 -- same predicate, same contract field, on the lifecycle the
+        # four-hour stall was measured on. Inside the full-board guard with
+        # the other two attachments: the narrowed board is the kernel asking
+        # about one unit, not a dispatch anyone is about to prompt from.
+        import loop_engine as _loop
+
+        _loop.attach_loop_status(action, project_dir)
     action.setdefault("_build_mode", "spq")
     return action
 
@@ -2695,7 +2927,7 @@ def main(argv: list[str]) -> None:
             "verbs: init, read, next_action, transition, approve_baseline, "
             "open_cycle, revise_manifest, hydrate_cycle, cut_work_unit, "
             "rebind_cut, run_barrier, promote_cycle, close_cycle, "
-            "record_handover, "
+            "record_handover, record_commitment, discharge_commitment, "
             "record_sync, acceptance_status, publish_event, refresh_ledger, "
             "dep_status"
         )
@@ -2832,6 +3064,21 @@ def main(argv: list[str]) -> None:
                 codebase=_flag(args, "--codebase", "") or "",
                 documentation=_flag(args, "--documentation", "") or "",
                 operating_knowledge=_flag(args, "--operating-knowledge", "") or "",
+            ))
+        elif verb == "record_commitment":
+            _emit(record_commitment(
+                project_dir,
+                description=_flag(args, "--description", "") or "",
+                recorded_by=_flag(args, "--recorded-by", "") or "",
+            ))
+        elif verb == "discharge_commitment":
+            commitment_id = _flag(args, "--commitment-id") or (
+                args[0] if args and not args[0].startswith("--") else ""
+            )
+            _emit(discharge_commitment(
+                project_dir,
+                commitment_id=commitment_id or "",
+                discharged_by=_flag(args, "--discharged-by", "") or "",
             ))
         elif verb == "record_sync":
             _emit(record_sync(

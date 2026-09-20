@@ -108,6 +108,45 @@ BLOCKED_FROM_ROLE: Dict[str, Tuple[str, str]] = {
     "awaiting_acceptance": ("project-owner", "po"),
 }
 
+# What LEAVING `blocked` costs (#802). `story_pipeline.VALID_TRANSITIONS`
+# permits five exits from `blocked`; before this table the kernel bound a
+# receipt role to none of them, so `expected_receipt_role` answered None and
+# every one was refused as `no_bound_role`. The two tables disagreed about
+# what a blocked unit may do, and the kernel's side won: `blocked` was a dead
+# end that only `begin_dispatch`'s unblock side effect could leave. A unit
+# rejected at review could therefore never be re-verified by QE, because the
+# route back to `testing` was legal and unreachable at the same time.
+#
+# THE RULE, so the two tables agree by construction rather than by a second
+# hand-maintained list: a blocked unit may enter stage X exactly when it can
+# show the evidence that normally EARNS entry to X. So each row mirrors its
+# destination's inbound edge in `TRANSITION_RECEIPT` above -- `blocked ->
+# testing` costs the same SE receipt as `in_progress -> testing`, and landing
+# there is what puts QE next in line. Each of these four destinations has
+# exactly one inbound edge, so the mirror is unambiguous;
+# `test_blocked_exit_mirrors_inbound_edge` asserts that and fails if a future
+# row makes it ambiguous.
+#
+# `queued` is absent because it earns no evidence -- see `UNGATED_EDGES`.
+BLOCKED_EXIT_ROLE: Dict[str, Tuple[str, str]] = {
+    "in_progress": ("software-engineer", "se"),
+    "testing": ("software-engineer", "se"),
+    "reviewing": ("quality-engineer", "qe"),
+    "awaiting_acceptance": ("code-reviewer", "cr"),
+}
+
+# Edges that are DELIBERATELY not receipt-gated, stated rather than implied.
+# The gate below refuses an edge it finds no binding for, which is correct for
+# a table bug and wrong for an edge that should cost nothing -- and absence
+# cannot tell the two apart. That ambiguity is #802 in miniature, so the
+# intent is written down where it can be read and reviewed.
+#
+# `blocked -> queued` returns a unit to the backlog. It claims no work, so
+# there is no receipt it could carry; demanding one would make the ordinary
+# way to park a unit impossible, which is what the rest of this fix exists to
+# stop doing.
+UNGATED_EDGES: frozenset = frozenset({("blocked", "queued")})
+
 # Transitions that land a story on the DoD gate edge.
 _DONE_EDGE = ("done", "awaiting_acceptance")
 
@@ -405,6 +444,210 @@ def _spq_independently_dispatchable(
 
 
 
+def unclaimed_artifacts(
+    project_dir: str, story_id: str, artifacts: Any
+) -> List[str]:
+    """This unit's receipt artifacts that its declared `path_scope` never claimed.
+
+    SPQ only; empty for every other lifecycle, for an unreadable declaration,
+    and for a unit the declaration does not admit.
+
+    `#818`. `receipt_validator` checks each artifact is a string, exists, and
+    is non-empty -- never whether it is inside the unit's declared scope. The
+    first thing that notices is `_eval_admitted_set_closed` at the Checkpoint,
+    by which point the declaration is SEALED and `revise_manifest` is
+    prohibited: the refusal arrives at the one moment it can no longer be
+    fixed by adjusting the scope. The reporting engagement paid the review
+    rounds and the regression first, and the offending file was a record of
+    open questions written hours earlier at the coordinator's own instruction.
+
+    Same predicate, asked early enough to be actionable: `path_scope.uncovered`
+    is what the barrier itself calls, so a dispatch cannot be told one thing
+    here and another at the close.
+
+    A WARNING, NOT A REFUSAL, and the asymmetry with the barrier is
+    deliberate. An artifact outside the scope is sometimes intended -- the
+    coordinator may mean to land it separately -- and the cost this closes is
+    entirely that nobody was told while it was still cheap. Refusing here
+    would convert a late surprise into an early blocker, which is a different
+    and worse trade for a case that is legitimately ambiguous. The barrier
+    still refuses at the close, unchanged.
+
+    FAIL-OPEN THROUGHOUT. Every unreadable input answers "nothing unclaimed":
+    this is an advisory lane, and a warning that turned an unreadable
+    declaration into a hard error would be worse than the silence it replaces.
+    """
+    if not isinstance(artifacts, list) or not artifacts:
+        return []
+    try:
+        if build_mode(project_dir) != "spq":
+            return []
+    except Exception:  # noqa: BLE001 - an unreadable mode is not SPQ
+        return []
+    binding = _sealed_cycle_binding(project_dir)
+    if not isinstance(binding, dict) or binding.get("unreadable"):
+        return []
+    try:
+        import path_scope  # noqa: PLC0415
+        import spq_state_machine  # noqa: PLC0415
+
+        sealed = spq_state_machine.read_manifest(
+            project_dir, str(binding.get("cycle_id") or "")
+        )
+    except (ImportError, OSError, ValueError):
+        return []
+    scope = _declared_path_scopes(sealed).get(str(story_id)) or []
+    if not scope:
+        return []
+    paths = [a for a in artifacts if isinstance(a, str) and a.strip()]
+    if not paths:
+        return []
+    try:
+        return path_scope.uncovered(scope, paths)
+    except path_scope.PathScopeError:
+        # An artifact this grammar cannot read is not evidence of a violation,
+        # and the receipt's own validation already refuses a malformed path.
+        return []
+
+
+def concurrent_dispatch_batch(
+    project_dir: str,
+    state: Dict[str, Any],
+    selected: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """The Work Units that may run ALONGSIDE the one `next_action` named.
+
+    SPQ only; None for every other lifecycle and for any output that is not a
+    dispatch.
+
+    THIS ADDS NO PERMISSION. Every member is a unit `begin_dispatch` would
+    authorize today, by the three checks it already runs above its binding:
+    admitted to the sealed declaration, dependencies met, declared
+    `path_scope` disjoint from every live dispatch. What was missing was not
+    the permission but the RECOMMENDATION -- `next_action` returns one action,
+    an orchestrator executes the action it is given, and so the half of `C-07`
+    that computes the fact never reached the half that schedules on it.
+    `#807` measured the consequence: mean concurrency 0.95 over seven
+    mutually disjoint units, one of them running for 44% of the Cycle while
+    nothing else moved.
+
+    MEMBERSHIP IS DERIVED, NEVER FABRICATED. Each member's entry is the record
+    `_spq_independently_dispatchable` re-derives from the unit's own board, so
+    a concurrent dispatch carries the same role and the same DoD contract a
+    serial one would. Composing an entry here from the story dict instead is
+    how the two would come to disagree, which is the divergence
+    `attach_dispatch_dod_contract` exists to close.
+
+    DISJOINTNESS IS PAIRWISE ACROSS THE WHOLE BATCH, not merely against the
+    lead: three units A, B, C where A is disjoint from both B and C says
+    nothing about B against C, and dispatching all three would put two
+    colliding units in flight together. The scopes come from the sealed
+    declaration for the reason `_scope_collision` gives -- the board is
+    agent-writable and a unit able to narrow its own recorded scope could
+    dispatch straight into another unit's files.
+
+    A unit whose scope cannot be compared is LEFT OUT rather than included:
+    this is a recommendation, and the cost of omitting a legal unit is one
+    serial round, while the cost of naming an illegal one is a refusal the
+    orchestrator has to interpret.
+    """
+    try:
+        if build_mode(project_dir) != "spq":
+            return None
+    except Exception:  # noqa: BLE001 - an unreadable mode is not SPQ
+        return None
+    lead_id = str(selected.get("story_id") or "")
+    action = str(selected.get("action") or "")
+    if not lead_id or not action.startswith("dispatch_"):
+        return None
+
+    binding = _sealed_cycle_binding(project_dir)
+    if not isinstance(binding, dict) or binding.get("unreadable"):
+        return None
+    try:
+        import path_scope  # noqa: PLC0415
+        import spq_state_machine  # noqa: PLC0415
+
+        sealed = spq_state_machine.read_manifest(
+            project_dir, str(binding.get("cycle_id") or "")
+        )
+    except (ImportError, OSError, ValueError):
+        return None
+    declared = _declared_path_scopes(sealed)
+    lead_scope = declared.get(lead_id) or []
+    if not lead_scope:
+        return None
+
+    try:
+        cap = int(_sp().concurrency_policy(project_dir).get("max_concurrent") or 1)
+    except Exception:  # noqa: BLE001 - an unreadable ceiling is a ceiling of one
+        cap = 1
+    cap = max(1, cap)
+
+    batch: List[Dict[str, Any]] = [
+        {
+            "story_id": lead_id,
+            "action": action,
+            "role": selected.get("role"),
+        }
+    ]
+    scopes: List[List[str]] = [lead_scope]
+    held: List[str] = []
+
+    for story in state.get("current_stories") or []:
+        if len(batch) >= cap:
+            break
+        if not isinstance(story, dict):
+            continue
+        sid = str(story.get("id") or "")
+        if not sid or sid == lead_id:
+            continue
+        if _has_live_dispatch(story):
+            continue  # already running; recommending it again would double-dispatch
+        theirs = declared.get(sid) or []
+        if not theirs:
+            held.append("%s (no declared path scope)" % sid)
+            continue
+        try:
+            if any(path_scope.intersects(theirs, other) for other in scopes):
+                held.append("%s (path scope intersects the batch)" % sid)
+                continue
+        except path_scope.PathScopeError as exc:
+            held.append("%s (path scope unreadable: %s)" % (sid, exc))
+            continue
+        # LAST, because it is the expensive one: it re-reads the unit's board,
+        # receipts and config to answer with the unit's own dispatch record.
+        answer = _spq_independently_dispatchable(project_dir, sid)
+        if answer is None:
+            continue
+        batch.append(
+            {
+                "story_id": sid,
+                "action": str(answer.get("action") or ""),
+                "role": answer.get("role"),
+            }
+        )
+        scopes.append(theirs)
+
+    eligible = len(batch) > 1
+    reason = (
+        "%d Work Units are dispatchable now with pairwise-disjoint declared "
+        "path scopes (`C-07`); dispatch them concurrently" % len(batch)
+        if eligible
+        else "no other admitted Work Unit is dispatchable with a disjoint "
+        "declared path scope"
+    )
+    if held:
+        reason += "; held back: %s" % ", ".join(held[:5])
+    return {
+        "eligible": eligible,
+        "batch": batch,
+        "max_concurrent": cap,
+        "governed_by": "declared path scope (C-07)",
+        "reason": reason,
+    }
+
+
 def _region_contradiction(project_dir: str) -> Optional[Dict[str, Any]]:
     """Another live reservation overlaps this Cycle's own. Refuse the dispatch.
 
@@ -527,6 +770,43 @@ def _region_contradiction(project_dir: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _declared_path_scopes(sealed: Dict[str, Any]) -> Dict[str, List[str]]:
+    """`{unit id: declared path scope}` read off ONE sealed declaration.
+
+    Extracted so the two answers derived from these scopes -- the refusal
+    (`_scope_collision`) and the recommendation (`concurrent_dispatch_batch`)
+    -- read the same field of the same document. A second reader that said
+    `paths` where this one says `path_scope`, or that tolerated a unit the
+    other skipped, would advertise a dispatch the kernel then refused, which
+    is worse than advertising none.
+    """
+    declared: Dict[str, List[str]] = {}
+    for unit in sealed.get("admitted_units") or []:
+        if isinstance(unit, dict) and unit.get("id"):
+            declared[str(unit["id"])] = [
+                str(p) for p in (unit.get("path_scope") or [])
+            ]
+    return declared
+
+
+def _has_live_dispatch(story: Any) -> bool:
+    """True when some stage of `story` holds a dispatch with an attempt id.
+
+    The same predicate `_scope_collision` applies to the units it compares
+    against: a live attempt is what "running now" means, and a unit sitting
+    in `in_progress` with no attempt is stalled work rather than running work.
+    """
+    if not isinstance(story, dict):
+        return False
+    dispatches = story.get("mcp_active_dispatches")
+    if not isinstance(dispatches, dict):
+        return False
+    return any(
+        isinstance(d, dict) and str(d.get("attempt_id") or "")
+        for d in dispatches.values()
+    )
+
+
 def _scope_collision(
     project_dir: str, story_id: str
 ) -> Optional[Tuple[str, List[str]]]:
@@ -573,12 +853,7 @@ def _scope_collision(
         # actually being tolerated: no SPQ runtime, an unreadable file, a
         # malformed one.
         return None
-    declared: Dict[str, List[str]] = {}
-    for unit in sealed.get("admitted_units") or []:
-        if isinstance(unit, dict) and unit.get("id"):
-            declared[str(unit["id"])] = [
-                str(p) for p in (unit.get("path_scope") or [])
-            ]
+    declared = _declared_path_scopes(sealed)
     mine = declared.get(str(story_id)) or []
     if not mine:
         return None
@@ -1643,6 +1918,23 @@ def next_action(project_dir: str) -> Dict[str, Any]:
 # ── receipt helpers ──────────────────────────────────────────────────────────
 
 
+def static_bound_role(
+    from_state: str, to_state: str
+) -> Optional[Tuple[str, str]]:
+    """(role, abbrev) bound to this edge BEFORE any DoD-intensity waiver.
+
+    One lookup over all three edge tables, so a caller that needs to tell
+    "this edge was never bound" from "this edge is bound and the tier waived
+    it" asks one question instead of reaching for `TRANSITION_RECEIPT`
+    directly and missing the two blocked tables (#802).
+    """
+    if to_state == "blocked":
+        return BLOCKED_FROM_ROLE.get(from_state)
+    if from_state == "blocked":
+        return BLOCKED_EXIT_ROLE.get(to_state)
+    return TRANSITION_RECEIPT.get((from_state, to_state))
+
+
 def expected_receipt_role(
     from_state: str, to_state: str, intensity: Optional[str] = None
 ) -> Optional[Tuple[str, str]]:
@@ -1652,9 +1944,11 @@ def expected_receipt_role(
     demand a CR receipt the planner will never dispatch. `intensity=None`
     keeps the static table (tests and callers that have not resolved a tier).
     """
+    bound = static_bound_role(from_state, to_state)
     if to_state == "blocked":
-        return BLOCKED_FROM_ROLE.get(from_state)
-    bound = TRANSITION_RECEIPT.get((from_state, to_state))
+        # De-escalation keeps the static answer: blocking is not a claim about
+        # work done, so no DoD tier can waive what it costs.
+        return bound
     if bound and bound[1] == "cr" and intensity is not None:
         checks = _sp().DOD_TIER_CHECKS.get(intensity) or _sp().DOD_TIER_CHECKS["early"]
         if "code_reviewed" not in checks:
@@ -2223,12 +2517,13 @@ def evaluate_advance(
         digest: Optional[str] = None
         path: Optional[Path] = None
         if expected is None or not gated:
-            table_bound = TRANSITION_RECEIPT.get((from_state, to_state))
+            table_bound = static_bound_role(from_state, to_state)
             if (
                 expected is None
                 and gated
                 and to_state != "blocked"
                 and table_bound is None
+                and (from_state, to_state) not in UNGATED_EDGES
             ):
                 bad = _fail(
                     NO_BOUND_ROLE,
@@ -2313,6 +2608,21 @@ def evaluate_advance(
 
                 result = validate_receipt_payload(receipt, project_dir)
                 warnings.extend(result.warnings or [])
+                # #818 -- the same path-scope predicate the barrier applies at
+                # the close, asked at the dispatch that caused it, while the
+                # declaration can still be adjusted.
+                _unclaimed = unclaimed_artifacts(
+                    project_dir, story_id, receipt.get("artifacts")
+                )
+                if _unclaimed:
+                    warnings.append(
+                        "artifacts outside %s's declared path_scope: %s. The "
+                        "Checkpoint barrier refuses a candidate that changes "
+                        "paths the declaration never claimed, and the "
+                        "declaration is sealed by then -- move the file, or "
+                        "re-cut the Cycle now rather than at the close"
+                        % (story_id, ", ".join(_unclaimed))
+                    )
                 if not result.valid:
                     bad = _fail(
                         RECEIPT_INVALID,
@@ -3673,7 +3983,20 @@ def _execute_dispatch_locked(
         # very next operation a host performs after `next_action`. The
         # dead end moved rather than closing.
         if current == "blocked":
-            state = sp.unblock_story(state, story_id, project_dir)
+            # #802. `next_action` decides the resume state, because it is the
+            # side that can read the receipts: a unit rejected at review whose
+            # code has moved since resumes at `testing` so QE can re-verify
+            # it, instead of returning to `reviewing` where QE is unreachable.
+            # Absent or unrecognised, `unblock_story` falls back to
+            # `blocked_from` and nothing changes.
+            resume_to = None
+            if isinstance(recovery, dict):
+                candidate = recovery.get("resume_to")
+                if isinstance(candidate, str) and candidate:
+                    resume_to = candidate
+            state = sp.unblock_story(
+                state, story_id, project_dir, restore_to=resume_to
+            )
     elif current == "queued":
         state = sp.transition_story(
             state, story_id, "in_progress", None, project_dir

@@ -1133,6 +1133,70 @@ def tool_spq_lifecycle(arguments: dict[str, Any]) -> dict[str, Any]:
             )
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
+    # ── The engagement store: the two inputs `complete` actually reads ──────
+    #
+    # `is_final_acceptance` is an AND of "nothing outstanding" and "a handover
+    # is recorded", and `transition COMPLETE` consults it through
+    # `assert_close_permitted`. Both inputs live on the engagement, and until
+    # #776 only one of them had a writer anywhere in the product: the
+    # commitments list was read in five places and written in none, so the
+    # predicate silently reduced to the handover alone. Giving it a writer on
+    # Claude and not here would have re-opened `spq_ceremony_surface` from the
+    # other side -- the ceremony that instructs these verbs is composed for
+    # this host, and a mutation the composer cannot map fails the build.
+    #
+    # THREE OPERATIONS, NOT ONE SHARED "record". The enum is what a fresh
+    # install advertises in `tools/list`, so an operation folded behind a
+    # discriminator argument is an operation no model discovers; and a single
+    # entry point would have to decide which verb was meant by looking at
+    # which arguments happen to be present, which is the same "infer the verb
+    # from the shape of the call" defaulting that rendered `hydrate_cycle` as
+    # `get_state`. Each of the three has a different required set and a
+    # different refusal, so each gets its own name.
+    #
+    # NO SECOND COPY OF THE REFUSALS. `core/` raises on a blank description, a
+    # blank attributor, a handover missing any of its three items and an
+    # unknown commitment id; re-checking them here would put the rule in two
+    # places and let the hosts drift on what "accountable" means. What this
+    # boundary owns is the part `core/` cannot: the regulated-project refusal,
+    # the SPQ-mode check and the server-side readiness re-check above, which a
+    # disabled or untrusted hook cannot skip.
+    if operation == "record_handover":
+        try:
+            return module.record_handover(
+                str(project),
+                recorded_by=str(arguments.get("recorded_by") or ""),
+                codebase=str(arguments.get("codebase") or ""),
+                documentation=str(arguments.get("documentation") or ""),
+                operating_knowledge=str(arguments.get("operating_knowledge") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - a tool refuses, never raises
+            return {"error": str(exc)}
+    if operation == "record_commitment":
+        try:
+            return module.record_commitment(
+                str(project),
+                description=str(arguments.get("description") or ""),
+                recorded_by=str(arguments.get("recorded_by") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+    if operation == "discharge_commitment":
+        # DELIBERATELY NOT STAGE-RESTRICTED, in either direction. A commitment
+        # is recorded when the owner accepts the debt -- #776's own example was
+        # a Checkpoint decision to integrate anyway, mid-CYCLE -- and it is
+        # discharged when the work is actually paid, which is likewise not
+        # necessarily during an Acceptance. Gating either on ACCEPTANCE would
+        # force the operator to record the debt after the moment it was
+        # incurred, which is exactly the unrecorded window that cost #776.
+        try:
+            return module.discharge_commitment(
+                str(project),
+                commitment_id=str(arguments.get("commitment_id") or ""),
+                discharged_by=str(arguments.get("discharged_by") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
     if operation in ("enter_cycle", "enter_acceptance"):
         # THROUGH `transition`, which runs `check_transition`. Writing the
         # stage directly is the hole `open_cycle` had before #644: `COMPLETE`
@@ -1751,6 +1815,18 @@ TOOLS: dict[str, dict[str, Any]] = {
                         # (`C-15`) reachable on this host rather than only in
                         # the kernel.
                         "enter_cycle", "enter_acceptance",
+                        # THE TWO INPUTS `complete` DERIVES FINALITY FROM.
+                        # `is_final_acceptance` is an AND of "nothing
+                        # outstanding" and "a handover is recorded"; the
+                        # commitments half had no writer anywhere in the
+                        # product (#776), so the predicate reduced to the
+                        # handover alone and an Acceptance could end the
+                        # engagement with owner-accepted debt still owed.
+                        # Three names rather than one, because the enum is the
+                        # discovery surface and a verb folded behind a
+                        # discriminator argument is a verb nobody finds.
+                        "record_handover", "record_commitment",
+                        "discharge_commitment",
                         # Per-Work-Unit board mutations. Present because the
                         # composed SPQ prompts instruct them and the ceremony
                         # composer fails the build on an unmapped mutation.
@@ -1795,6 +1871,21 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "waiting_unit_id": {"type": "string"},
                 "producing_cycle_id": {"type": "string"},
                 "resolution": {"type": "string"},
+                # The engagement store. Each item of the handover is a
+                # REFERENCE the recipient can follow -- a revision, a document,
+                # a runbook -- not a boolean saying it happened, which is why
+                # there are three strings here and no `handover_recorded` flag
+                # a caller could set. `commitment_id` is the id
+                # `record_commitment` returns; there is no "discharge the one
+                # that looks like this", because a fuzzy match on a governance
+                # ledger discharges the wrong debt silently.
+                "recorded_by": {"type": "string"},
+                "codebase": {"type": "string"},
+                "documentation": {"type": "string"},
+                "operating_knowledge": {"type": "string"},
+                "description": {"type": "string"},
+                "commitment_id": {"type": "string"},
+                "discharged_by": {"type": "string"},
                 # NEITHER `integrated_sha` NOR `barrier_verdict` is here any
                 # more. Both were caller-supplied facts about work the caller
                 # had not necessarily done: the close derives the verdict from

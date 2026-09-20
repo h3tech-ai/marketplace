@@ -761,3 +761,108 @@ def test_the_grammar_the_barrier_reads_is_the_one_it_publishes():
     """A drifted grammar version would make every declaration a mismatch, so the
     pairing is asserted rather than assumed."""
     assert _declaration()["path_grammar"] == path_scope.GRAMMAR_VERSION
+
+
+# ── #817 — a passing criterion must say what it ranged over ──────────────────
+
+
+def test_the_closure_verdict_says_how_many_paths_it_ranged_over():
+    """A verified path guarantee and a vacuous one must not read alike."""
+    verdict = _evaluate(
+        changed_paths=["api/routers/auth.py", "api/models/user.py"],
+    )
+    closed = verdict["criteria"]["admitted_set_closed"]
+
+    assert closed["passed"] is True
+    assert closed["changed_paths_observed"] == 2
+    assert "2 changed paths" in closed["detail"]
+
+
+def test_a_vacuous_path_lane_does_not_claim_the_guarantee():
+    """#817: the detail asserted `every changed path is inside the
+    declaration` having ranged over nothing."""
+    verdict = _evaluate(changed_paths=[])
+    closed = verdict["criteria"]["admitted_set_closed"]
+
+    assert closed["passed"] is True
+    assert closed["changed_paths_observed"] == 0
+    # The identity lane DID run and may still be claimed.
+    assert "by identity" in closed["detail"]
+    # The two path lanes did not, and the verdict must not say otherwise.
+    assert "NOT evaluated here" in closed["detail"]
+    assert "every changed path is inside the declaration (" not in closed["detail"]
+
+
+def test_an_integrated_candidate_is_named_as_the_reason_the_diff_is_empty():
+    """The operator needs to know this is by construction, not a near miss."""
+    verdict = _evaluate(trunk=_trunk(promoted=True), changed_paths=[])
+    detail = verdict["criteria"]["admitted_set_closed"]["detail"]
+
+    assert "already an ancestor of the trunk" in detail
+    assert "PROMOTION" in detail
+
+
+def test_integration_and_an_empty_diff_are_the_same_fact():
+    """Why #817's stronger remedy is refused, pinned as an executable fact.
+
+    `changed_paths` is `git diff merge-base(candidate, trunk)..candidate`, and
+    `_eval_trunk_integrated` passes only when the candidate is an ancestor of
+    the trunk -- at which point that merge-base IS the candidate and the diff
+    is empty. So EVERY close has an empty diff. Returning a non-`True` verdict
+    for a vacuous lane would put `admitted_set_closed` in `unmet` on every
+    close and no Cycle could ever close again.
+    """
+    verdict = _evaluate(trunk=_trunk(promoted=True), changed_paths=[])
+
+    assert verdict["criteria"]["trunk_integrated"]["passed"] is True
+    assert verdict["criteria"]["admitted_set_closed"]["changed_paths_observed"] == 0
+    # The barrier's own unmet rule is `passed is not True`, so a vacuous lane
+    # reporting anything other than True would strand this Cycle.
+    assert "admitted_set_closed" not in verdict["unmet"]
+    assert verdict["unmet"] == []
+
+
+def test_a_real_violation_still_refuses_when_paths_are_observed():
+    """The honesty fix must not soften the lane it is honest about."""
+    verdict = _evaluate(changed_paths=["docs/unclaimed.md"])
+    closed = verdict["criteria"]["admitted_set_closed"]
+
+    assert closed["passed"] is False
+    assert closed["paths_outside_the_declaration"] == ["docs/unclaimed.md"]
+    assert closed["changed_paths_observed"] == 1
+
+
+# ── #814 — the same state before and after a promotion means opposite things ──
+
+
+def test_before_a_promotion_a_non_ancestor_candidate_is_the_expected_state():
+    verdict = _evaluate(trunk=_trunk(promoted=False, candidate="c1"))
+    integrated = verdict["criteria"]["trunk_integrated"]
+
+    assert integrated["passed"] is False
+    assert integrated["code"] == "not_promoted"
+    assert "Before promotion this is the correct state" in integrated["detail"]
+
+
+def test_a_promoted_candidate_missing_from_the_trunk_names_squash_and_the_repair():
+    """#814: the old message said `not_promoted` AFTER a successful promotion,
+    and an engagement lost two days reading it as `you have not promoted`."""
+    trunk = _trunk(promoted=False, candidate="b9c5c5417c89", current="c51a069deadbe")
+    trunk["candidate_from"] = "promotion"
+    integrated = _evaluate(trunk=trunk)["criteria"]["trunk_integrated"]
+
+    assert integrated["passed"] is False
+    assert integrated["code"] == "promoted_candidate_not_in_trunk"
+    assert "not_promoted" != integrated["code"]
+    # It must name what happened, the cause, and the repair.
+    assert "AUTHORIZED by a promotion" in integrated["detail"]
+    assert "squash or rebase" in integrated["detail"]
+    assert "git merge -s ours b9c5c5417c89" in integrated["detail"]
+    # And must NOT keep telling the operator this is the pre-promotion state.
+    assert "Before promotion this is the correct state" not in integrated["detail"]
+
+
+def test_an_integrated_promoted_candidate_still_passes():
+    trunk = _trunk(promoted=True, candidate="c1")
+    trunk["candidate_from"] = "promotion"
+    assert _evaluate(trunk=trunk)["criteria"]["trunk_integrated"]["passed"] is True

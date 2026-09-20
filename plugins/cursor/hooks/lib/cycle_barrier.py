@@ -570,6 +570,7 @@ def _eval_admitted_set_closed(ctx: Dict[str, Any]) -> Dict[str, Any]:
     reported = {str(k) for k in ctx["unit_results"]}
     missing = sorted(effective - reported)
     extra = sorted(reported - effective)
+    changed = list(ctx.get("changed_paths") or ())
     cut_paths = _cut_code_in_candidate(ctx)
     outside = _paths_outside_the_declaration(ctx)
     parts = []
@@ -589,16 +590,77 @@ def _eval_admitted_set_closed(ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
     return {
         "passed": not parts,
-        "detail": "; ".join(parts) or (
-            "the reported set equals the effective set exactly, by identity "
-            "(%d units), no cut unit's paths are in the candidate, and every "
-            "changed path is inside the declaration" % len(effective)
-        ),
+        "detail": "; ".join(parts) or _closure_detail(ctx, len(effective), changed),
         "missing": missing,
         "extra": extra,
         "cut_paths_in_candidate": cut_paths,
         "paths_outside_the_declaration": outside,
+        # #817 -- WHAT THE TWO PATH LANES ACTUALLY RANGED OVER. A machine
+        # reader could not previously tell a verified path guarantee from a
+        # vacuous one, because both produced the same `passed: true` and the
+        # same prose.
+        "changed_paths_observed": len(changed),
     }
+
+
+def _closure_detail(ctx: Dict[str, Any], units: int, changed: List[object]) -> str:
+    """The passing detail for `admitted_set_closed`, saying what was RANGED OVER.
+
+    `#817`. The old string asserted three guarantees unconditionally -- set
+    identity, no cut code in the candidate, every changed path inside the
+    declaration. Only the first is always evaluated. The other two range over
+    `changed_paths`, and when that list is empty they report clean because
+    there was nothing to report, not because anything was checked.
+
+    THE EMPTY CASE IS NOT AN EDGE CASE AT THE CLOSE; IT IS EVERY CLOSE.
+    `changed_paths` is `git diff observed_sha..candidate_sha`, and
+    `observed_sha` is `git merge-base candidate trunk`. Once the candidate is
+    an ancestor of the trunk that merge-base IS the candidate, so the diff is
+    empty by construction -- and `_eval_trunk_integrated` REQUIRES exactly that
+    ancestry to pass. The condition that makes integration provable is the same
+    fact that empties the path lanes. They are not complementary, they coincide.
+
+    So the path guarantee is really obtained at PROMOTION, before integration,
+    where the diff still has content. That is sound, and this function does not
+    change it. What it changes is that the close no longer claims the check as
+    its own.
+
+    WHY THIS REPORTS RATHER THAN REFUSES. Returning `passed: None`/`False` for
+    a vacuous lane -- the stronger remedy the field report proposed -- would
+    make `evaluate`'s `unmet` test (`passed is not True`) fire on every close,
+    because every close has an empty diff by the paragraph above. No Cycle
+    could ever close again. The honest verdict here is a true statement about
+    a narrower check, not a refusal of a check that cannot be performed at this
+    point in the lifecycle.
+    """
+    identity = (
+        "the reported set equals the effective set exactly, by identity "
+        "(%d units)" % units
+    )
+    if changed:
+        return (
+            "%s, no cut unit's paths are in the candidate, and every changed "
+            "path is inside the declaration (%d changed path%s)"
+            % (identity, len(changed), "" if len(changed) == 1 else "s")
+        )
+    trunk = ctx.get("trunk")
+    integrated = (
+        isinstance(trunk, Mapping)
+        and trunk.get("candidate_is_ancestor_of_trunk") is True
+    )
+    why = (
+        "the candidate is already an ancestor of the trunk, so its diff "
+        "against its own merge-base is empty by construction; the path lanes "
+        "range over content at PROMOTION, before integration"
+        if integrated else
+        "no changed path was observed, so there was nothing for them to "
+        "range over"
+    )
+    return (
+        "%s. The two path lanes (no cut unit's code in the candidate, every "
+        "changed path inside the declaration) were NOT evaluated here: %s"
+        % (identity, why)
+    )
 
 
 def _cut_code_in_candidate(ctx: Dict[str, Any]) -> List[str]:
@@ -832,13 +894,45 @@ def _eval_trunk_integrated(ctx: Dict[str, Any]) -> Dict[str, Any]:
     if not str(trunk.get("candidate_sha") or ""):
         return {"passed": False, "detail": "the observation names no candidate revision"}
     if trunk.get("candidate_is_ancestor_of_trunk") is not True:
+        # #814 -- THE TWO CASES READ IDENTICALLY AND MEAN OPPOSITE THINGS.
+        # Before a promotion, a non-ancestor candidate is the expected state
+        # and the operator has nothing to do. AFTER one, it means the
+        # authorized revision never reached the trunk -- and the message said
+        # "Before promotion this is the correct state" with `not_promoted`
+        # beside it, which reads as "you have not promoted yet". An engagement
+        # read it exactly that way and spent two days looking in the wrong
+        # place while the Cycle held its source region.
+        #
+        # `candidate_from` is the discriminator and the observation already
+        # carries it: `_trunk_observation` sets it to "promotion" when the
+        # candidate came from the promotion pin rather than from HEAD.
+        candidate = str(trunk.get("candidate_sha") or "")
+        if str(trunk.get("candidate_from") or "") == "promotion":
+            return {
+                "passed": False,
+                "detail": (
+                    "candidate %s was AUTHORIZED by a promotion but is not an "
+                    "ancestor of %s (now at %s), so the revision this Cycle "
+                    "promoted never reached the trunk. The usual cause is a "
+                    "squash or rebase merge: both rewrite the commit, so the "
+                    "authorized SHA never enters the trunk's ancestry and no "
+                    "later revision can substitute for it -- the candidate is "
+                    "pinned to what was promoted. Repair by making the "
+                    "authorized commit an ancestor without changing the tree: "
+                    "`git merge -s ours %s` on %s."
+                    % (candidate[:12], declared_ref,
+                       str(trunk.get("current_sha") or "")[:12],
+                       candidate[:12], declared_ref)
+                ),
+                "code": "promoted_candidate_not_in_trunk",
+            }
         return {
             "passed": False,
             "detail": (
                 "candidate %s is not an ancestor of %s, so nothing has been "
                 "integrated. Before promotion this is the correct state: "
                 "`promote` requires every OTHER criterion and `close` requires "
-                "this one." % (str(trunk.get("candidate_sha"))[:12], declared_ref)
+                "this one." % (candidate[:12], declared_ref)
             ),
             "code": "not_promoted",
         }

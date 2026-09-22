@@ -100,6 +100,8 @@ AskQuestion(questions=[{
 
 ## Step 4: Compose the Issue
 
+**The body is capped at 8,000 characters (#808).** The CLI refuses an over-long body before it reaches the network, so nothing is sent and nothing is written to `.failed-reports/` — but you still have to compose within the cap. A long analysis belongs in a linked document with the issue body carrying the summary; #807's first draft was 14.2k characters and cost two failed submissions before this was checked client-side.
+
 Build a structured issue body:
 
 ```markdown

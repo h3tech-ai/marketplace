@@ -114,6 +114,24 @@ def record_problems(record: Mapping[str, Any]) -> List[str]:
     return found
 
 
+def delivered_count(record: Mapping[str, Any]) -> Optional[int]:
+    """How many Work Units this Cycle delivered, or None if it cannot say.
+
+    `None` IS A THIRD ANSWER and the reason this is a function. A record that
+    does not carry the field has not told us it delivered nothing -- it has
+    told us nothing -- and the caller must not read the absence either way.
+
+    `work_units_done` is written by both producers: `cycle_barrier.close` (from
+    the effective set, which a green verdict has already proved complete) and
+    the `cycles_completed` archive entry (from the board). A record predating
+    `#825` carries neither, and answers `None`.
+    """
+    raw = record.get("work_units_done") if isinstance(record, Mapping) else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
 # ─── Accepted throughput ─────────────────────────────────────────────────────
 
 
@@ -181,6 +199,34 @@ def accepted_throughput(record: Mapping[str, Any]) -> Dict[str, Any]:
         # An incomplete observation reports unavailable, never a lower count: a
         # partial number is indistinguishable from a measured one afterwards.
         return _unavailable(bad, count=None, credited=[])
+
+    # `#825`: A CYCLE THAT NEVER RECORDED ACCEPTANCE IS NOT A CYCLE THAT
+    # ACCEPTED NOTHING. Both arrive here with an empty `credited`, and this
+    # function answered `available: True, value: 0` to both -- the exact shape
+    # this module's header forbids, on the one number `SC-MTH-015` nominates as
+    # the basis for capacity planning. Two Cycles that delivered thirteen Work
+    # Units between them read `0.0 accepted work units per day`, and a project
+    # following the method plans its next Cycle against that.
+    #
+    # THE ZERO IS KEPT WHERE IT IS HONEST. A Cycle that delivered nothing
+    # accepted nothing, and that is a measurement. A record that cannot say
+    # what it delivered (`delivered_count` is None) is not second-guessed
+    # either -- inferring an omission from a missing field would be the same
+    # substitution one field over.
+    delivered = delivered_count(record)
+    if not credited and delivered:
+        return _unavailable(
+            [
+                "no acceptance is recorded for %d delivered Work Unit%s, so "
+                "throughput cannot be measured. Acceptance is credited at "
+                "Checkpoint, per unit, by an accountable human; until it is "
+                "recorded this Cycle has no accepted count -- which is not the "
+                "same as an accepted count of zero" % (delivered, "" if delivered == 1 else "s")
+            ],
+            count=None,
+            credited=[],
+            work_units_done=delivered,
+        )
 
     return {
         "available": True,

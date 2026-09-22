@@ -38,6 +38,10 @@ def _history(**over):
         "admitted_unit_ids": ["WU-01", "WU-02", "WU-03", "WU-04"],
         "admitted_count_at_commit": 4,
         "cut_unit_ids": ["WU-04"],
+        # Both producers write this (`#825`), so the fixture carries it: a
+        # fixture lighter than the real record is how a reader comes to be
+        # tested against a shape nothing writes.
+        "work_units_done": 3,
         "accepted_units": [_credit("WU-01"), _credit("WU-02"), _credit("WU-03")],
         "integrated_sha": "c1",
         "integrated_at": "2026-09-08T09:00:00Z",
@@ -55,10 +59,67 @@ def _history(**over):
 def test_a_technical_done_credits_no_accepted_throughput():
     """§5.4 credits a Work Unit only once an accountable human accepted it as
     verified, so a Cycle whose units all reported `done` and none of which was
-    accepted measures zero -- and measures it, rather than being unavailable."""
+    accepted credits NOTHING.
+
+    The crediting rule and the availability rule are separate, and `#825` is
+    about the second. Reporting `done` does not make a credit -- but a Cycle
+    that delivered three units and recorded no acceptance has not measured
+    zero throughput, it has failed to measure throughput, and the two must not
+    share a shape. What this pins is the crediting half: nothing in the
+    delivered set leaks into `credited`.
+    """
     measured = cm.accepted_throughput(_history(accepted_units=[]))
+    assert measured["credited"] == []
+    assert measured["count"] is None
+
+
+def test_delivered_and_unaccepted_is_unavailable_not_zero():
+    """`#825`. Two Cycles that delivered thirteen Work Units between them
+    reported `available: True, value: 0` and a rate of `0.0 per day`, because
+    acceptance had never been recorded. `SC-MTH-015` nominates this number as
+    what capacity is planned against, so a project following the method plans
+    against zero and cannot tell why."""
+    measured = cm.accepted_throughput(_history(accepted_units=[], work_units_done=6))
+    assert measured["available"] is False
+    assert measured["value"] is None
+    assert measured["count"] is None
+    assert measured["work_units_done"] == 6
+    problem = " ".join(measured["problems"])
+    assert "6 delivered Work Units" in problem
+    # It must name where acceptance is recorded. The predecessor defect one
+    # level down (`#824`) was a refusal that named the rule and not the
+    # remedy, and `accept_story` does not exist on this lifecycle.
+    assert "Checkpoint" in problem
+    assert "accept_story" not in problem
+
+
+def test_a_cycle_that_delivered_nothing_keeps_its_honest_zero():
+    """The zero stays where it is a measurement. A Cycle that delivered no
+    unit accepted no unit, and that is a fact about the Cycle rather than a
+    gap in the record."""
+    measured = cm.accepted_throughput(_history(accepted_units=[], work_units_done=0))
     assert measured["available"] is True
     assert measured["count"] == 0
+    assert measured["value"] == 0
+
+
+def test_a_record_that_cannot_say_what_it_delivered_is_not_second_guessed():
+    """A pre-`#825` record carries no `work_units_done`. Inferring an omission
+    from a missing field would be the same substitution this fix removes, one
+    field over -- so the count stands and the record is not called broken."""
+    legacy = _history(accepted_units=[])
+    legacy.pop("work_units_done")
+    measured = cm.accepted_throughput(legacy)
+    assert measured["available"] is True
+    assert measured["count"] == 0
+    assert cm.delivered_count(legacy) is None
+
+
+def test_a_malformed_delivered_count_reads_as_no_answer():
+    """Not as zero, and not as a delivery. `True` is an `int` in Python and a
+    string is what a hand-edited record carries."""
+    for bad in (True, "6", -1, None, 1.5):
+        assert cm.delivered_count(_history(work_units_done=bad)) is None
 
 
 def test_a_retry_creates_no_duplicate_credit():
@@ -467,3 +528,62 @@ def test_the_barriers_close_record_measures_without_translation():
     assert measured["throughput"]["count"] == 1
     assert measured["cut_rate"]["denominator"] == 1
     assert cm.history_report([closed["history"]])["available"] is True
+    # The writer's half of `#825`. Asserted on the real close record rather
+    # than on a fixture, because a reader proved only against a fixture is a
+    # reader proved against a shape nothing writes.
+    assert closed["history"]["work_units_done"] == 1
+
+
+def test_a_real_close_with_no_acceptance_measures_unavailable():
+    """`#825` end to end, through the producer. A green barrier does not
+    require a recorded acceptance -- the reporting engagement closed three
+    Cycles this way -- so the close record must carry enough for the measurer
+    to tell this apart from a Cycle that accepted nothing."""
+    import cycle_barrier as cb
+    import cycle_records as cr
+
+    declaration = cr.seal({
+        "cycle_id": "008-1a2b3c4d",
+        "repository": "h3tech-ai/synaptory-v1",
+        "trunk_ref": "refs/heads/dev",
+        "baseline_ref": "baseline-3",
+        "goal": "storage",
+        "engineering_lead": "alice@h3t.co",
+        "source_region": ["api/"],
+        "barrier_criteria": list(cr.BARRIER_CRITERIA),
+        "admitted_units": [{
+            "id": "WU-01", "kind": "story", "acceptance_criteria": ["AC-1"],
+            "path_scope": ["api/routers/"], "depends_on": [],
+        }],
+        "shared_path_owners": [],
+    })
+    verdict = cb.evaluate(
+        declaration=declaration,
+        # Every criterion met, and NO `acceptance` block -- the shape that
+        # read as `0.0 accepted work units per day`.
+        unit_results={"WU-01": {
+            "schema_version": cb.RESULT_SCHEMA_VERSION,
+            "acceptance_criteria": {"AC-1": {"passed": True}},
+        }},
+        proofs={"regression": {"passed": True}},
+        trunk={
+            "trunk_ref": "refs/heads/dev", "observed_sha": "t0", "current_sha": "t0",
+            "candidate_sha": "c1", "candidate_is_ancestor_of_trunk": True,
+        },
+        opened_at="2026-09-01T00:00:00Z",
+    )
+    assert verdict["green"] is True, verdict["unmet"]
+    assert verdict["accepted_units"] == []
+    promotion = cb.promote(verdict=verdict, ledger=[], principal="alice@h3t.co")
+    closed = cb.close(verdict=verdict, ledger=[promotion], principal="alice@h3t.co")
+
+    assert closed["history"]["work_units_done"] == 1
+    measured = cm.measure_cycle(closed["history"])
+    assert measured["available"] is False
+    assert measured["throughput"]["value"] is None
+    assert "1 delivered Work Unit," in " ".join(measured["problems"])
+    # And a history made only of such Cycles is an absence, not a history of
+    # zero throughput -- which is the number capacity would be planned against.
+    report = cm.history_report([closed["history"]])
+    assert report["available"] is False
+    assert report["throughput"]["value"] is None

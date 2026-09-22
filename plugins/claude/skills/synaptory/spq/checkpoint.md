@@ -221,7 +221,32 @@ Three properties of the verdict are worth stating to the operator:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" promote_cycle "$(pwd)" \
-  --principal "<principal>" --rationale "<why>"
+  --principal "<principal>" --rationale "<why>" \
+  --open-findings '[{"id": "CR-002", "severity": "high", "rationale": "not blocking this Checkpoint"}]'
+```
+
+**A finding accepted open goes in `--open-findings`, not in `--rationale`.** A
+finding raised by a reviewer and accepted open by the owner is an accountable
+decision to ship a known defect. It has every property a cut has (raised by a
+named role, decided by a human, with a reason) and until `#823` it had no
+record: the only durable home was prose inside `--rationale`, which is
+unsearchable and carries no severity, no status and no owner. One engagement
+shipped fifteen such findings across three Cycles and six survive as bare ids
+whose substance nobody transcribed.
+
+Pass `id` and, where the owner is re-judging it, `severity`, `status` and
+`rationale`. Everything else is filled in from the receipt that raised it, so
+a finding is not retyped into the record meant to preserve it. **An id no
+receipt in this Cycle raises is refused** -- an accepted finding nobody raised
+is not a judgement -- and that is the only refusal this adds. **Open findings
+block nothing**: the owner's judgement at promotion is the gate.
+
+The set lands in `.synaptory/cycles/<cycle-id>/findings.json`, committed beside
+`cuts.json`, and `close_cycle` reports it. Read it with `read_findings` when a
+later Cycle enters the same region; the archive entry carries it too.
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" read_findings "$(pwd)"
 ```
 
 One verb, not a heredoc assembling a ledger: the promotion reads the latest

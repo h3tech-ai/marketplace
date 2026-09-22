@@ -34,6 +34,8 @@ import inspect
 import json
 from pathlib import Path
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import advance_kernel as ak
@@ -42,7 +44,16 @@ import advance_kernel as ak
 pytestmark = pytest.mark.unit
 
 STAGE_ENTERED = "2026-01-01T00:00:00+00:00"
-FUTURE = "2090-01-01T00:00:00+00:00"
+# A receipt timestamp that POST-DATES the stage it advances out of, which is
+# what the staleness gate asks for. It used to be a hard-coded year 2090/2099,
+# and #801 is why it no longer is: a `completed_at` in the future passes the
+# staleness gate BY CONSTRUCTION for as long as the drift lasts, so the suite
+# was reaching the gate through the very hole the product now refuses. Near
+# future keeps every test's intent (fresh, post-dating stage entry) while
+# staying inside `receipt_validator.COMPLETED_AT_FUTURE_TOLERANCE_SECONDS`.
+FUTURE = (
+    datetime.now(timezone.utc) + timedelta(seconds=900)
+).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _project(tmp_path: Path, *, build_mode: str = "scrum") -> Path:
@@ -634,6 +645,18 @@ class TestTheSteerContentStaysOffTheBoard:
         "attempt_id", "authorized_at", "classification", "prior_attempt_id",
         "prior_failure_class", "state", "failure_class", "failure_class_source",
         "superseded_by", "superseded_at", "advanced_at",
+        # `#822`. An IDENTITY, which is what this ledger is for, and not
+        # content: `dispatch_id` is the other half of the same binding, minted
+        # in the same call and already on the live copy. It is admitted
+        # because a receipt names the dispatch and not the attempt, so without
+        # it the ledger cannot be asked whether an identity it recorded was
+        # ever live -- which is how an authorization this kernel issued and
+        # then superseded came to be refused in the #592 forgery wording.
+        "dispatch_id",
+        # Written by the recovery path, not by the mint. Present on this list
+        # already in spirit: `#690` added them to record where a superseded
+        # attempt's evidence went.
+        "receipt_digest", "archived_receipt",
     })
 
     def test_no_reconciliation_parameter_can_carry_content(self):

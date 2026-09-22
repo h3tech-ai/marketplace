@@ -165,6 +165,10 @@ One stage that repeats. Plan → build → prove happens continuously inside it,
 
 The per-unit pipeline itself is unchanged: SE -> QE -> CR per Work Unit, with the sub-states `queued -> in_progress -> testing -> reviewing -> done` (or `blocked`). Fetch and follow its protocol -- the body is control-plane delivered per ADR-016 and does not exist on local disk:
 
+**THE CR STAGE IS CONDITIONAL ON THE TIER, AND `dod.stages_required` IS THE ANSWER (#809).** At DoD tier `early` the machine does **not** ask for a code review -- `code_reviewed` is not in that tier, so `next_action` never returns `dispatch_cr` and the closing edge never binds a CR receipt. Dispatch a reviewer only when `dod.stages_required` contains `cr`. Reading "SE -> QE -> CR" as an unconditional three-stage pipeline is what cost one engagement **20m30s per unit** for a stage the Definition of Done did not require.
+
+It is worse than redundant. A `needs-work` verdict at `early` has nowhere good to go: `code_reviewed` is not in the tier, so the verdict blocks a unit the DoD would otherwise have closed. If you want a review at `early`, put `code_reviewed` in the tier (`quality.dod_tier`) so the machine asks for it and the verdict has a defined route -- do not dispatch one the tier does not name.
+
 ```
 Bash("synaptory skills get protocols/story-pipeline")
 ```

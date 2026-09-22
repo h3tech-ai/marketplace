@@ -3,7 +3,7 @@
 **Multi-agent adaptive delivery for Claude Code, Cursor, and Codex.**
 Published and maintained by [H3Tech Inc.](https://h3t.co)
 
-> **Catalog version: `1.3.4`** — this repository is a **generated
+> **Catalog version: `1.3.5`** — this repository is a **generated
 > distribution tree**. It is rebuilt and force-synced by
 > `./synaptory deploy prod` on every release. Do not open pull requests or
 > edit files here; changes are overwritten on the next publish.

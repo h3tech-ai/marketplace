@@ -834,7 +834,35 @@ class GitHubAdapter(ArtifactAdapter):
         return None
 
     def create_sprint(self, sprint: SprintInfo) -> SprintInfo:
+        """Adopt the milestone if it exists, create it if it does not (#793).
+
+        A plain POST returned GitHub's 422 whenever the title already existed,
+        which is exactly what a RE-DELIVERY looks like: the same body of work
+        opened a second time, naming the tracker cycle it always named. The
+        operator saw a transport error where the honest answer was "this cycle
+        is already there, use it".
+
+        REFUSES RATHER THAN ADOPTS when the existing milestone already carries
+        Work Units, because then the two are not the same cycle -- adopting
+        would silently merge this Cycle's admitted set into somebody else's
+        backlog, which is the wrong-mirror failure #793 is about, one step
+        further along.
+        """
         title = f"{self.milestone_prefix}{sprint.number}"
+        for existing in self.list_sprints():
+            if existing.number != sprint.number:
+                continue
+            if getattr(existing, "story_ids", None):
+                raise ValueError(
+                    "%s already exists and holds %d Work Unit(s), so it is a "
+                    "different body of work from the one being committed. "
+                    "Adopting it would merge two Cycles' admitted sets into "
+                    "one backlog. Resolve the number -- check `tracker_ref` "
+                    "against the plan -- before committing."
+                    % (title, len(existing.story_ids))
+                )
+            existing.goal = sprint.goal or existing.goal
+            return existing
         ms = self.transport.create_milestone(
             title=title,
             description=sprint.goal,

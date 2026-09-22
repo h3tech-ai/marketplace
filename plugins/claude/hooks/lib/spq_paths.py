@@ -328,6 +328,39 @@ def committed_barrier_path(project_dir: str, cycle_id: str) -> str:
     return os.path.join(committed_cycle_dir(project_dir, cycle_id), "barrier.json")
 
 
+def committed_findings_path(project_dir: str, cycle_id: str) -> str:
+    """Findings raised, judged non-blocking, and shipped with this Cycle.
+
+    COMMITTED, AND NOT IN THE DECLARATION, for exactly the reasons the cut
+    record is neither. A finding is a fact discovered DURING the Cycle, so it
+    cannot live in a document hash-sealed at Commit; and the decision to ship
+    a known defect must be readable in a clone that did not make it, because
+    the next Cycle entering the same region is the reader who needs it.
+
+    WHY IT EXISTS AT ALL (`#823`). A receipt carries `findings`, the validator
+    checks their shape, and the DoD gate reads `metrics.findings_critical` for
+    `no_critical_findings`. Then nothing persisted them. An owner who accepted
+    a finding open at promotion made an accountable decision to ship a known
+    defect, and the only durable home it had was free prose inside
+    `decision.rationale` in `barrier.json` -- unsearchable, with no severity,
+    no status and no owner. Across three Cycles on the reporting engagement,
+    fifteen findings were accepted that way and six survive as bare ids whose
+    substance nobody transcribed.
+
+    THE ASYMMETRY THIS CLOSES. A cut is a recorded event the barrier reads,
+    precisely so nothing vanishes quietly. A finding accepted open has every
+    property a cut has -- raised by a named role, decided by an accountable
+    human, with a reason -- and had no record. One engagement caught the same
+    defect recurring in the next unit only because a reviewer happened to have
+    read the earlier receipt.
+
+    REPORTING, NOT ENFORCEMENT. Nothing here may block a promotion or a close.
+    The owner's judgement at promotion is the right gate and it works; what
+    was missing is that the judgement left no trace a machine can read.
+    """
+    return os.path.join(committed_cycle_dir(project_dir, cycle_id), "findings.json")
+
+
 def integration_branch(cycle_id: str) -> str:
     """The Cycle's one integration ref.
 

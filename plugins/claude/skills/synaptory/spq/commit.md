@@ -36,7 +36,8 @@ Read the answer literally. **`available: false` is a real answer and never a zer
 |---|---|
 | `available: true` | the measured throughput and cut-rate, the Cycle ids, the sample size and the observation window |
 | `available: false`, no Cycle has closed | the Discovery calibration sample plus **an explicit bootstrap assumption**, named as such |
-| `available: false`, Cycles have closed | neither. Fix the archive, or state that the plan is unsupported by data -- a bootstrap while real Cycles exist is ignoring what was measured, and `assert_plan_supported` refuses it |
+| `available: false`, Cycles have closed, `problems` names unrecorded acceptance | neither, and the archive is NOT what is wrong. `SC-MTH-015` credits a Work Unit only once an accountable human accepted it as verified, so a Cycle that delivered and recorded no acceptance has no throughput to cite. Record the acceptance at Checkpoint (`spq/checkpoint.md` step 3, per unit, by a named human); it cannot be back-filled by an agent |
+| `available: false`, Cycles have closed, any other reason | neither. Fix the archive, or state that the plan is unsupported by data -- a bootstrap while real Cycles exist is ignoring what was measured, and `assert_plan_supported` refuses it |
 
 Then read the last Checkpoint's report for where the method chafed: a criterion routinely close to failing, a unit class that keeps getting cut, an admitted set that was consistently too large. That is process signal, and Commit is where it changes behaviour.
 
@@ -206,6 +207,10 @@ A path outside every declared region -- a contract, a schema, a shared library, 
 
 The seal refuses a shared path with no owner, an owner whose own `path_scope` does not cover it, and a path covered by two units. **Two owners is the same unrecoverable merge as none.** State the map even when it is empty -- an empty list is a position, a missing key is not.
 
+Those three are about ONE declaration. A fourth refusal is about two: **a path an open Cycle already holds.** A shared path lies outside every source region by definition, so the region reservation does not cover it -- two Cycles could each claim `web/src/main.tsx`, each pass its own `shared_paths_owned`, and both seal, at which point the second merge overwrites the first and neither declaration can still be changed (`#827`). Commit compares this map against the declarations committed into this checkout and refuses a collision, naming both units and both Cycles. Resolve it by withdrawing the unit, handing the path to the Cycle that holds it, or waiting for that Cycle to Checkpoint, which releases the claim.
+
+**A clean Commit is not proof there is no collision.** That comparison sees only what this checkout has fetched, and it records its own scope in the seal as `shared_path_check`, where `registry: "none"` means no registry was consulted. A Cycle sealed on a branch you have not fetched is invisible to it, so on a multi-machine engagement fetch first.
+
 ### Dependencies: what an edge may wait for
 
 An edge names a **verifiable condition** rather than merely "done", because `done` is the producer's own claim about itself while the others are facts another unit can check.
@@ -321,13 +326,31 @@ Output: the ADRs this Cycle needs, and any contract change that has to be **owne
 
 The tracker mirrors the Cycle; it is never its source. A cycle renamed or renumbered in the tracker cannot repoint a Cycle, because identity lives in the sealed declaration.
 
+**TWO NUMBERS, AND THEY ARE NOT THE SAME NUMBER (#793).** `cycle_seq` is Synaptory's allocation counter. `tracker_ref` is this Cycle's name in the tracker's namespace, sealed at Commit. Use each for its own purpose:
+
+| Use | Which number | Why |
+|---|---|---|
+| Tracker calls -- `create-sprint`, `get-sprint-backlog` | **`tracker_ref`** | The tracker numbers a BODY OF WORK |
+| Pseudo Work Unit id for receipts -- `CYCLE-{CYCLE_SEQ}` | **`cycle_seq`** | Synaptory's own identity; changing it moves every receipt path |
+
+They coincide only until they do not, and three ordinary things separate them **permanently**: a body of work re-delivered (one tracker cycle, two sequences), Cycles opened concurrently (sequences land in Commit order, not tracker order), and a Cycle abandoned before close (which still spends a sequence). No offset corrects the gap.
+
+Read the sealed value rather than assuming it:
+
 ```bash
+TRACKER_REF=$(python3 "${CLAUDE_PLUGIN_ROOT}/hooks/lib/spq_state_machine.py" read "$(pwd)" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tracker_ref") or "")')
+
 ${TRACKER_CLI} health-check
 ${TRACKER_CLI} list-sprints
-echo '{"number":{CYCLE_SEQ},"goal":"{CYCLE_GOAL}"}' | ${TRACKER_CLI} create-sprint
+echo '{"number":'"${TRACKER_REF}"',"goal":"{CYCLE_GOAL}"}' | ${TRACKER_CLI} create-sprint
 ```
 
-SPQ adds no tracker adapter surface: a Cycle maps onto the existing sprint interface, and `get-sprint-backlog {CYCLE_SEQ}` is how a clone reads it back.
+SPQ adds no tracker adapter surface: a Cycle maps onto the existing sprint interface, and `get-sprint-backlog ${TRACKER_REF}` is how a clone reads it back.
+
+**`create-sprint` is adopt-or-create.** An existing empty milestone with this number is adopted (that is what a re-delivery looks like); one that already holds Work Units is **refused**, because adopting it would merge two Cycles' admitted sets into one backlog.
+
+**If `tracker_ref` is empty** the Cycle predates `#793` -- `open_cycle` now refuses to seal without it on `github`, `jira`, `teamwork` and `linear`. Do **not** substitute `CYCLE_SEQ` silently: `get-sprint-backlog` with the wrong number SUCCEEDS and returns another Cycle's Work Units, with no error and a well-formed result. Confirm the number against the plan with the operator first.
 
 **There is no verb that assigns a unit to a cycle.** `tracker_cli.py` exposes no field-update verb at all, and the remote adapters restrict `update_story()` to a fixed field allow-list that would silently drop the rest -- so moving tickets into the cycle is a tracker-UI action. Do not invent a verb for it; the Cycle's own authority is the sealed declaration, and the tracker is a mirror of it.
 

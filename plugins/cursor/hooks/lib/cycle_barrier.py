@@ -1363,6 +1363,18 @@ def close(
         "admitted_count_at_commit": len(verdict.get("admitted_unit_ids") or ()),
         "cut_unit_ids": list(verdict.get("cut_unit_ids") or ()),
         "effective_unit_ids": list(verdict.get("effective_unit_ids") or ()),
+        # WHAT THIS CYCLE DELIVERED, so a later reader can tell a Cycle that
+        # accepted nothing from one whose acceptance was never recorded. The
+        # two were indistinguishable: both carried `accepted_units: []` and
+        # `accepted_throughput` measured both as zero (`#825`).
+        #
+        # Derived from the effective set rather than from a board state,
+        # because a close REFUSES a verdict with anything unmet -- so by the
+        # time this record exists every effective unit has met the barrier's
+        # per-unit criteria, and the two counts are the same number. Deriving
+        # it here also keeps it off the verdict body, whose digest and
+        # operation identity a new field would move.
+        "work_units_done": len(verdict.get("effective_unit_ids") or ()),
         "accepted_units": list(verdict.get("accepted_units") or ()),
         "integrated_sha": str(trunk.get("candidate_sha") or ""),
         "trunk_ref": str(verdict.get("trunk_ref") or ""),

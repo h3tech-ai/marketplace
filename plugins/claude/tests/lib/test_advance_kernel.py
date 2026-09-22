@@ -24,12 +24,23 @@ import json
 import os
 from pathlib import Path
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import advance_kernel as ak
 import story_pipeline as sp
 
-FUTURE = "2099-01-01T00:00:00Z"
+# A receipt timestamp that POST-DATES the stage it advances out of, which is
+# what the staleness gate asks for. It used to be a hard-coded year 2090/2099,
+# and #801 is why it no longer is: a `completed_at` in the future passes the
+# staleness gate BY CONSTRUCTION for as long as the drift lasts, so the suite
+# was reaching the gate through the very hole the product now refuses. Near
+# future keeps every test's intent (fresh, post-dating stage entry) while
+# staying inside `receipt_validator.COMPLETED_AT_FUTURE_TOLERANCE_SECONDS`.
+FUTURE = (
+    datetime.now(timezone.utc) + timedelta(seconds=900)
+).strftime("%Y-%m-%dT%H:%M:%SZ")
 PAST = "2000-01-01T00:00:00Z"
 STAGE_ENTERED = "2026-01-01T00:00:00+00:00"
 

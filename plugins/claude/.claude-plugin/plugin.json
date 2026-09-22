@@ -1,7 +1,7 @@
 {
   "name": "synaptory",
-  "version": "1.3.4",
-  "cli_min_version": "1.3.4",
+  "version": "1.3.5",
+  "cli_min_version": "1.3.5",
   "description": "Synaptory — governed multi-agent SPQ delivery for Claude Code, backed by the H3Tech control plane. Role-specific receipts, Cycle/Sync/Checkpoint governance, and optional capability-profile runtime routing. /synaptory — deliver, inspect, debug, and more.",
   "author": {
     "name": "H3Tech Inc.",

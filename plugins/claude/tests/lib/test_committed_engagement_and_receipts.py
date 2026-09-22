@@ -39,7 +39,12 @@ import story_pipeline as story
 
 from _spq_fixture import CYCLE_KWARGS, unit as _fx_unit
 
-GITIGNORE = ".synaptory/*\n!.synaptory/cycles/\n!.synaptory/engagement.json\n"
+# The documented recipe, exactly. It carried a third line,
+# `!.synaptory/engagement.json`, which matches nothing -- the engagement
+# file lives at `.synaptory/cycles/engagement.json` and is already
+# un-ignored by the second line. A fixture with a line that does nothing
+# is a fixture that does not test the recipe it claims to.
+GITIGNORE = ".synaptory/*\n!.synaptory/cycles/\n"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -120,6 +125,54 @@ def test_a_fresh_worktree_can_open_a_cycle(project: Path, tmp_path: Path):
 
     assert opened["ok"] is True
     assert sm.read_state(str(elsewhere))["lifecycle_state"] == "CYCLE"
+
+
+@pytest.mark.unit
+def test_the_baseline_refusal_names_where_the_approval_lives(project: Path):
+    """`#824`. The refusal explained WHY a baseline is required and not WHERE
+    the approval is kept, so a clone that could not see one had no next step.
+    The reporter's conclusion was that a second machine simply cannot open a
+    Cycle; the remedy was one sentence away."""
+    with pytest.raises(ValueError) as excinfo:
+        sm.open_cycle(
+            str(project), goal="no baseline yet",
+            admitted_units=[_fx_unit("WU-01")], **CYCLE_KWARGS,
+        )
+
+    message = str(excinfo.value)
+    assert "SC-MTH-009" in message              # the rule, still stated
+    assert spq_paths.ENGAGEMENT_RELPATH in message   # and now the artifact
+    assert "approve_baseline" in message             # and the verb
+    # Both situations are named, because they need different actions and the
+    # old wording could not tell them apart.
+    assert "no baseline has been approved yet" in message
+    assert "approved on another machine" in message
+    # And it warns against the one wrong move: re-approving to satisfy a tool
+    # falsifies the record with a new date and a new approver.
+    assert "Do not re-run `approve_baseline`" in message
+    # The transport here is fine, so the gitignore remedy stays out of the way.
+    assert ".synaptory/*" not in message
+
+
+@pytest.mark.unit
+def test_the_baseline_refusal_adds_the_gitignore_remedy_only_when_it_applies(
+    project: Path,
+):
+    """The silent case: the approval could be committed and still not arrive.
+    Naming the two lines is only useful in the tree where they are missing --
+    printed everywhere it would be noise, and noise is what gets skipped."""
+    (project / ".gitignore").write_text(".synaptory/\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        sm.open_cycle(
+            str(project), goal="no baseline yet",
+            admitted_units=[_fx_unit("WU-01")], **CYCLE_KWARGS,
+        )
+
+    message = str(excinfo.value)
+    assert "is gitignored" in message
+    assert ".synaptory/*" in message
+    assert "!.synaptory/cycles/" in message
 
 
 @pytest.mark.unit

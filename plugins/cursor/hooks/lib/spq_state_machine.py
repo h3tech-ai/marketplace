@@ -70,7 +70,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -84,6 +84,7 @@ import spq_paths as _paths  # noqa: E402
 import state_store as _store  # noqa: E402
 from story_pipeline import (  # noqa: E402
     attach_dispatch_dod_contract,
+    collect_story_receipts,
     create_story,
     evaluate_story_dod,
     resolve_dod_tier,
@@ -182,7 +183,33 @@ def read_engagement(project_dir: str) -> dict[str, Any]:
         return dict(committed["engagement"])
     pointer = read_pointer(project_dir)
     engagement = pointer.get("engagement")
-    return dict(engagement) if isinstance(engagement, dict) else {}
+    if not isinstance(engagement, dict) or not engagement:
+        return {}
+    # #800 -- PROMOTE WHAT THE SHIM FOUND, ONCE.
+    #
+    # The shim above is backward compatible in the directory that HOLDS the
+    # pointer, which is exactly the directory #766 was not about. The write
+    # side has two callers -- `approve_baseline` and `record_handover` -- and
+    # both are once-per-engagement governance acts, so a project that approved
+    # its baseline before 1.3.3 had NO reachable verb that would ever write the
+    # committed file. It kept the symptom the change fixed: a clean checkout
+    # still read `baseline_approved: null`.
+    #
+    # The only route on offer was to re-run `approve_baseline`, which records a
+    # new approval date and a new approver for a decision the owner already
+    # made. A tooling upgrade must not require re-performing a governance act,
+    # and an operator who does it has falsified the record to satisfy the tool.
+    #
+    # So the promotion carries the ORIGINAL facts across unchanged -- it is a
+    # migration, not an approval, and it invents no date and no principal.
+    # Best effort and idempotent: a read that cannot write still returns the
+    # facts, because answering is this function's job and migrating is a
+    # side effect it should never fail on.
+    try:
+        _write_engagement(project_dir, dict(engagement))
+    except Exception:  # noqa: BLE001 - see the paragraph above
+        pass
+    return dict(engagement)
 
 
 def _write_engagement(project_dir: str, fields: dict[str, Any]) -> None:
@@ -276,6 +303,158 @@ def _engagement_view(project_dir: str) -> dict[str, Any]:
         if key != "discovery" and key in engagement:
             view[key] = engagement[key]
     return view
+
+
+def list_cycles(project_dir: str) -> dict[str, Any]:
+    """Every Cycle this repository knows about, and what state each is in.
+
+    `#797`. SPQ state was trapped in the one working tree that produced it.
+    The board lives under `.synaptory/.orchestrator/`, which the documented
+    recipe gitignores, so a clean checkout of the trunk answered
+    `lifecycle_state: DISCOVERY` with `.synaptory/cycles/<id>/manifest.json`
+    sitting committed two directories away. Not "unknown" -- CONFIDENTLY
+    WRONG, which is worse, and of the nineteen verbs none listed Cycles at
+    all. To learn "Cycle 1 closed, Cycle 2 open" a person had to `ls` and open
+    each manifest by hand.
+
+    IT READS THE COMMITTED TREE, not the local index, and that is the whole
+    point: the index is gitignored, so a reader who only had the index would
+    still be answering from the one directory. A Cycle appears here when its
+    DECLARATION is committed, which is what travels through git.
+
+    `hydrate_cycle` was the documented recovery and it is circular -- it needs
+    `--cycle-id`, which is the thing being asked for. This is the verb that
+    answers it.
+    """
+    root = Path(str(project_dir), _paths.COMMITTED_RELDIR)
+    out: list[dict[str, Any]] = []
+    try:
+        entries = sorted(d for d in root.iterdir() if d.is_dir())
+    except OSError:
+        entries = []
+    local = {
+        str(c.get("cycle_id")): c for c in _paths.list_cycles(str(project_dir))
+    }
+    for entry in entries:
+        cid = entry.name
+        try:
+            declaration = read_manifest(project_dir, cid)
+        except (OSError, ValueError):
+            declaration = {}
+        if not declaration:
+            continue
+        hydrated = bool(_store.read_json(_board_path(project_dir, cid)))
+        out.append({
+            "cycle_id": cid,
+            "cycle_seq": declaration.get("cycle_seq"),
+            # #793 -- the operator's own number, when the Cycle declared one.
+            "tracker_ref": declaration.get("tracker_ref") or "",
+            "goal": declaration.get("goal") or (local.get(cid) or {}).get("goal") or "",
+            "state": _cycle_state(project_dir, cid),
+            # WHETHER THIS CHECKOUT CAN ACT ON IT. A Cycle can be perfectly
+            # readable here and still have no board in this tree, which is the
+            # difference between "what exists" and "what I can drive".
+            "hydrated_here": hydrated,
+        })
+    current = str(read_pointer(project_dir).get("spq", {}).get("cycle_id") or "")
+    return {
+        "cycles": out,
+        "current_cycle_id": current,
+        "count": len(out),
+    }
+
+
+def resolve_cycle_number(project_dir: str, number: str) -> dict[str, Any]:
+    """Turn the number an OPERATOR types into a Cycle this repository knows.
+
+    `#799`. `routing-rules.json` advertises an `open|start|run|next cycle N`
+    pattern, so an operator reasonably
+    types `/synaptory start cycle 2` -- and nothing could act on that `2`. It
+    is not the sequence (an allocation counter), and before `#793` no field
+    mapped it to one. The operator's own number, the only identifier they
+    know, was the one thing the method could not accept.
+
+    Returns `{resolved, cycle_id, match, candidates, message}`.
+
+    IT MATCHES `tracker_ref` FIRST and the sequence only as a fallback, which
+    is the ordering `#793` makes meaningful: the tracker number names a body
+    of work, the sequence counts runs, and on any project that has
+    re-delivered or opened Cycles concurrently they differ. Matching the
+    sequence first would resolve confidently to the wrong Cycle, which is the
+    failure both issues are about.
+
+    AN AMBIGUOUS NUMBER DOES NOT RESOLVE. If `2` is one Cycle's `tracker_ref`
+    and another's `cycle_seq`, both are returned and the caller must ask. A
+    guess here is exactly the silent wrong answer being removed.
+    """
+    wanted = str(number or "").strip()
+    listing = list_cycles(project_dir)
+    if not wanted:
+        return {
+            "resolved": False, "cycle_id": "", "match": "",
+            "candidates": listing["cycles"],
+            "message": "no Cycle number was given",
+        }
+    by_ref = [c for c in listing["cycles"] if str(c.get("tracker_ref") or "") == wanted]
+    by_seq = [c for c in listing["cycles"] if str(c.get("cycle_seq") or "") == wanted]
+    if len(by_ref) == 1 and not by_seq:
+        return {
+            "resolved": True, "cycle_id": by_ref[0]["cycle_id"],
+            "match": "tracker_ref", "candidates": by_ref, "message": "",
+        }
+    if by_ref and by_seq and by_ref[0]["cycle_id"] != (by_seq[0]["cycle_id"]):
+        return {
+            "resolved": False, "cycle_id": "", "match": "ambiguous",
+            "candidates": by_ref + by_seq,
+            "message": (
+                "%r is the tracker_ref of %s and the cycle_seq of %s. Those "
+                "are different Cycles, and picking one would be a guess -- say "
+                "which you mean."
+                % (wanted, by_ref[0]["cycle_id"], by_seq[0]["cycle_id"])
+            ),
+        }
+    if len(by_ref) == 1:
+        return {
+            "resolved": True, "cycle_id": by_ref[0]["cycle_id"],
+            "match": "tracker_ref", "candidates": by_ref, "message": "",
+        }
+    if len(by_seq) == 1:
+        return {
+            "resolved": True, "cycle_id": by_seq[0]["cycle_id"],
+            "match": "cycle_seq", "candidates": by_seq,
+            "message": (
+                "matched %r against cycle_seq because no Cycle declares it as "
+                "a tracker_ref. On a project that has re-delivered a body of "
+                "work or opened Cycles concurrently the two differ -- confirm "
+                "this is the Cycle you mean." % wanted
+            ),
+        }
+    return {
+        "resolved": False, "cycle_id": "", "match": "",
+        "candidates": listing["cycles"],
+        "message": (
+            "no Cycle in this repository declares %r as its tracker_ref or "
+            "carries it as its cycle_seq" % wanted
+        ),
+    }
+
+
+def _cycle_state(project_dir: str, cycle_id: str) -> str:
+    """`closed` | `open` | `declared`, from committed evidence only.
+
+    `closed` is a recorded barrier, which is the document that says a Cycle
+    ended. `open` means a board exists in this tree. `declared` means the
+    declaration travelled here and nothing else did -- the exact state a clean
+    checkout is in, and the one that used to render as `DISCOVERY`.
+    """
+    try:
+        if Path(_paths.committed_barrier_path(project_dir, cycle_id)).exists():
+            return "closed"
+    except Exception:  # noqa: BLE001 - an unreadable barrier is not a close
+        pass
+    if _store.read_json(_board_path(project_dir, cycle_id)):
+        return "open"
+    return "declared"
 
 
 def read_state(project_dir: str, cycle_id: str | None = None) -> dict[str, Any]:
@@ -526,6 +705,75 @@ def transport_ignored(project_dir: str, relpath: str) -> bool:
 _SPQ_DEFAULT_KEYS = ("trunk_ref", "source_region")
 
 
+#: Tracker backends that mirror a Cycle onto a namespace SOMEBODY ELSE numbers.
+#: `local` is excluded because its "numbers" are Synaptory's own, so there is no
+#: second namespace for the two identities to drift apart in.
+MIRRORED_TRACKER_BACKENDS = ("github", "jira", "teamwork", "linear")
+
+
+def cycle_tracker_ref(declaration: dict[str, Any]) -> dict[str, Any]:
+    """Which cycle this is IN THE TRACKER, and whether that was declared.
+
+    `#793`. One accessor so the Commit and Checkpoint flows stop spelling the
+    substitution themselves. Returns `{ref, declared, warning}`:
+
+      declared=True   -- the declaration named it; use `ref` and say nothing.
+      declared=False  -- nothing named it, so `ref` falls back to `cycle_seq`
+                         and `warning` says why that may be the wrong cycle.
+
+    THE FALLBACK IS NOT A DEFAULT, it is a legacy path. `open_cycle` now
+    refuses to seal without `tracker_ref` on a mirrored backend, so only
+    Cycles sealed before #793 -- and projects on the `local` tracker, where
+    the numbers are Synaptory's own and cannot drift -- reach it.
+
+    `cycle_seq` REMAINS CORRECT for Synaptory's own identity, which is the
+    distinction that makes this fix safe: `CYCLE-{seq}` is the pseudo Work
+    Unit id receipts bind to, and changing that would move every receipt path.
+    Only the TRACKER's namespace is wrong to derive from a local counter.
+    """
+    ref = str((declaration or {}).get("tracker_ref") or "").strip()
+    if ref:
+        return {"ref": ref, "declared": True, "warning": ""}
+    seq = str((declaration or {}).get("cycle_seq") or "").strip()
+    return {
+        "ref": seq,
+        "declared": False,
+        "warning": (
+            "this Cycle declares no `tracker_ref`, so tracker calls fall back "
+            "to cycle_seq=%s. That is the tracker's number ONLY while no body "
+            "of work has been re-delivered, no two Cycles have been opened "
+            "concurrently, and no Cycle has been abandoned -- each of those "
+            "separates the two permanently. Verify the number against the plan "
+            "before reading a backlog with it." % (seq or "<unset>")
+        ),
+    }
+
+
+def tracker_backend(project_dir: str) -> str:
+    """`tracker.backend` from `.synaptory.yaml`, or "local".
+
+    Yaml-lite for the reason `spq_defaults` gives just below: this runtime
+    depends on no YAML parser and must not start now.
+    """
+    try:
+        text = Path(str(project_dir), ".synaptory.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return "local"
+    in_tracker = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line:
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent == 0:
+            in_tracker = stripped.startswith("tracker:")
+            continue
+        if in_tracker and indent == 2 and stripped.startswith("backend:"):
+            return stripped.split(":", 1)[1].strip().strip('"').strip("'").lower()
+    return "local"
+
+
 def spq_defaults(project_dir: str) -> dict[str, Any]:
     """`spq.trunk_ref` and `spq.source_region` from `.synaptory.yaml`, if set.
 
@@ -768,6 +1016,7 @@ def open_cycle(
     specification_refs: list[Any] | None = None,
     readmits: list[str] | None = None,
     verification: dict[str, Any] | None = None,
+    tracker_ref: str = "",
 ) -> dict[str, Any]:
     """Commit: seal the admitted set, and record that it happened.
 
@@ -779,10 +1028,38 @@ def open_cycle(
     """
     state = read_state(project_dir)
     if not (state.get("discovery") or {}).get("baseline_approved"):
+        # NAME WHERE THE APPROVAL LIVES, not only the rule it serves (`#824`).
+        # The rule-only wording read identically in two situations an operator
+        # must act on differently -- a baseline genuinely never approved, and
+        # an approval this clone cannot see -- and the reporting engagement
+        # spent the difference finding out which it had. A message that
+        # explains WHY a thing is required and not WHERE to obtain it turns a
+        # two-minute step into a dead end; it is the same defect this product
+        # fixed one level down, where a refusal named the wrong artifact and
+        # cost a day.
         raise ValueError(
             "a Cycle cannot open before Discovery approves a baseline: the "
             "baseline is the line a cut must not move (`SC-MTH-009`), and "
-            "without it there is nothing for a cut to be measured against"
+            "without it there is nothing for a cut to be measured against.\n"
+            "The approval is a committed fact, kept in %s, so it travels to "
+            "every clone and worktree of this repository.\n"
+            "  - If no baseline has been approved yet, run `approve_baseline` "
+            "-- it is a governance act and takes an approver, a baseline ref "
+            "and a calibration sample.\n"
+            "  - If a baseline WAS approved on another machine, that file is "
+            "what carries it here: fetch the branch that holds it. Do not "
+            "re-run `approve_baseline` to satisfy this message -- that records "
+            "a new approver and a new date for a decision the owner already "
+            "made.%s" % (
+                _paths.ENGAGEMENT_RELPATH,
+                (
+                    "\n  - In THIS checkout %s is gitignored, so it could not "
+                    "arrive even if it were committed. The two documented "
+                    "lines are:\n"
+                    "        .synaptory/*\n"
+                    "        !.synaptory/cycles/" % _paths.ENGAGEMENT_RELPATH
+                ) if transport_ignored(project_dir, _paths.ENGAGEMENT_RELPATH) else ""
+            )
         )
     # Opening a Cycle IS a stage change, so it goes through the same check as
     # every other one -- checked here, before the seal, so a refusal leaves
@@ -816,6 +1093,25 @@ def open_cycle(
         "cycle_seq": seq,
         "repository": repository,
         "trunk_ref": _trunk_ref,
+        # #793 -- THIS CYCLE'S NAME IN THE TRACKER'S OWN NAMESPACE.
+        #
+        # `cycle_seq` is an allocation counter and was being substituted for
+        # the tracker's number. The two coincide only until they do not, and
+        # three ordinary things separate them PERMANENTLY: a body of work
+        # re-delivered (one tracker cycle, two sequences), Cycles opened
+        # concurrently (sequences land in Commit order, not in tracker order),
+        # and a Cycle abandoned before close (which still spends a sequence).
+        # The gap is therefore not a constant and no offset corrects it.
+        #
+        # The dangerous half is the READ: `get-sprint-backlog <seq>` on a
+        # drifted project SUCCEEDS and returns a different Cycle's Work Units
+        # -- no error, no warning, a well-formed wrong answer.
+        #
+        # A claim about intent, so it belongs on the declaration and is sealed
+        # with the rest. NOT a replacement for `cycle_seq` everywhere: the
+        # pseudo Work Unit id `CYCLE-{seq}` that receipts bind to is
+        # Synaptory's OWN identity and stays the sequence.
+        "tracker_ref": str(tracker_ref or "").strip(),
         # #807 S6 -- WHERE THE TRUNK WAS WHEN THIS CYCLE WAS ADMITTED.
         #
         # `trunk_ref` names a moving target; this pins the commit it named at
@@ -871,9 +1167,77 @@ def open_cycle(
     #
     # Validate first, so a declaration that was never going to seal does not
     # leave a reservation behind for a Cycle that does not exist.
+    # #793 -- a mirrored tracker needs the Cycle's name in ITS namespace, and
+    # refusing here is what makes the guarantee real. A warning would not:
+    # the failure it prevents is a read that SUCCEEDS with another Cycle's
+    # backlog, so anything the orchestrator can continue past leaves the wrong
+    # answer looking right. Refused before the seal, so a rejected Commit
+    # leaves nothing on disk.
+    _backend = tracker_backend(project_dir)
+    if _backend in MIRRORED_TRACKER_BACKENDS and not declaration["tracker_ref"]:
+        raise _records.DeclarationError([
+            "tracker_ref is required on the %s tracker: a Cycle mirrored onto "
+            "a namespace somebody else numbers must say which cycle it is "
+            "there. Without it the flow substitutes `cycle_seq`, an allocation "
+            "counter that drifts from the tracker's number the first time a "
+            "body of work is re-delivered, two Cycles open concurrently, or a "
+            "Cycle is abandoned -- and `get-sprint-backlog` then returns "
+            "ANOTHER Cycle's Work Units with no error. Pass --tracker-ref with "
+            "the number the plan uses." % _backend
+        ])
+
     _found = _records.problems(declaration)
     if _found:
         raise _records.DeclarationError(_found)
+
+    # #827. SHARED PATHS ARE OUTSIDE EVERY REGION, so the reservation below
+    # does not cover them. `_eval_shared_paths_owned` enforces one owner per
+    # shared path over the effective set of ONE declaration; nothing compared
+    # two. Two Cycles could each claim `web/src/main.tsx`, each seal, and
+    # whoever merged second would overwrite the first -- discovered at a
+    # barrier where the declaration is immutable, which is why this is checked
+    # here and not there.
+    #
+    # BEFORE THE RESERVATION, so a refusal leaves nothing behind: same reason
+    # the declaration is validated first.
+    #
+    # THIS IS A SECOND NET, NOT THE FIX. It sees the declarations committed
+    # into THIS checkout, which is where the reporting engagement's near-miss
+    # was caught by hand. A Cycle sealed on a machine whose branch has not
+    # been fetched is invisible to it, and no local read can change that --
+    # the registry is the only party that sees both in time. So the scope is
+    # sealed into the declaration below rather than left implicit: a check
+    # whose coverage an auditor cannot establish is one whose silence gets
+    # read as proof.
+    _claimed = live_shared_path_claims(project_dir, exclude_cycle_id=allocated)
+    _collisions = [
+        (path, unit, _claimed[path])
+        for path, unit in _records.shared_path_owners(declaration).items()
+        if path in _claimed
+    ]
+    if _collisions:
+        raise ValueError(
+            "this Cycle claims %d shared path(s) an open Cycle already holds, "
+            "and a shared path lies outside every source region so the region "
+            "reservation does not cover it (`#827`). Both Cycles would seal, "
+            "both would deliver, and whoever merged second would overwrite the "
+            "first -- at a barrier where neither declaration can still be "
+            "changed:\n%s\n"
+            "Resolve it before Commit: withdraw the unit, hand the path to the "
+            "Cycle that already holds it, or wait for that Cycle to "
+            "Checkpoint, which releases the claim."
+            % (
+                len(_collisions),
+                "\n".join(
+                    "    %s -- claimed here by %s, already held by %s in Cycle %s"
+                    % (path, unit or "<no owner named>",
+                       held.get("owning_unit_id") or "<no owner named>",
+                       held.get("cycle_id"))
+                    for path, unit, held in sorted(_collisions)
+                ),
+            )
+        )
+
     import advance_kernel as _ak
     import region_registry as _registry
 
@@ -924,6 +1288,20 @@ def open_cycle(
         declaration["region_reservation"] = {
             "registry": _reservation.get("registry"),
             "outcome": _reservation.get("outcome"),
+        }
+        # #827. WHAT THE SHARED-PATH CHECK COULD SEE when this Cycle sealed.
+        # Sealed for the same reason the reservation outcome is: a reader must
+        # be able to tell how separation was established, and this check is
+        # partial by construction. `scope` says a clone's committed
+        # declarations were compared and a registry was not, so "no collision
+        # reported" cannot be mistaken for "no collision exists".
+        declaration["shared_path_check"] = {
+            "scope": "local-committed-declarations",
+            "registry": "none",
+            "cycles_compared": sorted(
+                {held["cycle_id"] for held in _claimed.values()}
+            ),
+            "paths_claimed": sorted(_records.shared_path_owners(declaration)),
         }
         sealed = _records.seal(declaration)
 
@@ -1750,6 +2128,133 @@ def _run_regression(project_dir: str) -> dict[str, Any]:
     }
 
 
+#: Receipt roles whose `verdict` block may speak for the unit's criteria. The
+#: prover and the reviewer; the PRODUCER is deliberately absent, because a
+#: builder asserting its own work met the criteria is the self-attestation the
+#: evidence contract exists to refuse.
+_CRITERIA_VERDICT_ROLES = ("qe", "cr")
+
+
+def _declared_criteria_refused(
+    receipts_dir: str | None, story_id: str
+) -> tuple[bool, str]:
+    """Did a prover state IN ITS RECEIPT that this unit's criteria are not met?
+
+    `#805`. `verdict.unit_criteria_met` is produced by the QE receipt protocol
+    and was read by NOTHING -- `grep -rn unit_criteria_met core/ plugin-claude/`
+    returned zero. A field with that name will be trusted by someone, and on
+    the engagement that filed this it was: a QE closed two findings, filed two
+    new HIGH ones, recorded `unit_criteria_met: false`, and warned in its own
+    receipt that the gate might not read it. It did not. Had the unit been
+    advanced, the barrier would have credited all six of its acceptance
+    criteria as passed.
+
+    IT DECLINED TO GAME THE GATE, which is why this matters. The same receipt
+    says it would not inflate a `high` to `critical` to force
+    `no_critical_findings` false, on the ground that gaming a gate in the safe
+    direction is still gaming it. So the honest verdict had nowhere to go and
+    the dishonest one would have worked -- the incentive was inverted, which is
+    the shape `#494` already fixed for dropped test cases.
+
+    ONLY AN EXPLICIT `false` REFUSES. Absent, malformed, or `true` all leave
+    the existing derivation alone, so no Cycle that closes today stops closing.
+    That restraint is deliberate: the `#817` lesson is that a verdict which
+    fails on a state every unit passes through strands the lifecycle, and
+    "no per-criterion evidence" is that state for every unit authored before
+    this field was read.
+    """
+    if not receipts_dir:
+        return False, ""
+    try:
+        receipts = collect_story_receipts(receipts_dir, story_id)
+    except Exception:  # noqa: BLE001 - an unreadable receipt refuses nothing
+        return False, ""
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        role = str(receipt.get("role") or "").strip().lower()
+        if role not in _CRITERIA_VERDICT_ROLES:
+            continue
+        verdict = receipt.get("verdict")
+        if not isinstance(verdict, dict):
+            continue
+        if verdict.get("unit_criteria_met") is False:
+            return True, str(
+                verdict.get("summary")
+                or verdict.get("reason")
+                or "no reason recorded"
+            )
+    return False, ""
+
+
+def _case_outcomes_by_criterion(
+    project_dir: str, state: dict[str, Any], story: dict[str, Any],
+    receipts_dir: str | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """`{criterion: [case outcome, ...]}` for cases that NAME their criterion.
+
+    `#805`'s first branch (`checks.get(criterion)`) was dead: `checks` is keyed
+    by DoD check id (`tests_pass`, `build_succeeds`, ...) and `criterion` is
+    criterion prose, so the keys could never intersect and every criterion of
+    every `done` unit fell through to the DoD-derived credit.
+
+    This is the per-criterion source that branch was reaching for. It joins the
+    sealed authored cases to the verifying receipt's per-case results through
+    `criterion_ref`, which is the only field that claims to say which declared
+    criterion a case proves.
+
+    IT IS OFTEN EMPTY, AND THAT IS STATED RATHER THAN HIDDEN. `criterion_ref`
+    is documented as "traceability only: nothing selects a path or a command
+    from it", and `normalize_case` defaults it to `""` for every bare-string
+    case -- which is how most cases are authored. So this returns `{}` for most
+    units today, and the caller must NOT read an empty result as "criteria
+    unproven, refuse". Building the fix on this field alone would have
+    replaced one dead branch with another.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    try:
+        from story_pipeline import resolve_authored_cases  # noqa: PLC0415
+
+        cases, _origin, _witness = resolve_authored_cases(
+            project_dir, str(story.get("id") or ""), state
+        )
+    except Exception:  # noqa: BLE001 - no seal, no per-criterion source
+        return out
+    if not isinstance(cases, (list, tuple)) or not cases:
+        return out
+    by_case: dict[str, str] = {}
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        ref = str(case.get("criterion_ref") or "").strip()
+        cid = str(case.get("id") or "").strip()
+        if ref and cid:
+            by_case[cid] = ref
+    if not by_case:
+        return out
+    try:
+        receipts = collect_story_receipts(receipts_dir, str(story.get("id") or ""))
+    except Exception:  # noqa: BLE001
+        return out
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        if str(receipt.get("role") or "").strip().lower() not in _CRITERIA_VERDICT_ROLES:
+            continue
+        atc = (receipt.get("metrics") or {}).get("authored_test_cases")
+        results = atc.get("results") if isinstance(atc, dict) else None
+        if not isinstance(results, dict):
+            continue
+        for cid, result in results.items():
+            ref = by_case.get(str(cid))
+            if not ref or not isinstance(result, dict):
+                continue
+            out.setdefault(ref, []).append(
+                {"case_id": str(cid), "status": str(result.get("status") or "")}
+            )
+    return out
+
+
 def _unit_results(project_dir: str, state: dict[str, Any]) -> dict[str, Any]:
     """Per-unit results in the shape the barrier reads.
 
@@ -1795,6 +2300,11 @@ def _unit_results(project_dir: str, state: dict[str, Any]) -> dict[str, Any]:
             continue
         dod = evaluate_story_dod(project_dir, uid, intensity, receipts_dir=receipts)
         checks = (dod or {}).get("checks") or {}
+        # #805 -- the two per-criterion sources, read once per unit.
+        by_criterion = _case_outcomes_by_criterion(
+            project_dir, state, story, receipts
+        )
+        refused, refusal_reason = _declared_criteria_refused(receipts, uid)
         criteria: dict[str, Any] = {}
         for criterion in story.get("acceptance_criteria") or []:
             # ONE VERDICT PER DECLARED CRITERION, from the DoD gate rather than
@@ -1802,11 +2312,43 @@ def _unit_results(project_dir: str, state: dict[str, Any]) -> dict[str, Any]:
             # check for returns nothing, which the barrier reads as unmet --
             # the safe direction, and the one that keeps adding a criterion
             # honest.
-            entry = checks.get(str(criterion))
-            if isinstance(entry, dict):
+            # #805, IN PRECEDENCE ORDER: a case that names this criterion
+            # beats a blanket verdict, and a blanket refusal beats the DoD
+            # derivation. The old first branch (`checks.get(criterion)`) is
+            # gone: `checks` is keyed by DoD check id and `criterion` is
+            # criterion prose, so it could never match and every criterion of
+            # every `done` unit was credited from three booleans.
+            outcomes = by_criterion.get(str(criterion)) or []
+            if outcomes:
+                bad = [
+                    o for o in outcomes
+                    if o["status"] not in ("passed", "not-applicable")
+                ]
                 criteria[str(criterion)] = {
-                    "passed": entry.get("passed") is True,
-                    "detail": str(entry.get("detail") or ""),
+                    "passed": not bad,
+                    "detail": (
+                        "%d authored case%s name this criterion; %s"
+                        % (
+                            len(outcomes),
+                            "" if len(outcomes) == 1 else "s",
+                            "all passed" if not bad else "not passed: " + ", ".join(
+                                "%s=%s" % (o["case_id"], o["status"] or "unrecorded")
+                                for o in bad
+                            ),
+                        )
+                    ),
+                }
+            elif refused:
+                # A PROVER SAID SO IN ITS OWN RECEIPT. Crediting the criterion
+                # against an explicit `unit_criteria_met: false` is what let a
+                # unit pass `acceptance_criteria_met` with two open HIGH
+                # findings on the engagement that filed #805.
+                criteria[str(criterion)] = {
+                    "passed": False,
+                    "detail": (
+                        "a verifying receipt records `verdict.unit_criteria_met"
+                        ": false` for this unit: %s" % refusal_reason
+                    ),
                 }
             elif str(story.get("state")) == "done" and not dod_gate_block_reason(dod):
                 # THE GATE'S OWN ANSWER, not `all_pass`. That field is
@@ -1822,9 +2364,24 @@ def _unit_results(project_dir: str, state: dict[str, Any]) -> dict[str, Any]:
                 # to allow the done edge, so crediting a declared criterion on
                 # it credits exactly what the product already decided. Recorded
                 # as derived so a reader can tell it from an itemised result.
+                # #805 -- SAYS WHAT IT IS. This is a blanket credit from three
+                # DoD booleans, not a verdict about this criterion, and the
+                # detail now says so rather than reading like an itemised
+                # result. It is still a credit, deliberately: refusing here
+                # would strand every unit authored without `criterion_ref`,
+                # which is most of them (the field is documented as
+                # traceability only and defaults to empty), and #817 is the
+                # standing lesson about a verdict that fails on a state every
+                # unit passes through.
                 criteria[str(criterion)] = {
                     "passed": True,
-                    "detail": "derived from the unit's Definition of Done gate",
+                    "detail": (
+                        "derived from the unit's Definition of Done gate; NO "
+                        "per-criterion evidence was read (no authored case "
+                        "names this criterion, and no verifying receipt "
+                        "recorded a criteria verdict)"
+                    ),
+                    "evidence": "derived",
                 }
         record: dict[str, Any] = {
             "schema_version": "1",
@@ -1850,6 +2407,69 @@ def _unit_results(project_dir: str, state: dict[str, Any]) -> dict[str, Any]:
             }
         out[uid] = record
     return out
+
+
+def live_shared_path_claims(
+    project_dir: str, *, exclude_cycle_id: str = ""
+) -> dict[str, dict[str, str]]:
+    """path -> the open Cycle already claiming it, from committed declarations.
+
+    `#827`. `region_registry.reserve` guards REGIONS, and a shared path is by
+    definition outside every region -- so two concurrent Cycles can each claim
+    `web/src/main.tsx`, each pass `shared_paths_owned` (which ranges over ONE
+    declaration), each seal, and whoever merges second overwrites the first.
+    The first discovers it at a barrier where the declaration can no longer be
+    changed. On the reporting engagement it was one step from happening and
+    was caught only because a coordinating session read both sealed manifests
+    by hand and compared them. This is that comparison.
+
+    WHAT IT CAN SEE, and the limit is the point rather than a caveat. Sealed
+    declarations are COMMITTED, so every Cycle whose manifest has reached this
+    checkout is visible here. A Cycle sealed on another machine whose branch
+    has not been fetched is NOT, and no local read can change that: the
+    registry is the only party that sees both in time, which is why the real
+    fix is a shared-path reservation and this is a second net under it.
+
+    So a caller must record what was compared and must not report silence as
+    safety. `open_cycle` seals the scope into the declaration for exactly that
+    reason.
+
+    A CLOSED CYCLE HOLDS NOTHING. Its work is on the trunk and its claim is
+    spent, so it is skipped -- otherwise every path any Cycle ever shared
+    would be permanently unclaimable.
+    """
+    claims: dict[str, dict[str, str]] = {}
+    root = os.path.join(str(project_dir), _paths.COMMITTED_RELDIR)
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return claims
+    for name in entries:
+        if not os.path.isdir(os.path.join(root, name)):
+            continue
+        try:
+            other = _paths.valid_cycle_id(name)
+        except Exception:  # noqa: BLE001 - a stray directory is not a Cycle
+            continue
+        if exclude_cycle_id and other == exclude_cycle_id:
+            continue
+        declaration = _store.read_json(
+            _paths.committed_manifest_path(project_dir, other)
+        )
+        if not isinstance(declaration, dict) or not declaration:
+            continue
+        if any(
+            str(record.get("kind")) == "close"
+            for record in read_barrier_ledger(project_dir, other)
+        ):
+            continue
+        for path, unit in _records.shared_path_owners(declaration).items():
+            # FIRST CLAIM WINS THE REPORT, not the last read. Two open Cycles
+            # already holding the same path is a state this check exists to
+            # prevent reaching, and naming either one gets the operator to the
+            # same conversation.
+            claims.setdefault(path, {"cycle_id": other, "owning_unit_id": unit})
+    return claims
 
 
 def run_barrier(project_dir: str, *, cycle_id: str | None = None) -> dict[str, Any]:
@@ -1968,12 +2588,112 @@ def _append_barrier_record(
     return ledger
 
 
+#: Severities a finding may carry, from `receipt-protocol.md`. An unknown one
+#: is recorded verbatim rather than coerced: `medium` is the report layer's
+#: display default, and silently promoting an unrecognised value into it would
+#: put a number in a severity column nobody stated.
+FINDING_SEVERITIES = ("critical", "high", "medium", "low")
+
+
+def receipt_findings(
+    project_dir: str, cycle_id: str, unit_ids: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    """finding id -> what the receipts say about it, for this Cycle's units.
+
+    The corroboration `promote_cycle` checks an owner's open-finding list
+    against. Not a harvest: which findings were accepted OPEN is the owner's
+    judgement and cannot be derived from a receipt, since a receipt does not
+    know what a human decided at promotion. What a receipt does know is that
+    the finding EXISTS, and who raised it -- so a supplied id that no receipt
+    mentions is refused, and severity and title are filled in from the
+    receipt rather than retyped.
+
+    IT READS THE RAW `findings` LIST, deliberately, and does not reuse
+    `summary.receipts.extract_findings`. That function takes receipts already
+    normalised by the report layer (`_findings`, `_blocking_issues`), and
+    `core/lib` imports nothing from `core/scripts` -- inverting that
+    dependency to save twenty lines would give the shared runtime a reporting
+    dependency it has never had.
+    """
+    import story_pipeline as _sp
+
+    receipts_dir = _paths.receipts_dir(project_dir, cycle_id)
+    found: dict[str, dict[str, Any]] = {}
+    for unit_id in unit_ids:
+        for receipt in _sp.collect_story_receipts(receipts_dir, str(unit_id)):
+            raw = receipt.get("findings")
+            if not isinstance(raw, list):
+                # A counts-only `metrics.findings_critical` says how many
+                # there were and never which; it cannot corroborate an id.
+                continue
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                fid = str(entry.get("id") or "").strip()
+                if not fid or fid in found:
+                    continue
+                found[fid] = {
+                    "id": fid,
+                    "unit_id": str(unit_id),
+                    "raised_by": str(receipt.get("agent") or receipt.get("role") or ""),
+                    "severity": str(entry.get("severity") or "").strip().lower(),
+                    "title": str(entry.get("title") or "").strip(),
+                    "file_ref": str(entry.get("file_ref") or "").strip(),
+                    "description": str(entry.get("description") or "").strip(),
+                }
+    return found
+
+
+def read_findings(project_dir: str, cycle_id: str) -> list[dict[str, Any]]:
+    """Findings this Cycle shipped open, oldest first, or [] if none.
+
+    Tolerant on purpose, like `read_cuts` and `read_barrier_ledger` beside it:
+    an unreadable record must not make a Cycle unclosable, because this store
+    reports and gates nothing.
+    """
+    path = _paths.committed_findings_path(project_dir, cycle_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            found = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    return [f for f in found if isinstance(f, dict)] if isinstance(found, list) else []
+
+
+def _append_findings(
+    project_dir: str, cycle_id: str, records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Append what this promotion accepted open, once.
+
+    IDEMPOTENT ON (id, operation_id), the same key shape `_append_barrier_
+    record` uses and for the same reason: `cycle_barrier.promote` is
+    idempotent under an operation identity, so a reconciled retry must not
+    make one accepted finding look like two to a later reader.
+    """
+    ledger = read_findings(project_dir, cycle_id)
+    keys = {
+        (str(r.get("id")), str(r.get("operation_id") or "")) for r in ledger
+    }
+    added = [
+        record for record in records
+        if (str(record.get("id")), str(record.get("operation_id") or "")) not in keys
+    ]
+    if not added:
+        return ledger
+    ledger.extend(added)
+    path = _paths.committed_findings_path(project_dir, cycle_id)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    _store.write_json_atomic(path, ledger)
+    return ledger
+
+
 def promote_cycle(
     project_dir: str,
     *,
     principal: str,
     rationale: str = "",
     cycle_id: str | None = None,
+    open_findings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Authorize one atomic promotion of this Cycle's candidate, or refuse.
 
@@ -1984,12 +2704,36 @@ def promote_cycle(
     THE VERDICT IS DERIVED HERE, from `run_barrier`, for the same reason
     `close_cycle` derives its own: a promotion authorized against a verdict its
     caller supplied is a promotion authorized against nothing.
+
+    `open_findings` IS STRUCTURED, NOT PROSE (`#823`). A finding raised by a
+    reviewer and accepted open by the owner is an accountable decision to ship
+    a known defect, and its only durable home was free text inside
+    `decision.rationale`. Fifteen such findings across three Cycles on the
+    reporting engagement live there, six as bare ids whose substance nobody
+    transcribed. Each entry is `{id, severity, unit_id, raised_by, status,
+    rationale}`; `id` is the only required field and the rest are filled in
+    from the receipts where they are absent.
+
+    WHY THE LIST IS SUPPLIED AND NOT DERIVED. Which findings were accepted
+    OPEN is the owner's judgement at promotion, and no receipt records it --
+    this module's own rule against caller-supplied facts is about facts the
+    process can observe. So the list is the owner's, and every id in it is
+    CORROBORATED against the Cycle's receipts: an id no receipt mentions is
+    refused, because an accepted finding nobody raised is not a judgement.
+
+    IT GATES NOTHING. The issue is explicit that the owner's judgement is the
+    right gate and it works; a refusal here would turn a report into an
+    enforcement nobody asked for. The only refusal is of an id that does not
+    exist, which is a typo or a fabrication, never a finding.
     """
     import cycle_barrier as _barrier
 
     state = read_state(project_dir, cycle_id=cycle_id)
     cid = str(state.get("_cycle_id") or "")
     verdict = run_barrier(project_dir, cycle_id=cid)
+    _findings_to_record = _resolve_open_findings(
+        project_dir, cid, verdict, open_findings or []
+    )
     record = _barrier.promote(
         verdict=verdict,
         ledger=read_barrier_ledger(project_dir, cid),
@@ -1997,7 +2741,73 @@ def promote_cycle(
         rationale=rationale,
     )
     _append_barrier_record(project_dir, cid, record)
+    if _findings_to_record and str(record.get("outcome")) == "promoted":
+        # AFTER the promotion is recorded, and only for one that happened. A
+        # findings row written beside a REFUSED promotion would say a defect
+        # was shipped by a promotion that shipped nothing.
+        operation_id = str(record.get("operation_id") or "")
+        _append_findings(project_dir, cid, [
+            dict(entry, operation_id=operation_id,
+                 accepted_by=principal, accepted_at=_now(),
+                 accepted_rationale=str(rationale or ""))
+            for entry in _findings_to_record
+        ])
+        record["open_findings_recorded"] = [e["id"] for e in _findings_to_record]
     return record
+
+
+def _resolve_open_findings(
+    project_dir: str,
+    cycle_id: str,
+    verdict: dict[str, Any],
+    supplied: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Complete each supplied finding from the receipts, or refuse the id."""
+    if not supplied:
+        return []
+    corroborated = receipt_findings(
+        project_dir, cycle_id, list(verdict.get("effective_unit_ids") or ())
+    )
+    resolved: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    for entry in supplied:
+        if not isinstance(entry, dict):
+            unknown.append(repr(entry))
+            continue
+        fid = str(entry.get("id") or "").strip()
+        if not fid:
+            unknown.append(repr(entry))
+            continue
+        evidence = corroborated.get(fid)
+        if evidence is None:
+            unknown.append(fid)
+            continue
+        merged = dict(evidence)
+        # The owner's values win where they are stated, because severity may
+        # be re-judged at promotion; everything else comes from the receipt so
+        # a finding is not retyped into the record it is meant to preserve.
+        for key in ("severity", "title", "unit_id", "raised_by", "rationale"):
+            value = str(entry.get(key) or "").strip()
+            if value:
+                merged[key] = value
+        merged["status"] = str(entry.get("status") or "open").strip() or "open"
+        merged["schema_version"] = "1"
+        resolved.append(merged)
+    if unknown:
+        raise ValueError(
+            "no receipt in this Cycle raises %s, so %s cannot be recorded as "
+            "accepted open. A finding accepted at promotion was raised by a "
+            "named role in a receipt; an id nothing raised is a typo or a "
+            "fabrication, and recording it would put a defect in the shipped "
+            "set that no evidence supports. Findings this Cycle's receipts do "
+            "raise: %s"
+            % (
+                ", ".join(sorted(unknown)),
+                "they" if len(unknown) > 1 else "it",
+                ", ".join(sorted(corroborated)) or "none",
+            )
+        )
+    return resolved
 
 
 def close_cycle(
@@ -2049,6 +2859,13 @@ def close_cycle(
         rationale=rationale,
     )
     _append_barrier_record(project_dir, cid, closed)
+    # #823. THE SET THIS CLOSE IS SHIPPING, reported rather than left in
+    # prose. Read from the committed record rather than taken as an argument
+    # -- `close_cycle` takes no verdict for the same reason, and a close that
+    # could be handed its own list of known defects would be reporting a
+    # caller's claim about what shipped. Resolved before the reconciled
+    # branch, because a retry ships the same set as the close it reconciles.
+    _open_findings = read_findings(project_dir, cid)
     if closed.get("reconciled"):
         # §4.3 STEP 7, THE WHOLE OF IT. `cycle_barrier.close` reconciles a
         # second close of the same operation, and `_append_barrier_record` is
@@ -2067,6 +2884,10 @@ def close_cycle(
             "integrated_sha": str(
                 (closed.get("trunk") or {}).get("current_sha") or ""
             ),
+            # #823. A reconciled close records nothing further and ships the
+            # same set as the close it reconciles, so it reports it rather
+            # than answering an empty list to a caller that retried.
+            "open_findings": _open_findings,
         }
     integrated_sha = str(
         (barrier_verdict.get("trunk") or {}).get("current_sha") or ""
@@ -2184,6 +3005,12 @@ def close_cycle(
         "trunk_ref": sealed.get("trunk_ref"),
         "closed_at": _now(),
         "dod": agg,
+        # #823. Carried into the archive too, so a later Cycle entering this
+        # region can be told what is already known about it without opening
+        # another Cycle's barrier ledger. The reporting engagement found the
+        # same defect recurring one unit along only because a reviewer
+        # happened to have read the earlier receipt.
+        "open_findings": read_findings(project_dir, cycle_id),
     }]
     state["method_events"] = _events.append(
         state.get("method_events") or [],
@@ -2219,6 +3046,7 @@ def close_cycle(
         "cycle_id": cycle_id,
         "integrated_sha": integrated_sha,
         "region_released": _released.get("outcome"),
+        "open_findings": _open_findings,
     }
 
 
@@ -2925,12 +3753,13 @@ def main(argv: list[str]) -> None:
     if len(argv) < 3:
         _die(
             "usage: spq_state_machine.py <verb> <project_dir> [flags]\n"
-            "verbs: init, read, next_action, transition, approve_baseline, "
+            "verbs: init, read, list_cycles, resolve_cycle_number, next_action, "
+            "transition, approve_baseline, "
             "open_cycle, revise_manifest, hydrate_cycle, cut_work_unit, "
             "rebind_cut, run_barrier, promote_cycle, close_cycle, "
             "record_handover, record_commitment, discharge_commitment, "
             "record_sync, acceptance_status, publish_event, refresh_ledger, "
-            "dep_status"
+            "dep_status, read_findings"
         )
     verb, project_dir, args = argv[1], argv[2], list(argv[3:])
     try:
@@ -2938,6 +3767,10 @@ def main(argv: list[str]) -> None:
             _emit(initialize(project_dir))
         elif verb == "read":
             _emit(read_state(project_dir, cycle_id=_flag(args, "--cycle-id")))
+        elif verb == "list_cycles":
+            _emit(list_cycles(project_dir))
+        elif verb == "resolve_cycle_number":
+            _emit(resolve_cycle_number(project_dir, _flag(args, "--number", "") or ""))
         elif verb == "next_action":
             _emit(next_action(project_dir, cycle_id=_flag(args, "--cycle-id")))
         elif verb == "transition":
@@ -2969,6 +3802,7 @@ def main(argv: list[str]) -> None:
                     _flag(args, "--verification", "null") or "null"
                 ),
                 readmits=json.loads(_flag(args, "--readmits", "[]") or "[]"),
+                tracker_ref=_flag(args, "--tracker-ref", "") or "",
             ))
         elif verb == "revise_manifest":
             # REACHABLE, and it had to become so. Three refusals in
@@ -3018,14 +3852,50 @@ def main(argv: list[str]) -> None:
             # observation would push the caller-supplied-verdict hole one
             # layer out of the barrier and into the CLI.
             _emit(run_barrier(project_dir, cycle_id=_flag(args, "--cycle-id")))
+        elif verb == "read_findings":
+            # #823. A findings store no verb can read is a store that reports
+            # to nobody, which is the state `barrier.json`'s prose was already
+            # in. This is how a Cycle entering a region learns what is already
+            # known about it.
+            _emit({
+                "cycle_id": identity(
+                    project_dir, cycle_id=_flag(args, "--cycle-id")
+                ).cycle_id,
+                "findings": read_findings(
+                    project_dir,
+                    identity(
+                        project_dir, cycle_id=_flag(args, "--cycle-id")
+                    ).cycle_id,
+                ),
+            })
         elif verb == "promote_cycle":
             # The authorization, recorded against the candidate and the trunk
             # revision it was built on. It does not merge.
+            # #823. `--open-findings` takes JSON, because the field it
+            # replaces was prose and the point is that a machine can read it.
+            # A findings record reachable from no verb is the shape the report
+            # calls out: `cycle_records.py` had no findings function, so the
+            # only durable home a finding had was `--rationale`.
+            _raw_findings = _flag(args, "--open-findings", "") or ""
+            try:
+                _open_findings = json.loads(_raw_findings) if _raw_findings else []
+            except ValueError as exc:
+                raise ValueError(
+                    "--open-findings must be a JSON list of "
+                    '{"id", "severity", "status", "rationale"} objects: %s' % exc
+                )
+            if not isinstance(_open_findings, list):
+                raise ValueError(
+                    "--open-findings must be a JSON LIST; a single object "
+                    "records one finding where the caller probably meant one "
+                    "of several"
+                )
             _emit(promote_cycle(
                 project_dir,
                 principal=_flag(args, "--principal", "") or "",
                 rationale=_flag(args, "--rationale", "") or "",
                 cycle_id=_flag(args, "--cycle-id"),
+                open_findings=_open_findings,
             ))
         elif verb == "close_cycle":
             # NO `--barrier-verdict` AND NO `--integrated-sha`. Both were

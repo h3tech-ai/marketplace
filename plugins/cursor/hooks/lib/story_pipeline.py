@@ -4263,6 +4263,23 @@ def next_action(
     cr_required = "code_reviewed" in DOD_TIER_CHECKS.get(
         intensity, DOD_TIER_CHECKS["early"]
     )
+    # #809 -- SAY WHICH STAGES THIS TIER ACTUALLY ASKS FOR.
+    #
+    # Two places decided the pipeline's shape and they disagreed: the tier
+    # table omits `code_reviewed` at `early`, while the orchestration prose
+    # described the pipeline as SE -> QE -> CR unconditionally. The one with
+    # no code in it won, silently -- an Engineering Lead dispatched a reviewer
+    # because the document said there were three stages, and paid 20m30s for a
+    # stage the Definition of Done never required.
+    #
+    # Nothing errored, because nothing was wrong: the tier was computed
+    # correctly and the guard worked correctly. The only way to notice was to
+    # read `cr_required` and the board's timings side by side, which is not
+    # something anyone does mid-Cycle. So the answer travels on the contract
+    # the orchestrator already reads, rather than staying a fact the code knows
+    # and the prompt does not.
+    out["dod"]["stages_required"] = ["se", "qe"] + (["cr"] if cr_required else [])
+    out["dod"]["cr_required"] = cr_required
 
     def _fill(story: dict[str, Any], **kw: Any) -> dict[str, Any]:
         out.update(
@@ -5443,6 +5460,87 @@ def _producer_verifier_diversity(
     return diversity_signal(producer_receipt, verifier_receipt)
 
 
+def _receipt_predates_scope(
+    project_dir: str, story: dict[str, Any], receipt: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Was this receipt written BEFORE the newest file in the unit's scope?
+
+    `#816`. `build_succeeds` is sourced from `WU-<id>-se.json` and never
+    compared against the tree, so after a repair made without an SE dispatch
+    the receipt describes code that no longer exists and the gate credits it
+    anyway. On the engagement that filed this, one SE receipt predated two
+    subsequent repairs — a reconciliation of two implementations, and a new
+    database constraint plus migration — and `build_succeeds` passed on every
+    evaluation in between. It happened to be true; the gate had no way to know
+    that, and would have passed identically had a repair broken the build.
+
+    THE SAME CLASS THE BARRIER ALREADY GUARDS ELSEWHERE. `trunk_integrated` is
+    careful precisely because a caller-supplied claim about integration is not
+    an observation of it.
+
+    IT REPORTS, IT DOES NOT REFUSE, which is what the issue asked for as a
+    minimum and is also the only safe move: a repair that legitimately needs no
+    rebuild is ordinary, and failing every unit whose scope was touched after
+    its last receipt would strand work the gate has no reason to doubt. The
+    annotation is what was missing -- it would have told the reporting
+    engagement immediately that the recovery path it was forced onto had left
+    evidence behind.
+
+    Scope comes from the unit's DECLARED `path_scope` where there is one, so
+    this asks about the region the unit is answerable for rather than about
+    the whole tree. No scope, no receipt, or no readable timestamp: no claim.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    completed = _parse_iso_timestamp(receipt.get("completed_at"))
+    if completed is None:
+        return None
+    scope = [
+        str(p).strip()
+        for p in (story.get("path_scope") or story.get("file_scope") or [])
+        if str(p).strip()
+    ]
+    if not scope:
+        return None
+    newest_path, newest_mtime = "", None
+    for entry in scope:
+        root = os.path.join(project_dir, entry)
+        candidates = []
+        if os.path.isfile(root):
+            candidates = [root]
+        elif os.path.isdir(root):
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+                candidates.extend(os.path.join(dirpath, f) for f in filenames)
+        for path in candidates:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if newest_mtime is None or mtime > newest_mtime:
+                newest_path, newest_mtime = path, mtime
+    if newest_mtime is None:
+        return None
+    newest_dt = datetime.fromtimestamp(newest_mtime, tz=timezone.utc)
+    if newest_dt <= completed:
+        return None
+    return {
+        "receipt_completed_at": receipt.get("completed_at"),
+        "newest_path": os.path.relpath(newest_path, project_dir),
+        "newest_modified_at": newest_dt.isoformat(timespec="seconds"),
+        "summary": (
+            "the receipt was written %s and %s in the unit's declared scope "
+            "changed at %s, so this check credits evidence about code that has "
+            "since moved"
+            % (
+                receipt.get("completed_at"),
+                os.path.relpath(newest_path, project_dir),
+                newest_dt.isoformat(timespec="seconds"),
+            )
+        ),
+    }
+
+
 def evaluate_story_dod(
     project_dir: str,
     story_id: str,
@@ -5630,6 +5728,16 @@ def evaluate_story_dod(
                 entry["definitive_negative"] = True
             elif _gap_detail is not None:
                 entry["detail"] = _gap_detail
+        # #816 — SAY SO WHEN THE EVIDENCE PREDATES THE TREE. A receipt is a
+        # statement about the past; this gate was reading it as a statement
+        # about the code that exists now.
+        _stale = _receipt_predates_scope(project_dir, story_rec or {}, receipt)
+        if _stale:
+            entry["evidence_stale"] = _stale
+            entry["detail"] = (
+                "%s [STALE EVIDENCE: %s]"
+                % (str(entry.get("detail") or "").strip(), _stale["summary"])
+            ).strip()
         checks[check_id] = entry
 
     # #44 phase 5 — `integration_verified` spans the whole receipt set (the

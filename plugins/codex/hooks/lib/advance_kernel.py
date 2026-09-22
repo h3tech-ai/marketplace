@@ -205,6 +205,19 @@ DEPS_UNMET = "deps_unmet"
 DISPATCH_ALREADY_STARTED = "dispatch_already_started"
 RECEIPT_ALREADY_PRESENT = "receipt_already_present"
 DISPATCH_BINDING_MISMATCH = "dispatch_binding_mismatch"
+# #822/#803. NOT a narrower `DISPATCH_BINDING_MISMATCH`, because the two
+# accuse different parties and send an operator to different places. A
+# mismatch says the receipt names an authority that was never granted, which
+# is the #592 forgery case and is the right reading when it is true. This says
+# the authority WAS granted, by this kernel, and then destroyed by a later
+# dispatch for the same stage -- the evidence is orphaned, not forged. The
+# reporting engagement read the forgery wording, went looking at the producing
+# agent, and re-ran a review round that had already passed.
+#
+# Two things that mean different things may not share a representation: an
+# operator filtering telemetry for forged authority must not have to subtract
+# every ordinary retry from the count.
+DISPATCH_BINDING_ORPHANED = "dispatch_binding_orphaned"
 RECEIPT_DELIVERY_FAILED = "receipt_delivery_failed"
 STATE_LOCK_TIMEOUT = "state_lock_timeout"
 # Epic #339. The attempt is the CP-durable, fenced form of the dispatch
@@ -287,6 +300,13 @@ _EVIDENCE_CODES = frozenset(
         LEDGER_INVALID,
         REPLAY,
         DISPATCH_BINDING_MISMATCH,
+        # In the set for the same reason its sibling is, and the reasoning has
+        # to be stated rather than inherited: this is a statement about the
+        # evidence's identity, not about correctness. A host that downgrades
+        # `DISPATCH_BINDING_MISMATCH` under `enforcement="warn"` and refuses
+        # this one would be made STRICTER by a change whose whole purpose is
+        # to describe an existing refusal more accurately.
+        DISPATCH_BINDING_ORPHANED,
         ATTEMPT_BINDING_MISMATCH,
     }
 )
@@ -1112,6 +1132,74 @@ def attempt_history(story: Any, role: str) -> Tuple[Dict[str, Any], ...]:
     return _history_view(story, abbrev)
 
 
+def superseded_authorization(
+    story: Any, role: str, *, dispatch_id: str = "", attempt_id: str = ""
+) -> Optional[Dict[str, Any]]:
+    """The ledger record for an identity this kernel issued and then destroyed.
+
+    `#822`/`#803`. `mcp_active_dispatches[role]` is overwritten whole by the
+    next dispatch of that stage, so a receipt produced under the previous one
+    arrives at the gate naming an identity the LIVE binding does not know.
+    Read against the live binding alone, that is indistinguishable from a
+    receipt naming an identity that never existed -- and the refusal said so,
+    in the #592 forgery wording, about evidence this kernel had authorized
+    minutes earlier.
+
+    The ledger already survives the overwrite: `_archive_predecessor` stamps
+    `superseded_by` before the assignment. This is the supported reader for
+    that fact, so the refusal does not reach into the state key.
+
+    RETURNS THE RECORD ONLY WHEN IT WAS SUPERSEDED. A record with no
+    `superseded_by` is a live or completed attempt and is not this case; an
+    identity absent from the ledger entirely is the forgery case and must keep
+    reading as one. Answering "orphaned" for either would forgive exactly what
+    `#592` exists to refuse.
+    """
+    abbrev = role_abbrev(role) or str(role or "").strip().lower()
+    wanted_dispatch = str(dispatch_id or "").strip()
+    wanted_attempt = str(attempt_id or "").strip()
+    if not wanted_dispatch and not wanted_attempt:
+        return None
+    for record in _history_view(story, abbrev):
+        if not record.get("superseded_by"):
+            continue
+        if wanted_dispatch and str(record.get("dispatch_id") or "") == wanted_dispatch:
+            return dict(record)
+        if wanted_attempt and str(record.get("attempt_id") or "") == wanted_attempt:
+            return dict(record)
+    return None
+
+
+def _orphaned_binding_reason(
+    record: Dict[str, Any], story_id: str, abbrev: str, claimed: str
+) -> str:
+    """Why this receipt cannot be credited, and what actually happened to it."""
+    classification = str(record.get("classification") or "") or "a later dispatch"
+    return (
+        "receipt claims dispatch %s for %s at the %s stage. This kernel DID "
+        "issue that dispatch -- it is attempt %s -- and then superseded it at "
+        "%s when %s was authorized for the same stage (classified `%s`). The "
+        "evidence is orphaned, not forged: the receipt is unchanged and may "
+        "still validate, but the authority it was produced under no longer "
+        "exists, so there is nothing left to check it against. Do not go "
+        "looking at the producing agent.\n"
+        "Recovery: a fresh dispatch for this role is accepted and arrives "
+        "classified `retry` with %s as its `prior_attempt_id`, so the attempt "
+        "history stays honest. Re-produce the receipt under that dispatch "
+        "rather than editing this one's binding tokens."
+        % (
+            claimed,
+            story_id,
+            abbrev,
+            str(record.get("attempt_id") or "<unrecorded>"),
+            str(record.get("superseded_at") or "<unrecorded>"),
+            str(record.get("superseded_by") or "another attempt"),
+            classification,
+            str(record.get("attempt_id") or "<unrecorded>"),
+        )
+    )
+
+
 def unadvanceable_attempt(story: Any, role: str) -> Optional[Dict[str, Any]]:
     """This stage's bound attempt, when its recorded state refuses its receipt.
 
@@ -1399,6 +1487,7 @@ def _record_authorized_attempt(
     prior_attempt_id: str = "",
     prior_failure_class: str = "",
     authorized_at: str = "",
+    dispatch_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Remember that `abbrev` on this story was authorized `attempt_id`.
 
@@ -1424,6 +1513,12 @@ def _record_authorized_attempt(
         record.setdefault("prior_attempt_id", prior_attempt_id)
     if prior_failure_class:
         record.setdefault("prior_failure_class", prior_failure_class)
+    if dispatch_id:
+        # `#822`. The live binding carries both ids and is overwritten whole;
+        # the ledger carried only the attempt. A receipt names the dispatch,
+        # so without this the ledger could not answer a question asked in the
+        # only vocabulary the refusal has.
+        record.setdefault("dispatch_id", dispatch_id)
     return record
 
 
@@ -1514,7 +1609,12 @@ def _archive_predecessor(
     record = _history_record(story, abbrev, prior_id, create=True)
     if record is None:
         return
-    for key in ("state", "failure_class", "failure_class_source"):
+    # `dispatch_id` joins the list for `#822`. The refusal that meets an
+    # orphaned receipt holds a `dispatch_id` and nothing else, and until this
+    # was recorded the ledger could not be asked whether that identity had
+    # once been live -- so an identity this kernel issued and then destroyed
+    # was indistinguishable from one it never issued.
+    for key in ("dispatch_id", "state", "failure_class", "failure_class_source"):
         value = str(predecessor.get(key) or "")
         if value and not record.get(key):
             record[key] = value
@@ -2768,20 +2868,46 @@ def evaluate_advance(
                     #   on every ordinary story. Failing closed here would
                     #   refuse the normal pipeline, which is a different defect
                     #   rather than a safer one.
+                    #
+                    # #822/#803 SPLIT THE FIRST TWO CASES BY CAUSE, not by
+                    # outcome. Both still refuse -- the receipt is genuinely
+                    # unbound and crediting it would be worse -- but a
+                    # superseded identity and an invented one are different
+                    # events, and the operator's next move differs. Note the
+                    # ledger is consulted ONLY to word a refusal already
+                    # decided: what authorizes is still the live binding and
+                    # nothing here weakens that (#608, below).
                     dispatch_id = active.get("dispatch_id")
                     claimed_dispatch = receipt.get("dispatch_id")
+                    if claimed_dispatch and claimed_dispatch != dispatch_id:
+                        orphan = superseded_authorization(
+                            story,
+                            abbrev,
+                            dispatch_id=str(claimed_dispatch),
+                            attempt_id=str(receipt.get("attempt_id") or ""),
+                        )
+                    else:
+                        orphan = None
                     if dispatch_id and claimed_dispatch != dispatch_id:
                         bad = _fail(
-                            DISPATCH_BINDING_MISMATCH,
-                            "receipt dispatch_id does not match the active dispatch",
+                            DISPATCH_BINDING_ORPHANED if orphan
+                            else DISPATCH_BINDING_MISMATCH,
+                            _orphaned_binding_reason(
+                                orphan, story_id, abbrev, str(claimed_dispatch)
+                            ) if orphan
+                            else "receipt dispatch_id does not match the active dispatch",
                             story=story,
                         )
                         if bad is not None:
                             return bad
                     if not dispatch_id and claimed_dispatch:
                         bad = _fail(
-                            DISPATCH_BINDING_MISMATCH,
-                            (
+                            DISPATCH_BINDING_ORPHANED if orphan
+                            else DISPATCH_BINDING_MISMATCH,
+                            _orphaned_binding_reason(
+                                orphan, story_id, abbrev, str(claimed_dispatch)
+                            ) if orphan
+                            else (
                                 "receipt claims dispatch %s, but this kernel "
                                 "authorized no dispatch for %s at the %s stage. "
                                 "A dispatch identity the kernel never issued "
@@ -3870,6 +3996,7 @@ def _execute_dispatch_locked(
                 classification=lineage["classification"],
                 prior_attempt_id=lineage["prior_attempt_id"],
                 prior_failure_class=lineage["prior_failure_class"],
+                dispatch_id=dispatch_id,
             )
             # On the LIVE binding as well as in the history, because ADR-031
             # section 11's rule is stated about the new attempt ("if it
@@ -3970,6 +4097,44 @@ def _execute_dispatch_locked(
             decision.extra["archived_receipt"] = str(archived)
             decision.extra["archived_receipt_digest"] = receipt_digest
             decision.extra["retry_count"] = retry_count
+
+    # #803. SAY IT WHERE IT IS CAUSED, not two transitions later.
+    #
+    # Superseding a live attempt is the mechanism, and it is correct. What was
+    # wrong is that it is SILENT: the operator's model is that this call
+    # authorizes work, and it also unbinds whatever evidence the role already
+    # had. The consequence surfaced at the next gate as `criteria_gap_declared`
+    # or as the #592 forgery wording, neither of which points back here, and
+    # the reporting engagement needed three separate recoveries in one unit
+    # before working out what had happened.
+    #
+    # The guard above already refuses when a FRESH receipt exists and this is
+    # not a recovery, and the block above archives the one a recovery names.
+    # This covers what falls between them: a receipt that is stale, or one for
+    # this role that the recovery did not name. It is on the receipt still
+    # being on disk, so an archived one is not reported twice.
+    #
+    # IT WARNS, IT REFUSES NOTHING. The dispatch is legitimate and refusing it
+    # would strand the unit -- the issue asks to fail loudly here rather than
+    # silently at the gate, and a notice on the dispatch is the form of that
+    # which does not create a second deadlock.
+    if superseded_attempt_id and abbrev:
+        _orphan_path = canonical_receipt_path(project_dir, story_id, abbrev)
+        if _orphan_path.is_file():
+            decision.extra["orphaned_receipt"] = {
+                "path": str(_orphan_path),
+                "superseded_attempt_id": superseded_attempt_id,
+                "role": abbrev,
+                "summary": (
+                    "this dispatch superseded attempt %s for the %s stage, "
+                    "and %s is still on disk bound to it. The receipt is not "
+                    "deleted and not invalid -- it is unbound, so the gate "
+                    "will not credit it and `advance` will refuse it as "
+                    "`dispatch_binding_orphaned`. Re-produce it under the "
+                    "dispatch just issued."
+                    % (superseded_attempt_id, abbrev, _orphan_path.name)
+                ),
+            }
 
     if action == "recover_blocked":
         # UNBLOCK ONLY WHAT IS BLOCKED. `recover_blocked` covers two shapes: a

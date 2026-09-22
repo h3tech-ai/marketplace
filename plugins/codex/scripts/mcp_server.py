@@ -982,6 +982,23 @@ def tool_spq_lifecycle(arguments: dict[str, Any]) -> dict[str, Any]:
         # every call, so the one read that tells an operator what an Acceptance
         # still owes was the read that could not be made.
         return module.acceptance_readiness(str(project))
+    if operation == "read_findings":
+        # #823. READ-ONLY, and placed beside `acceptance_status` rather than
+        # after the execution-ready gate: a Cycle entering a region asks what
+        # is already known about it BEFORE it is ready to execute, which is
+        # exactly when the answer is useful.
+        return {
+            "cycle_id": module.identity(
+                str(project), cycle_id=str(arguments.get("cycle_id") or "") or None
+            ).cycle_id,
+            "findings": module.read_findings(
+                str(project),
+                module.identity(
+                    str(project),
+                    cycle_id=str(arguments.get("cycle_id") or "") or None,
+                ).cycle_id,
+            ),
+        }
 
     blocked = _require_execution_ready(project)
     if blocked:
@@ -1073,10 +1090,25 @@ def tool_spq_lifecycle(arguments: dict[str, Any]) -> dict[str, Any]:
                 )
             }
         try:
+            # #823. `open_findings` is STRUCTURED and the server does not
+            # trust it: `promote_cycle` corroborates every id against the
+            # Cycle's own receipts and refuses one nothing raised. So a
+            # caller cannot record a defect as shipped that no evidence
+            # supports, which is the only property this argument needs on a
+            # boundary where the caller is the agent being graded.
+            findings = arguments.get("open_findings") or []
+            if not isinstance(findings, list):
+                return {
+                    "error": (
+                        "open_findings must be an array of "
+                        '{"id", "severity", "status", "rationale"} objects'
+                    )
+                }
             return module.promote_cycle(
                 str(project),
                 principal=principal,
                 rationale=str(arguments.get("rationale") or ""),
+                open_findings=list(findings),
             )
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
@@ -1805,6 +1837,12 @@ TOOLS: dict[str, dict[str, Any]] = {
                         # is recorded" and nothing in the enum can produce one.
                         "promote_cycle", "close_cycle",
                         "acceptance_status", "complete",
+                        # #823. The read a Cycle makes when it enters a region
+                        # somebody else already shipped a known defect into.
+                        # Named in the enum rather than folded behind a
+                        # discriminator for the reason stated below: the enum
+                        # is the discovery surface.
+                        "read_findings",
                         # THE TWO STAGE EDGES A CYCLE NEEDS TO REACH A GO-LIVE.
                         # The enum had `complete` and neither of these, so a
                         # Codex project could open Cycles and close them and
@@ -1854,6 +1892,15 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "engineering_lead": {"type": "string"},
                 "crew": {"type": "array", "items": {"type": "string"}},
                 "shared_path_owners": {
+                    "type": "array", "items": {"type": "object"},
+                },
+                # #823. Findings raised by a reviewer and accepted OPEN by the
+                # owner at promotion. Declared as objects because the record
+                # they land in has a severity, a status and an owner, none of
+                # which prose in `rationale` could carry. The server does not
+                # trust the list: `promote_cycle` corroborates every id
+                # against the Cycle's own receipts.
+                "open_findings": {
                     "type": "array", "items": {"type": "object"},
                 },
                 "specification_refs": {"type": "array", "items": {"type": "string"}},

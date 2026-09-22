@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 try:  # pragma: no cover - import plumbing
@@ -556,6 +557,81 @@ def _validate_runtime_identity_overlay(
     )
 
 
+#: How far ahead of now a `completed_at` may sit before it is refused (#801).
+#:
+#: BOUNDED FROM ABOVE BY THE SMALLEST TIMEZONE. The error actually seen is a
+#: local clock labelled `Z`, and the smallest real-world offset that produces
+#: it is UTC+1 -- so a tolerance at or above an hour would admit the very bug
+#: this refuses. Everything below that is a judgement about how much honest
+#: clock skew to absorb.
+#:
+#: Thirty minutes rather than something tighter, for a reason the test suite
+#: made concrete: a fixture computes its "fresh" stamp once at import and the
+#: full gate then runs for eight minutes, so a tight window turns a slow suite
+#: into a failing one -- a flake whose cause is invisible from the assertion.
+#: The product loses nothing by the difference, because no clock is thirty
+#: minutes out without being wrong in a way somebody already knows about.
+COMPLETED_AT_FUTURE_TOLERANCE_SECONDS = 1800
+
+
+def _check_completed_at_bounds(result: "ValidationResult", raw: str) -> None:
+    """Refuse a `completed_at` in the future (#801).
+
+    The whole check used to be "non-empty string", unbounded in both
+    directions. Two `software-engineer` receipts in a live Cycle carried a
+    `completed_at` roughly SEVEN HOURS ahead — the agent wrote local time
+    (UTC+7) and labelled it `Z` — and both validated.
+
+    THE METRICS DAMAGE IS THE SMALLER HALF. `completed_at` is the input to the
+    staleness gate: a receipt is fresh when it post-dates the stage it is
+    advancing out of. A future-dated receipt therefore passes that gate BY
+    CONSTRUCTION, for as long as the drift lasts, no matter what it actually
+    describes — including a receipt written before the stage it claims to
+    complete.
+
+    AN UNPARSEABLE VALUE IS NOT REFUSED HERE. `completed_at` has never been
+    required to parse, several fixtures and older receipts carry values this
+    would reject, and turning a format question into a hard error is a
+    separate decision from bounding a value that DOES parse. It warns instead,
+    so the shape is visible without failing work that was fine yesterday.
+    """
+    parsed = _parse_iso8601(raw)
+    if parsed is None:
+        result.warn(
+            "'completed_at' %r is not a parseable ISO 8601 timestamp, so the "
+            "staleness gate cannot compare it against the stage it advances "
+            "out of" % raw
+        )
+        return
+    now = datetime.now(timezone.utc)
+    ahead = (parsed - now).total_seconds()
+    if ahead > COMPLETED_AT_FUTURE_TOLERANCE_SECONDS:
+        result.error(
+            "'completed_at' is %.1f hours in the FUTURE (%s, now %s). A "
+            "future-dated receipt passes the staleness gate by construction "
+            "for as long as the drift lasts. The usual cause is writing local "
+            "time and labelling it `Z` -- record UTC, e.g. "
+            "`date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`."
+            % (ahead / 3600.0, raw, now.isoformat(timespec="seconds"))
+        )
+
+
+def _parse_iso8601(raw: str):
+    """A timezone-aware datetime, or None. Naive input is read as UTC."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def validate_receipt_payload(receipt: Any, project_dir: str) -> ValidationResult:
     """Validate an already-parsed receipt object.
 
@@ -705,6 +781,8 @@ def validate_receipt_payload(receipt: Any, project_dir: str) -> ValidationResult
         completed_at = receipt["completed_at"]
         if not isinstance(completed_at, str) or not completed_at.strip():
             result.error("'completed_at' must be a non-empty ISO 8601 timestamp string")
+        else:
+            _check_completed_at_bounds(result, completed_at)
 
     # Optional: confidence (recommended for controlled mode)
     if "confidence" in receipt:

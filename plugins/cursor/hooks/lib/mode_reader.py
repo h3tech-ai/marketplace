@@ -52,6 +52,34 @@ def normalize_mode(raw: str) -> str:
     return MODE_ALIASES.get(raw.lower(), DEFAULT_MODE)
 
 
+def classify_mode(raw) -> dict:
+    """Say what an engagement-mode spelling is, using this module's vocabulary.
+
+    Returns `{"value", "kind", "canonical"}` where `kind` is one of:
+
+      canonical  a name in CANONICAL_MODES (case-insensitive, as the runtime reads it)
+      alias      a name in MODE_ALIASES that is not canonical; `canonical` is the
+                 spelling to move to, which is the mode it MEANS (`autonomous` is
+                 `structured`, `controlled` is `interactive`, never the reverse)
+      absent     nothing declared; the runtime defaults to DEFAULT_MODE
+      unknown    a name this module does not know; `canonical` is empty
+
+    `doctor` asks this instead of holding its own copy of the sets. Its copy
+    named `controlled` canonical and called `autonomous` a legacy alias, the
+    inverse of the comment above MODE_ALIASES, and its auto-fix rewrote a
+    correct `interactive` project to the legacy spelling (#846).
+    """
+    value = "" if raw is None else str(raw).strip()
+    key = value.lower()
+    if not key:
+        return {"value": value, "kind": "absent", "canonical": DEFAULT_MODE}
+    if key in CANONICAL_MODES:
+        return {"value": value, "kind": "canonical", "canonical": key}
+    if key in MODE_ALIASES:
+        return {"value": value, "kind": "alias", "canonical": MODE_ALIASES[key]}
+    return {"value": value, "kind": "unknown", "canonical": ""}
+
+
 def get_engagement_mode(project_dir: str) -> str:
     """Read engagement mode from project settings.
 

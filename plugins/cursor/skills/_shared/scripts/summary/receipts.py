@@ -3,6 +3,7 @@
 
 import os
 import re
+from typing import Optional
 
 # v2 role abbreviation mapping for story-scoped receipt naming.
 # Canonical direction: abbreviation -> full role name.
@@ -78,7 +79,11 @@ def normalize_receipt(raw: dict) -> dict:
         artifacts_count = 0
 
     # Verification commands
-    verification_commands = raw.get("verification_commands", [])
+    # `null` or a scalar here once aborted the whole summary build (#847); a
+    # receipt that cannot say what it ran contributes no commands.
+    verification_commands = raw.get("verification_commands")
+    if not isinstance(verification_commands, list):
+        verification_commands = []
 
     # Story DoD (per-story Definition of Done evaluation)
     story_dod = raw.get("story_dod", {})
@@ -121,14 +126,77 @@ def normalize_receipt(raw: dict) -> dict:
     }
 
 
-def extract_findings(receipts: list) -> dict:
+#: Severities the report layer knows how to render, most severe first.
+#: `unknown` is the bucket for a finding that did not state a usable one: it is
+#: counted, never promoted into `medium` (the display default for a dict with
+#: no `severity` key at all), so a number never shows up in a column nobody
+#: wrote it under. Matches the rule `spq_state_machine.FINDING_SEVERITIES`
+#: documents for the Cycle-side reader.
+SEVERITIES = ("critical", "high", "medium", "low", "unknown")
+
+
+def _text(value) -> str:
+    """A receipt field as display text. Absent, null and structured values are "".
+
+    Receipts are written by agents, and a field that should be text arrives as
+    null, a list or a number often enough that one bad value must not decide
+    whether the whole dashboard builds (#847). An int is kept (`"id": 7`);
+    containers are not, since a dict or list is unhashable and has no sensible
+    one-line form.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _severity(value, default: str = "unknown") -> str:
+    """Lower-cased severity text, or `default` when the value is not usable text."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return default
+
+
+def _receipt_label(r: dict) -> str:
+    """Name a receipt for a warning: its file, with the home it came from."""
+    name = r.get("_filename") or "<unnamed receipt>"
+    home = r.get("_receipt_home")
+    return os.path.join(home, name) if home else name
+
+
+def shape_warnings(raw: dict) -> list:
+    """What `normalize_receipt` had to tolerate in one raw receipt, as warnings."""
+    out = []
+    if not isinstance(raw.get("verification_commands", []), list):
+        out.append(
+            f"{_receipt_label(raw)}: verification_commands is "
+            f"{type(raw['verification_commands']).__name__}, expected a list; ignored"
+        )
+    return out
+
+
+def extract_findings(receipts: list, warnings: Optional[list] = None) -> dict:
     """Build structured findings from receipt data only (no markdown regex).
 
     Collects findings from all agent receipts (QE, CE, CR, and others).
+
+    Tolerant by design (#847): one receipt with a malformed `findings` /
+    `fixes` / `blocking_issues` / `sr_results` must not abort the summary the
+    status dashboard is built from. What cannot be read is dropped or filed
+    under severity `unknown`, and `warnings` (when given) names the receipt and
+    the shape, so the loss is stated rather than silent.
     """
     items = []
-    summary = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-    fixed = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    summary = {sev: 0 for sev in SEVERITIES}
+    fixed = {sev: 0 for sev in SEVERITIES}
+    if warnings is None:
+        warnings = []
+
+    def warn(r: dict, what: str) -> None:
+        msg = f"{_receipt_label(r)}: {what}"
+        if msg not in warnings:
+            warnings.append(msg)
 
     for r in receipts:
         findings_data = r.get("_findings", {})
@@ -138,17 +206,34 @@ def extract_findings(receipts: list) -> dict:
         # Case 1: findings is a list of structured items
         if isinstance(findings_data, list):
             for f in findings_data:
-                sev = f.get("severity", "medium").lower()
+                if isinstance(f, str) and f.strip():
+                    # A legacy receipt listing findings as plain strings. The
+                    # text is all it states, so it becomes the title and the
+                    # severity is honestly unknown.
+                    warn(r, "findings entry is a plain string; counted as severity unknown")
+                    f = {"title": f}
+                    sev = "unknown"
+                elif not isinstance(f, dict):
+                    warn(r, f"findings entry of type {type(f).__name__} skipped")
+                    continue
+                elif "severity" not in f:
+                    # No `severity` key keeps its historical `medium` default;
+                    # a key that is present but unusable is `unknown`.
+                    sev = "medium"
+                else:
+                    sev = _severity(f["severity"])
+                    if sev == "unknown":
+                        warn(r, "finding severity is not usable text; counted as unknown")
                 items.append({
-                    "id": f.get("id", ""),
-                    "title": f.get("title", ""),
+                    "id": _text(f.get("id")),
+                    "title": _text(f.get("title")),
                     "severity": sev,
-                    "status": f.get("status", "open"),
-                    "fixed_by": f.get("fixed_by", ""),
+                    "status": _text(f.get("status")) or "open",
+                    "fixed_by": _text(f.get("fixed_by")),
                     "source_role": role,
                     "source_story": story_id,
-                    "file_ref": f.get("file_ref", ""),
-                    "description": f.get("description", ""),
+                    "file_ref": _text(f.get("file_ref")),
+                    "description": _text(f.get("description")),
                 })
                 summary[sev] = summary.get(sev, 0) + 1
 
@@ -165,7 +250,11 @@ def extract_findings(receipts: list) -> dict:
                 summary[sev] = summary.get(sev, 0) + count
 
             # Extract blocking_issues as individual finding items
-            for issue in r.get("_blocking_issues", []):
+            blocking = r.get("_blocking_issues", [])
+            if blocking is not None and not isinstance(blocking, list):
+                warn(r, f"blocking_issues is {type(blocking).__name__}, expected a list; ignored")
+                blocking = []
+            for issue in blocking or []:
                 if isinstance(issue, str):
                     # Parse "SR-01: Description" format
                     m = re.match(r"^([\w-]+):\s*(.+)", issue)
@@ -184,7 +273,11 @@ def extract_findings(receipts: list) -> dict:
                     })
 
             # Extract SR results as findings
-            for sr_id, result in r.get("_sr_results", {}).items():
+            sr_results = r.get("_sr_results", {})
+            if sr_results is not None and not isinstance(sr_results, dict):
+                warn(r, f"sr_results is {type(sr_results).__name__}, expected an object; ignored")
+                sr_results = {}
+            for sr_id, result in (sr_results or {}).items():
                 if result in ("FAIL", "PARTIAL", "NOT_IMPLEMENTED"):
                     sev = "critical" if result == "FAIL" else "medium"
                     items.append({
@@ -199,28 +292,44 @@ def extract_findings(receipts: list) -> dict:
                         "description": "",
                     })
 
+        elif findings_data is not None and not isinstance(findings_data, dict):
+            warn(r, f"findings is {type(findings_data).__name__}, expected a list or object; ignored")
+
     # Apply fixes from remediation receipts
     fixes_applied = []
     for r in receipts:
         fixes = r.get("_fixes", [])
         story_id = r["story_id"]
-        for fix in fixes:
+        if fixes is not None and not isinstance(fixes, list):
+            warn(r, f"fixes is {type(fixes).__name__}, expected a list; ignored")
+            fixes = []
+        for fix in fixes or []:
             if isinstance(fix, dict):
-                finding_ref = fix.get("finding") or fix.get("finding_id") or fix.get("id", "")
-                sev = fix.get("severity", "").lower()
+                finding_ref = (
+                    _text(fix.get("finding"))
+                    or _text(fix.get("finding_id"))
+                    or _text(fix.get("id"))
+                )
+                sev = _severity(fix.get("severity"), default="")
                 fixes_applied.append({
                     "finding_ref": finding_ref,
                     "severity": sev,
                     "fixed_by": story_id,
-                    "title": fix.get("title", ""),
-                    "description": fix.get("description", ""),
+                    "title": _text(fix.get("title")),
+                    "description": _text(fix.get("description")),
                 })
+            else:
+                warn(r, f"fixes entry of type {type(fix).__name__} skipped")
 
     # Mark items as fixed based on fixes
     for fix in fixes_applied:
         matched = False
         for item in items:
-            if (fix["finding_ref"] and
+            # An item with no id cannot be matched by reference: "" is a
+            # substring of every string, so an id-less finding (every plain
+            # string finding, #847) would otherwise be marked fixed by
+            # whichever fix came first.
+            if (fix["finding_ref"] and item["id"] and
                 (fix["finding_ref"] in item["id"] or
                  item["id"] in fix["finding_ref"])):
                 item["status"] = "fixed"
@@ -265,8 +374,8 @@ def extract_findings(receipts: list) -> dict:
             unique_items.append(item)
 
     # Sort by severity
-    SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    unique_items.sort(key=lambda x: SEV_ORDER.get(x["severity"], 4))
+    SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
+    unique_items.sort(key=lambda x: SEV_ORDER.get(x["severity"], 5))
 
     return {
         "summary": summary,

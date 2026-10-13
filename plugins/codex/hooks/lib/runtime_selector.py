@@ -901,6 +901,34 @@ def read_build_mode(project_dir: Any) -> str:
     return _build_mode_of(_read_config(project_dir))
 
 
+def read_declared(project_dir: Any, *path: str) -> Optional[Any]:
+    """The scalar `.synaptory.yaml` declares at `path`, or None when absent.
+
+    `read_declared(d, "engagement_mode")` reads a top-level key and
+    `read_declared(d, "agents", "default_backend")` a nested one. This is the
+    public face of the section parser below, for callers (`doctor`) that need a
+    nested key and would otherwise grow a column-0 regex that never matches an
+    indented one. The value is returned as the parser reads it, so an unquoted
+    `true` is a bool and a quoted one a string; absent, a mapping where a scalar
+    was asked for, and an unreadable file are all None.
+    """
+    text = _read_config(project_dir)
+    if not path:
+        return None
+    if len(path) == 1:
+        for line in text.splitlines():
+            match = _KEY_RE.match(line)
+            if match and match.group(1) == path[0]:
+                return _scalar(_strip_comment(match.group(2)).strip())
+        return None
+    node, _problems = _parse_section(text, path[0])
+    for key in path[1:]:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return None if isinstance(node, (dict, list)) else node
+
+
 def load_policy(project_dir: Any) -> RuntimePolicy:
     """Read the project's runtime policy from `.synaptory.yaml`.
 

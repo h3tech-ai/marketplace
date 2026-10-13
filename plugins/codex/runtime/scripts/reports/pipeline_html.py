@@ -8,6 +8,7 @@ SEV_COLOR = {
     "high": "#f97316", "High": "#f97316",
     "medium": "#eab308", "Medium": "#eab308",
     "low": "#6b7280", "Low": "#6b7280",
+    "unknown": "#9ca3af", "Unknown": "#9ca3af",
 }
 
 STAGE_ICON = {
@@ -100,6 +101,7 @@ a { color: var(--accent2); text-decoration: none; }
 .finding-item[data-sev="high"] { border-left: 3px solid #f97316; }
 .finding-item[data-sev="medium"] { border-left: 3px solid #eab308; }
 .finding-item[data-sev="low"] { border-left: 3px solid #6b7280; }
+.finding-item[data-sev="unknown"] { border-left: 3px dashed #9ca3af; }
 .finding-item.fixed { opacity: 0.6; }
 .sev-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; margin-top: 6px; }
 .finding-title { font-size: 13px; font-weight: 600; }
@@ -260,7 +262,7 @@ def _html_findings(s: dict) -> str:
         btns += f'<button class="filter-btn" data-sev="open" onclick="filterFindings(\'open\')">Open ({open_count})</button>'
     if fixed_count:
         btns += f'<button class="filter-btn" data-sev="fixed" onclick="filterFindings(\'fixed\')">Fixed ({fixed_count})</button>'
-    for sev in ["critical", "high", "medium", "low"]:
+    for sev in ["critical", "high", "medium", "low", "unknown"]:
         if sev in counts:
             btns += f'<button class="filter-btn" data-sev="{sev}" onclick="filterFindings(\'{sev}\')">{sev.capitalize()} ({counts[sev]})</button>'
 
@@ -372,7 +374,7 @@ def _html_sprint_detail(s: dict) -> str:
     dod = detail["dod_checklist"]
     summary = detail["summary"]
 
-    SEV_DOT = {"critical": "#ef4444", "high": "#f97316", "medium": "#eab308", "low": "#6b7280"}
+    SEV_DOT = {"critical": "#ef4444", "high": "#f97316", "medium": "#eab308", "low": "#6b7280", "unknown": "#9ca3af"}
     STATUS_CSS = {
         "done": ("var(--green)", "✓ Done"),
         "review": ("var(--yellow)", "⚠ Review"),

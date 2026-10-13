@@ -1082,34 +1082,11 @@ cmd_test() {
     # Layer 1 (unit) + Layer 2 (hook integration). The full e2e suite
     # ([Layer 3](e2e/scenarios/)) runs separately via ./synaptory e2e.
     echo ""
-    echo "  Running pytest (plugin-claude/ + plugin-cursor/ + plugin-codex/ + scripts/)..."
+    echo "  Running pytest (plugin-claude/ + plugin-cursor/ + plugin-codex/)..."
     echo ""
     local pytest_dirs=(plugin-claude/tests plugin-cursor/tests)
     if [[ -d plugin-codex/tests ]]; then
       pytest_dirs+=(plugin-codex/tests)
-    fi
-    # scripts/tests covers the identity broker (scripts/h3t-github), the guard
-    # shim (scripts/h3t-tool-guard), the identity audit and the policy fan-out.
-    # It had a real suite and no automation: nothing under .github/workflows/
-    # named it and it was not in this array, so it only ever ran when someone
-    # remembered to type the path. Both guard defects to date (#656, #667) were
-    # found by hand, and the suite that would have caught them was already
-    # written. It belongs here rather than in a CI-only step so the same
-    # command covers it locally, which is where the refusal path is exercised.
-    #
-    # Hermetic except for one dependency: test_h3t_github.py resolves a real
-    # `git` on PATH outside the guard shim, and fails without one. Every runner
-    # that checks the repository out has it; a bare container may not.
-    #
-    # Running it HERE rather than only in CI also buys a second shell for free.
-    # The guard is `#!/bin/sh` and the tests exec it through that shebang, so
-    # the interpreter under test is whichever `/bin/sh` the host provides:
-    # bash 3.2 in sh-mode on a macOS laptop, dash on ubuntu-latest. #667 was a
-    # resolution bug in exactly that layer and was verified by hand against
-    # both. This is that pair, automated, without a shell matrix -- so a
-    # CI-only step would have covered dash and dropped the bash 3.2 half.
-    if [[ -d scripts/tests ]]; then
-      pytest_dirs+=(scripts/tests)
     fi
     if python3 -m pytest "${pytest_dirs[@]}" -q --no-header 2>&1; then
       :

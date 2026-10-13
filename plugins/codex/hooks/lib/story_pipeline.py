@@ -437,28 +437,106 @@ def phi_risk_signals(project_dir: str | os.PathLike) -> tuple[str, ...]:
     return DEFAULT_PHI_RISK_SIGNALS + tuple(e for e in extra if e)
 
 
+#: Artifact suffixes that mark a documentation-only file (#858). A document's
+#: file name is prose, not code: `ci-04-double-reduction-audit.md` describes
+#: an audit, it does not write one, so its name is not a PHI-risk signal.
+_PHI_DOC_SUFFIXES: tuple[str, ...] = (".md", ".mdx", ".rst", ".txt", ".adoc")
+
+#: Path segments that mark a documentation tree (#858).
+_PHI_DOC_SEGMENTS: frozenset[str] = frozenset({"docs"})
+
+#: A camelCase transition (`auditService`, `PHIAccess`) is a word boundary,
+#: so it is split before the blob is lowercased (#858).
+_CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _phi_is_doc_artifact(path: str) -> bool:
+    """True when an artifact path names a documentation-only file (#858)."""
+    norm = path.strip().replace("\\", "/").lower()
+    if not norm:
+        return False
+    if norm.endswith(_PHI_DOC_SUFFIXES):
+        return True
+    return any(seg in _PHI_DOC_SEGMENTS for seg in norm.split("/")[:-1])
+
+
+def _phi_signal_matches(sig: str, blob: str) -> bool:
+    """Match one lowercased generic signal against the lowercased blob (#858).
+
+    The signal matches only where it is not embedded in a larger alphanumeric
+    word, so `phi` no longer matches `graphic` and `ehr` no longer matches
+    inside an unrelated word. Anything that is not `[a-z0-9]` is a boundary — including `_`, `-`,
+    `.` and `/` — so `audit_log`, `logger.warn`, `src/audit/audit.service.ts`
+    and `patient-pii.subscriber.ts` still match. An optional plural `s`/`es`
+    is tolerated (`patients/`, `audits`).
+    """
+    pattern = r"(?<![a-z0-9])" + re.escape(sig) + r"(?:e?s)?(?![a-z0-9])"
+    return re.search(pattern, blob) is not None
+
+
 def story_touches_phi(
     receipts: list[dict[str, Any]], signals: tuple[str, ...]
 ) -> bool:
-    """True if any receipt references a PHI-risk signal (#31).
+    """True if any receipt references a PHI-risk signal (#31, #858).
 
-    Scans changed-file artifacts and the task/summary text (case-insensitive
-    substring). This is the diff-signal trigger the issue asks for: PHI module
-    paths, `logger.*`, `phi_access_log`/audit writes, FHIR clients, etc.
+    Scans changed-file artifacts and the task/summary text. This is the
+    diff-signal trigger the issue asks for: PHI module paths, `logger.*`,
+    `phi_access_log`/audit writes, FHIR clients, etc.
+
+    Matching rule (#858):
+
+    * A generic signal from `DEFAULT_PHI_RISK_SIGNALS` matches
+      case-insensitively and only on token boundaries: never embedded in a
+      larger alphanumeric word. Any non-alphanumeric character (`_`, `-`, `.`,
+      `/`, whitespace) and a camelCase transition (detected on the original
+      case, before lowercasing) count as boundaries; an optional plural
+      `s`/`es` is tolerated.
+    * Every other signal — a project `healthcare.phi_paths` entry, with or
+      without `/` — keeps plain case-insensitive substring matching, so a
+      fragment such as `271` or `officeally` still catches `edi271-parser.ts`
+      or `officeallyClient.ts`. Narrowing a project's own PHI gate would be a
+      safety regression.
+    * For every signal, documentation-only artifacts (`*.md`, `*.mdx`, `*.rst`, `*.txt`,
+      `*.adoc`, or anything under a `docs/` segment) are left out of the path
+      haystack, so a document's file name never makes a unit PHI-touching. A
+      unit that also changes a real source file is judged on that file, and
+      task/summary text is still scanned.
     """
     haystack: list[str] = []
     for r in receipts:
         for art in r.get("artifacts") or []:
             if isinstance(art, str):
-                haystack.append(art.lower())
+                if _phi_is_doc_artifact(art):
+                    continue
+                haystack.append(art)
             elif isinstance(art, dict):
-                haystack.append(json.dumps(art).lower())
+                ref = art.get("path") or art.get("file")
+                if isinstance(ref, str) and _phi_is_doc_artifact(ref):
+                    continue
+                haystack.append(json.dumps(art))
         for key in ("task", "summary"):
             val = r.get(key)
             if isinstance(val, str):
-                haystack.append(val.lower())
-    blob = "\n".join(haystack)
-    return any(sig.lower() in blob for sig in signals if sig)
+                haystack.append(val)
+    joined = "\n".join(haystack)
+    # Project entries match the text as written; generic signals match the
+    # camelCase-split text (split on the ORIGINAL case, then lowercased), so
+    # `auditService.ts` exposes `audit` without `phi` matching `graphic`.
+    raw_blob = joined.lower()
+    token_blob = _CAMEL_SPLIT.sub(" ", joined).lower()
+    for sig in signals:
+        if not sig:
+            continue
+        needle = sig.lower()
+        if needle not in _DEFAULT_PHI_TOKENS:
+            # A project `healthcare.phi_paths` entry (a path such as
+            # `apps/app-service/src/modules/patient/`, or a bare fragment such
+            # as `officeally` or `271`) keeps substring matching.
+            if needle in raw_blob:
+                return True
+        elif _phi_signal_matches(needle, token_blob):
+            return True
+    return False
 
 
 #: The compliance obligations the compliance-engineer used to discharge by
@@ -1141,7 +1219,11 @@ DOD_TIER_CHECKS: dict[str, list[str]] = {
 # these (changed-file paths, verification commands, summary) is treated as
 # PHI-sensitive. Generic on purpose — projects extend the list with their own
 # module paths via `.synaptory.yaml: healthcare.phi_paths: [...]`. Matching is
-# case-insensitive substring against receipt artifacts + task/summary text.
+# case-insensitive and token-boundary aware (#858): a signal matches only where
+# it is not embedded in a larger alphanumeric word (`_`, `-`, `.`, `/` and
+# camelCase transitions are boundaries), against non-documentation receipt
+# artifacts + task/summary text. Project `phi_paths` entries are NOT narrowed:
+# they keep plain case-insensitive substring matching. See `story_touches_phi`.
 DEFAULT_PHI_RISK_SIGNALS: tuple[str, ...] = (
     "logger",
     "logging",
@@ -1154,6 +1236,12 @@ DEFAULT_PHI_RISK_SIGNALS: tuple[str, ...] = (
     "ehr",
     "medical",
     "clinical",
+)
+
+#: The generic signals that get token-boundary matching (#858). Anything else
+#: in a signal list is project-supplied and keeps substring matching.
+_DEFAULT_PHI_TOKENS: frozenset[str] = frozenset(
+    sig.lower() for sig in DEFAULT_PHI_RISK_SIGNALS
 )
 
 

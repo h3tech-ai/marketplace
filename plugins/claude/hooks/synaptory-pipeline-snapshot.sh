@@ -110,8 +110,26 @@ SNAPSHOT
 
 # Build pipeline summary and generate reports (PIPELINE.md + PIPELINE.html)
 SCRIPTS_DIR="${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts"
+# A failed build used to vanish here (`2>/dev/null || true`), and since the
+# builder left the previous summary in place, status read a 19-day-old file as
+# current (#847). The builder now removes the stale file and exits non-zero;
+# this records WHY, in a file `/synaptory status` and a human can both find.
+# It must still never block or fail the Stop event, so every step is guarded.
+SUMMARY_LOG="$SUITE_DIR/.orchestrator/summary-build.log"
 if [ -f "$SCRIPTS_DIR/build_summary.py" ]; then
-  "$_py" "$SCRIPTS_DIR/build_summary.py" "$CLAUDE_PROJECT_DIR" 2>/dev/null || true
+  _summary_err=$("$_py" "$SCRIPTS_DIR/build_summary.py" "$CLAUDE_PROJECT_DIR" 2>&1 >/dev/null)
+  _summary_rc=$?
+  if [ "$_summary_rc" -ne 0 ]; then
+    mkdir -p "$(dirname "$SUMMARY_LOG")" 2>/dev/null || true
+    {
+      printf '%s build_summary.py exited %s\n' "$TIMESTAMP" "$_summary_rc"
+      printf '%s\n' "$_summary_err"
+    } > "$SUMMARY_LOG" 2>/dev/null || true
+    printf 'synaptory: pipeline summary build failed (exit %s), see %s\n' \
+      "$_summary_rc" "$SUMMARY_LOG" >&2
+  else
+    rm -f "$SUMMARY_LOG" 2>/dev/null || true
+  fi
 fi
 if [ -f "$SCRIPTS_DIR/generate_reports.py" ]; then
   "$_py" "$SCRIPTS_DIR/generate_reports.py" "$CLAUDE_PROJECT_DIR" 2>/dev/null || true

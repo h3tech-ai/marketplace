@@ -422,3 +422,179 @@ def test_a_flat_v2_project_still_reads_exactly_as_before(
     assert summary["project"]["name"] == PROJECT_NAME
     stage_names = [s["name"] for s in summary["pipeline"]["stages"]]
     assert "SPRINT_EXECUTION" in stage_names
+
+
+# ── #847: a malformed receipt, and a failed build, must not leave a stale file ─
+#
+# `/synaptory status` reads `.synaptory/pipeline-summary.json`. A legacy receipt
+# with `findings: ["text"]` crashed the builder, the old file stayed on disk, and
+# status rendered a 19-day-old summary as current. Two contracts: the builder
+# tolerates what an agent can plausibly have written, and when it fails anyway
+# the previous summary is gone, so absence is the signal status treats as an
+# unreadable board.
+
+_STALE = {"generated_at": "2000-01-01T00:00:00+00:00", "stale": True}
+
+
+def _flat_project_with_receipt(project: Path, receipt: dict) -> Path:
+    """A bare `.synaptory/` with one receipt and a stale summary beside it."""
+    receipts = project / ".synaptory" / ".orchestrator" / "receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "US-001-qe.json").write_text(json.dumps(receipt), encoding="utf-8")
+    summary = project / ".synaptory" / "pipeline-summary.json"
+    summary.write_text(json.dumps(_STALE), encoding="utf-8")
+    return summary
+
+
+def _run_builder(repo_root: Path, project: Path) -> "subprocess.CompletedProcess":
+    return subprocess.run(
+        [sys.executable, str(repo_root / "core" / "scripts" / "build_summary.py"),
+         str(project)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_a_string_finding_builds_and_replaces_the_stale_summary(
+    tmp_path: Path, repo_root: Path
+):
+    """The report, literally: one receipt whose `findings` is a list of strings."""
+    project = tmp_path / "string-findings"
+    summary_path = _flat_project_with_receipt(project, {
+        "task": "t", "agent": "quality-engineer", "backend": "claude",
+        "model": "sonnet", "story_id": "US-001", "role": "qe",
+        "findings": ["some finding text"],
+    })
+
+    proc = _run_builder(repo_root, project)
+
+    assert proc.returncode == 0, proc.stderr
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert "stale" not in summary, "the old summary was left in place"
+    assert summary["findings"]["summary"]["unknown"] == 1
+    assert [i["title"] for i in summary["findings"]["items"]] == ["some finding text"]
+    assert len(summary["warnings"]) == 1
+    assert "US-001-qe.json" in summary["warnings"][0]
+    leftovers = [p.name for p in summary_path.parent.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == [], "the atomic write left a temp file behind"
+
+
+def _failing_driver(tmp_path: Path, repo_root: Path) -> Path:
+    """A launcher that runs the real builder `__main__` with one builder broken.
+
+    Every malformed receipt shape the tolerance covers no longer fails the
+    build, so an unexpected failure has to be injected: `main()` must treat ANY
+    exception as a failed build, not only the two it used to name.
+    """
+    driver = tmp_path / "failing_driver.py"
+    driver.write_text(
+        "import runpy, sys\n"
+        "scripts = %r\n"
+        "sys.path[:0] = [scripts, %r]\n"
+        "import summary.pipeline as p\n"
+        "def boom(*a, **k):\n"
+        "    raise ValueError('injected failure for #847')\n"
+        "p.build_open_items = boom\n"
+        "sys.argv = [scripts + '/build_summary.py'] + sys.argv[1:]\n"
+        "runpy.run_path(scripts + '/build_summary.py', run_name='__main__')\n"
+        % (str(repo_root / "core" / "scripts"), str(repo_root / "core" / "lib")),
+        encoding="utf-8",
+    )
+    return driver
+
+
+def test_a_failed_build_exits_nonzero_and_removes_the_stale_summary(
+    tmp_path: Path, repo_root: Path
+):
+    project = tmp_path / "failing-build"
+    summary_path = _flat_project_with_receipt(project, {
+        "task": "t", "agent": "quality-engineer", "story_id": "US-001", "role": "qe",
+    })
+    assert summary_path.exists()
+
+    proc = subprocess.run(
+        [sys.executable, str(_failing_driver(tmp_path, repo_root)), str(project)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode != 0
+    assert not summary_path.exists(), (
+        "a failed build left the previous pipeline-summary.json to be read as current"
+    )
+    assert "ValueError" in proc.stderr and "injected failure for #847" in proc.stderr
+    assert "Removed the previous pipeline-summary.json" in proc.stderr
+    assert "Traceback" not in proc.stderr, "the cause should be a message, not a crash dump"
+
+
+def test_a_failed_custom_output_build_leaves_the_default_summary_alone(
+    tmp_path: Path, repo_root: Path
+):
+    """Only the file this run was going to write is stale because of this run."""
+    project = tmp_path / "custom-output"
+    default = _flat_project_with_receipt(project, {
+        "task": "t", "story_id": "US-001", "role": "qe",
+    })
+    custom = tmp_path / "elsewhere.json"
+    custom.write_text(json.dumps(_STALE), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(_failing_driver(tmp_path, repo_root)), str(project),
+         "--output", str(custom)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert proc.returncode != 0
+    assert not custom.exists()
+    assert default.exists()
+
+
+def test_a_missing_workspace_still_fails_cleanly(tmp_path: Path, repo_root: Path):
+    proc = _run_builder(repo_root, tmp_path)
+    assert proc.returncode == 1
+    assert ".synaptory/ not found" in proc.stderr
+
+
+def test_a_non_object_receipt_root_is_skipped_and_named(
+    tmp_path: Path, summary_modules
+):
+    build_summary, _ = summary_modules
+    project = tmp_path / "list-root"
+    _flat_project_with_receipt(project, {"task": "t", "story_id": "US-001", "role": "qe"})
+    receipts = project / ".synaptory" / ".orchestrator" / "receipts"
+    (receipts / "legacy.json").write_text('["not", "an", "object"]', encoding="utf-8")
+
+    summary = build_summary.assemble(project)
+
+    assert len(summary["receipts_normalized"]) == 1
+    assert any("legacy.json" in w and "list" in w for w in summary["warnings"])
+
+
+def test_mixed_numeric_and_text_story_ids_do_not_break_the_sort(
+    tmp_path: Path, summary_modules
+):
+    build_summary, _ = summary_modules
+    project = tmp_path / "mixed-ids"
+    receipts = project / ".synaptory" / ".orchestrator" / "receipts"
+    receipts.mkdir(parents=True)
+    for name, story_id in (("a.json", 5), ("b.json", "US-002"), ("c.json", 12)):
+        (receipts / name).write_text(
+            json.dumps({"task": "t", "role": "qe", "story_id": story_id}),
+            encoding="utf-8")
+
+    summary = build_summary.assemble(project)
+
+    assert len(summary["receipts_normalized"]) == 3
+
+
+def test_null_verification_commands_does_not_break_the_build(
+    tmp_path: Path, summary_modules
+):
+    build_summary, _ = summary_modules
+    project = tmp_path / "null-vc"
+    _flat_project_with_receipt(project, {
+        "task": "t", "story_id": "US-001", "role": "qe", "verification_commands": None,
+    })
+
+    summary = build_summary.assemble(project)
+
+    assert summary["verification"]["commands"] == []
+    assert any("verification_commands" in w for w in summary["warnings"])

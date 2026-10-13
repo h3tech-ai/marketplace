@@ -477,7 +477,7 @@ def render_quality_html(data: dict) -> str:
             btns += f'<button class="filter-btn" data-sev="open" onclick="filterFindings(\'open\')">Open ({open_count})</button>'
         if fixed_count:
             btns += f'<button class="filter-btn" data-sev="fixed" onclick="filterFindings(\'fixed\')">Fixed ({fixed_count})</button>'
-        for sev in ["critical", "high", "medium", "low"]:
+        for sev in ["critical", "high", "medium", "low", "unknown"]:
             if sev in counts:
                 btns += f'<button class="filter-btn" data-sev="{sev}" onclick="filterFindings(\'{sev}\')">{sev.capitalize()} ({counts[sev]})</button>'
 

@@ -399,3 +399,79 @@ def test_waiver_cannot_dodge_a_non_waivable_gate(tmp_path: Path, receipts_dir: P
         str(tmp_path), "US-14", "early", receipts_dir=str(receipts_dir)
     )
     assert result["checks"]["tests_pass"]["required"] is True
+
+
+# ---------------------------------------------------------------------------
+# #858 — PHI-risk signals match on token boundaries, not file-name substrings
+# ---------------------------------------------------------------------------
+
+
+def _phi(artifacts=None, summary=None, signals=sp.DEFAULT_PHI_RISK_SIGNALS):
+    receipt: dict = {"agent": "software-engineer"}
+    if artifacts is not None:
+        receipt["artifacts"] = artifacts
+    if summary is not None:
+        receipt["summary"] = summary
+    return sp.story_touches_phi([receipt], signals)
+
+
+@pytest.mark.unit
+def test_phi_docs_only_artifact_does_not_trigger_by_file_name():
+    # The GH-732 reproduction: a Markdown-only unit whose file name contains
+    # `audit` must not be promoted to the PHI gates.
+    assert _phi(["docs/requirements/contract-intelligence/ci-04-double-reduction-audit.md"]) is False
+
+
+@pytest.mark.unit
+def test_phi_source_audit_module_triggers():
+    assert _phi(["src/modules/audit/audit.service.ts"]) is True
+
+
+@pytest.mark.unit
+def test_phi_access_log_in_path_triggers():
+    assert _phi(["src/db/migrations/1700000000-phi_access_log.ts"]) is True
+    assert _phi(["src/db/phi_access_log.ts"], signals=("phi_access_log",)) is True
+
+
+@pytest.mark.unit
+def test_phi_logger_call_in_summary_triggers():
+    assert _phi(["src/components/Button.tsx"], summary="Call logger.warn on retry") is True
+
+
+@pytest.mark.unit
+def test_phi_signal_embedded_in_larger_word_does_not_trigger():
+    assert _phi(["src/components/graphic-design.ts"]) is False
+    assert _phi(["src/components/graphic-design.ts"], signals=("phi",)) is False
+
+
+@pytest.mark.unit
+def test_phi_project_entries_without_slash_keep_substring_matching():
+    # Project `phi_paths` entries are never narrowed: bare fragments match
+    # inside larger words, exactly as before #858.
+    assert _phi(["src/edi/edi271-parser.ts"], signals=sp.DEFAULT_PHI_RISK_SIGNALS + ("271",)) is True
+    assert _phi(["src/clients/officeallyClient.ts"], signals=sp.DEFAULT_PHI_RISK_SIGNALS + ("officeally",)) is True
+    # ...but a project entry still cannot fire through a documentation file name.
+    assert _phi(["docs/integrations/edi271-notes.md"], signals=sp.DEFAULT_PHI_RISK_SIGNALS + ("271",)) is False
+
+
+@pytest.mark.unit
+def test_phi_project_path_fragment_still_matches_as_substring():
+    signals = sp.DEFAULT_PHI_RISK_SIGNALS + ("apps/app-service/src/modules/estimation/",)
+    assert _phi(["apps/app-service/src/modules/estimation/estimate.service.ts"], signals=signals) is True
+    # A fragment ending mid-word still matches as a plain substring.
+    assert _phi(["apps/web/src/pages/estimations/List.tsx"], signals=("apps/web/src/pages/estim",)) is True
+
+
+@pytest.mark.unit
+def test_phi_docs_artifact_plus_source_artifact_triggers():
+    assert _phi(["docs/runbooks/audit-retention.md", "src/modules/patient/patient.service.ts"]) is True
+
+
+@pytest.mark.unit
+def test_phi_boundaries_keep_snake_kebab_camel_and_plural_matches():
+    assert _phi(["src/db/audit_log.py"]) is True
+    assert _phi(["src/subscribers/patient-pii.subscriber.ts"]) is True
+    assert _phi(["src/services/auditService.ts"]) is True
+    assert _phi(["src/modules/patients/list.ts"]) is True
+    # Not a doc: a `.ts` file whose name merely sits next to `docs` text.
+    assert _phi(["src/docs-viewer/ehr/client.ts"]) is True

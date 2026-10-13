@@ -132,13 +132,13 @@ def _md_findings(s: dict) -> str:
     if total == 0 and not items:
         return ""
 
-    SEV_ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+    SEV_ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢", "unknown": "⚪"}
     lines = ["## Quality & Findings\n"]
 
     # Summary table
     lines.append("| Severity | Found | Fixed | Open |")
     lines.append("|----------|-------|-------|------|")
-    for sev in ("critical", "high", "medium", "low"):
+    for sev in ("critical", "high", "medium", "low", "unknown"):
         found = summary.get(sev, 0)
         fx = fixed.get(sev, 0)
         # Count from items for more accuracy
@@ -149,6 +149,8 @@ def _md_findings(s: dict) -> str:
         found_display = max(found, found_items)
         fixed_display = max(fx, fixed_items)
         open_display = found_display - fixed_display if found_display > fixed_display else open_items
+        if sev == "unknown" and not found_display:
+            continue  # a row for a bucket nothing landed in is noise on every healthy report
         icon = SEV_ICON[sev]
         lines.append(f"| {icon} {sev.upper()} | {found_display} | {fixed_display} | {open_display} |")
     lines.append("")

@@ -30,6 +30,16 @@ Behaviors (sentinel):
     - write: merges new key-value pairs into existing sentinel (preserves unmentioned keys),
              or appends a new sentinel block if none exists
     - Sentinel is a standalone HTML comment, invisible in rendered markdown (~150 bytes)
+
+Behaviors (build_mode: spq):
+    The sentinel is a Scrum/Kanban artifact: its fields (lifecycle_state,
+    current_sprint, last_agent) describe a board that an SPQ project does not
+    have, because under SPQ pipeline-state.json is only a mode + identity
+    pointer. So both sentinel writers (--rollup-sentinel, --sentinel-write)
+    write NOTHING on an SPQ project, and never create a CLAUDE.md for it. The
+    one thing the rollup path still does there is remove a Scrum-shaped block a
+    pre-fix hook left behind (see strip_stale_scrum_sentinel). The generic
+    fenced-section updater is not affected: it is how the section is generated.
 """
 from __future__ import annotations
 
@@ -191,6 +201,75 @@ def _format_sentinel(sentinel_dict: dict) -> str:
     return "\n".join(lines)
 
 
+# Keys that only the Scrum/Kanban rollup writes. A block carrying either one is
+# the shape a hook wrote into an SPQ project before #845; an SPQ-shaped block
+# (`stage:`) carries neither and is left alone.
+SCRUM_SENTINEL_KEYS = ("lifecycle_state", "current_sprint")
+
+
+def is_spq_project(project_dir: str) -> bool:
+    """Is this project's build_mode `spq`?
+
+    Asks `pipeline_board.read_board`, the one sanctioned reader of pipeline
+    state, rather than parsing the file here: the SPQ pointer is a different
+    shape from the board, and a second parser is how four readers went blind
+    (#514). `read_board` never raises and reports the mode on an unreadable SPQ
+    board too, so a project that cannot be read this session is still skipped
+    rather than written to. An unimportable accessor reads as "not SPQ", which
+    keeps the long-standing Scrum/Kanban behavior.
+    """
+    try:
+        import pipeline_board
+    except ImportError:  # pragma: no cover - same-dir import
+        return False
+    return bool(pipeline_board.read_board(project_dir).is_spq)
+
+
+def strip_stale_scrum_sentinel(project_dir: str, filename: str = "CLAUDE.md") -> bool:
+    """Remove a Scrum-shaped sentinel a pre-#845 hook wrote into an SPQ project.
+
+    Left in place it reads as an instruction (Sprint 0, empty lifecycle) on a
+    project that is in Discovery, and nothing would ever rewrite it. Idempotent:
+    when the file holds no such block nothing is read back for writing, so a
+    second run is a no-op. Returns True when a block was removed.
+
+    A file that held nothing but the stale block (the hook created it) is
+    deleted rather than left empty.
+    """
+    filepath = os.path.join(project_dir, filename)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+
+    stale = [
+        m for m in SENTINEL_PATTERN.finditer(text)
+        if any(k in _parse_sentinel(m.group(1)) for k in SCRUM_SENTINEL_KEYS)
+    ]
+    if not stale:
+        return False
+
+    # Undo exactly what the writers inserted: "\n<block>\n" after the fence,
+    # or a blank-line separator plus the block at the end of the file.
+    for m in reversed(stale):
+        before, after = text[: m.start()], text[m.end():]
+        if after.startswith("\n"):
+            after = after[1:]
+        if not after.strip():
+            text = (before.rstrip("\n") + "\n") if before.strip() else ""
+        elif before.endswith("\n"):
+            text = before[:-1] + after
+        else:
+            text = before + after
+
+    if not text.strip():
+        os.remove(filepath)
+    else:
+        _atomic_write(filepath, text)
+    return True
+
+
 def build_rollup_sentinel(project_dir: str) -> dict:
     """Read pipeline-state.json and build the canonical sentinel dict.
 
@@ -286,7 +365,14 @@ def write_sentinel_rollup(project_dir: str, filename: str = "CLAUDE.md") -> dict
     This is the canonical multi-spec write path — instead of merging
     individual keys (the legacy `write_sentinel` API), it re-renders the
     sentinel as a complete rollup. Returns the dict that was written.
+
+    Under `build_mode: spq` nothing is written: the sentinel's fields belong to
+    a Scrum/Kanban board that an SPQ project does not have (#845). Returns {}
+    after removing any Scrum-shaped block an earlier hook left behind.
     """
+    if is_spq_project(project_dir):
+        strip_stale_scrum_sentinel(project_dir, filename)
+        return {}
     rollup = build_rollup_sentinel(project_dir)
     if not rollup:
         return {}
@@ -341,7 +427,13 @@ def write_sentinel(
     Merges new key-value pairs into the existing sentinel (unknown keys are
     preserved). If no sentinel exists, appends a new one at the end of the
     file. Atomic write via temp file + os.replace().
+
+    Under `build_mode: spq` this is a no-op (#845): the settings-overlay caller
+    would otherwise append a Scrum-shaped block, or create a CLAUDE.md holding
+    only that block, on a project the sentinel does not describe.
     """
+    if is_spq_project(project_dir):
+        return
     filepath = os.path.join(project_dir, filename)
 
     if not os.path.exists(filepath):

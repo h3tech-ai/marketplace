@@ -239,8 +239,7 @@ import pytest
 #: re-derives it. The tool is imported rather than re-implemented so the id
 #: slug and the table digest have exactly one definition: if the suite computed
 #: a digest its own way, the two could agree with each other and with nothing.
-#: It lives in `scripts/` with no extension, following `scripts/h3t-github`, so
-#: it is loaded by path.
+#: It lives in `scripts/` with no extension, so it is loaded by path.
 TABLE_PATH = "plugin-claude/tests/fixtures/retired_vocabulary_table.json"
 DRIFT_CHECK_PATH = "scripts/check-retired-vocabulary-table"
 

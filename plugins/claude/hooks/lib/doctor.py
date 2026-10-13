@@ -9,6 +9,7 @@ SessionStart does.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -82,6 +83,37 @@ def _loop_lines(project_dir: str) -> tuple[list[str], bool]:
     )
 
 
+def config_facts(project_dir: str) -> dict:
+    """What `.synaptory.yaml` declares, for the `/synaptory doctor` mode document.
+
+    The mode document used to read these with column-0 regexes, which cannot
+    match an indented key: `agents.default_backend` always came back as the
+    default, so the BAA/backend consistency check could never fire (#846). The
+    values come from the runtime's own readers instead, and the engagement
+    vocabulary from `mode_reader`, so doctor holds no copy of either that can
+    drift from what the runtime accepts.
+
+    `cli` is the binary a probe must call: `synaptory-local` on the local
+    channel, the same choice `_run_cli` makes.
+    """
+    import mode_reader  # noqa: PLC0415
+    import runtime_selector  # noqa: PLC0415
+    import story_pipeline  # noqa: PLC0415
+
+    def declared(*path: str) -> str:
+        value = runtime_selector.read_declared(project_dir, *path)
+        return "" if value is None else str(value)
+
+    return {
+        "cli": "synaptory-local" if host_env.local_plugin_runtime() else "synaptory",
+        "project_id": declared("project_id"),
+        "build_mode": runtime_selector.read_build_mode(project_dir),
+        "engagement": mode_reader.classify_mode(declared("engagement_mode")),
+        "baa_enforced": bool(story_pipeline.healthcare_baa_enforced(project_dir)),
+        "declared_backend": declared("agents", "default_backend"),
+    }
+
+
 def run(project_dir: str | None = None) -> int:
     # `host_env.project_dir`, never the Claude-specific env name directly:
     # this module is projected wholesale into the Cursor and Codex packages,
@@ -141,5 +173,14 @@ def run(project_dir: str | None = None) -> int:
     return 0
 
 
+def main(argv: list[str]) -> int:
+    """`doctor.py` runs the diagnostic; `doctor.py facts <project_dir>` prints JSON."""
+    if argv and argv[0] == "facts":
+        project_dir = argv[1] if len(argv) > 1 else host_env.project_dir(os.getcwd())
+        print(json.dumps(config_facts(project_dir)))
+        return 0
+    return run()
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main(sys.argv[1:]))

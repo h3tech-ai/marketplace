@@ -592,3 +592,100 @@ def test_session_guard_counts_spq_receipts(
     assert f"{len(written)} pipeline receipts" in combined, (
         f"session-guard counted the wrong number of SPQ receipts:\n{combined}"
     )
+
+
+# ─── SPQ writes no Scrum-shaped sentinel (#845) ─────────────────────────────
+
+
+@pytest.fixture
+def spq_initialised(
+    hook_env: dict[str, str], plugin_root: Path
+) -> Path:
+    """An SPQ project exactly as the reporter had it: `spq_state_machine.py
+    init`, a settings.md carrying the keys the hooks overlay, a committed
+    `CLAUDE.md` with no sentinel, and a stale Scrum receipt in the legacy flat
+    directory (the thing `last_agent` used to name).
+    """
+    import subprocess
+    import sys
+
+    project_dir = Path(hook_env["CLAUDE_PROJECT_DIR"])
+    (project_dir / ".synaptory.yaml").write_text('build_mode: "spq"\n', encoding="utf-8")
+    done = subprocess.run(
+        [sys.executable, str(plugin_root / "hooks" / "lib" / "spq_state_machine.py"),
+         "init", str(project_dir)],
+        capture_output=True, text=True, check=False,
+    )
+    assert done.returncode == 0, f"spq init failed: {done.stderr!r}"
+
+    orch = project_dir / ".synaptory" / ".orchestrator"
+    (orch / "settings.md").write_text(
+        "Project: hano-app\nengagement: structured\nparallelism: 2\n", encoding="utf-8"
+    )
+    stale = orch / "receipts"
+    stale.mkdir(parents=True, exist_ok=True)
+    (stale / "INCEPTION-sa.json").write_text("{}", encoding="utf-8")
+    return project_dir
+
+
+def _run_both_sentinel_hooks(plugin_root, hook_env, run_hook) -> None:
+    """PreCompact then SessionEnd, the two hooks that write the sentinel.
+
+    Both detach the sentinel work into a background subshell that inherits the
+    hook's stdout pipe, so `subprocess.run(capture_output=True)` does not return
+    until it has finished; the short sleep is belt and braces, not the sync.
+    """
+    for name, stdin in (
+        ("synaptory-reanchor.sh", json.dumps({"hook_event_name": "PreCompact"})),
+        ("synaptory-session-end.sh", json.dumps({
+            "session_id": "spq-845", "end_reason": "user_quit",
+            "hook_event_name": "SessionEnd",
+        })),
+    ):
+        result = run_hook(plugin_root / "hooks" / name, env=hook_env, stdin=stdin)
+        assert result.returncode == 0, f"{name}: stderr={result.stderr!r}"
+    time.sleep(0.5)
+
+
+@pytest.mark.hook
+def test_spq_hooks_leave_claude_md_byte_identical(
+    plugin_root: Path,
+    hook_env: dict[str, str],
+    spq_initialised: Path,
+    run_hook,
+):
+    """The #845 reproduction, literally: committed CLAUDE.md, no sentinel,
+    `init`, then a session's PreCompact and SessionEnd. The file must not move.
+
+    Run twice, because the report was that it came back every session.
+    """
+    claude_md = spq_initialised / "CLAUDE.md"
+    claude_md.write_text("# hano-app\n\nUser-written notes.\n", encoding="utf-8")
+    before = claude_md.read_bytes()
+
+    for _session in range(2):
+        _run_both_sentinel_hooks(plugin_root, hook_env, run_hook)
+        assert claude_md.read_bytes() == before, (
+            "an SPQ session rewrote CLAUDE.md:\n" + claude_md.read_text("utf-8")
+        )
+
+
+@pytest.mark.hook
+def test_spq_hooks_do_not_create_a_claude_md(
+    plugin_root: Path,
+    hook_env: dict[str, str],
+    spq_initialised: Path,
+    run_hook,
+):
+    """With no CLAUDE.md at all the writers used to create one holding only the
+    sentinel (the rollup path, and the settings overlay through
+    `--sentinel-write`). Neither may under SPQ."""
+    claude_md = spq_initialised / "CLAUDE.md"
+    assert not claude_md.exists()
+
+    _run_both_sentinel_hooks(plugin_root, hook_env, run_hook)
+
+    assert not claude_md.exists(), (
+        "an SPQ session created a CLAUDE.md holding only a sentinel:\n"
+        + claude_md.read_text("utf-8")
+    )

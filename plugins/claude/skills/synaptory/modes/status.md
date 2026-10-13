@@ -10,6 +10,21 @@ First, refresh the canonical pipeline summary JSON from raw workspace data:
 Bash("python3 \"${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/build_summary.py\" \"${CLAUDE_PROJECT_DIR}\"")
 ```
 
+**Check the builder's exit code.** A non-zero exit means the summary could not be
+built, and the builder has already deleted any previous `pipeline-summary.json`
+so an old one cannot pass for current (#847). Treat that exactly like an
+unreadable board (see below): print the builder's error line, and **do not
+render a dashboard, and do not fall back to an older summary or to
+`last-session.md` numbers.** The same holds if the exit code was zero but
+`.synaptory/pipeline-summary.json` is missing. The Stop hook records its own
+failed builds in `.synaptory/.orchestrator/summary-build.log`; name that file
+too when it exists:
+
+```
+  ⚠ Board unreadable — pipeline summary could not be built: {builder error line}
+    Source: build_summary.py (exit {code})
+```
+
 Then read the assembled summary and sprint state as data sources:
 
 ```python
@@ -32,13 +47,14 @@ All dashboard data comes from `pipeline-summary.json`. Parse the JSON to extract
 - `current_stories[]` — story sub-states (queued, in_progress, testing, reviewing, done, blocked)
 - `sprints_completed[]` — velocity, DoD compliance, cycle time (Scrum)
 - `tickets_completed[]` — throughput, cycle time (Kanban)
-- `findings.summary` — counts by severity (critical, high, medium, low)
+- `findings.summary` — counts by severity (critical, high, medium, low, unknown); `unknown` is a finding whose severity could not be read, counted and shown, never folded into another bucket
 - `findings.fixed` — counts of remediated findings by severity
 - `findings.items[]` — individual findings with `status: "open"|"fixed"` and `fixed_by`
 - `verification.commands[]` — re-runnable checks from receipts
 - `context_packages[]` — brownfield knowledge packages
 - `project.engagement` — engagement mode
 - `board` — whether a board was read at all, and from where (see below)
+- `warnings[]`: receipts the builder had to tolerate (a malformed field it dropped or filed under severity `unknown`); each names the receipt file. Show them under the findings section so a tolerated receipt is visible, not silent
 
 ### An unreadable board is not an empty one
 
@@ -365,6 +381,9 @@ AskUserQuestion(questions=[{
 Bash("python3 \"${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/build_summary.py\" \"${CLAUDE_PROJECT_DIR}\"")
 Bash("python3 \"${CLAUDE_PLUGIN_ROOT}/skills/_shared/scripts/generate_reports.py\" \"${CLAUDE_PROJECT_DIR}\"")
 ```
+
+If `build_summary.py` exits non-zero, stop here and report the board as unreadable
+as in Step 1; do not run `generate_reports.py` against a missing or old summary.
 
 ## Notes
 

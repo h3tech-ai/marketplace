@@ -1,7 +1,7 @@
 {
-  "version": "1.3.5",
-  "build_hash": "5cf3d42f985e20cfa8c2b1730feec2fe3fadb045c427ed11665b4fcb53b7ff28",
-  "built_at": "2026-09-22T22:28:54Z",
+  "version": "1.3.6",
+  "build_hash": "846f77ecd250a00d063211ad52978d481794f5233872c55653923ee9f6288794",
+  "built_at": "2026-10-13T11:41:56Z",
   "manifest_file_count": 199,
   "ai_bom": {
     "model_pins": {

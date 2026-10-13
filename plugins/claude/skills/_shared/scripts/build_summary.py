@@ -13,12 +13,14 @@ Usage: python3 build_summary.py [project_dir] [--output path]
 """
 
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 from summary.helpers import _now_iso, _read, _ts_display
-from summary.receipts import normalize_receipt, extract_findings
+from summary.receipts import normalize_receipt, extract_findings, shape_warnings
 from summary.pipeline import (
     build_project, build_pipeline, build_dod_summary, build_verification,
     build_sprint_state, build_context_packages, build_open_items,
@@ -50,13 +52,21 @@ def assemble(project_dir: Path) -> dict:
     rework_log = _read(project_dir / ".synaptory" / ".orchestrator" / "rework-log.md")
 
     # Load and normalize receipts
-    raw_receipts = load_receipts_raw(project_dir)
+    # Receipts are agent-written, so a malformed one is a fact about that file,
+    # not a reason to build nothing: what had to be tolerated is named in
+    # `warnings` below instead of aborting the dashboard (#847).
+    warnings: list = []
+    raw_receipts = load_receipts_raw(project_dir, warnings)
+    for raw in raw_receipts:
+        warnings.extend(shape_warnings(raw))
     receipts = [normalize_receipt(r) for r in raw_receipts]
 
-    # Sort by story_id
-    receipts.sort(key=lambda r: r.get("story_id", ""))
+    # Sort by story_id. `str()` because a receipt may carry a numeric story_id
+    # beside the usual string ones, and `<` between an int and a str raises.
+    receipts.sort(key=lambda r: str(r.get("story_id", "")))
 
     sprint_state = build_sprint_state(state, receipts)
+    findings = extract_findings(receipts, warnings)
 
     result = {
         "generated_at": _now_iso(),
@@ -65,11 +75,12 @@ def assemble(project_dir: Path) -> dict:
         "board": build_board_report(board, project_dir),
         "pipeline": build_pipeline(state, receipts, board),
         "dod_summary": build_dod_summary(state),
-        "findings": extract_findings(receipts),
+        "findings": findings,
         "verification": build_verification(receipts),
         "context_packages": build_context_packages(project_dir),
         "open_items": build_open_items(receipts),
         "receipts_normalized": receipts,
+        "warnings": warnings,
     }
 
     # Include sprint state when build_mode is scrum
@@ -84,6 +95,25 @@ def assemble(project_dir: Path) -> dict:
     return result
 
 
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Write `payload` so a reader sees the old file or the new one, never half.
+
+    Temp file in the TARGET directory (`os.replace` is only atomic within a
+    filesystem), unlinked on any failure so a `.tmp` is never left behind.
+    `core/lib/state_store.write_json_atomic` is not used because it cannot take
+    `default=str`, which this summary relies on for non-JSON values.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, default=str)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def generate(project_dir: Path, output_path: Optional[Path] = None) -> Path:
     synaptory_dir = project_dir / ".synaptory"
     if not synaptory_dir.exists():
@@ -94,17 +124,43 @@ def generate(project_dir: Path, output_path: Optional[Path] = None) -> Path:
     if output_path is None:
         output_path = synaptory_dir / "pipeline-summary.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    _write_json_atomic(output_path, summary)
     return output_path
+
+
+def _remove_stale_summary(path: Path) -> bool:
+    """Delete the summary a failed build would otherwise leave standing.
+
+    A build that fails while an older `pipeline-summary.json` is still on disk
+    is worse than one with no file: the reader opens the old numbers and renders
+    them as current. That is how a 19-day-old summary naming a different spec
+    and engagement mode reached the dashboard (#847). Absence is the signal
+    `modes/status.md` treats as an unreadable board.
+    """
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _failure_cause(exc: BaseException) -> str:
+    """`Type: message (file:line)` for the innermost frame that raised."""
+    cause = f"{type(exc).__name__}: {exc}"
+    tb = exc.__traceback__
+    if tb is None:
+        return cause
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return f"{cause} (at {Path(tb.tb_frame.f_code.co_filename).name}:{tb.tb_lineno})"
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 def main():
     import argparse
-    from summary.versioned_data import (
-        generate_sprint_data, generate_requirements_data, generate_technical_data,
-    )
 
     parser = argparse.ArgumentParser(
         description="Assemble pipeline-summary.json and optional report data"
@@ -124,8 +180,19 @@ def main():
     args = parser.parse_args()
 
     project_dir = Path(args.project_dir).resolve()
+    default_run = not (args.sprint or args.requirements or args.technical)
+    summary_path = (
+        Path(args.output) if args.output
+        else project_dir / ".synaptory" / "pipeline-summary.json"
+    )
 
     try:
+        # Imported inside the guard: a broken projection that cannot import this
+        # must fail the way a bad receipt does, not as a bare traceback that
+        # leaves the previous summary standing.
+        from summary.versioned_data import (
+            generate_sprint_data, generate_requirements_data, generate_technical_data,
+        )
         if args.sprint:
             out = generate_sprint_data(project_dir, args.sprint, args.sprint_type)
             print(f"[synaptory] Sprint {args.sprint} data written to: {out}")
@@ -139,8 +206,14 @@ def main():
             output_path = Path(args.output) if args.output else None
             out = generate(project_dir, output_path)
             print(f"[synaptory] Pipeline summary written to: {out}")
-    except (FileNotFoundError, RuntimeError) as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error: {_failure_cause(e)}", file=sys.stderr)
+        if default_run and _remove_stale_summary(summary_path):
+            print(
+                f"[synaptory] Removed the previous {summary_path.name} so it cannot "
+                "be read as current; the board is unreadable until this is fixed.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
 

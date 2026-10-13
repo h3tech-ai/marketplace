@@ -158,6 +158,14 @@ OWNS = {
 
 AWARE = {
     "core/lib/signals.py": "reads through pipeline_board.read_board (#514)",
+    "core/lib/update_claude_md.py": (
+        "the CLAUDE.md sentinel is a Scrum/Kanban artifact (lifecycle_state, "
+        "current_sprint, last_agent), so under SPQ both writers now ask "
+        "pipeline_board.read_board for the mode and write NOTHING (#845). Was "
+        "BLIND: it anchored to lifecycle_state='' / current_sprint=0 and "
+        "rewrote CLAUDE.md on every PreCompact and SessionEnd. Probed by "
+        "test_update_claude_md_sees_the_real_board below"
+    ),
     "conformance/drivers/base.py": (
         "the SPQ declaration probes (#640). Cycle identity comes from "
         "pipeline_board.read_board, never from opening the pointer -- this "
@@ -216,11 +224,6 @@ AWARE = {
 }
 
 BLIND = {
-    "core/lib/update_claude_md.py": (
-        "the CLAUDE.md sentinel — whose entire purpose is post-compaction "
-        "pipeline awareness — anchors to lifecycle_state='' / current_sprint=0. "
-        "Written by synaptory-reanchor.sh (PreCompact) and session-end"
-    ),
     "benchmarks/parallelism/measure.py": (
         "the SPQ-cutover baseline benchmark (§19.4) reports work_units 0/0 and "
         "observed concurrency 0 on a Cycle with admitted units. Its sibling "
@@ -565,6 +568,33 @@ def test_state_drift_accepts_the_real_board(real_spq_project: Path):
 
     verdict = state_drift.check_drift(str(real_spq_project))
     assert verdict["problems"] == []
+
+
+def test_update_claude_md_sees_the_real_board(real_spq_project: Path):
+    """Was a BLIND declaration until #845: the sentinel writer read the SPQ
+    pointer, found no `lifecycle_state`, and wrote `lifecycle_state: ` /
+    `current_sprint: 0` into CLAUDE.md on a project that is at `CYCLE` with two
+    admitted units.
+
+    Probed against a board `open_cycle` produced. The proof it SAW the board is
+    that it recognised the lifecycle and declined to write, rather than
+    describing a board it could not read: the mode comes from
+    `pipeline_board.read_board`, and the file is left alone.
+    """
+    import pipeline_board
+    import update_claude_md
+
+    assert pipeline_board.read_board(str(real_spq_project)).is_spq is True
+    assert update_claude_md.is_spq_project(str(real_spq_project)) is True
+
+    doc = real_spq_project / "CLAUDE.md"
+    doc.write_text("# proj\n", encoding="utf-8")
+    assert update_claude_md.write_sentinel_rollup(str(real_spq_project)) == {}
+    update_claude_md.write_sentinel(str(real_spq_project), {"engagement": "x"})
+    assert doc.read_text(encoding="utf-8") == "# proj\n", (
+        "the sentinel writer wrote a Scrum-shaped block into an SPQ project's "
+        "CLAUDE.md -- it is blind to the SPQ board again"
+    )
 
 
 # The BLIND declarations, asserted as still-blind. A declared gap that cannot

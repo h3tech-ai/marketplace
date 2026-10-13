@@ -130,8 +130,10 @@ fi
 `CLAUDE.md` is the session-persistent anchor that Claude Code reads at the start of every session. It must be generated during Inception — not deferred to Init mode — because Init is skipped when `.synaptory.yaml` already exists. Without `CLAUDE.md`, cross-session pipeline state, git safety rules, and agent roster context are lost.
 
 ```python
-# Generate only if CLAUDE.md is missing or has no synaptory section
-if not Read("CLAUDE.md") or "synaptory-state" not in Read("CLAUDE.md"):
+# Generate only if CLAUDE.md is missing or has no synaptory section.
+# The section is delimited by the `synaptory-start` fence that update_claude_md.py
+# writes around it, so the fence is the marker (not the `synaptory-state` comment).
+if not Read("CLAUDE.md") or "synaptory-start" not in Read("CLAUDE.md"):
     project_name = Read(".synaptory.yaml")  # extract project_name
     build_mode   = Read(".synaptory.yaml")  # extract build_mode, default "scrum"
     engagement   = Read(".synaptory.yaml")  # extract engagement_mode, default "autonomous"

@@ -334,7 +334,10 @@ def build_dod_summary(state: dict) -> dict:
 def build_verification(receipts: list) -> dict:
     commands = []
     for r in receipts:
-        for cmd in r.get("verification_commands", []):
+        cmds = r.get("verification_commands")
+        # `null` here aborted the whole build (#847); `normalize_receipt` already
+        # coerces it, this guards a caller handing in an un-normalized receipt.
+        for cmd in cmds if isinstance(cmds, list) else []:
             if isinstance(cmd, str):
                 # v2 simple string format
                 commands.append({
@@ -596,7 +599,14 @@ def receipt_dirs(project_dir: Path) -> list:
     return dirs
 
 
-def load_receipts_raw(project_dir: Path) -> list:
+def load_receipts_raw(project_dir: Path, warnings: Optional[list] = None) -> list:
+    """Every receipt under every home, as dicts.
+
+    A receipt whose root is not an object (a bare list or string) cannot carry
+    the `_filename` / `_receipt_home` fields the rest of the build relies on, and
+    used to abort the whole summary with a `TypeError` (#847). It is skipped
+    instead, and named in `warnings` when the caller supplies one.
+    """
     receipts = []
     for receipts_dir in receipt_dirs(project_dir):
         parent = receipts_dir.parent
@@ -604,6 +614,12 @@ def load_receipts_raw(project_dir: Path) -> list:
         cycle_id = parent.name if parent.parent.name == "cycles" else ""
         for f in sorted(receipts_dir.glob("*.json")):
             data = _load_json(f)
+            if data and not isinstance(data, dict):
+                if warnings is not None:
+                    warnings.append(
+                        f"{f}: receipt root is {type(data).__name__}, expected an object; skipped"
+                    )
+                continue
             if data:
                 data["_filename"] = f.name
                 data["_mtime"] = os.path.getmtime(str(f))

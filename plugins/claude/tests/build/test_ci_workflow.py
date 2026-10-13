@@ -117,13 +117,10 @@ def test_user_guide_docs_are_never_ignored(ignored, trigger):
 _TEST_COVERED_ROOT_MARKDOWN = {
     # test_runtime_claims_are_qualified.py reads it as a FRONT_DOORS surface.
     "README.md",
-    # scripts/tests/test_identity_policy_sync.py asserts both still match
-    # scripts/h3t-identity-policy.md, which fans out into them. A drifted
-    # generated copy is indistinguishable from a fresh one by eye, so the
-    # test is the only thing that reports it -- and it cannot report on a
-    # workflow run that never happened.
+    # test_model_pin_decision_record.py reads it in its census roots.
+    # AGENTS.md left this set when the identity policy test that read it
+    # moved to h3tech-ai/synaptory-infra with the tooling (SPD-197).
     "CLAUDE.md",
-    "AGENTS.md",
 }
 
 
@@ -154,10 +151,10 @@ def test_no_source_tree_is_ignored(ignored, trigger):
         "core", "cli", "api", "web", "conformance", "e2e", "infra",
         "benchmarks", "plugin-claude", "plugin-cursor", "plugin-codex",
         ".github",
-        # scripts/ carries the identity broker and the guard shim, and
-        # `./synaptory test` runs scripts/tests over both. It was never on
-        # this list because it had no CI consumer -- the same premise that
-        # had rotted for infra/scripts/ by #439. It has one now.
+        # scripts/ carries check-retired-vocabulary-table, which
+        # test_retired_vocabulary_census.py loads. It once carried the
+        # identity broker and its suite too; those left for
+        # h3tech-ai/synaptory-infra (SPD-197).
         "scripts",
     }
     # Documented exceptions: subtrees under a source root that no CI job reads.
@@ -739,7 +736,7 @@ _YAML_IMPORT_RE = re.compile(r"^\s*import yaml\s*$", re.MULTILINE)
 #: `pip install` step, and (via `./synaptory test`) release.yml's `release` job.
 _TEST_PLUGIN_JOB_TREES = (
     "plugin-claude/tests", "plugin-cursor/tests", "plugin-codex/tests",
-    "scripts/tests", "conformance",
+    "conformance",
 )
 
 

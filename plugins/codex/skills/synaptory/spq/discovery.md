@@ -50,12 +50,16 @@ git check-ignore -q .synaptory/cycles/ \
 **Generate `CLAUDE.md` (idempotent).** It is the session-persistent anchor read at the start of every session. Under SPQ it must name the lifecycle as `spq`, list the declared source regions, and carry the git safety rules verbatim -- those rules are what keep the trunk promotion a human act.
 
 ```python
-if not Read("CLAUDE.md") or "synaptory-state" not in Read("CLAUDE.md"):
+# The section is "already generated" when its fence is present. Do not key this
+# on a `synaptory-state` comment: SPQ writes none (nothing would ever update it),
+# and a stray one left by an older hook must not suppress generation.
+if not Read("CLAUDE.md") or "synaptory-start" not in Read("CLAUDE.md"):
     # Same section shape as ceremonies/inception.md, with:
     #   - Build mode: spq
     #   - the declared source regions, and the paths outside every region
     #   - the seven git safety rules VERBATIM from modes/spq.md
-    #   - a <!-- synaptory-state --> comment carrying stage: DISCOVERY
+    #   - NO <!-- synaptory-state --> comment. The sentinel is a Scrum/Kanban
+    #     artifact; `update_claude_md.py` writes nothing of it under spq.
     Bash('printf "%s" "$SECTION" | python3 "${PLUGIN_ROOT}/hooks/lib/update_claude_md.py" "${CLAUDE_PROJECT_DIR}"')
 ```
 

@@ -286,7 +286,7 @@ if plugin_installed and cli_min_version:
         "check": "CLI meets the plugin's cli_min_version",
         "result": "PASS" if cli_ok else "FAIL",
         "detail": cli_detail,
-        "fix": f"Update the CLI: {cli_name} update  (or reinstall: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash)"
+        "fix": f"Update the CLI: {cli_name} update  (or reinstall: curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash)"
     })
 
 # ── Group D: Control plane ───────────────────────────────────────────────
@@ -296,7 +296,7 @@ checks.append({
     "check": "CLI stamped control-plane URL",
     "result": "PASS" if cp_url else "FAIL",
     "detail": cp_url or "(empty)",
-    "fix": "Prod: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash\nLocal: ./synaptory deploy local (installs synaptory-local). Do not export SYNAPTORY_CONTROL_PLANE_URL."
+    "fix": "Prod: curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash\nLocal: ./synaptory deploy local (installs synaptory-local). Do not export SYNAPTORY_CONTROL_PLANE_URL."
 })
 if env_cp_url or env_cp_env:
     checks.append({
@@ -471,7 +471,7 @@ if not synaptory_enabled and project_settings_ok:
 
 manual_steps = []
 if not cp_url:
-    manual_steps.append("Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash  (or ./synaptory deploy local for synaptory-local)")
+    manual_steps.append("Install the CLI: curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash  (or ./synaptory deploy local for synaptory-local)")
 if not whoami_ok:
     manual_steps.append(f"{cli_name} login")
 if not plugin_installed:

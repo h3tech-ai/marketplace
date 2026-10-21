@@ -113,7 +113,7 @@ _PROTOCOL_FETCH_NAMES = (
     "ephemeral-environments",
 )
 
-DEFAULT_CP_URL = "https://synaptory.h3t.co"
+DEFAULT_CP_URL = "https://synaptory.h3t.ai"
 
 # The `!cat` rewriter, the decrypt-line rewriter and their protocol-path helper
 # are gone (#298). Authored markdown now carries `{{include:}}` / `{{read:}}` /
@@ -470,7 +470,7 @@ def orchestrator_stub(frontmatter: str) -> str:
         "```bash\n"
         "export SYNAPTORY_IDE=cursor\n"
         "if ! command -v synaptory >/dev/null 2>&1; then\n"
-        '  echo "Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash && synaptory login" >&2\n'
+        '  echo "Install the CLI: curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash && synaptory login" >&2\n'
         "  exit 1\n"
         "fi\n"
         "synaptory skills get synaptory --host cursor\n"

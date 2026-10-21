@@ -18,7 +18,7 @@ If the CLI is missing:
 
 ```
 The Synaptory CLI is not installed. Install it with:
-  curl -fsSL https://synaptory.h3t.co/cli/install.sh | sh
+  curl -fsSL https://synaptory.h3t.ai/cli/install.sh | sh
 
 Then re-run `/synaptory report`.
 ```
@@ -203,7 +203,7 @@ Print the composed issue as a copyable block so the user can submit it through a
 I've prepared your report. To submit it later:
 
   1. Install or sign in to the synaptory CLI:
-       curl -fsSL https://synaptory.h3t.co/cli/install.sh | sh
+       curl -fsSL https://synaptory.h3t.ai/cli/install.sh | sh
        synaptory login
   2. Re-run `/synaptory report` — your context will be re-gathered automatically.
 

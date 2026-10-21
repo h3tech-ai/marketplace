@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "host": "codex",
-  "version": "1.3.6",
-  "build_hash": "5b31a8a9cda3b9f6f9c6dabe7130de932ad24ef437c56addd6bd920869bed9b6",
+  "version": "1.3.7",
+  "build_hash": "6290cfc37b4aa312f70448ebe8266fa5eda9413423b591350dad0136bd1658b9",
   "files": {
-    ".codex-plugin/plugin.json": "682aec296f4eb4b43cd4db658a0dd09549088838537a1a8efaffa34ad10b1185",
+    ".codex-plugin/plugin.json": "5878c043f0531ac1f5a75e15bab7b55babc33e7c03807d3e37b92b2954b5fecc",
     ".mcp.json": "bf3bdf25426b5628fc8e689ec992150d1465f9baed9ccc044eb7d4da624cdcaf",
     "README.md": "f920f860b00ff3bf851c180bf6888fd6166f53c8d19922db23078cfa751a1200",
     "assets/agent-templates/code-reviewer.toml": "446ca6d2c5e8aa35c0b3d6ffccc5ad09c2e01afb136552ef630ead0e3255af94",
@@ -25,7 +25,7 @@
     "hooks/lib/advance_kernel.py": "441e3000d44bd864dab500a1bf2336ca62297f853317eb5fee1d1d34e6900c1b",
     "hooks/lib/aes_skills.py": "b8804dff99f709e265113cbf3ffd497938f88cc57e8009c9d42ca8d8e88a4e28",
     "hooks/lib/cli_probe.py": "5aba55270463c2f835af6a716cd0ff02c389fee437c7f247513c45176a664a7a",
-    "hooks/lib/cp-url": "811de201f15a874eb810497be13e430272c656fec1518a71690b2578d650c7a3",
+    "hooks/lib/cp-url": "0903f8d7bbc3e27790520ff0c3195347392a255622e890df286fecf7b8e81d6c",
     "hooks/lib/cycle_authority.py": "3e76bb9358f41b628a973dc8f78bb820303333217a97b5f9c28e49c1638d083a",
     "hooks/lib/cycle_barrier.py": "8204bd52465062de274c5dbfa1059a36214452b2961a3f66bad20c70a386aaeb",
     "hooks/lib/cycle_holder.py": "1ccdc25bcd0d003cccc3be94166f3cd53dae453464d67b290588c627c10ffce7",

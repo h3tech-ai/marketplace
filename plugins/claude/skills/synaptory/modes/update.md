@@ -2,12 +2,12 @@
 
 Run BEFORE any execution (all modes). Silent if current. One prompt max if update exists.
 
-Distribution uses the public GitHub primary at `https://github.com/h3tech-ai/marketplace` plus a release-synchronized legacy mirror at `https://synaptory.h3t.co/marketplace.git` for existing Claude installations (ADR-027). The CLI version pin lives at `https://synaptory.h3t.co/cli/latest.json`. The source repo (`h3tech-ai/synaptory-v1`) stays private; only the IP-stripped catalog is published.
+Distribution uses the public GitHub primary at `https://github.com/h3tech-ai/marketplace` plus a release-synchronized legacy mirror at `https://synaptory.h3t.ai/marketplace.git` for existing Claude installations (ADR-027). The CLI version pin lives at `https://synaptory.h3t.ai/cli/latest.json`. The source repo (`h3tech-ai/synaptory-v1`) stays private; only the IP-stripped catalog is published.
 
 **Step 0 — version check:**
 
 1. Read `~/.claude/plugins/installed_plugins.json` → find the `synaptory@h3tech-ai` entry → extract `version` (this is your local version).
-2. WebFetch `https://synaptory.h3t.co/cli/latest.json` → extract `version` (this is the remote version).
+2. WebFetch `https://synaptory.h3t.ai/cli/latest.json` → extract `version` (this is the remote version).
 3. **If WebFetch fails** (offline, timeout, non-200) → silently continue. Never block the pipeline over an update check.
 4. **If remote ≤ local** → continue silently (user sees nothing).
 5. **If remote > local** → prompt:

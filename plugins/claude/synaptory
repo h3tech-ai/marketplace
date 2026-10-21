@@ -71,7 +71,7 @@ USER_GUIDE_BUILDER="${REPO_ROOT}/plugin-claude/scripts/build_user_guide.py"
 # primary marketplace for new installs. The legacy synaptory.h3t.co catalog is
 # still published as a compatibility mirror for existing Claude Code users.
 # Override SYNAPTORY_WEB_BASE_URL for staging.
-WEB_BASE_URL="${SYNAPTORY_WEB_BASE_URL:-https://synaptory.h3t.co}"
+WEB_BASE_URL="${SYNAPTORY_WEB_BASE_URL:-https://synaptory.h3t.ai}"
 
 # PLUGIN_NAME is the marketplace entry name. v3 retires the transitional
 # "synaptory-next" channel and consolidates back to a single canonical
@@ -1873,7 +1873,7 @@ cmd_help() {
     SYNAPTORY_CP_ENTRA_CLIENT_ID=...    Entra application (client) ID.
 
   Optional env vars:
-    SYNAPTORY_WEB_BASE_URL=https://...  Self-hosted base URL (default synaptory.h3t.co).
+    SYNAPTORY_WEB_BASE_URL=https://...  Self-hosted base URL (default synaptory.h3t.ai).
     GHCR_OWNER=h3tech-ai           GitHub org for image registry (deploy prod).
 
   Commands:

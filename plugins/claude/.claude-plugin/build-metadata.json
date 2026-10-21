@@ -1,7 +1,7 @@
 {
-  "version": "1.3.6",
-  "build_hash": "846f77ecd250a00d063211ad52978d481794f5233872c55653923ee9f6288794",
-  "built_at": "2026-10-13T11:41:56Z",
+  "version": "1.3.7",
+  "build_hash": "114ee04e6d8255640a641d43aa6e7b159c57a2f2dc5263421498860fd49383e9",
+  "built_at": "2026-10-21T10:11:42Z",
   "manifest_file_count": 199,
   "ai_bom": {
     "model_pins": {
@@ -88,9 +88,9 @@
     }
   },
   "provenance": {
-    "builder_user": "synap",
-    "builder_host": "synap-vm",
-    "git_commit": "unknown",
-    "git_dirty": false
+    "builder_user": "quocdat029x",
+    "builder_host": "Dats-MacBook-Pro.local",
+    "git_commit": "5d1cd5cdca0bdb2a852f49af3d320fb346510250",
+    "git_dirty": true
   }
 }

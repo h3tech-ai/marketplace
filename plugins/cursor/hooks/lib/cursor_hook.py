@@ -336,7 +336,7 @@ def before_submit(data: dict[str, Any], project: str, root: Path) -> dict[str, A
             "continue": False,
             "user_message": (
                 "synaptory: CLI not found on $PATH. Install once per laptop:\n"
-                "  curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash\n"
+                "  curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash\n"
                 "then run `synaptory login`. /synaptory cannot start without it."
             ),
         }

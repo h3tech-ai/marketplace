@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Synaptory User Guide</title>
-  <meta name="synaptory-version" content="v1.3.6">
-  <meta name="synaptory-built-at" content="2026-10-13T11:41:51Z">
-  
+  <meta name="synaptory-version" content="v1.3.7">
+  <meta name="synaptory-built-at" content="2026-10-21T10:11:38Z">
+  <meta name="synaptory-git-sha" content="5d1cd5cd">
   <style>
     :root {
       --brand: #E00000;
@@ -381,7 +381,7 @@
             <p>SPQ-first delivery guidance for Claude Code, Codex, and Cursor.</p>
             <div class="hero-meta">
               <div class="hero-chip">36 chapters</div>
-              <div class="hero-chip" data-stamp="version">v1.3.6</div><div class="hero-chip" data-stamp="built-at">built 2026-10-13T11:41:51Z</div>
+              <div class="hero-chip" data-stamp="version">v1.3.7</div><div class="hero-chip" data-stamp="git-sha">5d1cd5cd</div><div class="hero-chip" data-stamp="built-at">built 2026-10-21T10:11:38Z</div>
             </div>
           </div>
         </div>
@@ -491,9 +491,9 @@
 <h2 id="getting-started-2-install-the-cli-and-sign-in">2. Install the CLI and sign in</h2>
 <p>Install once per laptop:</p>
 <pre class="code-block" data-lang="bash"><code># macOS / Linux
-curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash</code></pre>
+curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash</code></pre>
 <pre class="code-block" data-lang="powershell"><code># Windows PowerShell
-iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex</code></pre>
+iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex</code></pre>
 <p>Then sign in with your organization identity:</p>
 <pre class="code-block" data-lang="bash"><code>synaptory login
 synaptory whoami
@@ -598,10 +598,10 @@ synaptory runtimes doctor</code></pre>
 <p>The CLI is shipped separately from all host plugins. The download script detects your OS/architecture, verifies SHA-256, and places the binary on your <code>$PATH</code>.</p>
 <hr>
 <h2 id="install-cli-macos-linux">macOS / Linux</h2>
-<pre class="code-block" data-lang="bash"><code>curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash</code></pre>
+<pre class="code-block" data-lang="bash"><code>curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash</code></pre>
 <p>That&#x27;s it. The script:</p>
 <ul>
-<li>Detects <code>darwin-arm64</code>, <code>darwin-amd64</code>, <code>linux-amd64</code>, or <code>linux-arm64</code>.</li><li>Resolves <code>latest.json</code>, then downloads the versioned binary and <code>sha256sums.txt</code> from <code>synaptory.h3t.co/cli/</code>.</li><li>Verifies the SHA-256 before installing.</li><li>Installs to <code>~/.local/bin/synaptory</code>.</li><li>Tells you the line to add to <code>~/.zshrc</code> / <code>~/.bashrc</code> if <code>~/.local/bin</code> isn&#x27;t on your <code>$PATH</code>.</li>
+<li>Detects <code>darwin-arm64</code>, <code>darwin-amd64</code>, <code>linux-amd64</code>, or <code>linux-arm64</code>.</li><li>Resolves <code>latest.json</code>, then downloads the versioned binary and <code>sha256sums.txt</code> from <code>synaptory.h3t.ai/cli/</code>.</li><li>Verifies the SHA-256 before installing.</li><li>Installs to <code>~/.local/bin/synaptory</code>.</li><li>Tells you the line to add to <code>~/.zshrc</code> / <code>~/.bashrc</code> if <code>~/.local/bin</code> isn&#x27;t on your <code>$PATH</code>.</li>
 </ul>
 <p>After install:</p>
 <pre class="code-block" data-lang="bash"><code>synaptory version           # confirm the CLI is on PATH
@@ -618,10 +618,10 @@ synaptory login             # sign in via Entra (browser opens)</code></pre>
 synaptory logout            # if you want the keychain cleared first</code></pre>
 <hr>
 <h2 id="install-cli-uninstall">Windows</h2>
-<pre class="code-block" data-lang="powershell"><code>iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex</code></pre>
+<pre class="code-block" data-lang="powershell"><code>iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex</code></pre>
 <p>The script:</p>
 <ul>
-<li>Detects amd64 (the only Windows build we publish).</li><li>Resolves <code>latest.json</code>, then downloads <code>synaptory-windows-amd64.exe</code> and <code>sha256sums.txt</code> from <code>synaptory.h3t.co/cli/</code>.</li><li>Verifies the SHA-256.</li><li>Installs to <code>%USERPROFILE%\bin\synaptory.exe</code>.</li><li>Adds <code>%USERPROFILE%\bin</code> to your <strong>user</strong> <code>PATH</code> if it isn&#x27;t already (no admin needed; survives reboot).</li>
+<li>Detects amd64 (the only Windows build we publish).</li><li>Resolves <code>latest.json</code>, then downloads <code>synaptory-windows-amd64.exe</code> and <code>sha256sums.txt</code> from <code>synaptory.h3t.ai/cli/</code>.</li><li>Verifies the SHA-256.</li><li>Installs to <code>%USERPROFILE%\bin\synaptory.exe</code>.</li><li>Adds <code>%USERPROFILE%\bin</code> to your <strong>user</strong> <code>PATH</code> if it isn&#x27;t already (no admin needed; survives reboot).</li>
 </ul>
 <p>If the script added a directory to <code>PATH</code>, <strong>open a new PowerShell window</strong> so the updated <code>PATH</code> is loaded. Then:</p>
 <pre class="code-block" data-lang="powershell"><code>synaptory version
@@ -811,7 +811,7 @@ project_id: taskflow-pilot</code></pre>
 <hr>
 <h2 id="concepts-identity-and-access-sign-in-the-normal-path">Sign-in (the normal path)</h2>
 <p>Three OAuth audiences exist, all backed by <strong>one Entra app registration</strong> (<code>SYNAPTORY_CP_ENTRA_CLIENT_ID</code>). The same app holds two platform sections in Azure: a Web platform with a client secret, and a Mobile/desktop platform for PKCE.</p>
-<div class="table-wrap"><table><thead><tr><th>Caller</th><th>Flow</th><th>Redirect URI</th></tr></thead><tbody><tr><td>Control Plane browser</td><td>Authorization-code with <code>client_secret</code></td><td><code>https://synaptory.h3t.co/auth/callback</code></td></tr><tr><td><code>synaptory</code> CLI</td><td>PKCE public client</td><td><code>http://127.0.0.1/auth/callback</code> (loopback exception, random port)</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>Caller</th><th>Flow</th><th>Redirect URI</th></tr></thead><tbody><tr><td>Control Plane browser</td><td>Authorization-code with <code>client_secret</code></td><td><code>https://synaptory.h3t.ai/auth/callback</code></td></tr><tr><td><code>synaptory</code> CLI</td><td>PKCE public client</td><td><code>http://127.0.0.1/auth/callback</code> (loopback exception, random port)</td></tr></tbody></table></div>
 <p>After Entra issues an ID token, the API exchanges it for a SYNAPTORY1 token:</p>
 <pre class="code-block"><code>SYNAPTORY1.&lt;base64url(payload)&gt;.&lt;base64url(ed25519_sig)&gt;</code></pre>
 <p>Payload carries <code>sid</code>, <code>upn</code>, <code>grp</code>, <code>iat</code>, <code>exp</code>. There is <strong>no <code>prj</code> claim</strong> — that was the V1.5 design and was replaced. Project access is a per-request check against <code>project_members</code>, not a token claim.</p>
@@ -1773,7 +1773,7 @@ synaptory runtime explain --attempt &lt;id&gt;</code></pre>
   <div class="chapter-kicker">Guides · 19</div>
   <div class="chapter-body">
     <h1 id="guides-using-the-control-plane-using-the-control-plane">Using the Control Plane</h1>
-<p>The Control Plane at <code>https://synaptory.h3t.co/</code> provides project-scoped visibility into SPQ Cycles, Acceptances, runtime attempts, quality, cost, reliability, sessions, skills, and audit activity.</p>
+<p>The Control Plane at <code>https://synaptory.h3t.ai/</code> provides project-scoped visibility into SPQ Cycles, Acceptances, runtime attempts, quality, cost, reliability, sessions, skills, and audit activity.</p>
 <p>It complements repository-owned lifecycle state. It does not select the next role, mutate a Cycle merely because a page was opened, or replace Git evidence.</p>
 <h2 id="guides-using-the-control-plane-sign-in-and-scope">Sign in and scope</h2>
 <p>Open the Control Plane and sign in with the same organization identity used by the <code>synaptory</code> CLI. The root redirects administrators to <code>/overview</code> and other authenticated users to <code>/home</code>.</p>
@@ -2022,7 +2022,7 @@ synaptory migrate             # apply (asks to confirm; --yes to skip)</code></p
 <p>Then, in Claude Code, point at the Synaptory marketplace and re-authenticate:</p>
 <pre class="code-block"><code>/plugin marketplace add https://github.com/h3tech-ai/marketplace
 /plugin install synaptory@h3tech-ai</code></pre>
-<pre class="code-block" data-lang="bash"><code>synaptory login    # re-authenticate against synaptory.h3t.co</code></pre>
+<pre class="code-block" data-lang="bash"><code>synaptory login    # re-authenticate against synaptory.h3t.ai</code></pre>
 <h2 id="guides-migrate-from-hiro-crew-notes">Notes</h2>
 <ul>
 <li><strong>Backup + git</strong> are your safety net — the &quot;thorough&quot; rewrite also updates</li>
@@ -2725,20 +2725,20 @@ Cancel this runtime attempt.</code></pre>
   <div class="chapter-body">
     <h1 id="reference-urls-urls-reference">URLs Reference</h1>
 <blockquote><p><strong>Diataxis category:</strong> Reference — information-oriented.</p></blockquote>
-<p>Every public URL on <code>synaptory.h3t.co</code>, what it does, and which container or static path serves it.</p>
+<p>Every public URL on <code>synaptory.h3t.ai</code>, what it does, and which container or static path serves it.</p>
 <p>The host is fronted by Caddy; see <a href="https://github.com/h3tech-ai/synaptory-v1/blob/main/infra/caddy/Caddyfile" target="_blank" rel="noreferrer">infra/caddy/Caddyfile</a> for the source of truth.</p>
 <p>Per <a href="https://github.com/h3tech-ai/synaptory-v1/blob/main/docs/adrs/ADR-019-unified-control-plane.md" target="_blank" rel="noreferrer">ADR-019</a> the <code>/console/*</code> and <code>/portal/*</code> URL trees are gone — every page in the Control Plane lives at root URLs.</p>
 <hr>
 <h2 id="reference-urls-user-facing-urls">User-facing URLs</h2>
-<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th><th>Audience</th></tr></thead><tbody><tr><td><code>https://synaptory.h3t.co/</code></td><td>Role-aware redirect (admin → <code>/overview</code>, else → <code>/home</code>)</td><td>Any signed-in user</td></tr><tr><td><code>https://synaptory.h3t.co/get-started</code></td><td>Public landing — install instructions, links into the user guide</td><td>Prospective users</td></tr><tr><td><code>https://synaptory.h3t.co/home</code>, <code>/overview</code>, <code>/projects/*</code>, <code>/cycles</code>, <code>/attempts</code>, <code>/operations</code>, <code>/agents</code>, <code>/activity</code>, <code>/audit</code>, <code>/sessions</code>, <code>/skills</code>, <code>/cost</code>, <code>/quality</code>, <code>/reliability</code>, <code>/people</code>, <code>/policy</code>, <code>/system</code>, <code>/grafana</code>, <code>/access-review</code>, <code>/settings</code>, <code>/profile</code></td><td>Control Plane pages (Next.js); each role-gated server-side</td><td><code>synaptory-users</code> (varying scope by role)</td></tr><tr><td><code>https://synaptory.h3t.co/auth/login</code></td><td>Sign-in entry point</td><td>Anyone (redirected to Entra)</td></tr><tr><td><code>https://synaptory.h3t.co/auth/callback</code></td><td>OAuth callback for Web flow</td><td>Browser (round-trip from Entra)</td></tr><tr><td><code>https://synaptory.h3t.co/docs/user-guide.html</code></td><td>This guide, single-file HTML</td><td>Anyone signed in (gated by Caddy if needed)</td></tr><tr><td><code>https://synaptory.h3t.co/docs/getting-started.html</code></td><td>Standalone multi-host onboarding guide</td><td>Anyone signed in (gated by Caddy if needed)</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th><th>Audience</th></tr></thead><tbody><tr><td><code>https://synaptory.h3t.ai/</code></td><td>Role-aware redirect (admin → <code>/overview</code>, else → <code>/home</code>)</td><td>Any signed-in user</td></tr><tr><td><code>https://synaptory.h3t.ai/get-started</code></td><td>Public landing — install instructions, links into the user guide</td><td>Prospective users</td></tr><tr><td><code>https://synaptory.h3t.ai/home</code>, <code>/overview</code>, <code>/projects/*</code>, <code>/cycles</code>, <code>/attempts</code>, <code>/operations</code>, <code>/agents</code>, <code>/activity</code>, <code>/audit</code>, <code>/sessions</code>, <code>/skills</code>, <code>/cost</code>, <code>/quality</code>, <code>/reliability</code>, <code>/people</code>, <code>/policy</code>, <code>/system</code>, <code>/grafana</code>, <code>/access-review</code>, <code>/settings</code>, <code>/profile</code></td><td>Control Plane pages (Next.js); each role-gated server-side</td><td><code>synaptory-users</code> (varying scope by role)</td></tr><tr><td><code>https://synaptory.h3t.ai/auth/login</code></td><td>Sign-in entry point</td><td>Anyone (redirected to Entra)</td></tr><tr><td><code>https://synaptory.h3t.ai/auth/callback</code></td><td>OAuth callback for Web flow</td><td>Browser (round-trip from Entra)</td></tr><tr><td><code>https://synaptory.h3t.ai/docs/user-guide.html</code></td><td>This guide, single-file HTML</td><td>Anyone signed in (gated by Caddy if needed)</td></tr><tr><td><code>https://synaptory.h3t.ai/docs/getting-started.html</code></td><td>Standalone multi-host onboarding guide</td><td>Anyone signed in (gated by Caddy if needed)</td></tr></tbody></table></div>
 <p>The legacy <code>/console/*</code> and <code>/portal/*</code> URL trees return 404. There are no redirects — bookmarks pointing at the v1.0 surfaces must be updated.</p>
 <hr>
 <h2 id="reference-urls-plugin-distribution">Plugin distribution</h2>
-<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th></tr></thead><tbody><tr><td><code>https://github.com/h3tech-ai/marketplace</code></td><td>Public git catalog and supported source for new installations.</td></tr><tr><td><code>https://synaptory.h3t.co/marketplace.git</code></td><td>Compatibility git catalog for existing Claude Code installations; release-mirrored to GitHub.</td></tr><tr><td><code>https://synaptory.h3t.co/marketplace</code></td><td>Discoverability landing page. <strong>Not</strong> the marketplace transport.</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th></tr></thead><tbody><tr><td><code>https://github.com/h3tech-ai/marketplace</code></td><td>Public git catalog and supported source for new installations.</td></tr><tr><td><code>https://synaptory.h3t.ai/marketplace.git</code></td><td>Compatibility git catalog for existing Claude Code installations; release-mirrored to GitHub.</td></tr><tr><td><code>https://synaptory.h3t.ai/marketplace</code></td><td>Discoverability landing page. <strong>Not</strong> the marketplace transport.</td></tr></tbody></table></div>
 <p>New users run <code>/plugin marketplace add https://github.com/h3tech-ai/marketplace</code>. Existing users on the <code>.git</code> compatibility URL do not need to change it.</p>
 <hr>
 <h2 id="reference-urls-cli-distribution">CLI distribution</h2>
-<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th></tr></thead><tbody><tr><td><code>https://synaptory.h3t.co/cli/install.sh</code></td><td>macOS / Linux install script</td></tr><tr><td><code>https://synaptory.h3t.co/cli/install.ps1</code></td><td>Windows install script</td></tr><tr><td><code>https://synaptory.h3t.co/cli/latest.json</code></td><td>Current CLI version + per-platform binary URLs</td></tr><tr><td><code>https://synaptory.h3t.co/cli/&lt;version&gt;/&lt;binary&gt;</code></td><td>Versioned binaries (e.g. <code>synaptory_darwin_arm64</code>)</td></tr><tr><td><code>https://synaptory.h3t.co/cli/&lt;version&gt;/sha256sums.txt</code></td><td>SHA-256 manifest for offline verification</td></tr><tr><td><code>https://synaptory.h3t.co/downloads</code></td><td>Human-readable download index</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th></tr></thead><tbody><tr><td><code>https://synaptory.h3t.ai/cli/install.sh</code></td><td>macOS / Linux install script</td></tr><tr><td><code>https://synaptory.h3t.ai/cli/install.ps1</code></td><td>Windows install script</td></tr><tr><td><code>https://synaptory.h3t.ai/cli/latest.json</code></td><td>Current CLI version + per-platform binary URLs</td></tr><tr><td><code>https://synaptory.h3t.ai/cli/&lt;version&gt;/&lt;binary&gt;</code></td><td>Versioned binaries (e.g. <code>synaptory_darwin_arm64</code>)</td></tr><tr><td><code>https://synaptory.h3t.ai/cli/&lt;version&gt;/sha256sums.txt</code></td><td>SHA-256 manifest for offline verification</td></tr><tr><td><code>https://synaptory.h3t.ai/downloads</code></td><td>Human-readable download index</td></tr></tbody></table></div>
 <p>The install scripts resolve <code>latest.json</code> first, then download the binary. Override with <code>SYNAPTORY_CLI_BASE_URL</code> for staging.</p>
 <hr>
 <h2 id="reference-urls-api-endpoints-v1">API endpoints (<code>/v1/*</code>)</h2>
@@ -2747,7 +2747,7 @@ Cancel this runtime attempt.</code></pre>
 <p>The <code>/v1/me/*</code> namespace was retired by ADR-019. Identity comes from the iron-session cookie&#x27;s claims; member-scoped reads go through the scope-aware <code>/v1/{projects,sessions,analytics}</code> endpoints.</p>
 <hr>
 <h2 id="reference-urls-operator-urls">Operator URLs</h2>
-<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th></tr></thead><tbody><tr><td><code>https://synaptory.h3t.co/grafana</code></td><td>Grafana embed (Caddy reverse-proxy, admin-only)</td></tr><tr><td><code>https://synaptory.h3t.co/system</code></td><td>Probes + versions + last backup</td></tr><tr><td><code>https://synaptory.h3t.co/audit</code></td><td>Audit log (scope-aware: admins see everything; project admins see their projects)</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>URL</th><th>Purpose</th></tr></thead><tbody><tr><td><code>https://synaptory.h3t.ai/grafana</code></td><td>Grafana embed (Caddy reverse-proxy, admin-only)</td></tr><tr><td><code>https://synaptory.h3t.ai/system</code></td><td>Probes + versions + last backup</td></tr><tr><td><code>https://synaptory.h3t.ai/audit</code></td><td>Audit log (scope-aware: admins see everything; project admins see their projects)</td></tr></tbody></table></div>
 <p>Direct Grafana (without the iframe) is also available via SSH tunnel — see <a href="https://github.com/h3tech-ai/synaptory-v1/blob/main/infra/README.md" target="_blank" rel="noreferrer">infra/README.md</a>.</p>
 <hr>
 <h2 id="reference-urls-local-dev-urls">Local dev URLs</h2>
@@ -2767,7 +2767,7 @@ Cancel this runtime attempt.</code></pre>
 <p>For the conceptual model and per-request enforcement, see <a href="#concepts-identity-and-access">Identity and access</a>.</p>
 <hr>
 <h2 id="reference-auth-flows-flow-1-web-control-plane-browser-sign-in">Flow 1: Web (Control Plane browser sign-in)</h2>
-<p>Used by every page in the Control Plane (<code>synaptory.h3t.co/*</code>) — single unified app per ADR-019.</p>
+<p>Used by every page in the Control Plane (<code>synaptory.h3t.ai/*</code>) — single unified app per ADR-019.</p>
 <pre class="mermaid">sequenceDiagram
   participant U as User (browser)
   participant W as Next.js (web)

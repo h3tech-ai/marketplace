@@ -91,7 +91,7 @@ _validate_candidate() {
     cat >&2 <<EOF
 synaptory: refusing loopback-stamped CLI for a production plugin (${candidate_url}).
 This is the issue #108 local/prod collision. Restore the production CLI:
-  curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+  curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash
 Keep local testing at ~/.local/bin/synaptory-local; do not overwrite synaptory.
 EOF
     return 1
@@ -152,10 +152,10 @@ The Synaptory CLI is installed separately from the plugin (one prod install
 per laptop). Pick the line that matches your OS:
 
   macOS / Linux:
-    curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+    curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash
 
   Windows (PowerShell):
-    iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex
+    iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex
 
 After installing, open a new terminal so $PATH picks up ~/.local/bin
 (or %USERPROFILE%\bin on Windows).

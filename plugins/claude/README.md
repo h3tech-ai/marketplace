@@ -2,7 +2,7 @@
 
 **Governed multi-agent SPQ delivery for Claude Code.** Synaptory coordinates role-based work through SPQ Cycles, validates dispatch-bound receipts and verification evidence, and stops at human decisions instead of treating agent completion as delivery acceptance.
 
-> **Version:** 1.3.6 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
+> **Version:** 1.3.7 · **Author:** [H3Tech Inc.](https://github.com/h3tech-ai) · **Distribution:** Proprietary
 
 ## Requirements
 
@@ -18,12 +18,12 @@
 
 ```bash
 # macOS / Linux
-curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash
 ```
 
 ```powershell
 # Windows PowerShell
-iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex
+iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex
 ```
 
 ```bash

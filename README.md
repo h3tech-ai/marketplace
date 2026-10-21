@@ -3,7 +3,7 @@
 **Multi-agent adaptive delivery for Claude Code, Cursor, and Codex.**
 Published and maintained by [H3Tech Inc.](https://h3t.co)
 
-> **Catalog version: `1.3.6`** — this repository is a **generated
+> **Catalog version: `1.3.7`** — this repository is a **generated
 > distribution tree**. It is rebuilt and force-synced by
 > `./synaptory deploy prod` on every release. Do not open pull requests or
 > edit files here; changes are overwritten on the next publish.
@@ -26,10 +26,10 @@ Synaptory is licensed software for H3Tech staff and customers. You need:
 
    ```bash
    # macOS / Linux
-   curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+   curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash
 
    # Windows (PowerShell)
-   iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex
+   iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex
    ```
 
 3. A signed-in session:
@@ -116,7 +116,7 @@ a hard requirement rather than a convenience.
 
 - In-session: ask Synaptory to report an issue from Claude Code, Codex, or Cursor.
 - Email: engineering@h3t.co
-- Control plane: https://synaptory.h3t.co
+- Control plane: https://synaptory.h3t.ai
 
 ## License
 

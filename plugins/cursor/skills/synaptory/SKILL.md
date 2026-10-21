@@ -18,7 +18,7 @@ Cursor does not expand Claude `` !`bash` `` stubs. **First action:** run this wi
 ```bash
 export SYNAPTORY_IDE=cursor
 if ! command -v synaptory >/dev/null 2>&1; then
-  echo "Install the CLI: curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash && synaptory login" >&2
+  echo "Install the CLI: curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash && synaptory login" >&2
   exit 1
 fi
 synaptory skills get synaptory --host cursor

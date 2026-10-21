@@ -36,7 +36,7 @@ Agent `roles/*/SKILL.md` + phases still ship plaintext — same leftover as Clau
 2. Install the CLI once per laptop (same binary as Claude Code staff):
 
 ```bash
-curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash
+curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash
 synaptory login
 synaptory skills sync --host cursor
 ```

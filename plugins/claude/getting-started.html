@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Synaptory Getting Started</title>
-  <meta name="synaptory-version" content="v1.3.6">
-  <meta name="synaptory-built-at" content="2026-10-13T11:41:51Z">
-  
+  <meta name="synaptory-version" content="v1.3.7">
+  <meta name="synaptory-built-at" content="2026-10-21T10:11:38Z">
+  <meta name="synaptory-git-sha" content="5d1cd5cd">
   <style>
     :root {
       --brand: #E00000;
@@ -381,7 +381,7 @@
             <p>Install a host, configure SPQ, and start your first governed Cycle.</p>
             <div class="hero-meta">
               <div class="hero-chip">2 chapters</div>
-              <div class="hero-chip" data-stamp="version">v1.3.6</div><div class="hero-chip" data-stamp="built-at">built 2026-10-13T11:41:51Z</div>
+              <div class="hero-chip" data-stamp="version">v1.3.7</div><div class="hero-chip" data-stamp="git-sha">5d1cd5cd</div><div class="hero-chip" data-stamp="built-at">built 2026-10-21T10:11:38Z</div>
             </div>
           </div>
         </div>
@@ -404,9 +404,9 @@
 <h2 id="getting-started-2-install-the-cli-and-sign-in">2. Install the CLI and sign in</h2>
 <p>Install once per laptop:</p>
 <pre class="code-block" data-lang="bash"><code># macOS / Linux
-curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash</code></pre>
+curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash</code></pre>
 <pre class="code-block" data-lang="powershell"><code># Windows PowerShell
-iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex</code></pre>
+iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex</code></pre>
 <p>Then sign in with your organization identity:</p>
 <pre class="code-block" data-lang="bash"><code>synaptory login
 synaptory whoami
@@ -511,10 +511,10 @@ synaptory runtimes doctor</code></pre>
 <p>The CLI is shipped separately from all host plugins. The download script detects your OS/architecture, verifies SHA-256, and places the binary on your <code>$PATH</code>.</p>
 <hr>
 <h2 id="install-cli-macos-linux">macOS / Linux</h2>
-<pre class="code-block" data-lang="bash"><code>curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash</code></pre>
+<pre class="code-block" data-lang="bash"><code>curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash</code></pre>
 <p>That&#x27;s it. The script:</p>
 <ul>
-<li>Detects <code>darwin-arm64</code>, <code>darwin-amd64</code>, <code>linux-amd64</code>, or <code>linux-arm64</code>.</li><li>Resolves <code>latest.json</code>, then downloads the versioned binary and <code>sha256sums.txt</code> from <code>synaptory.h3t.co/cli/</code>.</li><li>Verifies the SHA-256 before installing.</li><li>Installs to <code>~/.local/bin/synaptory</code>.</li><li>Tells you the line to add to <code>~/.zshrc</code> / <code>~/.bashrc</code> if <code>~/.local/bin</code> isn&#x27;t on your <code>$PATH</code>.</li>
+<li>Detects <code>darwin-arm64</code>, <code>darwin-amd64</code>, <code>linux-amd64</code>, or <code>linux-arm64</code>.</li><li>Resolves <code>latest.json</code>, then downloads the versioned binary and <code>sha256sums.txt</code> from <code>synaptory.h3t.ai/cli/</code>.</li><li>Verifies the SHA-256 before installing.</li><li>Installs to <code>~/.local/bin/synaptory</code>.</li><li>Tells you the line to add to <code>~/.zshrc</code> / <code>~/.bashrc</code> if <code>~/.local/bin</code> isn&#x27;t on your <code>$PATH</code>.</li>
 </ul>
 <p>After install:</p>
 <pre class="code-block" data-lang="bash"><code>synaptory version           # confirm the CLI is on PATH
@@ -531,10 +531,10 @@ synaptory login             # sign in via Entra (browser opens)</code></pre>
 synaptory logout            # if you want the keychain cleared first</code></pre>
 <hr>
 <h2 id="install-cli-uninstall">Windows</h2>
-<pre class="code-block" data-lang="powershell"><code>iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex</code></pre>
+<pre class="code-block" data-lang="powershell"><code>iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex</code></pre>
 <p>The script:</p>
 <ul>
-<li>Detects amd64 (the only Windows build we publish).</li><li>Resolves <code>latest.json</code>, then downloads <code>synaptory-windows-amd64.exe</code> and <code>sha256sums.txt</code> from <code>synaptory.h3t.co/cli/</code>.</li><li>Verifies the SHA-256.</li><li>Installs to <code>%USERPROFILE%\bin\synaptory.exe</code>.</li><li>Adds <code>%USERPROFILE%\bin</code> to your <strong>user</strong> <code>PATH</code> if it isn&#x27;t already (no admin needed; survives reboot).</li>
+<li>Detects amd64 (the only Windows build we publish).</li><li>Resolves <code>latest.json</code>, then downloads <code>synaptory-windows-amd64.exe</code> and <code>sha256sums.txt</code> from <code>synaptory.h3t.ai/cli/</code>.</li><li>Verifies the SHA-256.</li><li>Installs to <code>%USERPROFILE%\bin\synaptory.exe</code>.</li><li>Adds <code>%USERPROFILE%\bin</code> to your <strong>user</strong> <code>PATH</code> if it isn&#x27;t already (no admin needed; survives reboot).</li>
 </ul>
 <p>If the script added a directory to <code>PATH</code>, <strong>open a new PowerShell window</strong> so the updated <code>PATH</code> is loaded. Then:</p>
 <pre class="code-block" data-lang="powershell"><code>synaptory version

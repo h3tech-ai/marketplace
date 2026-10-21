@@ -104,8 +104,8 @@ Update with:
   synaptory update           # auto-fetches the latest version
 
 Or reinstall:
-  curl -fsSL https://synaptory.h3t.co/cli/install.sh | bash   (macOS / Linux)
-  iwr -useb https://synaptory.h3t.co/cli/install.ps1 | iex    (Windows)
+  curl -fsSL https://synaptory.h3t.ai/cli/install.sh | bash   (macOS / Linux)
+  iwr -useb https://synaptory.h3t.ai/cli/install.ps1 | iex    (Windows)
 
 Then start a new Claude Code session.'''
 emit('SessionStart', additional_context=msg)
